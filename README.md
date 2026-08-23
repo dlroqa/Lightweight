@@ -10,9 +10,11 @@ the UI or the API.
 
 ## Status
 
-Milestones 0 and 1 are complete: GGUF metadata reading, CPU and memory probing,
-RAM estimation with admission control, and a CLI over all three. The gateway,
-the engine supervisor and the UI are not built yet.
+Milestones 0 to 2 are complete: GGUF metadata reading, CPU and memory probing,
+RAM estimation with admission control, engine acquisition, and a supervised
+llama.cpp child process behind the `InferenceBackend` trait. The
+OpenAI-compatible gateway and the UI are next. See
+[docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint.
 
 ## Verified constraints
 
@@ -52,6 +54,9 @@ cargo test --workspace       # 165 tests, no network, no model downloads
 ./scripts/check.sh           # fmt, clippy -D warnings, tests, dependency gate
 ```
 
+`HERMES_TEST_MODEL=<path.gguf>` additionally enables the real-engine tests,
+which download the pinned engine and load a genuine model.
+
 `scripts/fetch-real-headers.sh` captures the headers of six real models from
 HuggingFace with HTTP range requests — a few megabytes rather than the tens of
 gigabytes the full models would cost. The tests that use them skip when they are
@@ -64,6 +69,10 @@ turn that skip into a failure, which is what CI does.
 cargo run -p hermes-cli -- sysinfo
 cargo run -p hermes-cli -- inspect model.gguf
 cargo run -p hermes-cli -- estimate model.gguf --ctx 8192 --kv-type q8_0
+
+# Acquire the engine, admit the model, load it, hold it.
+# With no --ctx, the largest context that fits this machine is chosen.
+cargo run -p hermes-cli -- serve model.gguf
 ```
 
 `estimate` exits non-zero when a model would not fit, so scripts can branch on
@@ -78,8 +87,25 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `hermes-gguf` | Bounded, panic-free GGUF header reader. Never reads tensor data |
 | `hermes-system-info` | CPU topology, ISA detection, memory probing, data directories |
 | `hermes-memory` | RAM estimation and admission verdicts |
+| `hermes-inference` | The backend abstraction. Contains no engine, by design |
+| `hermes-backend-llamacpp` | Acquires and supervises `llama-server` as a child process |
 | `hermes-observability` | Structured logging, rotation, privacy-mode wiring |
 | `hermes-cli` | Command-line access to the above |
+
+## Designed for the machine it runs on
+
+Limits are derived at runtime, never frozen as constants measured during
+development. Thread count comes from detected physical cores; the RAM safety
+margin is `max(512 MiB, 15% of available)`, so it grows with the machine; the
+ggml CPU variant is chosen by detected instruction set, so one artifact is
+optimal on a modern CPU and functional on an old one; and `serve` with no
+`--ctx` picks the largest context that still loads safely, which is 8K on a
+small laptop and the model's full maximum on a capable machine.
+
+The development machine is deliberately a constrained one — four slow cores, no
+AVX, most of its memory already spoken for — but it is one end of the range, not
+the design point. Nothing in the repository is tuned to it; `CARGO_BUILD_JOBS`
+is documented for constrained hosts rather than pinned in `.cargo/config.toml`.
 
 ## Two invariants worth preserving
 

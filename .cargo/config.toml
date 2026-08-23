@@ -1,4 +1,11 @@
-[build]
-# 4 concurrent rustc processes on ~2.3 GB available RAM will swap and end up
-# SLOWER than 3. Leave one core for the editor / daemon.
-jobs = 3
+# Build settings that suit every machine.
+#
+# Deliberately no `jobs` setting. Cargo defaults to the host's core count, which
+# is what a capable machine should use; pinning a low number here would throttle
+# every larger host to match the smallest one this was developed on.
+#
+# On a memory-constrained machine, cap it per-invocation instead — concurrent
+# rustc processes are the memory hog, and on a box with ~2 GB free, four of them
+# will swap and end up slower than three:
+#
+#     CARGO_BUILD_JOBS=3 cargo build

@@ -1,7 +1,15 @@
-//! Runtime parameters that determine a model's memory footprint.
+//! Runtime parameters for a loaded model.
+//!
+//! These live in `hermes-core` rather than beside either of their users
+//! because both need them and neither should depend on the other: the RAM
+//! estimator computes a footprint from them, and the inference backend turns
+//! them into engine arguments. A shared vocabulary is the point - an estimate
+//! computed for one set of parameters and a model loaded with another would be
+//! silently meaningless.
 
-use hermes_core::GgmlType;
 use serde::{Deserialize, Serialize};
+
+use crate::ggml::GgmlType;
 
 /// The knobs that change how much memory a loaded model occupies.
 ///
@@ -24,6 +32,10 @@ pub struct RuntimeParams {
     pub cache_type_k: GgmlType,
     /// Element type for the V cache.
     pub cache_type_v: GgmlType,
+    /// Inference threads. `None` means "use the machine's physical core count",
+    /// which is the section 9 default; hyperthread siblings share execution
+    /// units that matrix multiplication already saturates.
+    pub threads: Option<u32>,
 }
 
 impl Default for RuntimeParams {
@@ -38,6 +50,7 @@ impl Default for RuntimeParams {
             n_parallel: 1,
             cache_type_k: GgmlType::F16,
             cache_type_v: GgmlType::F16,
+            threads: None,
         }
     }
 }
@@ -45,6 +58,11 @@ impl Default for RuntimeParams {
 impl RuntimeParams {
     pub fn with_context(mut self, n_ctx: u32) -> Self {
         self.n_ctx = n_ctx;
+        self
+    }
+
+    pub fn with_threads(mut self, threads: u32) -> Self {
+        self.threads = Some(threads);
         self
     }
 

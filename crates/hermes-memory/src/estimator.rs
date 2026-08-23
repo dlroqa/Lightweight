@@ -5,7 +5,7 @@ use hermes_gguf::ModelMetadata;
 use hermes_system_info::{MemoryProbe, MemorySnapshot};
 
 use crate::estimate::{ComputeModel, Confidence, Estimate, Verdict};
-use crate::params::RuntimeParams;
+use hermes_core::RuntimeParams;
 
 /// Minimum headroom above the estimate for a [`Verdict::Safe`].
 const MIN_MARGIN: Bytes = Bytes(512 * 1024 * 1024);
@@ -789,5 +789,134 @@ mod context_ceiling_tests {
             machine(2),
         );
         assert!(estimate.max_context_that_fits.is_some());
+    }
+}
+
+impl Estimator {
+    /// The largest context preset that loads with a [`Verdict::Safe`] verdict.
+    ///
+    /// Exists so the product scales with the machine rather than to a constant.
+    /// A fixed default sized for a small laptop would leave a 64 GB workstation
+    /// running an 8K context for no reason, and a default sized for the
+    /// workstation would refuse to load anything on the laptop. Both ends fall
+    /// out of measuring the machine instead.
+    ///
+    /// Bounded by what the model was trained for, and by `ceiling` when the
+    /// caller has its own limit. Returns `None` when not even the smallest
+    /// preset fits, which is a refusal the caller should surface with remedies
+    /// rather than paper over.
+    pub fn largest_safe_context(
+        &self,
+        metadata: &ModelMetadata,
+        base: RuntimeParams,
+        snapshot: MemorySnapshot,
+        ceiling: Option<u32>,
+    ) -> Option<u32> {
+        let mut presets = RuntimeParams::context_presets_for(metadata.context_length);
+        if let Some(ceiling) = ceiling {
+            presets.retain(|&preset| preset <= ceiling);
+        }
+        // Largest first: the answer is the first that fits.
+        presets.into_iter().rev().find(|&n_ctx| {
+            self.estimate(metadata, base.with_context(n_ctx), snapshot)
+                .verdict
+                == Verdict::Safe
+        })
+    }
+}
+
+#[cfg(test)]
+mod scaling_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    #[test]
+    fn a_bigger_machine_is_offered_a_bigger_context() {
+        // The point of measuring rather than defaulting: the same model on a
+        // larger machine should use more of it.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+
+        let small = estimator
+            .largest_safe_context(&metadata, RuntimeParams::default(), machine(4), None)
+            .expect("something should fit on a 4 GiB machine");
+        let large = estimator
+            .largest_safe_context(&metadata, RuntimeParams::default(), machine(64), None)
+            .expect("something should fit on a 64 GiB machine");
+
+        assert!(
+            large > small,
+            "a 64 GiB machine was offered {large}, no more than the 4 GiB machine's {small}"
+        );
+    }
+
+    #[test]
+    fn the_chosen_context_actually_loads_safely() {
+        // The recommendation has to be true, or it is worse than no default.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        for available in [2, 4, 8, 16, 64] {
+            let snapshot = machine(available);
+            let Some(chosen) =
+                estimator.largest_safe_context(&metadata, RuntimeParams::default(), snapshot, None)
+            else {
+                continue;
+            };
+            let verdict = estimator
+                .estimate(
+                    &metadata,
+                    RuntimeParams::default().with_context(chosen),
+                    snapshot,
+                )
+                .verdict;
+            assert_eq!(
+                verdict,
+                Verdict::Safe,
+                "{chosen} tokens was not safe at {available} GiB"
+            );
+        }
+    }
+
+    #[test]
+    fn the_model_maximum_is_never_exceeded() {
+        // However much memory there is, the engine will not accept more than
+        // the model was trained for.
+        let mut metadata = model(4, 8, vec![2], 64);
+        metadata.context_length = Some(8192);
+        let chosen = bare_estimator()
+            .largest_safe_context(&metadata, RuntimeParams::default(), machine(256), None)
+            .expect("a tiny model on a huge machine");
+        assert_eq!(chosen, 8192);
+    }
+
+    #[test]
+    fn a_caller_supplied_ceiling_is_respected() {
+        let metadata = model(4, 8, vec![2], 64);
+        let chosen = bare_estimator()
+            .largest_safe_context(
+                &metadata,
+                RuntimeParams::default(),
+                machine(256),
+                Some(8192),
+            )
+            .expect("something fits");
+        assert!(chosen <= 8192);
+    }
+
+    #[test]
+    fn nothing_is_recommended_when_nothing_fits() {
+        // Better to refuse with remedies than to suggest a context that will
+        // be killed by the OOM killer.
+        let mut metadata = model(32, 32, vec![8], 128);
+        metadata.weight_bytes = Some(Bytes::from_gib(40).get());
+        assert_eq!(
+            bare_estimator().largest_safe_context(
+                &metadata,
+                RuntimeParams::default(),
+                machine(2),
+                None
+            ),
+            None
+        );
     }
 }

@@ -16,6 +16,8 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 
 use clap::{Parser, Subcommand};
+
+mod serve;
 use hermes_core::{Actionable, GgmlType, units::Bytes};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_memory::{Estimator, RuntimeParams, Verdict};
@@ -47,6 +49,29 @@ enum Command {
         /// download or a captured header.
         #[arg(long)]
         header_only: bool,
+    },
+    /// Acquire the engine, load a model and hold it resident.
+    ///
+    /// The OpenAI-compatible API arrives in the next milestone; this proves the
+    /// engine acquisition, admission and supervision path end to end.
+    Serve {
+        model: PathBuf,
+        /// Context length in tokens.
+        ///
+        /// Omitted, the largest size that still loads safely on this machine is
+        /// chosen, bounded by what the model supports. That is what lets the
+        /// same build use an 8K context on a small laptop and 128K on a
+        /// workstation, instead of a constant that is wrong for both.
+        #[arg(long)]
+        ctx: Option<u32>,
+        /// Inference threads. Defaults to the physical core count.
+        #[arg(long)]
+        threads: Option<u32>,
+        #[arg(long, default_value = "f16")]
+        kv_type: String,
+        /// Load even if the RAM estimate says it will not fit.
+        #[arg(long)]
+        force: bool,
     },
     /// Estimate what a model would cost to load, and whether it fits.
     Estimate {
@@ -116,6 +141,28 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
     match &cli.command {
+        Command::Serve {
+            model,
+            ctx,
+            threads,
+            kv_type,
+            force,
+        } => {
+            // Only this command needs an async runtime, so it is built here
+            // rather than wrapping every command in one.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("could not start the async runtime: {err}"))?;
+            runtime.block_on(serve::run(serve::ServeOptions {
+                model: model.clone(),
+                n_ctx: *ctx,
+                threads: *threads,
+                kv_type: kv_type.clone(),
+                force: *force,
+            }))?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Sysinfo => {
             sysinfo(out, cli.json);
             Ok(ExitCode::SUCCESS)

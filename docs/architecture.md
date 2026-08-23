@@ -103,3 +103,61 @@ the estimate reports `Confidence::Coarse` — the UI says so rather than implyin
 a precision the numbers do not have. That is the honest reading of "no
 guesswork": what can be exact is exact, and what cannot is measured, versioned
 and labelled rather than invented.
+
+## Why the engine is never reachable by anything else
+
+The child binds loopback on an **ephemeral** port and requires a random 24-byte
+API key regenerated on every launch. It is an implementation detail, not a
+second public endpoint: the gateway is the surface, and spec section 23 wants
+exactly one of those.
+
+The port is reserved by binding to `127.0.0.1:0`, reading the assignment and
+releasing it, which leaves a brief window where something else could take it.
+The alternative is a fixed port, which fails whenever a second instance runs or
+the port is already in use — far more common than losing that race, and a launch
+that does lose it fails at bind and is retried.
+
+## Why the supervisor works this hard to avoid orphans
+
+The engine holds an entire model in memory, hundreds of megabytes to several
+gigabytes. An orphaned one would be invisible and expensive, so there are three
+independent mechanisms: on Linux the child asks the kernel to `SIGKILL` it when
+its parent dies (`PR_SET_PDEATHSIG`), it is placed in its own session and process
+group by `setsid` so signals reach the whole tree rather than ours, and tokio's
+`kill_on_drop` remains as a backstop. The two syscalls run in `pre_exec` between
+`fork` and `exec`, where only async-signal-safe operations are permitted; both
+qualify, take no locks and allocate nothing.
+
+## Progress reporting must never block the work it reports
+
+Model loading sends progress over a bounded channel. Every send is `try_send`,
+never `send().await`.
+
+This is not a style preference — it was a deadlock. A cold start fills the
+channel from the download loop, and if the caller is not draining it (a closed
+UI, or a test holding a receiver it never reads) the next blocking send waits
+forever, with the load frozen behind it. Progress is advisory: dropping an
+update nobody is reading is always better than stalling the operation.
+
+Related, and found the same way: extraction and digest re-hashing were running
+directly on the async executor. Both are CPU-bound and blocking, and on a
+current-thread runtime they starve every other task — including the one draining
+progress. They now run under `spawn_blocking`.
+
+## What the engine is told explicitly, and why
+
+Every memory-shaping parameter is passed on the command line even when its
+default already matches: `--ctx-size`, `--batch-size`, `--ubatch-size`,
+`--parallel`, `--threads`, `--cache-type-k`, `--cache-type-v`.
+
+The RAM estimate is computed for exactly those values. Leaving any of them to
+the engine would mean the estimate describes something other than what is
+running, and the engine's defaults are not always what one would guess:
+`--parallel` defaults to `-1` (auto), which sizes the KV cache for a slot count
+we did not choose. Verified from `llama-server --help` at the pinned build, not
+from documentation.
+
+The KV cache type is also validated before launch. Only nine ggml types are
+accepted there — `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` — so `q6_K`,
+which is perfectly good for weights, is refused with the list of alternatives
+rather than surfacing as an opaque engine exit.

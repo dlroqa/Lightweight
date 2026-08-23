@@ -9,8 +9,9 @@
 
 pub mod estimate;
 pub mod estimator;
-pub mod params;
 
 pub use estimate::{ComputeModel, Confidence, Estimate, Verdict};
 pub use estimator::Estimator;
-pub use params::RuntimeParams;
+/// Re-exported from `hermes-core`: the estimator and the inference backend must
+/// agree on exactly these parameters, so they share one definition.
+pub use hermes_core::RuntimeParams;

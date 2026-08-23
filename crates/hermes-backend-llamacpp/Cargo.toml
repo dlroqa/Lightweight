@@ -1,0 +1,45 @@
+[package]
+name = "hermes-backend-llamacpp"
+description = "Supervises a pinned llama.cpp server as a child process behind the InferenceBackend trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Test support: a stand-in for llama-server, so supervision failures can be
+# exercised without a model and without waiting for a real engine to start.
+# Integration tests locate it through CARGO_BIN_EXE_hermes-fake-engine, which
+# cargo only sets for binaries in the same package.
+[[bin]]
+name = "hermes-fake-engine"
+path = "src/bin/hermes-fake-engine.rs"
+
+[dependencies]
+hermes-core.workspace = true
+hermes-gguf.workspace = true
+hermes-inference.workspace = true
+hermes-system-info.workspace = true
+hermes-observability.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zip.workspace = true
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+hermes-memory.workspace = true

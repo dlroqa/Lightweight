@@ -15,5 +15,14 @@ if ./scripts/fetch-real-headers.sh >/dev/null 2>&1; then
 else
   echo "== test (real models) == skipped: headers unavailable (offline?)"
 fi
+# The real-engine tests need a GGUF model and download the pinned engine, so
+# they are opt-in. Point HERMES_TEST_MODEL at a .gguf to include them.
+if [ -n "${HERMES_TEST_MODEL:-}" ]; then
+  echo "== test (real engine) =="
+  cargo test -p hermes-backend-llamacpp --test real_engine -- --test-threads=1
+else
+  echo "== test (real engine) == skipped: set HERMES_TEST_MODEL to a .gguf to include"
+fi
+
 echo "== deps ==";    ./scripts/check-deps.sh
 echo "All checks passed."

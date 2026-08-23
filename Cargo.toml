@@ -4,6 +4,8 @@ members = [
     "crates/hermes-core",
     "crates/hermes-gguf",
     "crates/hermes-memory",
+    "crates/hermes-inference",
+    "crates/hermes-backend-llamacpp",
     "crates/hermes-cli",
     "crates/hermes-system-info",
     "crates/hermes-observability",
@@ -51,10 +53,36 @@ directories = "6.0.0"
 # --- command line ---
 clap = { version = "4.6.6", features = ["derive"] }
 
+# --- async runtime and process supervision ---
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "net", "time", "io-util", "sync", "signal", "fs"] }
+tokio-util = "0.7.19"
+async-trait = "0.1.92"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+
+# --- HTTP ---
+# `rustls-no-provider` is deliberate: the default `rustls` feature selects
+# aws-lc-rs, whose build requires cmake. We install the `ring` provider
+# ourselves instead. See the dependency policy above.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "http2", "charset", "json", "stream"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# --- archives and digests ---
+sha2 = "0.11.0"
+hex = "0.4.3"
+tar = "0.4.46"
+flate2 = "1.1.9"          # defaults to the pure-Rust miniz_oxide backend
+zip = "8.6.0"
+
+# --- platform ---
+libc = "0.2.189"
+getrandom = "0.4.3"   # OS entropy for the per-run engine API key
+
 # --- internal ---
 hermes-core = { path = "crates/hermes-core" }
 hermes-gguf = { path = "crates/hermes-gguf" }
 hermes-memory = { path = "crates/hermes-memory" }
+hermes-inference = { path = "crates/hermes-inference" }
+hermes-backend-llamacpp = { path = "crates/hermes-backend-llamacpp" }
 hermes-system-info = { path = "crates/hermes-system-info" }
 hermes-observability = { path = "crates/hermes-observability" }
 

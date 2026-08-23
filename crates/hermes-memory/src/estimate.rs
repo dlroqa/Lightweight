@@ -43,7 +43,7 @@ use hermes_core::{GgmlType, Remedy, RemedyAction, SettingsSection};
 use hermes_system_info::MemorySnapshot;
 use serde::{Deserialize, Serialize};
 
-use crate::params::RuntimeParams;
+use hermes_core::RuntimeParams;
 
 /// Whether a load should be allowed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
