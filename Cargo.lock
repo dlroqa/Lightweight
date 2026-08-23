@@ -655,6 +655,7 @@ dependencies = [
  "hermes-core",
  "hermes-gguf",
  "hermes-inference",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

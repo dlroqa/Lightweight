@@ -122,6 +122,12 @@ pub struct MockBackend {
     generations: AtomicU64,
     /// Counts loads, which is how residency and unload behaviour is checked.
     loads: AtomicU64,
+    /// The last request this backend was asked to generate.
+    ///
+    /// Kept so a test can assert what actually reached the engine boundary —
+    /// which is the only way to prove that a request option a client sent was
+    /// forwarded rather than quietly dropped in the layers above.
+    last_request: Mutex<Option<GenerationRequest>>,
 }
 
 impl Default for MockBackend {
@@ -137,6 +143,7 @@ impl MockBackend {
             resident: Mutex::new(None),
             generations: AtomicU64::new(0),
             loads: AtomicU64::new(0),
+            last_request: Mutex::new(None),
         }
     }
 
@@ -163,6 +170,11 @@ impl MockBackend {
 
     pub fn load_count(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
+    }
+
+    /// What the last generation was actually asked for.
+    pub async fn last_request(&self) -> Option<GenerationRequest> {
+        self.last_request.lock().await.clone()
     }
 
     /// Load a model without a GGUF file on disk.
@@ -242,11 +254,12 @@ impl InferenceBackend for MockBackend {
     async fn generate(
         &self,
         instance: InstanceId,
-        _request: GenerationRequest,
+        request: GenerationRequest,
         cancel: CancellationToken,
     ) -> Result<GenerationStream, BackendError> {
         self.ensure_resident(instance).await?;
         self.generations.fetch_add(1, Ordering::Relaxed);
+        *self.last_request.lock().await = Some(request);
 
         let config = self.config.lock().await.clone();
         if let Script::Fail(detail) = &config.script {
@@ -579,6 +592,33 @@ mod tests {
             .expect("stream");
         let results: Vec<_> = stream.collect().await;
         assert!(results.iter().any(|result| result.is_err()));
+    }
+
+    #[tokio::test]
+    async fn the_backend_records_what_it_was_asked_for() {
+        // How a test proves that an option the client sent survived every
+        // layer above, rather than being dropped somewhere polite about it.
+        let backend = MockBackend::default();
+        let loaded = backend.make_resident(ModelId::new("mock@4k"), 4096).await;
+        let mut request = GenerationRequest::new(vec![ChatMessage::user("hi")]).without_reasoning();
+        request
+            .template_options
+            .insert("enable_thinking".into(), serde_json::json!(false));
+
+        let _ = backend
+            .generate(loaded.instance, request, CancellationToken::new())
+            .await
+            .expect("stream");
+
+        let seen = backend
+            .last_request()
+            .await
+            .expect("a request was recorded");
+        assert_eq!(
+            seen.reasoning,
+            hermes_inference::generation::ReasoningControl::Disabled
+        );
+        assert_eq!(seen.template_options["enable_thinking"], false);
     }
 
     #[tokio::test]

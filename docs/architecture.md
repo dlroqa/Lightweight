@@ -298,3 +298,31 @@ single `tracing::debug!(?state)` would have written the key into a log file.
 `AuthPolicy` now implements `Debug` by hand and renders `<redacted>`, which is
 the same structural approach `hermes_core::Private` takes for prompts: the
 guarantee holds whether or not the next person writing a log line remembers it.
+
+## The gateway is a provider; the harness is a client
+
+Worth stating because the code could be misread as being built *for* one
+agent: it is not. This is an OpenAI-compatible model provider. It holds the
+model, the memory budget, the context policy and the wire contract, and it has
+no idea what is calling it — an agent harness, a chat UI, an editor plugin and
+`curl` are the same thing from in here.
+
+The evidence, rather than the assertion:
+
+- No crate depends on a harness at build time or at run time. The only mentions
+  anywhere are two doc comments citing where a fact was checked.
+- The compatibility suite points the genuine `openai` package at the gateway,
+  and one test additionally imports a real harness's error parser — because a
+  provider is best checked by the code that will consume it. Both **skip
+  cleanly** when that harness is absent, and the Rust suite never needs it.
+- Everything the gateway knows about clients is generic: tolerant request
+  parsing, the chunk sequence, `reasoning_effort`, the OpenAI error envelope.
+  Where a decision was made because one real client behaves a particular way,
+  the comment says so and names the file, so the reasoning can be rechecked
+  against a different client later.
+
+The relationship runs one way. A harness points its `base_url` at this gateway
+and treats it as a model; the gateway serves it exactly as it serves anything
+else. Nothing here is allowed to require that a harness exists, and nothing
+here should ever be specialized to one — the moment it is, this stops being a
+provider and becomes part of somebody else's agent.

@@ -6,7 +6,7 @@
 
 use hermes_core::Private;
 use hermes_inference::generation::{
-    ChatMessage, GenerationRequest, MessageRole, SamplingParams, ToolCall, Usage,
+    ChatMessage, GenerationRequest, MessageRole, ReasoningControl, SamplingParams, ToolCall, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -179,8 +179,22 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub stop: Option<OneOrMany<String>>,
-    /// Everything else the client sent: `reasoning_effort`, `think`,
-    /// `options`, `tools`, and whatever a future version adds.
+    /// How hard the model should think before answering.
+    ///
+    /// Acted on rather than merely tolerated, because it is the only portable
+    /// way a client can stop a reasoning model from spending a small token
+    /// budget entirely on thinking — which reaches the client as a completion
+    /// with no content in it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Options for the model's own chat template, such as `enable_thinking`.
+    ///
+    /// Every template invents its own switches, so these are forwarded
+    /// untouched rather than interpreted here.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<Map<String, Value>>,
+    /// Everything else the client sent: `think`, `options`, `tools`, and
+    /// whatever a future version adds.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -225,6 +239,16 @@ impl ChatCompletionRequest {
 
         Ok(GenerationRequest {
             messages,
+            reasoning: match self.reasoning_effort.as_deref().map(str::trim) {
+                // OpenAI's spelling for "do not think", and what the engine
+                // recognizes at the pinned build: `reasoning_effort: "none"`
+                // sets `enable_thinking = false` before the template is
+                // applied (`tools/server/server-common.cpp:1312-1322`).
+                Some("none") => ReasoningControl::Disabled,
+                Some(effort) if !effort.is_empty() => ReasoningControl::Effort(effort.to_owned()),
+                _ => ReasoningControl::Default,
+            },
+            template_options: self.chat_template_kwargs.clone().unwrap_or_default(),
             max_tokens: self.requested_max_tokens(),
             sampling: SamplingParams {
                 temperature: self.temperature,
@@ -404,6 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn a_reasoning_model_can_be_told_not_to_think() {
+        // The failure this prevents, seen against a real model: a reasoning
+        // model given 24 tokens spends all 24 inside its reasoning and returns
+        // a completion whose content is empty — which a client treats as an
+        // empty response and retries.
+        let request =
+            parse(r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}"#);
+        assert_eq!(
+            request.to_generation_request().expect("ok").reasoning,
+            ReasoningControl::Disabled
+        );
+
+        let effort =
+            parse(r#"{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#);
+        assert_eq!(
+            effort.to_generation_request().expect("ok").reasoning,
+            ReasoningControl::Effort("high".into())
+        );
+
+        // Absent means "whatever this model does by default": forcing it
+        // either way would change what every model produces.
+        let quiet = parse(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(
+            quiet.to_generation_request().expect("ok").reasoning,
+            ReasoningControl::Default
+        );
+    }
+
+    #[test]
+    fn chat_template_options_reach_the_backend_untouched() {
+        // Each template invents its own switches — `enable_thinking` is
+        // Qwen's — so these are forwarded rather than interpreted.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"hi"}],
+                "chat_template_kwargs":{"enable_thinking":false,"custom":"value"}}"#,
+        );
+        let generation = request.to_generation_request().expect("ok");
+        assert_eq!(generation.template_options["enable_thinking"], false);
+        assert_eq!(generation.template_options["custom"], "value");
+    }
+
+    #[test]
     fn a_request_full_of_unknown_fields_still_parses() {
         // Hermes sends `reasoning_effort` at the top level and arbitrary keys
         // under `extra_body`. A 400 here would break every request from a
@@ -420,12 +486,17 @@ mod tests {
         );
         assert_eq!(request.messages.len(), 1);
         let ignored = request.ignored_keys();
-        for key in ["reasoning_effort", "think", "options", "some_future_key"] {
+        for key in ["think", "options", "some_future_key"] {
             assert!(
                 ignored.contains(&key),
                 "{key} was not captured: {ignored:?}"
             );
         }
+        // `reasoning_effort` used to land in the catch-all too. It is now a
+        // typed field the gateway acts on, which is why it is no longer among
+        // the ignored keys - a strengthening, not a regression.
+        assert!(!ignored.contains(&"reasoning_effort"));
+        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

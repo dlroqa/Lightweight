@@ -89,6 +89,20 @@ Remote access, against the same engine serving a real model
   its id, model and prompt token count. What it does not record, checked by
   grep after a real request: the API key, the bound address, and the prompt.
 
+Thinking models, now covered deliberately rather than by accident:
+
+- `reasoning_effort` and `chat_template_kwargs` are typed request fields, carried
+  through as an engine-neutral `ReasoningControl` plus untouched template
+  options, and asserted at every layer — parsed in `hermes-api`, sent by the
+  llama.cpp adapter, seen by the backend in the gateway suite, and sent by the
+  genuine `openai` SDK in the contract suite.
+- Against a real thinking model, `reasoning_effort: "none"` produces content and
+  **no** reasoning; against a non-thinking model the same request is simply
+  content. The real-engine test establishes which kind of model it is running
+  before asserting, so both are meaningful.
+- The full real-engine tier now passes against **both** model types: 7 tests on
+  Qwen3-1.7B (reasoning) and 7 on SmolLM2-135M (not).
+
 ## Test counts
 
 | Suite | Count | Notes |
@@ -136,15 +150,36 @@ engine and the gateway behaved perfectly: the whole 24-token budget went into
 content **or** reasoning and still fails if neither arrives. The non-thinking
 model satisfies it through the same branch it always did.
 
-Found while verifying remote access, and left for M4:
+Found while verifying remote access, and fixed rather than deferred:
 
-- **Engine-side request options are accepted and dropped.** A client cannot
-  turn a thinking model's reasoning off, because `chat_template_kwargs` (and
-  `reasoning_effort`, and `tools`) land in the tolerant catch-all and go no
-  further. With a small `max_tokens`, Qwen3 spends the whole budget inside its
-  reasoning and the client sees a completion with no content — the shape that
-  makes a client retry blindly. Forwarding a curated set of these is M4's
-  request-passthrough work; the tolerance that accepts them is already right.
+- **Engine-side request options were accepted and dropped.** A client could not
+  turn a thinking model's reasoning off, because `reasoning_effort` and
+  `chat_template_kwargs` landed in the tolerant catch-all and went no further.
+  With a small `max_tokens`, Qwen3 spends the whole budget inside its reasoning
+  and the client sees a completion with no content — the shape that makes a
+  client retry blindly. Both are typed fields now, carried as an engine-neutral
+  `ReasoningControl` plus untouched template options, and verified end to end:
+  against a real thinking model, `reasoning_effort: "none"` produces content and
+  no reasoning at all. `tools` remains M4's work.
+
+Found by pointing a real agent harness at the gateway, and left for M5:
+
+- **A harness issues auxiliary requests alongside the main turn.** While a
+  5,596-token agent prompt was prefilling, the harness sent a small
+  non-streaming request of its own (title generation). With
+  `max_concurrent_requests: 1` it queued behind the long generation and the
+  harness's own timeout fired: `Auxiliary title generation failed: Request
+  timed out.` Nothing was lost and the session continued, but it is precisely
+  the case section 22's priority bands exist for — a short request must not sit
+  behind a multi-minute one. Queue position events and fairness are M5.
+- **A harness may impose a minimum context.** This one refuses any model
+  advertising under 64,000 tokens and says so at startup rather than failing
+  later. The gateway advertises what it is really serving, which is the right
+  behaviour; meeting such a floor is a question of loading a model at 64K, and
+  `hermes estimate <model> --ctx 65536` answers whether a machine can before
+  anything is loaded. On this box it cannot — Qwen3-1.7B at 32768 is already
+  2.47 GiB short, with ranked remedies — which is a property of the hardware,
+  not of the design.
 
 ## Verify-before-coding checklist
 

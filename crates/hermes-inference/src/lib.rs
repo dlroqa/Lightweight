@@ -19,6 +19,6 @@ pub use backend::{
 };
 pub use error::BackendError;
 pub use generation::{
-    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, MessageRole, SamplingParams,
-    Timings, ToolCall, Usage,
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, MessageRole, ReasoningControl,
+    SamplingParams, Timings, ToolCall, Usage,
 };

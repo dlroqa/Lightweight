@@ -847,3 +847,129 @@ async fn the_api_key_cannot_be_printed_by_accident() {
         "the key reached a debug rendering: {rendered}"
     );
 }
+
+#[tokio::test]
+async fn a_reasoning_control_reaches_the_backend() {
+    ensure_provider();
+    // Tolerating a request field and acting on it are different things. This
+    // asserts the second: what the client sent arrived at the engine boundary.
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let seen = harness
+        .backend
+        .last_request()
+        .await
+        .expect("the backend was asked to generate");
+    assert_eq!(
+        seen.reasoning,
+        hermes_inference::generation::ReasoningControl::Disabled
+    );
+    assert_eq!(seen.template_options["enable_thinking"], false);
+}
+
+#[tokio::test]
+async fn an_effort_level_is_passed_through_rather_than_interpreted() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let _ = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        }))
+        .await;
+
+    let seen = harness.backend.last_request().await.expect("a request");
+    assert_eq!(
+        seen.reasoning,
+        hermes_inference::generation::ReasoningControl::Effort("high".into())
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_says_nothing_about_reasoning_leaves_it_to_the_model() {
+    ensure_provider();
+    // Defaulting either way would change what every model produces.
+    let harness = Harness::default().await;
+    let _ = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+
+    let seen = harness.backend.last_request().await.expect("a request");
+    assert_eq!(
+        seen.reasoning,
+        hermes_inference::generation::ReasoningControl::Default
+    );
+    assert!(seen.template_options.is_empty());
+}
+
+#[tokio::test]
+async fn a_reasoning_only_completion_is_reported_honestly() {
+    ensure_provider();
+    // A reasoning model that spends its whole budget thinking produces no
+    // content. We do not invent any: the stream carries the reasoning it
+    // actually produced, terminates properly, and the client decides.
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Reasoning {
+                reasoning: vec!["thinking hard".into()],
+                content: Vec::new(),
+            },
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let events = read_stream(
+        harness
+            .post_chat(json!({
+                "model": "mock-model@4k",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            }))
+            .await,
+    )
+    .await;
+
+    let reasoning: String = events
+        .iter()
+        .filter(|event| !event.is_done())
+        .filter_map(|event| {
+            chunk(event)["choices"][0]["delta"]["reasoning_content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(reasoning, "thinking hard");
+    assert!(events.last().expect("frames").is_done());
+
+    // And the non-streaming form says the same thing.
+    let body: Value = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["choices"][0]["message"]["content"], "");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "thinking hard"
+    );
+}

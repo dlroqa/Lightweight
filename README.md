@@ -4,9 +4,16 @@ A local, **CPU and RAM only** LLM inference platform: an OpenAI-compatible
 gateway, GGUF model management, and a desktop UI. No GPU is required anywhere,
 and none is used.
 
-The inference engine sits behind a trait boundary so the current llama.cpp
-backend can later be replaced by a proprietary Hermes runtime without touching
-the UI or the API.
+**It is a model provider, not part of any agent.** It serves the OpenAI API and
+knows nothing about who is calling: an agent harness, a chat UI, an editor
+plugin or `curl` are all just clients. Nothing it depends on, builds against, or
+needs at runtime comes from a harness — the compatibility tests point a real
+client library at it precisely because that is the honest way to check a
+provider, and they skip cleanly when that client is not installed.
+
+The inference engine itself sits behind a trait boundary, so the current
+llama.cpp backend can later be replaced by a proprietary runtime without
+touching the UI or the API.
 
 ## Status
 
@@ -157,6 +164,25 @@ clear, so the API key protects against *use*, not against *reading*. On an
 untrusted network the honest answers are an overlay, an SSH tunnel, or a
 TLS-terminating proxy — the last two usually meaning an FQDN, with the
 consequence in the table above.
+
+### A client may demand more context than the machine can give
+
+The gateway advertises the context it is **actually** serving, which is the
+only number that prevents overflow — but a client is entitled to have its own
+floor. One agent harness tested against refuses any model advertising under
+64,000 tokens, and said so rather than failing later:
+
+```
+Model … has a context window of 8,192 tokens, which is below the
+minimum 64,000 required by … Choose a model with at least 64K context.
+```
+
+That is a client policy, not a fault in either side. Serving such a client
+means loading a model at 64K, and the KV cache for that is measured in
+gigabytes — `hermes estimate model.gguf --ctx 65536` says whether this machine
+can, before anything is loaded. On a machine that cannot, the honest options
+are a client with a lower floor or more memory; advertising a window the
+gateway is not serving would trade a clear refusal for silent truncation.
 
 ### Keeping it running
 

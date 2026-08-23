@@ -115,6 +115,30 @@ pub struct SamplingParams {
     pub stop: Vec<String>,
 }
 
+/// How much the model should think before answering.
+///
+/// Engine-neutral on purpose. A model that reasons is not a llama.cpp concept
+/// — it is a property of the model — so the *intent* is expressed here and each
+/// backend decides how to ask for it. A backend serving a model that cannot
+/// reason ignores this entirely, which is the correct behaviour rather than an
+/// error: the caller asked for less thinking, and got none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningControl {
+    /// Leave it to the model's own template. Most models reason by default if
+    /// they can.
+    #[default]
+    Default,
+    /// Do not reason; answer directly.
+    ///
+    /// Worth asking for more often than it looks. A reasoning model given a
+    /// small token budget can spend the whole of it thinking and return an
+    /// answer with no content in it at all, which a client reads as an empty
+    /// response.
+    Disabled,
+    /// A named effort level, passed through to the model's template.
+    Effort(String),
+}
+
 /// A request to generate a completion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationRequest {
@@ -127,6 +151,15 @@ pub struct GenerationRequest {
     /// and the backend receives a number it can honour.
     pub max_tokens: Option<u32>,
     pub sampling: SamplingParams,
+    /// Whether the model should reason before answering.
+    pub reasoning: ReasoningControl,
+    /// Options for the model's own chat template.
+    ///
+    /// An escape hatch, and deliberately untyped: chat templates are shipped
+    /// inside the model and each one invents its own switches. A backend that
+    /// applies a template forwards these; one that does not, ignores them.
+    /// Nothing above this line has to know which switches exist.
+    pub template_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl GenerationRequest {
@@ -135,7 +168,16 @@ impl GenerationRequest {
             messages,
             max_tokens: None,
             sampling: SamplingParams::default(),
+            reasoning: ReasoningControl::Default,
+            template_options: serde_json::Map::new(),
         }
+    }
+
+    /// Ask the model not to reason before answering.
+    #[must_use]
+    pub fn without_reasoning(mut self) -> Self {
+        self.reasoning = ReasoningControl::Disabled;
+        self
     }
 }
 
@@ -276,6 +318,19 @@ mod tests {
         assert_eq!(FinishReason::Length.as_str(), "length");
         assert_eq!(FinishReason::ToolCalls.as_str(), "tool_calls");
         assert_eq!(FinishReason::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn reasoning_defaults_to_the_models_own_behaviour() {
+        // Forcing reasoning off by default would silently change what every
+        // model produces; forcing it on would make non-reasoning models fail.
+        let request = GenerationRequest::new(vec![ChatMessage::user("hi")]);
+        assert_eq!(request.reasoning, ReasoningControl::Default);
+        assert!(request.template_options.is_empty());
+        assert_eq!(
+            request.without_reasoning().reasoning,
+            ReasoningControl::Disabled
+        );
     }
 
     #[test]

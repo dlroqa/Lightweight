@@ -27,6 +27,7 @@ use hermes_backend_mock::{MockBackend, MockConfig, Script};
 use hermes_core::ModelId;
 use hermes_gateway::catalog::{Catalog, ResidentModel};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
+use hermes_inference::generation::ReasoningControl;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -90,6 +91,29 @@ struct ControlRequest {
 
 struct Control {
     backend: Arc<MockBackend>,
+}
+
+/// What the gateway last asked the backend to generate.
+///
+/// The contract suite uses this to prove that an option the *real* client
+/// library sent — `reasoning_effort`, a chat-template switch — survived the
+/// whole path and reached the engine boundary, instead of being tolerated and
+/// dropped.
+async fn last_request(State(control): State<Arc<Control>>) -> axum::Json<serde_json::Value> {
+    let Some(request) = control.backend.last_request().await else {
+        return axum::Json(json!({ "seen": false }));
+    };
+    axum::Json(json!({
+        "seen": true,
+        "reasoning": match request.reasoning {
+            ReasoningControl::Default => json!("default"),
+            ReasoningControl::Disabled => json!("disabled"),
+            ReasoningControl::Effort(ref effort) => json!(effort),
+        },
+        "template_options": request.template_options,
+        "max_tokens": request.max_tokens,
+        "message_count": request.messages.len(),
+    }))
 }
 
 async fn set_script(
@@ -162,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app: Router = hermes_gateway::app(state).merge(
         Router::new()
             .route("/__test__/script", post(set_script))
+            .route("/__test__/last-request", axum::routing::get(last_request))
             .with_state(control),
     );
 

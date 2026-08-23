@@ -18,7 +18,7 @@ use hermes_backend_llamacpp::backend::ProcessBackend;
 use hermes_core::{Actionable, GgmlType, ModelId, RuntimeParams};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::generation::{
-    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, ReasoningControl, SamplingParams,
 };
 use hermes_inference::{BackendHealth, InferenceBackend, LoadRequest};
 use hermes_system_info::MemoryProbe as _;
@@ -257,6 +257,8 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
         .expect("load");
 
     let generation = GenerationRequest {
+        reasoning: ReasoningControl::Default,
+        template_options: serde_json::Map::new(),
         messages: vec![
             ChatMessage::system("Answer in one short sentence."),
             ChatMessage::user("Name a colour."),
@@ -366,6 +368,8 @@ async fn dropping_the_stream_stops_the_engine_decoding() {
         .generate(
             loaded.instance,
             GenerationRequest {
+                reasoning: ReasoningControl::Default,
+                template_options: serde_json::Map::new(),
                 messages: vec![ChatMessage::user("Write a long story about a robot.")],
                 max_tokens: Some(500),
                 sampling: SamplingParams::default(),
@@ -423,4 +427,106 @@ async fn engine_pid(backend: &ProcessBackend) -> Option<u32> {
             std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
                 .is_ok_and(|cmdline| cmdline.contains("llama-server"))
         })
+}
+
+#[tokio::test]
+async fn a_reasoning_model_can_be_told_to_answer_directly() {
+    // The problem this exists for, observed against a real model: a reasoning
+    // model given a small token budget spends all of it inside its reasoning
+    // and returns a completion with no content — which a client reads as an
+    // empty response and retries. A caller must be able to say "do not think"
+    // and have the engine honour it.
+    //
+    // Written to be meaningful for either kind of model: it first finds out
+    // whether this one reasons at all, then asserts the part that must hold
+    // regardless.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("reasoning");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams::default().with_context(2048);
+    let (tx, _rx) = mpsc::channel(64);
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("load");
+
+    let ask = |reasoning: ReasoningControl| GenerationRequest {
+        messages: vec![
+            ChatMessage::system("Answer in one short sentence."),
+            ChatMessage::user("Name a colour."),
+        ],
+        max_tokens: Some(32),
+        reasoning,
+        template_options: serde_json::Map::new(),
+        sampling: SamplingParams {
+            temperature: Some(0.0),
+            seed: Some(7),
+            ..SamplingParams::default()
+        },
+    };
+
+    // Does this model reason when left alone? Read only until the first
+    // fragment of either kind, then drop the stream — which cancels the work
+    // rather than waiting out a budget we do not need.
+    let mut events = backend
+        .generate(
+            loaded.instance,
+            ask(ReasoningControl::Default),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("generation");
+    let mut reasons_by_default = false;
+    while let Some(event) = events.next().await {
+        match event.expect("no error mid-stream") {
+            GenerationEvent::ReasoningDelta { .. } => {
+                reasons_by_default = true;
+                break;
+            }
+            GenerationEvent::ContentDelta { .. } => break,
+            _ => {}
+        }
+    }
+    drop(events);
+
+    // Now with reasoning refused. Content must arrive, and no reasoning may.
+    let mut events = backend
+        .generate(
+            loaded.instance,
+            ask(ReasoningControl::Disabled),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("generation");
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    while let Some(event) = events.next().await {
+        match event.expect("no error mid-stream") {
+            GenerationEvent::ContentDelta { text } => content.push_str(&text),
+            GenerationEvent::ReasoningDelta { text } => reasoning.push_str(&text),
+            _ => {}
+        }
+    }
+
+    assert!(
+        !content.is_empty(),
+        "asked not to reason, the model still produced no content \
+         (reasons_by_default = {reasons_by_default})"
+    );
+    if reasons_by_default {
+        // The whole point: this model *would* have reasoned, and did not.
+        assert!(
+            reasoning.is_empty(),
+            "reasoning was requested off and arrived anyway: {reasoning:?}"
+        );
+    } else {
+        eprintln!("note: this model does not reason by default; the off switch was still honoured");
+    }
+
+    backend.shutdown().await.expect("shutdown");
 }

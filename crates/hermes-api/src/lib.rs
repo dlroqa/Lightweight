@@ -4,9 +4,14 @@
 //! behaviour, and the codec that turns generation events into the exact bytes
 //! a client reads. The gateway supplies the HTTP.
 //!
-//! Two rules run through all of it, and both come from having read the client
-//! that must connect (`~/.hermes/hermes-agent/`) rather than from a
-//! specification.
+//! The contract implemented here is **OpenAI's**, not any particular client's.
+//! This gateway is a model provider: an agent harness, a chat UI, a script with
+//! `curl` — anything that speaks that API — is a client, and none of them is
+//! privileged.
+//!
+//! Two rules run through all of it, and both were learned by reading a real
+//! client's source rather than a specification, because a specification does
+//! not say which parts are load-bearing in practice.
 //!
 //! **Tolerance is not politeness, it is correctness.** Every request type
 //! carries `#[serde(default)]` and a `#[serde(flatten)]` catch-all, and

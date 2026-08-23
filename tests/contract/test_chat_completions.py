@@ -325,3 +325,97 @@ def test_multi_turn_conversations_keep_working(client, script):
         history.append({"role": "assistant", "content": content})
 
     assert len(history) == 7
+
+
+def _last_request(gateway):
+    """What the gateway last asked the backend to generate."""
+    import urllib.request
+
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{gateway['port']}/__test__/last-request", timeout=5
+    ) as response:
+        return json.load(response)
+
+
+def test_reasoning_effort_reaches_the_backend(client, script, gateway):
+    # Tolerating a field and acting on it are different things. A reasoning
+    # model given a small budget can spend all of it thinking and return a
+    # completion with no content, so a client must be able to say "do not
+    # think" and have that survive every layer.
+    script(kind="content", fragments=["direct answer"])
+    completion = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+    )
+    assert completion.choices[0].message.content == "direct answer"
+
+    seen = _last_request(gateway)
+    assert seen["seen"] is True
+    assert seen["reasoning"] == "disabled"
+
+
+def test_a_template_switch_survives_the_whole_path(client, script, gateway):
+    # `enable_thinking` is one model family's switch; there will be others.
+    # They are forwarded untouched rather than interpreted.
+    script(kind="content", fragments=["ok"])
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    seen = _last_request(gateway)
+    assert seen["template_options"] == {"enable_thinking": False}
+
+
+def test_an_effort_level_is_forwarded_not_interpreted(client, script, gateway):
+    script(kind="content", fragments=["ok"])
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+    )
+    assert _last_request(gateway)["reasoning"] == "high"
+
+
+def test_saying_nothing_about_reasoning_leaves_the_model_alone(client, script, gateway):
+    # Defaulting either way would change what every model produces.
+    script(kind="content", fragments=["ok"])
+    client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": "hi"}]
+    )
+    seen = _last_request(gateway)
+    assert seen["reasoning"] == "default"
+    assert seen["template_options"] == {}
+
+
+def test_a_thinking_model_that_produces_only_reasoning_is_reported_honestly(client, script):
+    # We never fabricate content to make a reasoning-only turn look answered.
+    # The client gets the reasoning that was produced, a proper finish, and
+    # usage — and decides for itself what to do about the empty content.
+    script(kind="reasoning", reasoning=["let me work through this"], content=[])
+
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+
+    content, reasoning, finish, usage = "", "", None, None
+    for chunk in stream:
+        if chunk.usage is not None:
+            usage = chunk.usage
+        for choice in chunk.choices:
+            if choice.delta.content:
+                content += choice.delta.content
+            if choice.finish_reason:
+                finish = choice.finish_reason
+            extra = choice.delta.model_dump()
+            if extra.get("reasoning_content"):
+                reasoning += extra["reasoning_content"]
+
+    assert content == ""
+    assert reasoning == "let me work through this"
+    assert finish == "stop"
+    assert usage is not None and usage.completion_tokens == 1

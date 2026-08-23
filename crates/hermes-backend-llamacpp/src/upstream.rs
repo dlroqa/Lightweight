@@ -34,7 +34,7 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use hermes_core::{SseDecoder, SseEvent};
 use hermes_inference::generation::{
-    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, Timings, Usage,
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, ReasoningControl, Timings, Usage,
 };
 use hermes_inference::{BackendError, GenerationStream};
 use serde_json::{Map, Value, json};
@@ -189,6 +189,32 @@ impl UpstreamClient {
 
         if let Some(max_tokens) = request.max_tokens {
             body.insert("max_tokens".into(), json!(max_tokens));
+        }
+
+        // Reasoning. At the pinned build `reasoning_effort: "none"` sets
+        // `enable_thinking = false` before the chat template is applied, and
+        // any other value is handed to the template
+        // (`tools/server/server-common.cpp:1312-1322`). `Default` sends
+        // nothing, so the model behaves as its own template intends.
+        match &request.reasoning {
+            ReasoningControl::Default => {}
+            ReasoningControl::Disabled => {
+                body.insert("reasoning_effort".into(), json!("none"));
+            }
+            ReasoningControl::Effort(effort) => {
+                body.insert("reasoning_effort".into(), json!(effort));
+            }
+        }
+
+        // Template switches, forwarded untouched. The engine merges these into
+        // the template's arguments, and `enable_thinking` there is the older,
+        // model-specific way to ask for the same thing as above; a client that
+        // sends both gets both, and the engine resolves it.
+        if !request.template_options.is_empty() {
+            body.insert(
+                "chat_template_kwargs".into(),
+                Value::Object(request.template_options.clone()),
+            );
         }
 
         let sampling = &request.sampling;
@@ -824,6 +850,8 @@ mod tests {
         let request = GenerationRequest {
             messages: vec![ChatMessage::user("hi")],
             max_tokens: Some(128),
+            reasoning: ReasoningControl::Default,
+            template_options: serde_json::Map::new(),
             sampling: SamplingParams {
                 temperature: Some(0.2),
                 stop: vec!["\n\n".into()],
@@ -836,6 +864,43 @@ mod tests {
         assert_eq!(body["temperature"], json!(0.2));
         assert_eq!(body["seed"], json!(7));
         assert_eq!(body["stop"], json!(["\n\n"]));
+    }
+
+    #[test]
+    fn reasoning_is_only_mentioned_when_the_caller_asked() {
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+
+        // Untouched by default: the model's own template decides.
+        let default =
+            client.build_request_body(&GenerationRequest::new(vec![ChatMessage::user("hi")]));
+        assert!(default.get("reasoning_effort").is_none());
+        assert!(default.get("chat_template_kwargs").is_none());
+
+        let quiet = client.build_request_body(
+            &GenerationRequest::new(vec![ChatMessage::user("hi")]).without_reasoning(),
+        );
+        assert_eq!(quiet["reasoning_effort"], json!("none"));
+
+        let mut effort = GenerationRequest::new(vec![ChatMessage::user("hi")]);
+        effort.reasoning = ReasoningControl::Effort("high".into());
+        assert_eq!(
+            client.build_request_body(&effort)["reasoning_effort"],
+            json!("high")
+        );
+    }
+
+    #[test]
+    fn template_options_are_forwarded_verbatim() {
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let mut request = GenerationRequest::new(vec![ChatMessage::user("hi")]);
+        request
+            .template_options
+            .insert("enable_thinking".into(), json!(false));
+        let body = client.build_request_body(&request);
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
     }
 
     #[test]
