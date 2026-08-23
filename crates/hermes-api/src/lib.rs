@@ -30,6 +30,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod chat;
+pub mod completions;
 pub mod error;
 pub mod models;
 pub mod props;
@@ -38,6 +39,10 @@ pub mod stream;
 pub use chat::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, RequestMessage, ResponseMessage,
     StreamOptions, UsageBody,
+};
+pub use completions::{
+    CompletionChoice, CompletionChunk, CompletionChunkBuilder, CompletionError, CompletionRequest,
+    CompletionResponse,
 };
 pub use error::{ErrorBody, ErrorEnvelope};
 pub use models::{ModelList, ModelRow};

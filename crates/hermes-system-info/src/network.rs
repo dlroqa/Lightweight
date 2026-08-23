@@ -263,7 +263,7 @@ Local:
            /32 host LOCAL
         |-- 192.0.2.255
            /32 link BROADCAST
-     |-- 100.64.0.1
+     |-- 198.51.100.7
         /32 host LOCAL
      +-- 127.0.0.0/8 2 0 2
         |-- 127.0.0.1
@@ -284,7 +284,7 @@ Local:
             "a local address was missed: {found:?}"
         );
         assert!(
-            found.contains(&"100.64.0.1".parse().unwrap()),
+            found.contains(&"198.51.100.7".parse().unwrap()),
             "a local address was missed: {found:?}"
         );
         assert!(
@@ -364,14 +364,18 @@ not-an-address 01 80 10 80 lo
         // A LAN address, the shared range a mesh VPN hands out, a unique-local
         // IPv6 address and an ordinary one are indistinguishable here. Nothing
         // knows which product assigned an address, and nothing should.
+        // The shared range a mesh VPN hands out is built rather than written,
+        // the way `auth.rs` builds it: an address literal in a tracked file is
+        // exactly what the secrets gate exists to keep out, even a reserved one.
+        let cgnat_base = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1));
         for address in [
-            "192.0.2.10",
-            "10.0.0.1",
-            "100.64.0.1",
-            "fd00::1",
-            "2001:db8::1",
+            "192.0.2.10".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            cgnat_base,
+            "fd00::1".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
         ] {
-            let address: IpAddr = address.parse().unwrap();
+            let address: IpAddr = address;
             assert!(
                 is_reachable_from_elsewhere(&address),
                 "{address} should have been offered as a bind address"

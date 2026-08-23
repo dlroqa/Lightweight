@@ -14,6 +14,7 @@ use hermes_core::{ModelId, SseDecoder, SseEvent};
 use hermes_gateway::catalog::{Catalog, ResidentModel};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_inference::InferenceBackend;
+use hermes_inference::generation::{Prompt, ToolChoice};
 use serde_json::{Value, json};
 
 /// A gateway bound to an ephemeral loopback port.
@@ -82,6 +83,16 @@ impl Harness {
         Self::client()
             .post(format!("{}/v1/chat/completions", self.base))
             // Exactly what the client sends when no key is configured.
+            .header("Authorization", "Bearer no-key-required")
+            .json(&body)
+            .send()
+            .await
+            .expect("request")
+    }
+
+    async fn post_completions(&self, body: Value) -> reqwest::Response {
+        Self::client()
+            .post(format!("{}/v1/completions", self.base))
             .header("Authorization", "Bearer no-key-required")
             .json(&body)
             .send()
@@ -971,5 +982,470 @@ async fn a_reasoning_only_completion_is_reported_honestly() {
     assert_eq!(
         body["choices"][0]["message"]["reasoning_content"],
         "thinking hard"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4: tools on the way *in*. The output side was already covered above; what
+// was missing was the half that makes any of it happen — a gateway that
+// accepts `tools` and does not forward them tells the model nothing, so the
+// model never calls anything and the agent loop never starts.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn declared_tools_reach_the_backend() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "what is the weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let seen = harness
+        .backend
+        .last_request()
+        .await
+        .expect("the backend saw a request");
+    assert_eq!(seen.tools.len(), 1, "the tool never reached the backend");
+    assert_eq!(seen.tools[0].name, "get_weather");
+    assert_eq!(
+        seen.tools[0].description.as_deref(),
+        Some("Get the weather for a city")
+    );
+    // Carried, not rewritten: these become the tokens the template renders.
+    assert_eq!(seen.tools[0].parameters["required"][0], "city");
+    assert_eq!(seen.tool_choice, ToolChoice::Auto);
+    assert_eq!(seen.parallel_tool_calls, Some(false));
+}
+
+#[tokio::test]
+async fn a_request_with_no_tools_declares_none() {
+    // An empty declaration is not the same as no declaration: a template
+    // renders the "you may call these" preamble either way, which costs prompt
+    // tokens and changes what the model does.
+    ensure_provider();
+    let harness = Harness::default().await;
+    harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .await;
+    let seen = harness.backend.last_request().await.expect("a request");
+    assert!(seen.tools.is_empty());
+    assert_eq!(seen.tool_choice, ToolChoice::Unspecified);
+}
+
+#[tokio::test]
+async fn an_unusable_tool_declaration_is_a_400_that_names_the_entry() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "fine"}},
+                {"type": "function", "function": {"description": "no name"}},
+            ],
+        }))
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_tools");
+    assert_eq!(body["error"]["param"], "tools");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("tools[1]")),
+        "the refusal must name the entry: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_choice_naming_an_undeclared_function_is_a_400() {
+    // The rename trap: renaming a tool but not its `tool_choice` would
+    // otherwise reach the model as a demand for a function it never received.
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+            "tool_choice": {"type": "function", "function": {"name": "read_fil"}},
+        }))
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_tool_choice");
+    assert_eq!(body["error"]["param"], "tool_choice");
+}
+
+#[tokio::test]
+async fn a_field_of_the_wrong_type_is_not_reported_as_invalid_json() {
+    // The engine answers 500 to `"tools": "nope"`, which is a client mistake
+    // reported as a server fault. It is a 400 here — and specifically not one
+    // that sends the client hunting for a syntax error that is not there.
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": "nope",
+        }))
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_request_body");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("not valid JSON"),
+        "the body was valid JSON; only a field was unreadable: {message}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4: /v1/completions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_text_completion_has_the_text_completion_shape() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Content(vec![" Paris".into(), ".".into()]),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": "The capital of France is",
+            "max_tokens": 8,
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["model"], "mock-model@4k");
+    assert_eq!(body["choices"][0]["text"], " Paris.");
+    assert_eq!(body["choices"][0]["index"], 0);
+    // Present and null rather than absent: clients index it.
+    assert!(body["choices"][0]["logprobs"].is_null());
+    assert!(
+        body["choices"][0]
+            .as_object()
+            .is_some_and(|choice| choice.contains_key("logprobs")),
+        "logprobs must be present: {body}"
+    );
+    // A completion is not a conversation: no message, no chat template.
+    assert!(body["choices"][0].get("message").is_none());
+    assert_eq!(body["usage"]["prompt_tokens"], 11);
+
+    let seen = harness.backend.last_request().await.expect("a request");
+    match &seen.prompt {
+        Prompt::Text(text) => assert_eq!(text.reveal(), "The capital of France is"),
+        Prompt::Chat(_) => panic!("a completion reached the backend as a conversation"),
+    }
+}
+
+#[tokio::test]
+async fn a_streamed_text_completion_ends_with_usage_then_done() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Content(vec![" Pa".into(), "ris".into()]),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": "The capital of France is",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    let events = read_stream(response).await;
+
+    assert!(
+        events.last().is_some_and(SseEvent::is_done),
+        "a stream must end with [DONE]"
+    );
+    let chunks: Vec<Value> = events
+        .iter()
+        .filter(|event| !event.is_done())
+        .map(chunk)
+        .collect();
+    assert!(
+        chunks.iter().all(|c| c["object"] == "text_completion"),
+        "every chunk carries the endpoint's object: {chunks:?}"
+    );
+
+    let text: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["text"].as_str())
+        .collect();
+    assert_eq!(text, " Paris");
+
+    // The finish chunk names the choice it closes.
+    // Content chunks carry finish_reason: null, so the closing one is the
+    // chunk where it becomes a string.
+    assert!(
+        chunks
+            .iter()
+            .filter(|c| !c["choices"].as_array().is_some_and(Vec::is_empty))
+            .all(|c| c["choices"][0]
+                .as_object()
+                .is_some_and(|choice| { choice.contains_key("finish_reason") })),
+        "finish_reason must be present on every choice: {chunks:?}"
+    );
+    let finish = chunks
+        .iter()
+        .find(|c| c["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    assert_eq!(finish["choices"][0]["index"], 0);
+
+    // OpenAI's shape, not the engine's: usage rides a chunk with no choices.
+    let usage = chunks.last().expect("a last chunk");
+    assert_eq!(usage["choices"].as_array().map(Vec::len), Some(0));
+    assert_eq!(usage["usage"]["prompt_tokens"], 11);
+}
+
+#[tokio::test]
+async fn an_array_prompt_yields_one_choice_per_prompt() {
+    // What the endpoint has always meant. Refusing it because this machine is
+    // slow would bake this machine into the product.
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Content(vec!["out".into()]),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": ["alpha", "beta", "gamma"],
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+
+    let choices = body["choices"].as_array().expect("choices");
+    assert_eq!(choices.len(), 3);
+    for (index, choice) in choices.iter().enumerate() {
+        assert_eq!(choice["index"], index);
+        assert_eq!(choice["text"], "out");
+    }
+    // One request, one set of numbers, covering all three generations.
+    assert_eq!(body["usage"]["prompt_tokens"], 33);
+    assert_eq!(harness.backend.generation_count(), 3);
+}
+
+#[tokio::test]
+async fn a_streamed_array_prompt_indexes_every_choice() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Content(vec!["x".into()]),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": ["one", "two"],
+            "stream": true,
+        }))
+        .await;
+    let events = read_stream(response).await;
+    let chunks: Vec<Value> = events
+        .iter()
+        .filter(|event| !event.is_done())
+        .map(chunk)
+        .collect();
+
+    let finished: Vec<u64> = chunks
+        .iter()
+        .filter(|c| c["choices"][0]["finish_reason"].is_string())
+        .filter_map(|c| c["choices"][0]["index"].as_u64())
+        .collect();
+    assert_eq!(finished, vec![0, 1], "each choice closes exactly once");
+}
+
+#[tokio::test]
+async fn echo_repeats_the_prompt_at_the_head_of_the_completion() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Content(vec![" Paris".into()]),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": "The capital of France is",
+            "echo": true,
+        }))
+        .await;
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["choices"][0]["text"], "The capital of France is Paris");
+}
+
+#[tokio::test]
+async fn a_token_prompt_is_refused_by_name() {
+    // Refused, not mis-parsed: a client that sent token ids and was told "not
+    // valid JSON" would have nothing to go on.
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_completions(json!({"model": "mock-model@4k", "prompt": [1, 2, 3]}))
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_prompt");
+    assert_eq!(body["error"]["param"], "prompt");
+}
+
+#[tokio::test]
+async fn a_completion_parameter_we_cannot_honour_is_refused_by_name() {
+    // Ignoring these would return a well-formed reply to a different request.
+    ensure_provider();
+    let harness = Harness::default().await;
+    for (param, body) in [
+        ("logprobs", json!({"prompt": "x", "logprobs": 5})),
+        ("best_of", json!({"prompt": "x", "best_of": 4})),
+        ("suffix", json!({"prompt": "x", "suffix": "</code>"})),
+    ] {
+        let response = harness.post_completions(body).await;
+        assert_eq!(response.status(), 400, "{param} was not refused");
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert_eq!(body["error"]["param"], param);
+    }
+}
+
+#[tokio::test]
+async fn an_overlong_completion_prompt_is_a_400_before_anything_streams() {
+    // The same guarantee the chat endpoint gives: a prompt that cannot fit is
+    // a parsable status, not an empty stream the client retries verbatim.
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            prompt_tokens: N_CTX + 10,
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": "far too long",
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "context_length_exceeded");
+    assert_eq!(body["error"]["param"], "prompt");
+    assert_eq!(
+        harness.backend.generation_count(),
+        0,
+        "nothing may be generated once the prompt is known not to fit"
+    );
+}
+
+#[tokio::test]
+async fn a_completion_for_a_model_we_do_not_have_is_a_404() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_completions(json!({"model": "something-else", "prompt": "x"}))
+        .await;
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "model_not_found");
+}
+
+#[tokio::test]
+async fn a_completion_that_fails_midway_ends_the_stream_cleanly() {
+    // Once headers are out an error cannot become a status, so it becomes a
+    // terminal chunk and a proper [DONE] rather than a dropped connection.
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::FailMidStream {
+                content: vec!["par".into()],
+                error: "the engine gave up".into(),
+            },
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_completions(json!({
+            "model": "mock-model@4k",
+            "prompt": "x",
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    let events = read_stream(response).await;
+    assert!(events.last().is_some_and(SseEvent::is_done));
+
+    let error_chunk = events
+        .iter()
+        .filter(|event| !event.is_done())
+        .map(chunk)
+        .find(|c| c.get("error").is_some())
+        .expect("a terminal error chunk");
+    assert!(
+        error_chunk["error"]["code"].is_string(),
+        "the error chunk must carry a code: {error_chunk}"
     );
 }

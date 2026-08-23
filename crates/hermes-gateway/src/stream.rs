@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Fifteen seconds is well inside the shortest idle timeout worth worrying
 /// about, and costs six bytes.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Holds a request's slot and cancels its work when dropped.
 ///
@@ -61,6 +61,15 @@ impl RequestGuard {
             cancel,
             _permit: permit,
         }
+    }
+
+    /// Cancel the work now rather than when the client finishes reading.
+    ///
+    /// `Drop` does this anyway; calling it early releases the slot as soon as
+    /// the last frame is queued, which on a single-slot gateway is the
+    /// difference between the next request waiting and not.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
     }
 }
 

@@ -18,7 +18,8 @@ use hermes_backend_llamacpp::backend::ProcessBackend;
 use hermes_core::{Actionable, GgmlType, ModelId, RuntimeParams};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::generation::{
-    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, ReasoningControl, SamplingParams,
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, ReasoningControl,
+    SamplingParams, ToolChoice, ToolDefinition,
 };
 use hermes_inference::{BackendHealth, InferenceBackend, LoadRequest};
 use hermes_system_info::MemoryProbe as _;
@@ -257,12 +258,6 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
         .expect("load");
 
     let generation = GenerationRequest {
-        reasoning: ReasoningControl::Default,
-        template_options: serde_json::Map::new(),
-        messages: vec![
-            ChatMessage::system("Answer in one short sentence."),
-            ChatMessage::user("Name a colour."),
-        ],
         max_tokens: Some(24),
         sampling: SamplingParams {
             // Pinned so the test is about the contract rather than about what
@@ -271,6 +266,10 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
             seed: Some(7),
             ..SamplingParams::default()
         },
+        ..GenerationRequest::new(vec![
+            ChatMessage::system("Answer in one short sentence."),
+            ChatMessage::user("Name a colour."),
+        ])
     };
 
     // Counted with the model's own chat template applied, which is the whole
@@ -368,11 +367,10 @@ async fn dropping_the_stream_stops_the_engine_decoding() {
         .generate(
             loaded.instance,
             GenerationRequest {
-                reasoning: ReasoningControl::Default,
-                template_options: serde_json::Map::new(),
-                messages: vec![ChatMessage::user("Write a long story about a robot.")],
                 max_tokens: Some(500),
-                sampling: SamplingParams::default(),
+                ..GenerationRequest::new(vec![ChatMessage::user(
+                    "Write a long story about a robot.",
+                )])
             },
             cancel.clone(),
         )
@@ -455,18 +453,17 @@ async fn a_reasoning_model_can_be_told_to_answer_directly() {
         .expect("load");
 
     let ask = |reasoning: ReasoningControl| GenerationRequest {
-        messages: vec![
-            ChatMessage::system("Answer in one short sentence."),
-            ChatMessage::user("Name a colour."),
-        ],
         max_tokens: Some(32),
         reasoning,
-        template_options: serde_json::Map::new(),
         sampling: SamplingParams {
             temperature: Some(0.0),
             seed: Some(7),
             ..SamplingParams::default()
         },
+        ..GenerationRequest::new(vec![
+            ChatMessage::system("Answer in one short sentence."),
+            ChatMessage::user("Name a colour."),
+        ])
     };
 
     // Does this model reason when left alone? Read only until the first
@@ -527,6 +524,166 @@ async fn a_reasoning_model_can_be_told_to_answer_directly() {
     } else {
         eprintln!("note: this model does not reason by default; the off switch was still honoured");
     }
+
+    backend.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_text_prompt_is_continued_rather_than_answered() {
+    // `/v1/completions` is a different endpoint, not an older spelling of the
+    // chat one. Proved here by behaviour rather than by routing: the model is
+    // given a sentence fragment, and what comes back must *continue* it. A
+    // request that had been wrapped in a chat template would answer it as a
+    // question instead, and this is the only tier that can tell the difference,
+    // because it is the only one with a real template and a real model.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("text-completion");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams::default().with_context(2048);
+    let (tx, _rx) = mpsc::channel(64);
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("load");
+
+    let generation = GenerationRequest {
+        max_tokens: Some(12),
+        sampling: SamplingParams {
+            temperature: Some(0.0),
+            seed: Some(7),
+            ..SamplingParams::default()
+        },
+        ..GenerationRequest::from_text("The capital city of France is")
+    };
+
+    // The token count goes through `/tokenize`, not through the chat template:
+    // a raw prompt has no template, so a count that included one would be
+    // measuring a prompt nobody is going to send.
+    let counted = backend
+        .count_prompt_tokens(loaded.instance, &generation)
+        .await
+        .expect("count");
+    assert!(counted > 0, "a non-empty prompt cannot be zero tokens");
+
+    let mut events = backend
+        .generate(loaded.instance, generation, CancellationToken::new())
+        .await
+        .expect("generate");
+
+    let mut text = String::new();
+    let mut usage = None;
+    while let Some(event) = events.next().await {
+        match event.expect("no error") {
+            GenerationEvent::ContentDelta { text: fragment } => text.push_str(&fragment),
+            GenerationEvent::Finished { usage: seen, .. } => usage = Some(seen),
+            _ => {}
+        }
+    }
+
+    assert!(
+        !text.is_empty(),
+        "the model continued the prompt with nothing"
+    );
+    let usage = usage.expect("a terminal usage report");
+    assert_eq!(
+        usage.prompt_tokens, counted,
+        "the pre-flight count and the engine's own count must agree, or the \
+         overflow check is guarding a different prompt than the one that runs"
+    );
+
+    backend.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn tool_declarations_change_the_prompt_the_engine_builds() {
+    // The measurement that decides whether the gateway's overflow check is
+    // sound. A tool-capable template renders every declaration into the prompt,
+    // so a token count taken without `tools` is short by the whole toolset —
+    // one small tool measured 148 tokens here, and an agent's toolset is
+    // thousands. If that check were wrong, an overflow would surface from the
+    // engine in wording no client can parse, which is exactly what the
+    // pre-flight exists to prevent.
+    //
+    // Meaningful for either kind of model: a template with no tool support
+    // renders nothing, and then the two counts agree and the assertion below
+    // still holds.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("tool-tokens");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams::default().with_context(2048);
+    let (tx, _rx) = mpsc::channel(64);
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("load");
+
+    let bare = GenerationRequest::new(vec![ChatMessage::user("hi")]);
+    let with_tools = GenerationRequest::new(vec![ChatMessage::user("hi")]).with_tools(
+        vec![ToolDefinition {
+            name: "get_weather".into(),
+            description: Some("Get the current weather for a named city".into()),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string", "description": "City name"}},
+                "required": ["city"],
+            }),
+        }],
+        ToolChoice::Auto,
+    );
+
+    let without = backend
+        .count_prompt_tokens(loaded.instance, &bare)
+        .await
+        .expect("count without tools");
+    let with = backend
+        .count_prompt_tokens(loaded.instance, &with_tools)
+        .await
+        .expect("count with tools");
+
+    assert!(
+        with >= without,
+        "declaring a tool cannot make the prompt shorter: {with} < {without}"
+    );
+
+    // Whatever the template did, the count must match what generation actually
+    // costs. That equality is the whole guarantee: it is what lets the gateway
+    // refuse an overflowing prompt before spending a minute of prefill on it.
+    let mut events = backend
+        .generate(
+            loaded.instance,
+            GenerationRequest {
+                max_tokens: Some(1),
+                sampling: SamplingParams {
+                    temperature: Some(0.0),
+                    seed: Some(7),
+                    ..SamplingParams::default()
+                },
+                ..with_tools
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("generate");
+
+    let mut usage = None;
+    while let Some(event) = events.next().await {
+        if let GenerationEvent::Finished { usage: seen, .. } = event.expect("no error") {
+            usage = Some(seen);
+        }
+    }
+    let usage = usage.expect("a terminal usage report");
+    assert_eq!(
+        usage.prompt_tokens, with,
+        "the counted prompt and the generated prompt must be the same prompt"
+    );
 
     backend.shutdown().await.expect("shutdown");
 }

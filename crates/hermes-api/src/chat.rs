@@ -6,21 +6,89 @@
 
 use hermes_core::Private;
 use hermes_inference::generation::{
-    ChatMessage, GenerationRequest, MessageRole, ReasoningControl, SamplingParams, ToolCall, Usage,
+    ChatMessage, GenerationRequest, MessageRole, Prompt, ReasoningControl, SamplingParams,
+    ToolCall, ToolChoice, ToolDefinition, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Why a request cannot be served.
 ///
-/// Deliberately tiny. Spec section 12 allows exactly two rejections — a
-/// request with no usable messages, and a prompt that does not fit — and every
-/// other oddity is accepted and worked with.
+/// Small on purpose. Spec section 12 allows a request with no usable messages
+/// and a prompt that does not fit to be rejected, and every other oddity is
+/// accepted and worked with.
+///
+/// The tool variants are the deliberate additions, and they earn their place by
+/// a different rule than tolerance: an unreadable *tool declaration* is not an
+/// oddity to work around, because working around it means telling the model
+/// about a tool the client did not declare, or not telling it about one the
+/// client did. Either way the client is left believing something false about
+/// what the model could call, and the symptom appears much later as a model
+/// that "won't use its tools". Refusing at the boundary, naming the field, is
+/// the only reading that keeps the client's picture true.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestError {
     /// `messages` was absent, empty, or contained nothing we could send.
     NoMessages,
+    /// A tool was declared with no function name, so nothing could call it.
+    ToolWithoutName { index: usize },
+    /// `tool_choice` was a string the OpenAI schema does not define.
+    UnknownToolChoice { value: String },
+    /// `tool_choice` named a function that `tools` does not declare.
+    ToolChoiceNotDeclared { name: String },
+    /// `tool_choice` asked for a tool while no tools were declared.
+    ToolChoiceWithoutTools,
 }
+
+impl RequestError {
+    /// The request field at fault, for `error.param`.
+    pub const fn param(&self) -> &'static str {
+        match self {
+            Self::NoMessages => "messages",
+            Self::ToolWithoutName { .. } => "tools",
+            Self::UnknownToolChoice { .. }
+            | Self::ToolChoiceNotDeclared { .. }
+            | Self::ToolChoiceWithoutTools => "tool_choice",
+        }
+    }
+
+    /// The stable code a client branches on.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoMessages => "invalid_messages",
+            Self::ToolWithoutName { .. } => "invalid_tools",
+            Self::UnknownToolChoice { .. }
+            | Self::ToolChoiceNotDeclared { .. }
+            | Self::ToolChoiceWithoutTools => "invalid_tool_choice",
+        }
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoMessages => f.write_str("messages must be a non-empty array of chat messages"),
+            Self::ToolWithoutName { index } => write!(
+                f,
+                "tools[{index}] has no function name, so the model would have no way to call it"
+            ),
+            Self::UnknownToolChoice { value } => write!(
+                f,
+                "tool_choice must be \"auto\", \"none\", \"required\", or \
+                 {{\"type\":\"function\",\"function\":{{\"name\":…}}}}, not {value:?}"
+            ),
+            Self::ToolChoiceNotDeclared { name } => write!(
+                f,
+                "tool_choice names the function {name:?}, which is not declared in tools"
+            ),
+            Self::ToolChoiceWithoutTools => {
+                f.write_str("tool_choice asks the model to call a tool, but no tools were declared")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
 
 /// `stream_options`, which is how a client asks for the usage chunk.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -123,6 +191,65 @@ pub struct RequestMessage {
     pub extra: Map<String, Value>,
 }
 
+/// A tool declaration as it arrives.
+///
+/// Every field optional, and unknown keys kept, for the same reason the rest of
+/// this module is tolerant: OpenAI has already added `strict` here and will add
+/// more. What cannot be tolerated is a missing *name*, which is checked when the
+/// declaration is converted rather than by serde, so the refusal can say which
+/// entry was at fault.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RequestTool {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub function: Option<RequestFunctionDef>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// The `function` half of a tool declaration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RequestFunctionDef {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON Schema, carried as-is.
+    #[serde(default)]
+    pub parameters: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `tool_choice`, which the OpenAI schema allows to be a string or an object.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RequestToolChoice {
+    /// `"auto"`, `"none"`, `"required"` — validated on conversion, not here,
+    /// so an unknown value names itself in the refusal.
+    Named(String),
+    Function(ToolChoiceFunction),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolChoiceFunction {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub function: Option<ToolChoiceName>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolChoiceName {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 /// A field that may be a single string or a list of them, like `stop`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -193,8 +320,26 @@ pub struct ChatCompletionRequest {
     /// untouched rather than interpreted here.
     #[serde(default)]
     pub chat_template_kwargs: Option<Map<String, Value>>,
-    /// Everything else the client sent: `think`, `options`, `tools`, and
-    /// whatever a future version adds.
+    /// Tools the model may call.
+    ///
+    /// Acted on rather than ignored, which is the whole of M4's first half: a
+    /// gateway that accepts `tools` and does not forward them tells the model
+    /// nothing, so the model never calls anything, and the agent loop above it
+    /// simply never starts.
+    #[serde(default)]
+    pub tools: Option<Vec<RequestTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<RequestToolChoice>,
+    /// Whether several tools may be called in one turn.
+    ///
+    /// Forwarded to the engine, which accepts it at the pinned build. Kept
+    /// typed rather than left in `extra` so that it is visibly *carried* rather
+    /// than visibly dropped — but note that whether it is honoured is a
+    /// property of the model's template, not of this gateway.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Everything else the client sent: `think`, `options`, and whatever a
+    /// future version adds.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -227,6 +372,91 @@ impl ChatCompletionRequest {
         self.extra.keys().map(String::as_str).collect()
     }
 
+    /// The declared tools, in engine-neutral form.
+    ///
+    /// A declaration with no name is refused rather than skipped: skipping it
+    /// would leave the client believing the model had been told about a tool it
+    /// had not, and the symptom — a model that never calls that one tool —
+    /// points nowhere near the cause.
+    pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, RequestError> {
+        let Some(tools) = &self.tools else {
+            return Ok(Vec::new());
+        };
+        tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let function = tool.function.as_ref();
+                let name = function
+                    .and_then(|function| function.name.as_ref())
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .ok_or(RequestError::ToolWithoutName { index })?;
+                Ok(ToolDefinition {
+                    name: name.to_owned(),
+                    description: function
+                        .and_then(|function| function.description.clone())
+                        .filter(|text| !text.trim().is_empty()),
+                    parameters: function
+                        .and_then(|function| function.parameters.clone())
+                        .unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    }
+
+    /// `tool_choice`, checked against what was actually declared.
+    ///
+    /// The cross-check matters: a client that renames a tool but not its
+    /// `tool_choice` would otherwise send the model a demand for a function it
+    /// was never given, and what comes back is a refusal or a hallucinated
+    /// call. Naming the mismatch here turns a confusing generation into a 400.
+    pub fn resolved_tool_choice(
+        &self,
+        declared: &[ToolDefinition],
+    ) -> Result<ToolChoice, RequestError> {
+        let Some(choice) = &self.tool_choice else {
+            return Ok(ToolChoice::Unspecified);
+        };
+
+        let choice = match choice {
+            RequestToolChoice::Named(value) => match value.trim() {
+                "auto" => ToolChoice::Auto,
+                "none" => ToolChoice::None,
+                "required" => ToolChoice::Required,
+                other => {
+                    return Err(RequestError::UnknownToolChoice {
+                        value: other.to_owned(),
+                    });
+                }
+            },
+            RequestToolChoice::Function(function) => {
+                let name = function
+                    .function
+                    .as_ref()
+                    .and_then(|inner| inner.name.as_ref())
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| RequestError::UnknownToolChoice {
+                        value: "an object with no function name".to_owned(),
+                    })?;
+                ToolChoice::Function(name.to_owned())
+            }
+        };
+
+        // `none` is the one choice that means something without tools: it says
+        // "do not call anything", which is already true.
+        match &choice {
+            ToolChoice::Required | ToolChoice::Function(_) if declared.is_empty() => {
+                Err(RequestError::ToolChoiceWithoutTools)
+            }
+            ToolChoice::Function(name) if !declared.iter().any(|tool| &tool.name == name) => {
+                Err(RequestError::ToolChoiceNotDeclared { name: name.clone() })
+            }
+            _ => Ok(choice),
+        }
+    }
+
     /// Translate into the engine-neutral request.
     ///
     /// `max_tokens` is **not** applied here: clamping needs the model's
@@ -237,8 +467,14 @@ impl ChatCompletionRequest {
             return Err(RequestError::NoMessages);
         }
 
+        let tools = self.tool_definitions()?;
+        let tool_choice = self.resolved_tool_choice(&tools)?;
+
         Ok(GenerationRequest {
-            messages,
+            prompt: Prompt::Chat(messages),
+            tools,
+            tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
             reasoning: match self.reasoning_effort.as_deref().map(str::trim) {
                 // OpenAI's spelling for "do not think", and what the engine
                 // recognizes at the pinned build: `reasoning_effort: "none"`
@@ -500,6 +736,168 @@ mod tests {
     }
 
     #[test]
+    fn declared_tools_reach_the_engine_neutral_request() {
+        // The gap M4 closes. Before this, `tools` landed in `extra` and was
+        // logged as ignored, so the model was never told a tool existed and
+        // the agent loop above could never start.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"weather?"}],
+                "tools":[{"type":"function","function":{
+                    "name":"get_weather",
+                    "description":"Get the weather for a city",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+                                  "required":["city"]}}}]}"#,
+        );
+        let generation = request.to_generation_request().expect("converted");
+        assert_eq!(generation.tools.len(), 1);
+        assert_eq!(generation.tools[0].name, "get_weather");
+        assert_eq!(
+            generation.tools[0].description.as_deref(),
+            Some("Get the weather for a city")
+        );
+        // The schema is carried, not rewritten: these are the tokens the
+        // template will render, and reordering them changes what the model sees.
+        assert_eq!(generation.tools[0].parameters["required"][0], "city");
+        assert_eq!(generation.tool_choice, ToolChoice::Unspecified);
+        // No longer among the fields we accept and quietly drop.
+        assert!(!request.ignored_keys().contains(&"tools"));
+    }
+
+    #[test]
+    fn every_tool_choice_spelling_is_understood() {
+        let with_tool = |choice: &str| {
+            parse(&format!(
+                r#"{{"messages":[{{"role":"user","content":"x"}}],
+                    "tools":[{{"type":"function","function":{{"name":"f"}}}}],
+                    "tool_choice":{choice}}}"#
+            ))
+            .to_generation_request()
+        };
+        assert_eq!(
+            with_tool(r#""auto""#).expect("ok").tool_choice,
+            ToolChoice::Auto
+        );
+        assert_eq!(
+            with_tool(r#""none""#).expect("ok").tool_choice,
+            ToolChoice::None
+        );
+        assert_eq!(
+            with_tool(r#""required""#).expect("ok").tool_choice,
+            ToolChoice::Required
+        );
+        assert_eq!(
+            with_tool(r#"{"type":"function","function":{"name":"f"}}"#)
+                .expect("ok")
+                .tool_choice,
+            ToolChoice::Function("f".into())
+        );
+    }
+
+    #[test]
+    fn a_tool_with_no_name_is_refused_rather_than_skipped() {
+        // Skipping it would leave the client believing the model had been told
+        // about a tool it had not, and the symptom - a model that never calls
+        // that one tool - points nowhere near the cause.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"ok"}},
+                         {"type":"function","function":{"description":"no name"}}]}"#,
+        );
+        let err = request.to_generation_request().expect_err("must refuse");
+        assert_eq!(err, RequestError::ToolWithoutName { index: 1 });
+        assert_eq!(err.param(), "tools");
+        assert_eq!(err.code(), "invalid_tools");
+        // The message must name the offending entry, or the client is left
+        // hunting through its own tool list.
+        assert!(err.to_string().contains("tools[1]"), "{err}");
+    }
+
+    #[test]
+    fn a_tool_choice_naming_an_undeclared_function_is_refused() {
+        // The rename trap: a client that renames a tool but not its
+        // `tool_choice` would otherwise send the model a demand for a function
+        // it was never given, and get back a refusal or an invented call.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"read_file"}}],
+                "tool_choice":{"type":"function","function":{"name":"read_fil"}}}"#,
+        );
+        let err = request.to_generation_request().expect_err("must refuse");
+        assert_eq!(
+            err,
+            RequestError::ToolChoiceNotDeclared {
+                name: "read_fil".into()
+            }
+        );
+        assert_eq!(err.param(), "tool_choice");
+        assert!(err.to_string().contains("read_fil"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_tool_choice_string_names_itself_in_the_refusal() {
+        let request =
+            parse(r#"{"messages":[{"role":"user","content":"x"}],"tool_choice":"banana"}"#);
+        let err = request.to_generation_request().expect_err("must refuse");
+        assert_eq!(
+            err,
+            RequestError::UnknownToolChoice {
+                value: "banana".into()
+            }
+        );
+        assert!(err.to_string().contains("banana"), "{err}");
+    }
+
+    #[test]
+    fn demanding_a_tool_with_none_declared_is_refused_but_declining_one_is_not() {
+        // "required" with no tools is unsatisfiable and says so. "none" with no
+        // tools is merely redundant - it asks for what is already true - so
+        // refusing it would reject a request nothing is wrong with.
+        let demand =
+            parse(r#"{"messages":[{"role":"user","content":"x"}],"tool_choice":"required"}"#);
+        assert_eq!(
+            demand.to_generation_request().expect_err("must refuse"),
+            RequestError::ToolChoiceWithoutTools
+        );
+
+        let decline = parse(r#"{"messages":[{"role":"user","content":"x"}],"tool_choice":"none"}"#);
+        assert_eq!(
+            decline.to_generation_request().expect("ok").tool_choice,
+            ToolChoice::None
+        );
+    }
+
+    #[test]
+    fn a_tool_declaration_may_carry_fields_we_do_not_know() {
+        // OpenAI has already added `strict` here and will add more. Rejecting
+        // an unknown key would break a client for a field that changes nothing
+        // about what the model can call.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","strict":true,"function":{
+                    "name":"f","strict":true,"parameters":{"type":"object"}}}],
+                "parallel_tool_calls":false}"#,
+        );
+        let generation = request.to_generation_request().expect("converted");
+        assert_eq!(generation.tools[0].name, "f");
+        assert_eq!(generation.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn a_tool_without_a_schema_still_declares_a_callable_tool() {
+        // A tool that takes no arguments is a real thing. The absent schema
+        // becomes an empty object at the engine boundary rather than here, so
+        // what the client sent stays distinguishable from what we defaulted.
+        let request = parse(
+            r#"{"messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"now"}}]}"#,
+        );
+        let generation = request.to_generation_request().expect("converted");
+        assert_eq!(generation.tools[0].name, "now");
+        assert!(generation.tools[0].parameters.is_null());
+        assert!(generation.tools[0].description.is_none());
+    }
+
+    #[test]
     fn a_request_with_no_messages_is_the_one_thing_refused() {
         let request = parse(r#"{"model": "m"}"#);
         assert_eq!(
@@ -521,7 +919,7 @@ mod tests {
         );
         let generation = request.to_generation_request().expect("converted");
         assert_eq!(
-            generation.messages[0].content.reveal(),
+            generation.messages()[0].content.reveal(),
             "describe this\nbriefly"
         );
     }
@@ -541,12 +939,12 @@ mod tests {
             ]}"#,
         );
         let generation = request.to_generation_request().expect("converted");
-        assert_eq!(generation.messages.len(), 3);
-        assert_eq!(generation.messages[1].role, MessageRole::Assistant);
-        assert_eq!(generation.messages[1].tool_calls[0].name, "read_file");
-        assert_eq!(generation.messages[2].role, MessageRole::Tool);
+        assert_eq!(generation.messages().len(), 3);
+        assert_eq!(generation.messages()[1].role, MessageRole::Assistant);
+        assert_eq!(generation.messages()[1].tool_calls[0].name, "read_file");
+        assert_eq!(generation.messages()[2].role, MessageRole::Tool);
         assert_eq!(
-            generation.messages[2].tool_call_id.as_deref(),
+            generation.messages()[2].tool_call_id.as_deref(),
             Some("call_1")
         );
     }

@@ -112,7 +112,7 @@ async fn last_request(State(control): State<Arc<Control>>) -> axum::Json<serde_j
         },
         "template_options": request.template_options,
         "max_tokens": request.max_tokens,
-        "message_count": request.messages.len(),
+        "message_count": request.messages().len(),
     }))
 }
 

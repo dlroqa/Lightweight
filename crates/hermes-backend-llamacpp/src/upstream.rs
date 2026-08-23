@@ -34,7 +34,8 @@ use std::time::Duration;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use hermes_core::{SseDecoder, SseEvent};
 use hermes_inference::generation::{
-    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, ReasoningControl, Timings, Usage,
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, Prompt, ReasoningControl,
+    Timings, ToolChoice, ToolDefinition, Usage,
 };
 use hermes_inference::{BackendError, GenerationStream};
 use serde_json::{Map, Value, json};
@@ -84,19 +85,36 @@ impl UpstreamClient {
     /// Counted by the engine rather than by us: the template is part of the
     /// prompt, it lives in the GGUF, and rendering it a second time in Rust
     /// would be both a reimplementation and a source of drift.
+    ///
+    /// **Tool declarations are part of the count.** The template renders every
+    /// one of them into the prompt, and measured against a tool-capable
+    /// template one small tool moved the count from 9 tokens to 157 — the same
+    /// +148 the real generation reported. Omitting `tools` here would leave the
+    /// gateway's overflow check short by a whole toolset, which for an agent is
+    /// thousands of tokens, and the overflow would then surface from the engine
+    /// in wording no client can parse.
     pub async fn count_prompt_tokens(
         &self,
         request: &GenerationRequest,
     ) -> Result<u32, BackendError> {
-        let body = json!({
-            "messages": messages_to_json(&request.messages),
-        });
+        let (path, body) = match &request.prompt {
+            Prompt::Chat(messages) => {
+                let mut body = Map::new();
+                body.insert("messages".into(), messages_to_json(messages));
+                if !request.tools.is_empty() {
+                    body.insert("tools".into(), tools_to_json(&request.tools));
+                }
+                ("/v1/chat/completions/input_tokens", Value::Object(body))
+            }
+            // No template to apply, so the question is only how the tokenizer
+            // splits the text. `/tokenize` answers exactly that, and counting
+            // the array it returns is the count.
+            Prompt::Text(text) => ("/tokenize", json!({ "content": text.reveal() })),
+        };
+
         let response = self
             .client
-            .post(format!(
-                "{}/v1/chat/completions/input_tokens",
-                self.base_url
-            ))
+            .post(format!("{}{path}", self.base_url))
             .bearer_auth(&self.api_key)
             .timeout(METADATA_TIMEOUT)
             .json(&body)
@@ -109,9 +127,18 @@ impl UpstreamClient {
         if !status.is_success() {
             return Err(upstream_error(&payload));
         }
-        payload
+
+        // Two endpoints, two shapes: a count, or the tokens to count.
+        let counted = payload
             .get("input_tokens")
             .and_then(Value::as_u64)
+            .or_else(|| {
+                payload
+                    .get("tokens")
+                    .and_then(Value::as_array)
+                    .map(|tokens| tokens.len() as u64)
+            });
+        counted
             .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
             .ok_or_else(|| BackendError::GenerationFailed {
                 detail: "the engine did not report a prompt token count".to_owned(),
@@ -153,7 +180,7 @@ impl UpstreamClient {
         let body = self.build_request_body(&request);
         let response = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(format!("{}{}", self.base_url, generation_path(&request)))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -180,7 +207,31 @@ impl UpstreamClient {
     /// model's recommended settings.
     fn build_request_body(&self, request: &GenerationRequest) -> Value {
         let mut body = Map::new();
-        body.insert("messages".into(), messages_to_json(&request.messages));
+        match &request.prompt {
+            Prompt::Chat(messages) => {
+                body.insert("messages".into(), messages_to_json(messages));
+                // Only sent when there are tools to declare. An empty `tools`
+                // array is not the same as no tools: the template renders the
+                // "you may call these" preamble either way, which costs tokens
+                // and changes the model's behaviour for no reason.
+                if !request.tools.is_empty() {
+                    body.insert("tools".into(), tools_to_json(&request.tools));
+                    if let Some(choice) = tool_choice_to_json(&request.tool_choice) {
+                        body.insert("tool_choice".into(), choice);
+                    }
+                    if let Some(parallel) = request.parallel_tool_calls {
+                        body.insert("parallel_tool_calls".into(), json!(parallel));
+                    }
+                }
+            }
+            // Raw text goes to the engine's own `/v1/completions`, which does
+            // not apply a chat template. Sending it as a single user message
+            // instead would wrap it in turn markers and answer it as a
+            // question, which is precisely what this endpoint exists not to do.
+            Prompt::Text(text) => {
+                body.insert("prompt".into(), json!(text.reveal()));
+            }
+        }
         body.insert("stream".into(), Value::Bool(true));
         // The usage chunk is not optional for us: the client reads token
         // counts from exactly that chunk, and the metrics layer needs the
@@ -247,6 +298,65 @@ impl UpstreamClient {
         // Passing it explicitly would only create a way to turn it off by
         // accident.
         Value::Object(body)
+    }
+}
+
+/// Which of the engine's endpoints serves this request.
+///
+/// The whole difference between the two OpenAI generation endpoints, in one
+/// place: a conversation is templated, raw text is not.
+fn generation_path(request: &GenerationRequest) -> &'static str {
+    match request.prompt {
+        Prompt::Chat(_) => "/v1/chat/completions",
+        Prompt::Text(_) => "/v1/completions",
+    }
+}
+
+/// Render tool declarations as the engine's `tools` array.
+///
+/// `parameters` defaults to an empty object schema rather than being omitted: a
+/// declaration with no schema is a tool that takes no arguments, and leaving
+/// the key out makes some templates render nothing callable at all.
+fn tools_to_json(tools: &[ToolDefinition]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                let mut function = Map::new();
+                function.insert("name".into(), json!(tool.name));
+                if let Some(description) = &tool.description {
+                    function.insert("description".into(), json!(description));
+                }
+                function.insert(
+                    "parameters".into(),
+                    if tool.parameters.is_null() {
+                        json!({ "type": "object", "properties": {} })
+                    } else {
+                        tool.parameters.clone()
+                    },
+                );
+                json!({ "type": "function", "function": Value::Object(function) })
+            })
+            .collect(),
+    )
+}
+
+/// Render a tool choice, or `None` to send nothing at all.
+///
+/// `Unspecified` sends nothing so the engine applies its own default, which is
+/// `auto` when tools are present. The named form is an object rather than a
+/// string, which is the shape the engine accepts — verified against the pinned
+/// build, where an unrecognized string is a 400.
+fn tool_choice_to_json(choice: &ToolChoice) -> Option<Value> {
+    match choice {
+        ToolChoice::Unspecified => None,
+        ToolChoice::Auto => Some(json!("auto")),
+        ToolChoice::None => Some(json!("none")),
+        ToolChoice::Required => Some(json!("required")),
+        ToolChoice::Function(name) => Some(json!({
+            "type": "function",
+            "function": { "name": name },
+        })),
     }
 }
 
@@ -484,6 +594,18 @@ fn absorb(state: &mut Translation, event: &SseEvent) {
 
     if let Some(delta) = choice.get("delta") {
         absorb_delta(state, delta);
+    }
+
+    // A text completion has no `delta`: its content arrives as `text` on the
+    // choice itself. Reading both here is what lets one translator serve both
+    // of the engine's generation endpoints, so cancellation, error handling and
+    // the finish/usage bookkeeping are shared rather than written twice.
+    if let Some(text) = choice.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        state.pending.push_back(Ok(GenerationEvent::ContentDelta {
+            text: text.to_owned(),
+        }));
     }
 
     if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
@@ -845,19 +967,154 @@ mod tests {
     }
 
     #[test]
+    fn declared_tools_are_sent_to_the_engine() {
+        // Verified against the pinned build: the engine accepts `tools` and
+        // `tool_choice` on /v1/chat/completions, and a tool-capable template
+        // renders them into the prompt.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let request = GenerationRequest::new(vec![ChatMessage::user("weather?")]).with_tools(
+            vec![ToolDefinition {
+                name: "get_weather".into(),
+                description: Some("Get the weather".into()),
+                parameters: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            }],
+            ToolChoice::Auto,
+        );
+        let body = client.build_request_body(&request);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            body["tools"][0]["function"]["description"],
+            "Get the weather"
+        );
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+        assert_eq!(body["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn no_tools_means_no_tools_key_at_all() {
+        // An empty `tools` array is not the same as no tools: a template
+        // renders the "you may call these" preamble either way, which costs
+        // prompt tokens and changes what the model does.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let body =
+            client.build_request_body(&GenerationRequest::new(vec![ChatMessage::user("hi")]));
+        assert!(body.get("tools").is_none(), "{body}");
+        assert!(body.get("tool_choice").is_none(), "{body}");
+    }
+
+    #[test]
+    fn an_unspecified_tool_choice_sends_nothing() {
+        // Same discipline as reasoning and sampling: sending nothing leaves the
+        // engine's own default in place, which is `auto` when tools exist.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let request = GenerationRequest::new(vec![ChatMessage::user("hi")]).with_tools(
+            vec![ToolDefinition {
+                name: "f".into(),
+                description: None,
+                parameters: Value::Null,
+            }],
+            ToolChoice::Unspecified,
+        );
+        let body = client.build_request_body(&request);
+        assert!(body.get("tools").is_some());
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        // A tool with no schema still has to be callable, so the absent schema
+        // becomes an empty object rather than being left out.
+        assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn a_named_tool_choice_is_sent_as_the_object_form() {
+        // The pinned build answers 400 to an unrecognized `tool_choice` string
+        // and 200 to the object form, so a function choice must be an object.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let request = GenerationRequest::new(vec![ChatMessage::user("hi")]).with_tools(
+            vec![ToolDefinition {
+                name: "f".into(),
+                description: None,
+                parameters: Value::Null,
+            }],
+            ToolChoice::Function("f".into()),
+        );
+        let body = client.build_request_body(&request);
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn a_text_prompt_goes_to_the_completions_endpoint_untemplated() {
+        // The whole point of /v1/completions. Sending this as a chat message
+        // would wrap it in turn markers and answer it as a question instead of
+        // continuing it.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let request = GenerationRequest::from_text("The capital of France is");
+        assert_eq!(generation_path(&request), "/v1/completions");
+        let body = client.build_request_body(&request);
+        assert_eq!(body["prompt"], "The capital of France is");
+        assert!(body.get("messages").is_none(), "{body}");
+        // Still streamed upstream, and still asking for usage: the gateway
+        // needs the same token counts whichever endpoint served the request.
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    }
+
+    #[test]
+    fn a_chat_prompt_goes_to_the_chat_endpoint() {
+        let request = GenerationRequest::new(vec![ChatMessage::user("hi")]);
+        assert_eq!(generation_path(&request), "/v1/chat/completions");
+    }
+
+    #[test]
+    fn a_text_completions_chunk_is_read_from_its_text_field() {
+        // A text completion has no `delta`: the content is `text` on the choice
+        // itself, and usage rides on the final chunk rather than a separate one.
+        // Captured from the pinned build.
+        let events = absorb_all(&[
+            r#"data: {"choices":[{"text":" Paris","index":0,"logprobs":null,"finish_reason":null}],"object":"text_completion"}
+
+"#,
+            r#"data: {"choices":[{"text":".","index":0,"logprobs":null,"finish_reason":"length"}],"object":"text_completion","usage":{"completion_tokens":2,"prompt_tokens":5,"total_tokens":7,"prompt_tokens_details":{"cached_tokens":0}}}
+
+"#,
+            "data: [DONE]\n\n",
+        ]);
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(GenerationEvent::ContentDelta { text }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, " Paris.");
+        let finished = events.iter().find_map(|event| match event {
+            Ok(GenerationEvent::Finished {
+                finish_reason,
+                usage,
+            }) => Some((*finish_reason, *usage)),
+            _ => None,
+        });
+        let (reason, usage) = finished.expect("a terminal event");
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 2);
+    }
+
+    #[test]
     fn given_sampling_parameters_are_sent() {
         let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
         let request = GenerationRequest {
-            messages: vec![ChatMessage::user("hi")],
             max_tokens: Some(128),
-            reasoning: ReasoningControl::Default,
-            template_options: serde_json::Map::new(),
             sampling: SamplingParams {
                 temperature: Some(0.2),
                 stop: vec!["\n\n".into()],
                 seed: Some(7),
                 ..SamplingParams::default()
             },
+            ..GenerationRequest::new(vec![ChatMessage::user("hi")])
         };
         let body = client.build_request_body(&request);
         assert_eq!(body["max_tokens"], json!(128));

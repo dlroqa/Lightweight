@@ -17,16 +17,19 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 to 3 are complete. The gateway serves an OpenAI-compatible API
+Milestones 0 to 4 are complete. The gateway serves an OpenAI-compatible API
 over a supervised llama.cpp child process: streamed and non-streamed chat
-completions, `/v1/models`, `/health` and `/props`, with RAM admission control
-and GGUF metadata underneath it.
+completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
+`/props`, with RAM admission control and GGUF metadata underneath it.
 
 A three-turn streamed conversation through the genuine `openai` Python SDK
 against a real model works end to end, and disconnecting mid-stream stops the
-engine within milliseconds. Tool calls in a real agent loop and the full error
-taxonomy are next. See [docs/PROGRESS.md](docs/PROGRESS.md) for the current
-checkpoint.
+engine within milliseconds. A **full agent loop** does too: against Qwen3-1.7B,
+the model called a declared tool, the tool ran, and the result came back as an
+answer — `finish_reason: "tool_calls"`, arguments that parse as JSON, and 166
+of 222 prompt tokens served from the prefix cache on the second turn. The
+scheduler and per-token metrics are next. See
+[docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint.
 
 ## Verified constraints
 
@@ -110,6 +113,54 @@ curl -N -H 'Authorization: Bearer no-key-required' \
 Authentication is off for a loopback bind — a client that sends
 `Bearer no-key-required`, or no header at all, is accepted — and is **forced on**
 the moment any bind is reachable from another machine.
+
+## The two generation endpoints
+
+They are different things, not two spellings of one. `/v1/chat/completions`
+renders a conversation through the model's own chat template;
+`/v1/completions` continues raw text with **no template at all**. Anything
+filling in a form, continuing a document, or driving a base model that has no
+chat template needs the second, and given only the first it would get an answer
+to a conversation it never had.
+
+```sh
+# Continues the sentence: " Paris. The capital city of the United States is…"
+curl "$BASE/v1/completions" -H 'Content-Type: application/json' \
+  -d '{"model":"'"$MODEL"'","prompt":"The capital city of France is","max_tokens":10}'
+```
+
+`prompt` may be an array, and `n` asks for more than one completion each; both
+expand to one choice per prompt, numbered in prompt order, sharing a single
+`usage`. They run one at a time because the gateway holds one slot per request
+— not because the endpoint says so, so raising the slot count later makes them
+concurrent without changing the endpoint.
+
+Four parameters are **refused by name** rather than ignored, because ignoring
+one returns a well-formed reply to a different request: `logprobs`, `best_of`,
+`suffix`, and a pre-tokenized `prompt`. A client that asked for `logprobs` and
+received `null` could not tell whether the model had nothing to say or the
+gateway never asked.
+
+### Tool calls
+
+`tools`, `tool_choice` and `parallel_tool_calls` are acted on, which is what
+makes an agent loop possible at all: a gateway that accepts `tools` and does
+not forward them tells the model nothing, so the model never calls anything and
+the loop never starts.
+
+Tool declarations **cost prompt tokens**, because the template renders every one
+of them into the prompt, and they are counted as such. Measured against a
+tool-capable template, one small tool moved the count from 9 tokens to 157 — the
+same +148 the real generation reported. A token count taken without them would
+leave the overflow check short by an entire toolset, and the overflow would then
+surface from the engine in wording no client can parse.
+
+An unusable tool declaration is a 400 that names the entry, rather than being
+skipped. Skipping it would leave the client believing the model had been told
+about a tool it had not, and the symptom — a model that never calls that one
+tool — points nowhere near the cause. The same goes for a `tool_choice` naming a
+function `tools` does not declare, which is what a half-finished rename looks
+like.
 
 ## Remote access
 

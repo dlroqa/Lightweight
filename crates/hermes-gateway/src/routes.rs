@@ -14,7 +14,7 @@
 //! 6. **Take a slot**, and hold it in a guard that releases on `Drop`.
 //! 7. **Stream or aggregate.**
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -26,6 +26,7 @@ use hermes_api::chat::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, RequestError, ResponseFunction,
     ResponseMessage, ResponseToolCall, UsageBody,
 };
+use hermes_api::completions::{CompletionChunkBuilder, CompletionRequest};
 use hermes_api::error::ErrorEnvelope;
 use hermes_api::models::ModelList;
 use hermes_api::props::PropsBody;
@@ -38,6 +39,7 @@ use serde_json::json;
 
 use crate::auth::AuthFailure;
 use crate::catalog::ResidentModel;
+use crate::completions::{self as completions_run, PendingCompletion};
 use crate::state::GatewayState;
 use crate::stream::{self as sse_stream, RequestGuard};
 
@@ -163,18 +165,9 @@ pub async fn chat_completions(
         return refusal;
     }
 
-    let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
+    let request: ChatCompletionRequest = match parse_body(&body) {
         Ok(request) => request,
-        Err(err) => {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                ErrorEnvelope::invalid_request(
-                    format!("the request body is not valid JSON: {err}"),
-                    "invalid_json",
-                ),
-            )
-            .into_response();
-        }
+        Err(err) => return err.into_response(),
     };
 
     // Logged once per request at debug, never at a level that would fill a
@@ -195,6 +188,178 @@ pub async fn chat_completions(
     }
 }
 
+/// `POST /v1/completions`.
+///
+/// The older endpoint, and a genuinely different one: raw text continued with
+/// no chat template. See [`crate::completions`] for why one request here can be
+/// several generations.
+pub async fn completions(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+
+    let request: CompletionRequest = match parse_body(&body) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+
+    let ignored = request.ignored_keys();
+    if !ignored.is_empty() {
+        tracing::debug!(
+            target: targets::API,
+            fields = ignored.join(","),
+            "accepted request fields that this gateway does not act on"
+        );
+    }
+
+    match serve_completions(state, request).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+/// The completion path, once the request has parsed.
+async fn serve_completions(
+    state: Arc<GatewayState>,
+    request: CompletionRequest,
+) -> Result<Response, ApiError> {
+    let model = state
+        .catalog
+        .resident()
+        .await
+        .ok_or_else(|| ApiError::from_backend(&BackendError::NoModelLoaded))?;
+    require_matching_model(&model, request.model.as_deref())?;
+
+    let prompts = request.expand().map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorEnvelope::invalid_request(err.to_string(), err.code()).with_param(err.param()),
+        )
+    })?;
+
+    // Every prompt is counted and clamped before any of them is generated. A
+    // request whose third prompt overflows the window must fail as a 400, not
+    // after two completions have already been streamed to the client.
+    let mut queue = VecDeque::with_capacity(prompts.len());
+    for (index, prompt) in prompts.iter().enumerate() {
+        let mut generation = request.to_generation_request(prompt);
+        let prompt_tokens = state
+            .backend
+            .count_prompt_tokens(model.instance, &generation)
+            .await
+            .map_err(|err| ApiError::from_backend(&err))?;
+        if prompt_tokens >= model.n_ctx {
+            return Err(ApiError::from_backend(&BackendError::ContextOverflow {
+                prompt_tokens,
+                n_ctx: model.n_ctx,
+            })
+            .with_param("prompt"));
+        }
+        generation.max_tokens = Some(clamp_max_tokens(
+            request.max_tokens,
+            model.n_ctx,
+            prompt_tokens,
+        ));
+        queue.push_back(PendingCompletion {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            request: generation,
+            echo: request.echoes_the_prompt().then(|| prompt.clone()),
+        });
+    }
+
+    // One permit for the whole request, held across every generation in it, so
+    // a multi-prompt request cannot be interleaved with another client's.
+    let cancel = state.job_token();
+    let permit = state.acquire_slot().await.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorEnvelope::invalid_request(
+                "the gateway is busy with another request; try again shortly",
+                "server_busy",
+            ),
+        )
+    })?;
+    let guard = RequestGuard::new(cancel, Some(permit));
+
+    let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
+    tracing::info!(
+        target: targets::INFERENCE,
+        id = builder.id(),
+        model = %model.id,
+        completions = queue.len(),
+        stream = request.stream,
+        "generating text completions"
+    );
+
+    let run = completions_run::Run {
+        state: Arc::clone(&state),
+        instance: model.instance,
+        queue,
+        builder,
+        guard,
+        model_id: model.id.to_string(),
+        include_usage: request.wants_usage(),
+    };
+
+    if request.stream {
+        Ok(streamed_response(completions_run::encode(run)))
+    } else {
+        match completions_run::aggregate(run).await {
+            Ok(response) => Ok((StatusCode::OK, axum::Json(response)).into_response()),
+            Err(err) => Err(ApiError::from_backend(&err)),
+        }
+    }
+}
+
+/// Parse a request body, telling malformed JSON apart from the wrong shape.
+///
+/// They are different mistakes and deserve different sentences. A body that is
+/// valid JSON with `tools` as a string is not "not valid JSON", and telling a
+/// client it is sends them hunting for a syntax error that is not there.
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorEnvelope::invalid_request(
+                format!("the request body is not valid JSON: {err}"),
+                "invalid_json",
+            ),
+        )
+    })?;
+    serde_json::from_value(value).map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorEnvelope::invalid_request(
+                format!("the request body has a field this endpoint cannot read: {err}"),
+                "invalid_request_body",
+            ),
+        )
+    })
+}
+
+/// Refuse a request naming a model this gateway is not serving.
+fn require_matching_model(model: &ResidentModel, requested: Option<&str>) -> Result<(), ApiError> {
+    let requested = requested.unwrap_or_default();
+    if model.matches(requested) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        ErrorEnvelope::invalid_request(
+            format!(
+                "the model {requested:?} is not loaded; this gateway is serving {:?}",
+                model.id
+            ),
+            "model_not_found",
+        )
+        .with_param("model"),
+    ))
+}
+
 /// The chat completion path, once the request has parsed.
 async fn serve_chat(
     state: Arc<GatewayState>,
@@ -206,31 +371,11 @@ async fn serve_chat(
         .await
         .ok_or_else(|| ApiError::from_backend(&BackendError::NoModelLoaded))?;
 
-    let requested_model = request.model.clone().unwrap_or_default();
-    if !model.matches(&requested_model) {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            ErrorEnvelope::invalid_request(
-                format!(
-                    "the model {requested_model:?} is not loaded; this gateway is serving {:?}",
-                    model.id
-                ),
-                "model_not_found",
-            )
-            .with_param("model"),
-        ));
-    }
+    require_matching_model(&model, request.model.as_deref())?;
 
-    let mut generation = request.to_generation_request().map_err(|err| match err {
-        RequestError::NoMessages => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            ErrorEnvelope::invalid_request(
-                "messages must be a non-empty array of chat messages",
-                "invalid_messages",
-            )
-            .with_param("messages"),
-        ),
-    })?;
+    // Every request-level refusal carries its own field, code and sentence, so
+    // adding one cannot accidentally produce a 400 that says nothing useful.
+    let mut generation = request.to_generation_request().map_err(bad_request)?;
 
     // Pre-flight. This is what turns "the conversation outgrew the window"
     // into a 400 the client can parse a number out of and act on, instead of
@@ -293,6 +438,14 @@ async fn serve_chat(
     } else {
         Ok(aggregate(events, builder, guard, &model).await)
     }
+}
+
+/// Turn a request-level refusal into the 400 that names the field at fault.
+fn bad_request(err: RequestError) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        ErrorEnvelope::invalid_request(err.to_string(), err.code()).with_param(err.param()),
+    )
 }
 
 /// The output budget for one request.
@@ -520,6 +673,262 @@ mod tests {
         assert_eq!(clamp_max_tokens(Some(0), 4096, 10), 1);
         assert_eq!(clamp_max_tokens(Some(500), 4096, 4095), 1);
         assert_eq!(clamp_max_tokens(None, 4096, 5000), 1);
+    }
+
+    /// Every failure spec section 27 enumerates, with the status it must carry.
+    ///
+    /// The table is written out rather than derived so that a variant whose
+    /// class changes fails here, in a diff a reviewer reads, instead of
+    /// silently turning a 400 a client can act on into a 500 it cannot.
+    fn section_27_taxonomy() -> Vec<(BackendError, StatusCode, &'static str)> {
+        vec![
+            // Runtime acquisition: our problem, not the caller's, except when
+            // the machine is out of room.
+            (
+                BackendError::UnsupportedPlatform {
+                    os: "plan9",
+                    arch: "x86_64",
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unsupported_platform",
+            ),
+            (
+                BackendError::RuntimeDownloadFailed {
+                    reason: "offline".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_download_failed",
+            ),
+            (
+                BackendError::RuntimeCorrupt {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_corrupt",
+            ),
+            (
+                BackendError::RuntimeMissing { path: "/x".into() },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runtime_missing",
+            ),
+            (
+                BackendError::LowDisk {
+                    needed: 100,
+                    available: 1,
+                },
+                StatusCode::INSUFFICIENT_STORAGE,
+                "low_disk",
+            ),
+            // Model admission: things the caller chose, so 400 or 404.
+            (
+                BackendError::ModelNotFound {
+                    path: "/x.gguf".into(),
+                },
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+            ),
+            (
+                BackendError::UnsupportedArchitecture {
+                    found: "xyz".into(),
+                    supported: vec!["llama".into()],
+                },
+                StatusCode::BAD_REQUEST,
+                "unsupported_architecture",
+            ),
+            (
+                BackendError::InvalidContextLength {
+                    requested: 99_999,
+                    max: 8192,
+                },
+                StatusCode::BAD_REQUEST,
+                "invalid_context_length",
+            ),
+            (
+                BackendError::ContextOverflow {
+                    prompt_tokens: 41_022,
+                    n_ctx: 32_768,
+                },
+                StatusCode::BAD_REQUEST,
+                "context_length_exceeded",
+            ),
+            (
+                BackendError::UnsupportedKvCacheType {
+                    requested: "q6_K".into(),
+                    supported: vec!["f16".into()],
+                },
+                StatusCode::BAD_REQUEST,
+                "unsupported_kv_cache_type",
+            ),
+            (
+                BackendError::InsufficientMemory {
+                    model: "m".into(),
+                    required: "8 GiB".into(),
+                    available: "2 GiB".into(),
+                },
+                StatusCode::INSUFFICIENT_STORAGE,
+                "insufficient_memory",
+            ),
+            // Process lifecycle: the engine is not able to serve right now.
+            (
+                BackendError::StartTimeout { seconds: 300 },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_start_timeout",
+            ),
+            (
+                BackendError::EngineCrashed {
+                    detail: "signal 11".into(),
+                    exit_code: None,
+                    signal: Some(11),
+                    tail: vec![],
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_crashed",
+            ),
+            (
+                BackendError::EngineOom { tail: vec![] },
+                StatusCode::INSUFFICIENT_STORAGE,
+                "engine_out_of_memory",
+            ),
+            (
+                BackendError::UnsupportedCpuInstruction {
+                    detected: "SSE4.2".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unsupported_cpu_instruction",
+            ),
+            (
+                BackendError::EngineUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_unavailable",
+            ),
+            (
+                BackendError::GenerationFailed {
+                    detail: "slot lost".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_failed",
+            ),
+            (
+                BackendError::NoModelLoaded,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_model_loaded",
+            ),
+            (
+                BackendError::Cancelled,
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                "cancelled",
+            ),
+            (
+                BackendError::io("reading", std::io::Error::other("boom")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io_error",
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_section_27_failure_becomes_the_right_status_and_body() {
+        // The gateway's half of the promise. `hermes_api` proves the body is
+        // well formed; this proves the status a client branches on before it
+        // ever reads the body, and that the two agree.
+        for (err, expected_status, expected_code) in section_27_taxonomy() {
+            let api_error = ApiError::from_backend(&err);
+            assert_eq!(
+                api_error.status, expected_status,
+                "{expected_code} carried the wrong status"
+            );
+
+            let json = serde_json::to_value(&*api_error.envelope).expect("serialize");
+            assert_eq!(json["error"]["code"], expected_code);
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "{expected_code} has an empty message"
+            );
+            assert!(
+                json["error"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.ends_with("error")),
+                "{expected_code} has a non-OpenAI type: {json}"
+            );
+            // The status the error itself claims and the one the response
+            // carries must never diverge - a client reading one and logging the
+            // other would be told two different things about one failure.
+            assert_eq!(u16::from(api_error.status), err.http_status());
+        }
+    }
+
+    #[test]
+    fn the_taxonomy_covers_every_variant_the_backend_can_produce() {
+        // A guard on the table above: a new `BackendError` variant that nobody
+        // adds here would otherwise be untested, and would reach a client with
+        // whatever status its class happened to default to.
+        let covered: std::collections::BTreeSet<&str> = section_27_taxonomy()
+            .iter()
+            .map(|(err, _, _)| err.code())
+            .collect();
+        assert_eq!(
+            covered.len(),
+            section_27_taxonomy().len(),
+            "two entries share a code, so one of them is not being checked"
+        );
+        // Every code the api crate's own error-path gate exercises must appear
+        // here too; the two lists are the same taxonomy seen from either side.
+        for code in [
+            "unsupported_platform",
+            "runtime_download_failed",
+            "runtime_corrupt",
+            "runtime_missing",
+            "low_disk",
+            "model_not_found",
+            "unsupported_architecture",
+            "invalid_context_length",
+            "context_length_exceeded",
+            "unsupported_kv_cache_type",
+            "insufficient_memory",
+            "engine_start_timeout",
+            "engine_crashed",
+            "engine_out_of_memory",
+            "unsupported_cpu_instruction",
+            "engine_unavailable",
+            "generation_failed",
+            "no_model_loaded",
+            "cancelled",
+            "io_error",
+        ] {
+            assert!(covered.contains(code), "{code} is not in the status table");
+        }
+    }
+
+    #[test]
+    fn a_request_level_refusal_names_its_field_and_code() {
+        // Each variant of `RequestError` must arrive as a 400 that says which
+        // field to look at; a 400 with no `param` sends the client guessing.
+        for err in [
+            RequestError::NoMessages,
+            RequestError::ToolWithoutName { index: 2 },
+            RequestError::UnknownToolChoice {
+                value: "banana".into(),
+            },
+            RequestError::ToolChoiceNotDeclared {
+                name: "missing".into(),
+            },
+            RequestError::ToolChoiceWithoutTools,
+        ] {
+            let api_error = bad_request(err.clone());
+            assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+            let json = serde_json::to_value(&*api_error.envelope).expect("serialize");
+            assert_eq!(json["error"]["param"], err.param());
+            assert_eq!(json["error"]["code"], err.code());
+            assert_eq!(json["error"]["type"], "invalid_request_error");
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,11 @@
 //! added — without an engine noticing, and lets a future Hermes runtime
 //! implement generation without knowing OpenAI exists.
 //!
+//! What is generated comes in two shapes, and [`Prompt`] keeps them apart: a
+//! conversation, which the model's chat template renders, and raw text, which
+//! must reach the model untouched. `/v1/completions` exists for the second, and
+//! collapsing the two would answer a conversation the caller never had.
+//!
 //! The event stream's shape is dictated by the client that has to consume it.
 //! Hermes accumulates tool calls keyed by `index`, **assigning** the name and
 //! **concatenating** the arguments, and treats a second `id` at an already-seen
@@ -37,6 +42,46 @@ impl MessageRole {
             Self::Tool => "tool",
         }
     }
+}
+
+/// A tool the model may call.
+///
+/// Engine-neutral, and deliberately thin: a name, a sentence, and a schema.
+/// Nothing here interprets the schema, because nothing here can — it is written
+/// by the client for the model, and the only party that has to understand it is
+/// the model's own chat template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDefinition {
+    pub name: String,
+    /// What the tool does. Optional in the OpenAI schema, and genuinely
+    /// optional here: a model can call a well-named tool without one.
+    pub description: Option<String>,
+    /// JSON Schema for the arguments, carried untouched.
+    ///
+    /// Not parsed, not validated, not re-serialized into a normal form. It
+    /// round-trips into the prompt the template builds, and rewriting it would
+    /// change the tokens the model sees for no benefit we could name.
+    pub parameters: serde_json::Value,
+}
+
+/// Whether, and which, tool the model must call.
+///
+/// [`ToolChoice::Unspecified`] exists for the same reason
+/// [`ReasoningControl::Default`] does: sending nothing lets the engine apply
+/// its own default — `auto` when tools are present — and writing our own value
+/// over it would override a decision we were never asked to make.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    #[default]
+    Unspecified,
+    /// The model decides whether to call a tool.
+    Auto,
+    /// The model must not call a tool.
+    None,
+    /// The model must call one of the declared tools.
+    Required,
+    /// The model must call this specific function.
+    Function(String),
 }
 
 /// A complete tool call, as it appears in conversation history.
@@ -139,10 +184,46 @@ pub enum ReasoningControl {
     Effort(String),
 }
 
+/// What the model is asked to continue.
+///
+/// The two variants are not a formatting detail. A chat prompt has the model's
+/// own chat template applied to it — roles, turn markers, the tool declarations
+/// — and a text prompt must have none of that: `/v1/completions` exists
+/// precisely to continue raw text, and wrapping it in a template would return
+/// an answer to a conversation the caller never had.
+///
+/// Keeping the distinction in the type is what stops it being decided by an
+/// `Option` somewhere further down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// A conversation. The engine applies the model's chat template.
+    Chat(Vec<ChatMessage>),
+    /// Raw text, continued verbatim with no template at all.
+    ///
+    /// [`Private`] for the same reason a message's content is: it is
+    /// user-authored text, and section 26 says it must not reach a log by
+    /// accident.
+    Text(Private<String>),
+}
+
 /// A request to generate a completion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationRequest {
-    pub messages: Vec<ChatMessage>,
+    pub prompt: Prompt,
+    /// Tools the model may call. Empty means the model is told of none.
+    ///
+    /// These cost prompt tokens — the template renders every declaration into
+    /// the prompt — which is why they must reach the token count as well as
+    /// the generation. Measured against a tool-capable template, one small
+    /// tool cost 148 tokens; an agent's whole toolset costs thousands.
+    pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
+    /// Whether several tools may be called in one turn.
+    ///
+    /// `None` sends nothing and lets the model's template decide, which is the
+    /// same discipline every other unset field here follows. Whether it is
+    /// honoured at all is a property of that template, not of any gateway.
+    pub parallel_tool_calls: Option<bool>,
     /// Maximum tokens to generate.
     ///
     /// Already clamped by the gateway against the remaining context. Hermes
@@ -163,14 +244,47 @@ pub struct GenerationRequest {
 }
 
 impl GenerationRequest {
+    /// A chat request. The signature predates [`Prompt`] and is kept, because
+    /// it is what every existing caller and test builds.
     pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self::with_prompt(Prompt::Chat(messages))
+    }
+
+    /// A raw-text request, for `/v1/completions`.
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self::with_prompt(Prompt::Text(Private::new(text.into())))
+    }
+
+    pub fn with_prompt(prompt: Prompt) -> Self {
         Self {
-            messages,
+            prompt,
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Unspecified,
+            parallel_tool_calls: None,
             max_tokens: None,
             sampling: SamplingParams::default(),
             reasoning: ReasoningControl::Default,
             template_options: serde_json::Map::new(),
         }
+    }
+
+    /// The conversation, or nothing when this is a raw-text request.
+    ///
+    /// Returning an empty slice rather than an `Option` because every caller
+    /// wants to iterate turns, and a text prompt genuinely has none.
+    pub fn messages(&self) -> &[ChatMessage] {
+        match &self.prompt {
+            Prompt::Chat(messages) => messages,
+            Prompt::Text(_) => &[],
+        }
+    }
+
+    /// Declare the tools the model may call.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolDefinition>, choice: ToolChoice) -> Self {
+        self.tools = tools;
+        self.tool_choice = choice;
+        self
     }
 
     /// Ask the model not to reason before answering.

@@ -18,8 +18,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M3.5** Remote access | **done** | serving any non-loopback address (LAN or overlay), repeatable name-resolving `--host`, key from the environment, metadata redaction for unauthenticated callers, engine key out of `argv`, secrets/address gate |
 | **M3.55** The remote leg | **done** | `hermes sysinfo` reports every bindable address; a `--host` name that resolves only to loopback is diagnosed instead of served silently |
 | **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
-| M4 | next | tool calls end to end in an agent loop, `tools` in the request, the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
-| M5 | pending | scheduler, metrics, queue fairness, per-token timings |
+| **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
+| M5 | next | scheduler, metrics, queue fairness, per-token timings |
 | M6 | pending | model manager, Electron shell + SPA |
 
 ## Verified by execution, not only by unit tests
@@ -140,14 +140,67 @@ Thinking models, now covered deliberately rather than by accident:
 - The full real-engine tier now passes against **both** model types: 7 tests on
   Qwen3-1.7B (reasoning) and 7 on SmolLM2-135M (not).
 
+M4, the half of tool calling that was missing:
+
+- **`tools` never reached the engine.** Everything on the way *out* had been
+  built and tested since M3 — delta parsing, the client's accumulation order,
+  `finish_reason: "tool_calls"`, the non-streamed assembly — but `tools` landed
+  in the request's catch-all and was logged as an ignored field. The model was
+  never told a tool existed, so it never called one, and no agent loop above
+  could start. That is now a typed field carried through an engine-neutral
+  `ToolDefinition` and `ToolChoice`.
+- **A real agent loop closes.** Against Qwen3-1.7B through the genuine `openai`
+  SDK: the model returned `finish_reason: "tool_calls"` with
+  `get_weather({"city": "Paris"})`, the tool ran, the result was replayed as a
+  `tool` message, and the second turn answered "The weather in Paris is 17°C
+  with clear skies." Prefix reuse across the turns: **166 of 222** prompt
+  tokens cached. Streamed, the same call arrives as 8 deltas whose concatenated
+  arguments parse as JSON.
+- **Tool declarations cost prompt tokens, and are now counted.** Measured, not
+  assumed: on a tool-capable template `input_tokens` went 9 → 157 when `tools`
+  was sent, matching the +148 the real generation reported. `count_prompt_tokens`
+  had been sending only `messages`, so the pre-flight overflow check would have
+  been short by an entire toolset — thousands of tokens for a real agent — and
+  the overflow would have surfaced from the engine in wording no client parses.
+  A real-engine test now asserts the counted prompt and the generated prompt are
+  the same prompt, on both model types.
+- **`/v1/completions` is a different endpoint, not an older spelling.** It
+  reaches the engine's own `/v1/completions` with `prompt`, so no chat template
+  is applied; the token count goes through `/tokenize` for the same reason.
+  Proved by behaviour against a real model rather than by routing: "The capital
+  city of France is" came back as " Paris. The capital city of the United States
+  is" — a continuation, which a templated request could not have produced.
+  Array prompts and `n` expand to one choice each, numbered in prompt order,
+  sharing one `usage`.
+- **Refused by name rather than ignored.** `logprobs`, `best_of`, `suffix` and a
+  pre-tokenized `prompt` each change what the client expects back, so each is a
+  400 naming the parameter. So is a tool declaration with no function name, and
+  a `tool_choice` naming a function `tools` does not declare — the shape a
+  half-finished rename takes.
+- **Section 27 now has statuses, not just bodies.** `hermes-api` already proved
+  every variant renders a well-formed body; the gateway now pins the status a
+  client branches on *before* it reads the body, for all 20 variants, with a
+  second test that fails if a new variant is added and not listed.
+- **Two errors the engine gets wrong are corrected at the boundary.** The pinned
+  build answers **500** to `"tools": "nope"` — a client mistake reported as a
+  server fault — and 400 to an unknown `tool_choice` string in its own wording.
+  Both are now our own 400s, with a code and a `param`. Relatedly, a body that
+  is valid JSON with one unreadable field no longer claims to be "not valid
+  JSON": that sent clients hunting for a syntax error that was not there.
+- **A gate blind spot, found by the gate.** `check-secrets.sh` used `git grep`,
+  which searches *tracked* files only, so a new file was invisible to it until
+  the commit that added it — one run too late, and how an address reached the
+  M3.55 commit. It now uses `git grep --untracked`, and the address it had
+  missed is fixed.
+
 ## Test counts
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 406 | no network, no model downloads |
-| openai-SDK contract (`scripts/contract-test.sh`) | 19 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
+| Default (`cargo test --workspace`) | 454 | no network, no model downloads |
+| openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
-| Real engine | 6 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
+| Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
 
 Measured on this machine, and recorded as a property of *this* box rather than
 of the build: Qwen3-1.7B Q4_K_M decodes at roughly 0.7 tokens per second on

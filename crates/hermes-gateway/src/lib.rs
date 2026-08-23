@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod catalog;
+pub mod completions;
 pub mod routes;
 pub mod state;
 pub mod stream;
@@ -42,5 +43,6 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/version", get(routes::version))
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/completions", post(routes::completions))
         .with_state(state)
 }
