@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+/frontend/node_modules
+/apps/desktop/node_modules
+/apps/desktop/dist
+/fixtures/generated
+/runtime
+*.gguf
+.env
+/fixtures/real-headers

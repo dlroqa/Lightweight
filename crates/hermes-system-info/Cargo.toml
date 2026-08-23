@@ -1,0 +1,16 @@
+[package]
+name = "hermes-system-info"
+description = "Platform data directories, CPU topology and memory probing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+directories.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

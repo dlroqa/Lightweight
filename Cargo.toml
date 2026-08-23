@@ -1,0 +1,79 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hermes-core",
+    "crates/hermes-gguf",
+    "crates/hermes-memory",
+    "crates/hermes-cli",
+    "crates/hermes-system-info",
+    "crates/hermes-observability",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/hermes/cpu-inference-gateway"
+
+# ---------------------------------------------------------------------------
+# DEPENDENCY POLICY - enforced, not advisory.
+#
+# This project must build on a machine with NO sudo, NO cmake, NO libssl-dev
+# and NO libclang. Violating any rule below makes the workspace unbuildable
+# there. `scripts/check-deps.sh` gates this in CI.
+#
+#   1. NO cmake.      rustls 0.23 defaults its crypto provider to `aws-lc-rs`,
+#                     whose build script REQUIRES cmake. We pin `ring` instead.
+#                     No `-sys` crate may shell out to cmake.
+#   2. NO OpenSSL.    `libssl-dev` is absent => `native-tls` / `openssl-sys`
+#                     are banned. rustls end to end.
+#   3. NO libclang.   => no `bindgen`, and therefore no llama.cpp FFI. The
+#                     inference engine is a supervised child process instead.
+#   4. Compile budget. Banned: polars, tonic, sqlx. Use rusqlite (bundled),
+#                     which builds with `cc` alone.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- core, no I/O ---
+thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+smallvec = { version = "1.15.2", features = ["serde", "union"] }
+
+# --- observability ---
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt", "time"] }
+tracing-appender = "0.2.5"
+
+# --- platform ---
+directories = "6.0.0"
+
+# --- command line ---
+clap = { version = "4.6.6", features = ["derive"] }
+
+# --- internal ---
+hermes-core = { path = "crates/hermes-core" }
+hermes-gguf = { path = "crates/hermes-gguf" }
+hermes-memory = { path = "crates/hermes-memory" }
+hermes-system-info = { path = "crates/hermes-system-info" }
+hermes-observability = { path = "crates/hermes-observability" }
+
+# ---------------------------------------------------------------------------
+# Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.
+# Dependencies get opt-level 1 (built once, then cached, and fast at runtime);
+# our own crates stay at opt-level 0 so edit-compile cycles stay short.
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = "line-tables-only"
+codegen-units = 256
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"
+panic = "abort"

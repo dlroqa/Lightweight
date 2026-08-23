@@ -1,0 +1,5 @@
+# Pinned so every machine and CI run builds with the same compiler.
+# No nightly: the dependency policy in Cargo.toml forbids nightly-only accelerators.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

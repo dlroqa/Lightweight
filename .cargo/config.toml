@@ -1,0 +1,4 @@
+[build]
+# 4 concurrent rustc processes on ~2.3 GB available RAM will swap and end up
+# SLOWER than 3. Leave one core for the editor / daemon.
+jobs = 3
