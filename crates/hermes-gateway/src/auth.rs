@@ -17,12 +17,29 @@
 use std::net::IpAddr;
 
 /// How requests are authenticated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is implemented by hand, and that is not a style choice. This type
+/// is reachable from `GatewayState`'s `Debug`, so a derived one would put the
+/// API key into any log line written as `?state` — the same accident
+/// [`hermes_core::Private`] exists to prevent for prompts. The guarantee is
+/// structural here for the same reason: a rule to remember is not a control.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthPolicy {
     /// Any bearer value is accepted, and so is none at all. Never 401.
     Disabled,
     /// A key is required and compared in constant time.
     Required { key: String },
+}
+
+impl std::fmt::Debug for AuthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            // Not even the length: that is a hint about the key, and nothing
+            // above this line has any use for it.
+            Self::Required { .. } => f.write_str("Required { key: <redacted> }"),
+        }
+    }
 }
 
 /// Why a request was refused.
@@ -48,10 +65,30 @@ impl AuthPolicy {
     /// other address requires a key, and if none was configured the caller is
     /// told rather than being silently exposed.
     pub fn for_bind(address: IpAddr, configured_key: Option<String>) -> Result<Self, NeedsKey> {
-        match (address.is_loopback(), configured_key) {
-            (_, Some(key)) if !key.is_empty() => Ok(Self::Required { key }),
-            (true, _) => Ok(Self::Disabled),
-            (false, _) => Err(NeedsKey),
+        Self::for_binds(std::slice::from_ref(&address), configured_key)
+    }
+
+    /// Choose one policy for a set of bind addresses.
+    ///
+    /// The policy is taken from the **most exposed** address in the set: if any
+    /// of them is off-loopback, a key is required on all of them. The
+    /// alternative — deciding per listener — would let a loopback bind quietly
+    /// relax a bind on a LAN or an overlay network, which is precisely the
+    /// mistake this type exists to make impossible.
+    ///
+    /// Note what is *not* consulted: the interface, the network, or which
+    /// product assigned the address. Loopback or not is the whole distinction,
+    /// which is why a LAN address, a CGNAT address from a mesh VPN and a
+    /// unique-local IPv6 address all behave identically.
+    pub fn for_binds(
+        addresses: &[IpAddr],
+        configured_key: Option<String>,
+    ) -> Result<Self, NeedsKey> {
+        let exposed = addresses.iter().any(|address| !address.is_loopback());
+        match configured_key {
+            Some(key) if !key.is_empty() => Ok(Self::Required { key }),
+            _ if exposed => Err(NeedsKey),
+            _ => Ok(Self::Disabled),
         }
     }
 
@@ -121,7 +158,21 @@ pub fn generate_key() -> Result<String, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // Addresses used below come from the ranges reserved for documentation
+    // (RFC 5737, RFC 3849) or from a range's base address, so that no address
+    // belonging to a real machine or network is written into this repository.
+    /// RFC 5737 documentation range.
+    const DOC_A: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    /// A second RFC 5737 range.
+    const DOC_B: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
+    /// The base of RFC 6598 shared address space, which mesh VPNs hand out.
+    const CGNAT_BASE: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1));
+    /// The base of the RFC 4193 unique-local IPv6 range.
+    const ULA_BASE: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+    /// RFC 1918, which every LAN and most overlays use.
+    const PRIVATE_BASE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
     #[test]
     fn the_clients_placeholder_key_is_accepted() {
@@ -165,21 +216,81 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_bind_needs_no_key_and_a_lan_bind_does() {
+    fn a_loopback_bind_needs_no_key_and_any_other_bind_does() {
         // Section 23: exposure beyond this machine is opt-in and
         // authenticated, and cannot be reached by accident.
         assert_eq!(
             AuthPolicy::for_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), None),
             Ok(AuthPolicy::Disabled)
         );
-        assert_eq!(
-            AuthPolicy::for_bind(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), None),
-            Err(NeedsKey)
-        );
+        assert_eq!(AuthPolicy::for_bind(DOC_A, None), Err(NeedsKey));
         assert!(
-            AuthPolicy::for_bind(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), Some("k".into()))
-                .is_ok_and(|policy| policy.is_enabled())
+            AuthPolicy::for_bind(DOC_A, Some("k".into())).is_ok_and(|policy| policy.is_enabled())
         );
+    }
+
+    #[test]
+    fn every_network_is_treated_the_same_way() {
+        // The property that makes this work on any fabric: a LAN address, the
+        // shared range a mesh VPN hands out, a unique-local IPv6 address and an
+        // ordinary one are indistinguishable here. Nothing knows which product
+        // assigned an address, and nothing should.
+        for address in [PRIVATE_BASE, CGNAT_BASE, ULA_BASE, DOC_A, DOC_B] {
+            assert_eq!(
+                AuthPolicy::for_bind(address, None),
+                Err(NeedsKey),
+                "{address} was treated as safe without a key"
+            );
+            assert!(
+                AuthPolicy::for_bind(address, Some("k".into()))
+                    .is_ok_and(|policy| policy.is_enabled()),
+                "{address} did not enable auth with a key"
+            );
+        }
+        for address in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert_eq!(
+                AuthPolicy::for_bind(address, None),
+                Ok(AuthPolicy::Disabled),
+                "{address} should not have demanded a key"
+            );
+        }
+    }
+
+    #[test]
+    fn one_exposed_bind_makes_the_whole_set_require_a_key() {
+        // A machine on an overlay usually holds several addresses at once.
+        // Deciding per listener would let a loopback bind quietly relax an
+        // exposed one.
+        let mixed = [IpAddr::V4(Ipv4Addr::LOCALHOST), CGNAT_BASE];
+        assert_eq!(AuthPolicy::for_binds(&mixed, None), Err(NeedsKey));
+        assert!(
+            AuthPolicy::for_binds(&mixed, Some("k".into())).is_ok_and(|policy| policy.is_enabled())
+        );
+
+        let local = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        assert_eq!(
+            AuthPolicy::for_binds(&local, None),
+            Ok(AuthPolicy::Disabled)
+        );
+    }
+
+    #[test]
+    fn the_key_never_appears_in_debug_output() {
+        // `GatewayState`'s Debug prints its config, which holds this policy, so
+        // a derived Debug here would write the key into any `?state` log line.
+        let policy = AuthPolicy::Required {
+            key: "super-secret-key-value".into(),
+        };
+        let rendered = format!("{policy:?}");
+        assert!(!rendered.contains("super-secret-key-value"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert_eq!(format!("{:?}", AuthPolicy::Disabled), "Disabled");
     }
 
     #[test]
@@ -187,7 +298,7 @@ mod tests {
         // Otherwise `--api-key ""` would look like authentication while
         // accepting an empty token from anyone.
         assert_eq!(
-            AuthPolicy::for_bind(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), Some(String::new())),
+            AuthPolicy::for_bind(PRIVATE_BASE, Some(String::new())),
             Err(NeedsKey)
         );
     }

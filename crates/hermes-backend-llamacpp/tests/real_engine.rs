@@ -288,6 +288,7 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
         .expect("generation");
 
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut started = false;
     let mut finished = None;
     let mut timings = None;
@@ -295,6 +296,7 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
         match event.expect("no error mid-stream") {
             GenerationEvent::Started { .. } => started = true,
             GenerationEvent::ContentDelta { text } => content.push_str(&text),
+            GenerationEvent::ReasoningDelta { text } => reasoning.push_str(&text),
             GenerationEvent::Timings(measured) => timings = Some(measured),
             GenerationEvent::Finished {
                 finish_reason,
@@ -305,7 +307,15 @@ async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
     }
 
     assert!(started, "no start event arrived");
-    assert!(!content.is_empty(), "the engine produced no content at all");
+    // Content *or* reasoning. Insisting on content assumed a model that answers
+    // immediately, and a thinking model given a small budget spends all of it
+    // inside its reasoning - which is output, not silence. Qwen3 failed this
+    // assertion while behaving perfectly; SmolLM2 still satisfies it through
+    // the content branch.
+    assert!(
+        !content.is_empty() || !reasoning.is_empty(),
+        "the engine produced neither content nor reasoning"
+    );
     let (finish_reason, usage) = finished.expect("the stream ended without a finish event");
     assert!(matches!(
         finish_reason,

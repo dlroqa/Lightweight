@@ -242,3 +242,59 @@ to `n_ctx - prompt_tokens - 1`, floored at one.
 Flooring at one matters: a budget of zero produces an empty completion, and an
 empty completion is exactly the `EmptyStreamError` that makes the client retry
 blindly.
+
+## Why the gateway knows nothing about the network it is on
+
+The gateway serves whatever addresses it is told to, and draws exactly one
+distinction: **loopback or not**. A LAN address, the shared-range address a
+mesh VPN hands out, a unique-local IPv6 address and anything else are all the
+same case, and `AuthPolicy::for_binds` is the whole of the policy — if any bind
+is reachable from another machine, a key is required on all of them.
+
+That is not indifference, it is the only design that survives contact with the
+range of networks this has to run on: a plain LAN, Tailscale or Headscale,
+Netmaker, ZeroTier, Nebula, a hand-rolled WireGuard, or nothing. Every one of
+them is an interface holding an address. The moment a product name appears in
+the code, the build has been fitted to one machine's network — the same mistake
+as fitting it to one machine's CPU.
+
+The consequence for configuration is that no address is ever written down here.
+`--host` takes a name or an address, resolves it at startup, and may be
+repeated, so a machine holding several addresses serves them all from one engine
+and one queue. Binding by name is the better habit: an overlay can reissue an
+address, and the name usually survives it.
+
+## What the client's timeouts depend on, and why it is not our problem to fix
+
+Hermes raises its stream read timeout from 120 s to 1800 s, and its
+stale-stream window from 180 s to 900 s, for hosts it considers local — private
+ranges, shared address space, unique-local IPv6, link-local, and any hostname
+without a dot (`agent/model_metadata.py:906-956`). On a CPU where prefill takes
+minutes, that difference decides whether long conversations work at all.
+
+What does *not* qualify: any dotted FQDN, `.local` mDNS names included, and
+routable addresses. So a deployment behind a TLS-terminating proxy or a MagicDNS
+name is on the short timeouts, and has to set them explicitly.
+
+This is a property of the client, not of the gateway, and trying to compensate
+for it here would mean guessing at a client we do not control. It is documented
+in the README instead, where the person choosing an address will see it.
+
+## Why credentials avoid both `argv` and `Debug`
+
+Two leaks of the same shape, closed the same way.
+
+`/proc/<pid>/cmdline` is world-readable on an ordinary Linux system, so a key on
+a command line is a key every local user can read. The engine's per-run key used
+to be passed as `--api-key`; it travels in `LLAMA_API_KEY` now, which lands in
+`/proc/<pid>/environ` and is readable only by the owner. Without that, any local
+user could drive the engine directly and bypass the gateway's admission control,
+context policy and auth entirely — the private port is only private in the sense
+that nothing advertises it.
+
+The gateway's own key had a subtler path out: `AuthPolicy` derived `Debug`,
+`GatewayConfig` holds it, and `GatewayState`'s `Debug` prints its config, so a
+single `tracing::debug!(?state)` would have written the key into a log file.
+`AuthPolicy` now implements `Debug` by hand and renders `<redacted>`, which is
+the same structural approach `hermes_core::Private` takes for prompts: the
+guarantee holds whether or not the next person writing a log line remembers it.

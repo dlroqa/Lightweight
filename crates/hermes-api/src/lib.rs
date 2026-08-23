@@ -5,7 +5,7 @@
 //! a client reads. The gateway supplies the HTTP.
 //!
 //! Two rules run through all of it, and both come from having read the client
-//! that must connect (`/home/agent/.hermes/hermes-agent/`) rather than from a
+//! that must connect (`~/.hermes/hermes-agent/`) rather than from a
 //! specification.
 //!
 //! **Tolerance is not politeness, it is correctness.** Every request type

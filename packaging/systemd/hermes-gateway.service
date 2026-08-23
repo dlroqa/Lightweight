@@ -1,0 +1,55 @@
+# Run the gateway as a user service. Linux example; not installed by anything.
+#
+# Every value lives in the environment file below, outside this repository,
+# because none of it belongs to the project: the model, the addresses to bind,
+# and the API key are one operator's choices on one machine.
+#
+#   mkdir -p ~/.config/hermes-gateway
+#   cp packaging/systemd/hermes-gateway.env.example ~/.config/hermes-gateway/env
+#   chmod 600 ~/.config/hermes-gateway/env      # it holds the API key
+#   $EDITOR ~/.config/hermes-gateway/env
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/hermes-gateway.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hermes-gateway
+#
+# `loginctl enable-linger $USER` keeps it running after logout.
+#
+# macOS (launchd) and Windows service wrappers arrive with cross-platform
+# packaging in M10. Until then, running `hermes serve` in the foreground works
+# everywhere and needs none of this.
+
+[Unit]
+Description=Hermes CPU inference gateway
+Documentation=https://github.com/hermes/cpu-inference-gateway
+# The gateway binds a specific address, which may belong to an interface that
+# comes up late - a LAN lease, or an overlay network still connecting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hermes-gateway/env
+# HERMES_SERVE_ARGS is deliberately unquoted so systemd splits it into
+# arguments: that is what lets one operator pass a single --host and another
+# pass several.
+ExecStart=%h/.local/bin/hermes serve ${HERMES_MODEL} $HERMES_SERVE_ARGS
+
+# A crashed gateway should come back; a gateway that cannot start should not
+# spin. The engine it supervises holds a model in memory, so restarting in a
+# tight loop would thrash a machine rather than recover it.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=3
+StartLimitIntervalSec=120
+
+# Modest hardening. This process supervises a child engine and reads model
+# files from the operator's home, so it is not sandboxed away from those.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

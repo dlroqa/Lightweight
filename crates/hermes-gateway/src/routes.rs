@@ -86,15 +86,27 @@ impl IntoResponse for ApiError {
 ///
 /// Shaped like llama.cpp's, because clients probe for exactly that, with what
 /// we additionally know appended.
-pub async fn health(State(state): State<Arc<GatewayState>>) -> Response {
+///
+/// Never refused, even when a key is configured: this is what a health check
+/// calls, and those rarely carry credentials. What it *says* narrows instead —
+/// an unauthenticated caller on a bind that requires a key is told whether the
+/// gateway is serving, and nothing about what.
+pub async fn health(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     let resident = state.catalog.resident().await;
-    let health = state.backend.health().await;
-    let body = json!({
+    let mut body = json!({
         "status": if resident.is_some() { "ok" } else { "no model loaded" },
         "backend": state.backend.id().to_string(),
-        "engine": health,
-        "model": resident.as_ref().map(|model| model.id.to_string()),
     });
+
+    if is_authorized(&state, &headers)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("engine".into(), json!(state.backend.health().await));
+        object.insert(
+            "model".into(),
+            json!(resident.as_ref().map(|model| model.id.to_string())),
+        );
+    }
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -112,16 +124,25 @@ pub async fn version() -> Response {
 /// llama.cpp's endpoint, answered with *our* numbers. A client that probes it
 /// must be told the same context `/v1/models` advertises; two endpoints
 /// disagreeing about the window is worse than one of them being absent.
-pub async fn props(State(state): State<Arc<GatewayState>>) -> Response {
+pub async fn props(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     let Some(model) = state.catalog.resident().await else {
         return ApiError::from_backend(&BackendError::NoModelLoaded).into_response();
     };
-    axum::Json(PropsBody::new(
+    let body = PropsBody::new(
         model.n_ctx,
         model.model_path.clone(),
         state.config.max_concurrent_requests,
-    ))
-    .into_response()
+    );
+    // Redacted rather than refused: a client resolving a model's context
+    // probes this endpoint, and a 401 would degrade that into a guess. The
+    // context and the slot count are what it came for; the filesystem path is
+    // not.
+    let body = if is_authorized(&state, &headers) {
+        body
+    } else {
+        body.redacted()
+    };
+    axum::Json(body).into_response()
 }
 
 /// `GET /v1/models`.
@@ -411,6 +432,17 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Whether this request carries credentials the policy accepts.
+///
+/// Distinct from [`authorize`], which produces the refusal: some endpoints
+/// answer either way and only vary in how much they say.
+fn is_authorized(state: &GatewayState, headers: &HeaderMap) -> bool {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    state.config.auth.check(presented).is_ok()
 }
 
 /// Check the request's credentials, if any are required.

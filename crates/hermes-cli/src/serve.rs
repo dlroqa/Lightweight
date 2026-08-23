@@ -12,7 +12,7 @@
 //! it — which is what keeps a client from sizing prompts to a window that does
 //! not exist.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,18 +42,62 @@ pub struct ServeOptions {
     /// benchmark has run. A user who knows their model better than we do
     /// should be able to say so — and be told plainly what they are overriding.
     pub force: bool,
-    /// Address to bind the gateway to.
-    pub host: IpAddr,
+    /// Addresses or hostnames to bind the gateway to.
+    ///
+    /// A machine on an overlay network usually holds several addresses at
+    /// once — a LAN address, a mesh address, both families of each — and
+    /// serving on two of them should not require opening the wildcard. Empty
+    /// means loopback.
+    pub hosts: Vec<String>,
     /// Port to bind. `0` picks a free one.
     pub port: u16,
-    /// Key required on every request. Mandatory for a non-loopback bind.
+    /// Key required on every request. Mandatory as soon as any bind is
+    /// reachable from another machine.
     pub api_key: Option<String>,
 }
+
+/// The environment variable holding the API key.
+///
+/// Preferred over the flag: an argument is visible in `ps` and readable from
+/// `/proc` by anyone on the machine, which is a poor place for a credential.
+pub const API_KEY_ENV: &str = "HERMES_API_KEY";
 
 /// Run the command. Returns once the engine has been shut down.
 pub async fn run(options: ServeOptions) -> Result<(), String> {
     let paths = DataPaths::discover().map_err(describe)?;
     paths.create_all().map_err(describe)?;
+
+    // A long-running server that keeps no record of what it did is not
+    // serviceable. `hermes-observability` has existed since the first
+    // milestone; nothing had called it, so every `tracing` line in the
+    // workspace went nowhere. The guard lives until this function returns,
+    // because dropping it stops the writers.
+    //
+    // Privacy Mode is installed here, before the first record: redaction is on
+    // by default and prompts cannot be logged even by a mistake in whatever
+    // configuration is read later.
+    let _logging = hermes_observability::init(hermes_observability::LogConfig {
+        directory: Some(paths.logs_dir()),
+        filter: "info".to_owned(),
+        console: false,
+        privacy: hermes_core::privacy::PrivacyMode::Standard,
+    })
+    .map_err(describe)?;
+
+    // Networking is settled first, and the addresses are claimed, before a
+    // byte of the model is read. Loading first would mean a missing API key or
+    // an address this machine no longer holds costs a multi-gigabyte load and
+    // several seconds before failing - which is exactly what happened the first
+    // time this was run against a real model.
+    let addresses = resolve_hosts(&options.hosts, options.port)?;
+    let key = options.api_key.clone().or_else(read_key_from_environment);
+    let bind_ips: Vec<IpAddr> = addresses.iter().map(SocketAddr::ip).collect();
+    let auth = AuthPolicy::for_binds(&bind_ips, key).map_err(|_| exposed_without_key(&bind_ips))?;
+
+    let mut listeners = Vec::with_capacity(addresses.len());
+    for address in &addresses {
+        listeners.push(bind(*address).await?);
+    }
 
     let file = GgufFile::open(&options.model).map_err(describe)?;
     let metadata = ModelMetadata::from_file(&file).map_err(describe)?;
@@ -205,16 +249,6 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         report_estimate_accuracy(estimate.total, usage.peak_rss);
     }
 
-    // The auth policy is decided by where we are binding, not by preference.
-    // Loopback keeps whatever the user configured, including nothing; anything
-    // else demands a key rather than being silently exposed.
-    let auth = AuthPolicy::for_bind(options.host, options.api_key.clone()).map_err(|_| {
-        format!(
-            "binding to {} would expose this gateway to the network; pass --api-key to allow it",
-            options.host
-        )
-    })?;
-
     let backend = Arc::new(backend);
     let catalog = Arc::new(Catalog::with_resident(ResidentModel {
         id: loaded.model.clone(),
@@ -240,14 +274,15 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         },
     ));
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::new(options.host, options.port))
-        .await
-        .map_err(|err| format!("could not bind {}:{}: {err}", options.host, options.port))?;
-    let bound = listener
-        .local_addr()
-        .map_err(|err| format!("could not read the bound address: {err}"))?;
-
-    println!("\nserving  http://{bound}/v1");
+    println!();
+    for listener in &listeners {
+        // Printed for the operator, deliberately not logged: which addresses
+        // this machine holds is not something the log file needs to remember.
+        let bound = listener
+            .local_addr()
+            .map_err(|err| format!("could not read the bound address: {err}"))?;
+        println!("serving  http://{bound}/v1");
+    }
     println!("  model    {}", loaded.model);
     println!("  context  {} tokens", loaded.effective.n_ctx);
     println!(
@@ -258,6 +293,14 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             "disabled (loopback only)"
         }
     );
+    tracing::info!(
+        target: hermes_observability::targets::STARTUP,
+        port = options.port,
+        listeners = listeners.len(),
+        auth = state.config.auth.is_enabled(),
+        "gateway listening"
+    );
+    println!("  logs     {}", paths.logs_dir().display());
     println!("\nPress Ctrl-C to stop.");
 
     // Two ways to stop, and both must leave nothing behind: the user asking,
@@ -266,18 +309,36 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     // something that takes this process with it.
     let shutdown_state = Arc::clone(&state);
     let death_watch = Arc::clone(&backend);
-    let shutdown = async move {
+    let watcher = tokio::spawn(async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => println!("\nstopping"),
             () = watch_for_death(&death_watch) => {}
         }
         shutdown_state.shutdown();
-    };
+    });
 
-    axum::serve(listener, hermes_gateway::app(Arc::clone(&state)))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|err| format!("the gateway stopped: {err}"))?;
+    // One server per listener, all sharing the same state, all stopping on the
+    // same token. A machine holding several addresses serves them from one
+    // engine and one queue - the addresses are a networking detail, not a
+    // second gateway.
+    let mut servers = Vec::with_capacity(listeners.len());
+    for listener in listeners {
+        let app = hermes_gateway::app(Arc::clone(&state));
+        let stopping = state.shutdown_token();
+        servers.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stopping.cancelled().await })
+                .await
+        }));
+    }
+    for server in servers {
+        match server.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(format!("the gateway stopped: {err}")),
+            Err(err) => return Err(format!("the gateway task failed: {err}")),
+        }
+    }
+    watcher.abort();
 
     backend.shutdown().await.map_err(describe)?;
     println!("engine stopped");
@@ -328,4 +389,181 @@ fn describe<E: Actionable>(err: E) -> String {
         }
     }
     out
+}
+
+/// Turn `--host` values into addresses to bind.
+///
+/// Each value may be a literal address in either family, or a name. Accepting
+/// names is what keeps addresses out of configuration files and out of this
+/// repository: a machine's overlay address can be reissued, but its name
+/// usually cannot, and `hermes serve --host "$(hostname)"` works on a LAN, on a
+/// mesh network, and on a laptop that moves between them.
+///
+/// A name that resolves to several addresses yields several binds — which is
+/// the common case on a dual-stack host, and exactly what the operator asked
+/// for by naming the machine rather than one of its addresses.
+fn resolve_hosts(hosts: &[String], port: u16) -> Result<Vec<SocketAddr>, String> {
+    if hosts.is_empty() {
+        return Ok(vec![SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )]);
+    }
+
+    let mut addresses: Vec<SocketAddr> = Vec::new();
+    for host in hosts {
+        let host = host.trim();
+        if host.is_empty() {
+            continue;
+        }
+        let resolved: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+            Ok(address) => vec![SocketAddr::new(address, port)],
+            Err(_) => (host, port)
+                .to_socket_addrs()
+                .map_err(|err| {
+                    format!(
+                        "could not resolve {host:?} to an address to bind: {err}. \
+                         Pass an address this machine holds, or a name that resolves to one."
+                    )
+                })?
+                .collect(),
+        };
+        if resolved.is_empty() {
+            return Err(format!("{host:?} resolved to no addresses"));
+        }
+        for address in resolved {
+            // A name and a literal can resolve to the same place; binding it
+            // twice would fail on the second attempt for no good reason.
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+
+    if addresses.is_empty() {
+        return Err("no addresses to bind".to_owned());
+    }
+    Ok(addresses)
+}
+
+/// Bind one address, explaining the failures an operator will actually hit.
+async fn bind(address: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    tokio::net::TcpListener::bind(address).await.map_err(|err| {
+        let explanation = match err.kind() {
+            // The common failure on any overlay network: the interface is
+            // down, or the address was reissued and this one no longer exists.
+            std::io::ErrorKind::AddrNotAvailable => {
+                " — this machine does not currently hold that address. \
+                 Check the interface is up, or bind by name instead so the \
+                 current address is looked up at startup."
+            }
+            std::io::ErrorKind::AddrInUse => {
+                " — something else is already listening there. Choose another \
+                 port, or stop the other process."
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                " — ports below 1024 need privileges this process does not have."
+            }
+            _ => "",
+        };
+        format!("could not bind {address}: {err}{explanation}")
+    })
+}
+
+/// Read the API key from the environment.
+///
+/// An empty value is treated as absent, so `HERMES_API_KEY=` in a service file
+/// cannot silently look like authentication.
+fn read_key_from_environment() -> Option<String> {
+    std::env::var(API_KEY_ENV)
+        .ok()
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+}
+
+/// Explain a refusal to bind somewhere reachable without a key.
+///
+/// Refusing is the whole point — there is no default key and never will be, so
+/// an unconfigured gateway cannot end up reachable by accident. What this adds
+/// is a key the operator can actually use, since needing one and having none is
+/// the entire problem at this moment.
+fn exposed_without_key(addresses: &[IpAddr]) -> String {
+    let exposed: Vec<String> = addresses
+        .iter()
+        .filter(|address| !address.is_loopback())
+        .map(ToString::to_string)
+        .collect();
+
+    let mut message = format!(
+        "binding to {} makes this gateway reachable from other machines, \
+         so an API key is required.",
+        exposed.join(", ")
+    );
+    if let Ok(suggestion) = hermes_gateway::auth::generate_key() {
+        message.push_str(&format!(
+            "\n\n  Put one in the environment, for example:\n\n    export {API_KEY_ENV}={suggestion}\n\
+             \n  --api-key works too, but an argument is visible in `ps` and in shell history."
+        ));
+    }
+    message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_host_means_loopback() {
+        // The default must stay exactly what it was: a gateway nobody asked to
+        // expose is not exposed.
+        let addresses = resolve_hosts(&[], 8737).expect("loopback");
+        assert_eq!(addresses.len(), 1);
+        assert!(addresses[0].ip().is_loopback());
+        assert_eq!(addresses[0].port(), 8737);
+    }
+
+    #[test]
+    fn literal_addresses_in_both_families_are_accepted() {
+        let addresses = resolve_hosts(&["127.0.0.1".into(), "::1".into()], 0).expect("resolve");
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
+    }
+
+    #[test]
+    fn a_name_resolves_to_whatever_it_currently_points_at() {
+        // Binding by name is what lets a machine whose address is reissued -
+        // every overlay network does this - keep working without editing
+        // anything.
+        let addresses = resolve_hosts(&["localhost".into()], 8737).expect("resolve");
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
+        assert!(addresses.iter().all(|address| address.port() == 8737));
+    }
+
+    #[test]
+    fn the_same_address_twice_is_bound_once() {
+        // A name and a literal often name the same place, and the second bind
+        // would fail for no reason worth reporting.
+        let addresses =
+            resolve_hosts(&["127.0.0.1".into(), "127.0.0.1".into()], 8737).expect("resolve");
+        assert_eq!(addresses.len(), 1);
+    }
+
+    #[test]
+    fn an_unresolvable_name_says_so() {
+        let err =
+            resolve_hosts(&["no-such-host.invalid".into()], 8737).expect_err("must not resolve");
+        assert!(err.contains("no-such-host.invalid"), "{err}");
+    }
+
+    #[test]
+    fn the_refusal_names_the_exposed_address_and_offers_a_key() {
+        // RFC 5737 documentation address: nothing here belongs to a real
+        // network.
+        let exposed = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+        let message = exposed_without_key(&[IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), exposed]);
+        assert!(message.contains("192.0.2.10"), "{message}");
+        assert!(!message.contains("127.0.0.1"), "{message}");
+        assert!(message.contains(API_KEY_ENV), "{message}");
+    }
 }

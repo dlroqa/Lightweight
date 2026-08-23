@@ -124,7 +124,8 @@ def hermes_parser():
     we can copy a regex. Importing the function the client actually runs is
     what makes the assertion mean something.
     """
-    home = pathlib.Path(os.environ.get("HERMES_AGENT_HOME", "/home/agent/.hermes/hermes-agent"))
+    default = pathlib.Path.home() / ".hermes" / "hermes-agent"
+    home = pathlib.Path(os.environ.get("HERMES_AGENT_HOME", default))
     if not (home / "agent" / "model_metadata.py").exists():
         pytest.skip(f"the agent source is not present at {home}")
     sys.path.insert(0, str(home))

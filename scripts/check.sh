@@ -36,4 +36,5 @@ else
 fi
 
 echo "== deps ==";    ./scripts/check-deps.sh
+echo "== secrets =="; ./scripts/check-secrets.sh
 echo "All checks passed."

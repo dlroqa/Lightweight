@@ -290,7 +290,14 @@ pub async fn start(
 
     let mut command = Command::new(&config.server_path);
     command
-        .args(build_args(config, port, &api_key))
+        .args(build_args(config, port))
+        // Through the environment, never the command line. `/proc/<pid>/cmdline`
+        // is world-readable on an ordinary Linux system, so a key in argv is a
+        // key any local user can read and then use to drive the engine
+        // directly, around every check this gateway makes. `/proc/<pid>/environ`
+        // is readable only by the owner. Verified available at the pinned
+        // build: `llama-server --help` lists `(env: LLAMA_API_KEY)`.
+        .env("LLAMA_API_KEY", &api_key)
         .current_dir(&config.install_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -439,7 +446,10 @@ async fn await_ready(
 /// these parameters and must not be invalidated by an engine default changing
 /// under it, and `--parallel` in particular defaults to `-1` (auto), which
 /// would size the KV cache for a slot count we did not choose.
-pub fn build_args(config: &EngineConfig, port: u16, api_key: &str) -> Vec<String> {
+///
+/// One thing deliberately absent: the API key. It travels in the environment,
+/// because a command line is readable by every user on the machine.
+pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
     let params = &config.params;
     vec![
         "--model".into(),
@@ -450,8 +460,6 @@ pub fn build_args(config: &EngineConfig, port: u16, api_key: &str) -> Vec<String
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string(),
-        "--api-key".into(),
-        api_key.to_owned(),
         "--ctx-size".into(),
         params.n_ctx.to_string(),
         "--batch-size".into(),
@@ -605,7 +613,7 @@ mod tests {
     }
 
     fn args() -> Vec<String> {
-        build_args(&config(), 45_871, "secret")
+        build_args(&config(), 45_871)
     }
 
     /// The value following `flag`, if present.
@@ -623,12 +631,26 @@ mod tests {
 
     #[test]
     fn the_engine_requires_a_key_that_changes_every_run() {
-        assert_eq!(value_of(&args(), "--api-key").as_deref(), Some("secret"));
-
         let first = random_api_key().expect("entropy");
         let second = random_api_key().expect("entropy");
         assert_ne!(first, second, "the key must not be reused between runs");
         assert_eq!(first.len(), 48, "24 bytes of entropy, hex encoded");
+    }
+
+    #[test]
+    fn the_engines_key_never_appears_on_its_command_line() {
+        // `/proc/<pid>/cmdline` is world-readable, so a key in argv is a key
+        // any local user can read - and then use to drive the engine directly,
+        // around the admission control, the context policy and the auth this
+        // gateway applies. It travels in the environment instead, which is
+        // readable only by the owner.
+        let args = args();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--api-key" || arg == "--api-key-file"),
+            "the key is being passed on the command line: {args:?}"
+        );
     }
 
     #[test]
@@ -659,7 +681,7 @@ mod tests {
         // Zero threads would be rejected by the engine; clamp rather than pass
         // through a value we know is invalid.
         assert_eq!(
-            value_of(&build_args(&zeroed, 1, "k"), "--threads").as_deref(),
+            value_of(&build_args(&zeroed, 1), "--threads").as_deref(),
             Some("1")
         );
     }
@@ -669,7 +691,7 @@ mod tests {
         let mut quantized = config();
         quantized.params.cache_type_k = GgmlType::Q8_0;
         quantized.params.cache_type_v = GgmlType::Q8_0;
-        let args = build_args(&quantized, 1, "k");
+        let args = build_args(&quantized, 1);
         assert_eq!(value_of(&args, "--cache-type-k").as_deref(), Some("q8_0"));
     }
 

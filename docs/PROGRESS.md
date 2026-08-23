@@ -15,7 +15,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M1** Metadata, system info, RAM estimation | **done** | GGUF reader, ggml type table, architecture table, CPU/ISA + memory probes, RAM estimator with admission verdicts, `hermes inspect \| estimate \| sysinfo` |
 | **M2** Engine acquisition and supervision | **done** | pinned runtime manifest with per-platform digests, download with resume + streamed sha256, archive extraction, `InferenceBackend` trait, supervised `llama-server` child process, crash classification, `hermes serve` |
 | **M3** Vertical slice: the gateway | **done** | SSE codec, generation events, upstream HTTP/SSE adapter, `MockBackend`, `hermes-api` DTOs, `hermes-gateway` serving `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/props`, `/version`, permissive auth, `Semaphore(1)`, cancellation, openai-SDK contract suite |
-| M4 | next | tool calls end to end in an agent loop, `reasoning_content` from a real model, the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
+| **M3.5** Remote access | **done** | serving any non-loopback address (LAN or overlay), repeatable name-resolving `--host`, key from the environment, metadata redaction for unauthenticated callers, engine key out of `argv`, secrets/address gate |
+| M4 | next | tool calls end to end in an agent loop, request-option passthrough (`chat_template_kwargs`, `reasoning_effort`, `tools`), the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
 | M5 | pending | scheduler, metrics, queue fairness, per-token timings |
 | M6 | pending | model manager, Electron shell + SPA |
 
@@ -47,7 +48,7 @@ M3, against a real engine (`b10590`) running a real model
   `EmptyStreamError`**.
 - An **overlong prompt** yields a 400 whose message Hermes' own
   `parse_context_limit_from_error` — imported from
-  `/home/agent/.hermes/hermes-agent/agent/model_metadata.py` — parses back to
+  `~/.hermes/hermes-agent/agent/model_metadata.py` — parses back to
   exactly `2048`, the effective context.
 - **Disconnecting mid-stream stops the engine**: CPU time consumed by the
   engine in the two seconds after the client went away was **0 ticks**, and the
@@ -55,6 +56,38 @@ M3, against a real engine (`b10590`) running a real model
 - `/props` and `/v1/models` agree on the context, and `/v1/models` advertises
   the **effective** 2048 while reporting the model's real 8192 ceiling under
   `hermes.model_max_context_length`.
+
+Remote access, against the same engine serving a real model
+(Qwen3-1.7B Q4_K_M) on a loopback **and** a non-loopback bind at once:
+
+- **One engine, several listeners.** `--host` given twice served both addresses
+  from one model and one queue.
+- **Unauthenticated callers are told less, not refused.** Over the exposed
+  bind, `/props` still reports `n_ctx` and `total_slots` — which is what a
+  client needs to size a prompt — while omitting the model's filesystem path;
+  `/health` answers `ok` without naming the model. With the key, both are
+  complete. `/v1/models` and `/v1/chat/completions` are 401 without it.
+- **Misconfiguration costs nothing.** Refusing an exposed bind with no key, and
+  binding an address this machine does not hold, both fail in about 10 ms —
+  they used to cost a full 2 GB model load first, because the model was loaded
+  before the networking was settled. Now the addresses are claimed first.
+- **The gateway key reaches no log**, and **the engine's key is no longer in
+  its command line**: `/proc/<pid>/cmdline` is world-readable, so it now travels
+  in `LLAMA_API_KEY` instead. Proven both ways — absent from `argv`, and a
+  wrong key on the engine's private port still gets a 401.
+- **`reasoning_content` works against a real thinking model.** Qwen3 streams its
+  reasoning separately from its content, and the gateway re-emits it as such.
+- **A two-turn streamed session over the exposed bind**, through the genuine
+  `openai` SDK with the key: 142 and 141 completion tokens, `finish_reason`
+  `stop` both times, `cached_tokens` 0 → 23 across the turns, and a wrong key
+  refused with 401 on the same socket.
+- **The log file exists at last.** `hermes-observability` has been complete
+  since M0 and nothing had ever called `init()`, so every `tracing` line in the
+  workspace went nowhere; `serve` now installs it. What a session records:
+  privacy mode, engine lifecycle, model loaded, `gateway listening` with the
+  port, listener count and whether auth is on, and one line per request with
+  its id, model and prompt token count. What it does not record, checked by
+  grep after a real request: the API key, the bound address, and the prompt.
 
 ## Test counts
 
@@ -64,6 +97,13 @@ M3, against a real engine (`b10590`) running a real model
 | openai-SDK contract (`scripts/contract-test.sh`) | 14 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 6 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
+
+Measured on this machine, and recorded as a property of *this* box rather than
+of the build: Qwen3-1.7B Q4_K_M decodes at roughly 0.7 tokens per second on
+four 1.5 GHz cores without AVX, with the engine resident at 1.70 GiB against a
+2.10 GiB estimate. A thinking model spends most of a small token budget inside
+its reasoning, so a short reply still takes minutes here. A machine with AVX2
+runs the same artifact several times faster; no number here is a product claim.
 
 ## Bugs found by running the code, and fixed
 
@@ -87,6 +127,24 @@ M3 added one, and one discovery worth the same treatment:
   partial answer survives and the failure is unmistakable — but it was
   *assumed* to iterate to a clean end until the contract suite said otherwise.
   The test now asserts what the client actually does.
+
+One test was corrected rather than the code, and it is worth stating plainly:
+`the_real_engine_streams_a_completion_and_reports_its_tokens` asserted that
+content arrived. Run against Qwen3 — a thinking model — it failed while the
+engine and the gateway behaved perfectly: the whole 24-token budget went into
+`reasoning_content`, which is output, not silence. The assertion now accepts
+content **or** reasoning and still fails if neither arrives. The non-thinking
+model satisfies it through the same branch it always did.
+
+Found while verifying remote access, and left for M4:
+
+- **Engine-side request options are accepted and dropped.** A client cannot
+  turn a thinking model's reasoning off, because `chat_template_kwargs` (and
+  `reasoning_effort`, and `tools`) land in the tolerant catch-all and go no
+  further. With a small `max_tokens`, Qwen3 spends the whole budget inside its
+  reasoning and the client sees a completion with no content — the shape that
+  makes a client retry blindly. Forwarding a curated set of these is M4's
+  request-passthrough work; the tolerance that accepts them is already right.
 
 ## Verify-before-coding checklist
 
@@ -112,9 +170,13 @@ Still open:
   shipped conservative defaults, so estimates report `Confidence::Coarse`.
   Fitting them from observed peak RSS is M9.
 - **The Hermes cutover** is a one-line change to `~/.hermes/config.yaml`
-  (`base_url: http://127.0.0.1:8737/v1`) and has **not** been made: that file is
+  (`base_url` pointing at this gateway) and has **not** been made: that file is
   protected and the change needs explicit permission. Everything the cutover
-  depends on has been proven against the same client library Hermes uses.
+  depends on has been proven against the same client library Hermes uses,
+  locally and over a non-loopback bind.
+- **A second machine has not been driven from here.** Everything on this side
+  is verified; the remote leg — a client on another host completing a session —
+  needs a command run on that host.
 
 ## Next step
 

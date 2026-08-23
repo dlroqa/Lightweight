@@ -742,3 +742,108 @@ async fn malformed_json_is_refused_in_the_shape_a_client_can_read() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["code"], "invalid_json");
 }
+
+#[tokio::test]
+async fn metadata_endpoints_stay_complete_when_auth_is_disabled() {
+    ensure_provider();
+    // Today's only mode. Nothing about a loopback gateway changes because the
+    // redaction path exists.
+    let harness = Harness::default().await;
+    let props: Value = harness.get("/props").await.json().await.expect("json");
+    assert_eq!(props["model_path"], "/mock/model.gguf");
+    let health: Value = harness.get("/health").await.json().await.expect("json");
+    assert_eq!(health["model"], "mock-model@4k");
+    assert_eq!(health["engine"]["state"], "ready");
+}
+
+#[tokio::test]
+async fn an_unauthenticated_caller_is_told_the_context_but_not_the_path() {
+    ensure_provider();
+    // The compromise that keeps both promises: a client resolving a model's
+    // context probes `/props` and must still find `n_ctx`, while a stranger on
+    // the network learns nothing about this filesystem.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "shared-secret".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let props: Value = harness.get("/props").await.json().await.expect("json");
+    assert_eq!(props["default_generation_settings"]["n_ctx"], N_CTX);
+    assert_eq!(props["total_slots"], 1);
+    assert!(
+        props.get("model_path").is_none(),
+        "the model path leaked to an unauthenticated caller: {props}"
+    );
+
+    // A health check with no credentials still gets a usable answer.
+    let health: Value = harness.get("/health").await.json().await.expect("json");
+    assert_eq!(health["status"], "ok");
+    assert!(health.get("model").is_none(), "{health}");
+    assert!(health.get("engine").is_none(), "{health}");
+}
+
+#[tokio::test]
+async fn an_authenticated_caller_sees_everything() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "shared-secret".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let authorized = |path: &str| {
+        Harness::client()
+            .get(format!("{}{path}", harness.base))
+            .header("Authorization", "Bearer shared-secret")
+            .send()
+    };
+
+    let props: Value = authorized("/props")
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(props["model_path"], "/mock/model.gguf");
+
+    let health: Value = authorized("/health")
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(health["model"], "mock-model@4k");
+}
+
+#[tokio::test]
+async fn the_api_key_cannot_be_printed_by_accident() {
+    ensure_provider();
+    // `GatewayState` is the thing most likely to be written into a log line as
+    // `?state`, and it prints its config, which holds the key.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "a-key-that-must-not-be-logged".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let rendered = format!("{:?}", harness.state);
+    assert!(
+        !rendered.contains("a-key-that-must-not-be-logged"),
+        "the key reached a debug rendering: {rendered}"
+    );
+}

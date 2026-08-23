@@ -17,7 +17,14 @@ pub struct PropsBody {
     /// Concurrent requests we serve. One today; the scheduler is written so
     /// that raising it is an internal change.
     pub total_slots: u32,
-    pub model_path: String,
+    /// Where the weights live.
+    ///
+    /// Optional because it is the one field here worth withholding: on a bind
+    /// that anyone else can reach, an unauthenticated caller has no business
+    /// learning a path on this filesystem. Omitted rather than blanked, so a
+    /// client reads "not told" instead of "empty".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
     /// Our build, not the engine's — this is the gateway's endpoint.
     pub build_info: String,
     /// What the engine itself reports, kept under our namespace so the two are
@@ -52,10 +59,22 @@ impl PropsBody {
                 },
             },
             total_slots,
-            model_path: model_path.into(),
+            model_path: Some(model_path.into()),
             build_info: concat!("hermes-gateway-", env!("CARGO_PKG_VERSION")).to_owned(),
             hermes: None,
         }
+    }
+
+    /// Drop the filesystem path, for a caller that has not authenticated.
+    ///
+    /// Everything a client needs in order to size a prompt — the context and
+    /// the slot count — still answers, so redacting costs no compatibility.
+    /// Refusing the whole endpoint would: clients probe `/props` while
+    /// resolving a model's context, and a 401 there degrades that discovery.
+    #[must_use]
+    pub fn redacted(mut self) -> Self {
+        self.model_path = None;
+        self
     }
 
     /// Attach the engine's own `/props`, for diagnostics.
@@ -75,6 +94,18 @@ mod tests {
             serde_json::to_value(PropsBody::new(8192, "/models/m.gguf", 1)).expect("serialize");
         assert_eq!(json["default_generation_settings"]["n_ctx"], 8192);
         assert_eq!(json["total_slots"], 1);
+    }
+
+    #[test]
+    fn redacting_keeps_the_numbers_and_drops_the_path() {
+        let json = serde_json::to_value(PropsBody::new(8192, "/models/m.gguf", 1).redacted())
+            .expect("serialize");
+        assert_eq!(json["default_generation_settings"]["n_ctx"], 8192);
+        assert_eq!(json["total_slots"], 1);
+        assert!(
+            json.get("model_path").is_none(),
+            "the path survived redaction: {json}"
+        );
     }
 
     #[test]

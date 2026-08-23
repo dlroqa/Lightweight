@@ -9,7 +9,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -74,20 +73,29 @@ enum Command {
         /// Load even if the RAM estimate says it will not fit.
         #[arg(long)]
         force: bool,
-        /// Address to bind.
+        /// Address or hostname to bind. Repeatable.
         ///
         /// Loopback by default: the gateway is a local service, and section 23
-        /// makes exposure beyond this machine a deliberate act rather than
+        /// makes reaching it from another machine a deliberate act rather than
         /// something a user can end up with by accident.
+        ///
+        /// A name is resolved at startup, which is usually the better choice on
+        /// a machine whose address can be reissued. Repeat the flag to serve
+        /// several addresses — a LAN address and an overlay address, say — from
+        /// the one engine.
         #[arg(long, default_value = "127.0.0.1")]
-        host: IpAddr,
+        host: Vec<String>,
         /// Port to bind. `0` picks a free one and prints it.
         #[arg(long, default_value_t = 8737)]
         port: u16,
         /// Require this key on every request.
         ///
-        /// Optional on loopback and mandatory otherwise; binding a non-loopback
-        /// address without one is refused rather than silently exposed.
+        /// Optional on loopback and mandatory as soon as any bind is reachable
+        /// from another machine; such a bind without a key is refused rather
+        /// than silently exposed.
+        ///
+        /// Prefer `HERMES_API_KEY`: an argument is visible in `ps`, readable
+        /// from `/proc`, and kept in shell history.
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -181,7 +189,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 threads: *threads,
                 kv_type: kv_type.clone(),
                 force: *force,
-                host: *host,
+                hosts: host.clone(),
                 port: *port,
                 api_key: api_key.clone(),
             }))?;
