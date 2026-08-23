@@ -193,6 +193,47 @@ M4, the half of tool calling that was missing:
   M3.55 commit. It now uses `git grep --untracked`, and the address it had
   missed is fixed.
 
+M4 profiled on the running gateway, for M5 planning (2026-08-23):
+
+- **There is no cold-start penalty; that hypothesis was wrong.** A first pass
+  blamed a slow tool-call turn on a cold engine. Measured against a genuinely
+  pristine boot — `engine ready` in **8931 ms**, first request at `cached_n: 0`
+  — cold prefill is **2.25 tok/s** (163 tokens in 72352 ms) against 2.6 tok/s
+  warm, and cold decode is **1.59 tok/s**, faster than *every* warm decode
+  recorded in the same session. There is no warm-up curve: request 1 performs
+  like request 100. The only genuine cold cost is the one-time 8931 ms load.
+- **The variance is machine load, not engine state.** The same payload at the
+  same cache state (`cached_n: 3`, 43 prompt tokens) took 29392 ms of prefill
+  and 25424 ms of decode under load average 4.14-4.87, and 13399 ms / 4327 ms
+  on a quiet box — **2.2x** and **5.9x**. Within one session an identical
+  15-token cached decode measured 11165, 11196 and 32468 ms: a **2.9x spread on
+  identical work**. This box is a 4-core Pentium Silver J5005 (1.5 GHz base)
+  where a chat app and the editor server hold roughly 1.5 cores while the engine
+  asks for `--threads 4`. Every timing here carries that error bar.
+- **Prefix reuse holds cold, incrementally, and across interleaving.** Cold, the
+  second identical request returned `prompt_n: 1, cached_n: 162` in 509 ms.
+  Across a tool loop the growth is incremental rather than a re-prefill: turn 2,
+  with the assistant tool call and the tool result appended, reported
+  `prompt_n: 48, cached_n: 159` — only the delta was computed. An unrelated
+  conversation run between two turns did **not** evict the first: session A came
+  back at `cached_n: 206` in 840 ms, despite the engine running `--parallel 1`.
+- **Reasoning is the largest lever on a tool-call turn: 3.8x.** Same prompt,
+  both warm, both returning a correct `tool_calls`: default thinking spent
+  **113** completion tokens over 135.3 s, and `reasoning_effort: "none"` spent
+  **20** over 35.4 s. Qwen3 deliberates ~100 tokens over arguments that are
+  `{"city": "Paris"}`. The control already exists from M3.6 (`reasoning_effort`
+  to `enable_thinking`); what M5 has to decide is the default on a dispatch turn.
+- **The M5 per-turn budget.** One tool-loop turn against a warm prefix costs the
+  delta prefill plus the decode — about 48 prompt and 20 completion tokens —
+  which is **~26 s on a quiet box** and **~45-50 s under contention**, putting a
+  five-turn loop between 2 and 4 minutes. Turn *count* is the cost driver, not
+  context length: the cache makes revisiting a long prefix nearly free, so the
+  scheduler should prefer fewer, fatter turns. Leave reasoning on and multiply
+  by ~3.8.
+- **Measured read-only against the live process**, through
+  `/v1/chat/completions` with the timings the gateway already returns; nothing
+  was restarted, and no source, test or configuration file was changed.
+
 ## Test counts
 
 | Suite | Count | Notes |
