@@ -21,7 +21,7 @@ mod serve;
 use hermes_core::{Actionable, GgmlType, units::Bytes};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_memory::{Estimator, RuntimeParams, Verdict};
-use hermes_system_info::{CpuInfo, MemoryProbe, SystemMemoryProbe};
+use hermes_system_info::{CpuInfo, MemoryProbe, SystemMemoryProbe, reachable_addresses};
 
 #[derive(Parser)]
 #[command(
@@ -293,6 +293,7 @@ fn render_json<T: serde::Serialize>(out: &mut String, value: &T) {
 fn sysinfo(out: &mut String, json: bool) {
     let cpu = CpuInfo::detect();
     let memory = SystemMemoryProbe.snapshot();
+    let addresses = reachable_addresses();
 
     if json {
         let value = serde_json::json!({
@@ -301,6 +302,13 @@ fn sysinfo(out: &mut String, json: bool) {
             "memory_error": memory.as_ref().err().map(ToString::to_string),
             "expected_ggml_variant": cpu.expected_ggml_variant(),
             "default_threads": cpu.default_threads(),
+            // The addresses another machine could reach this one at. Under
+            // `--json` so a script can pick a bind address instead of asking a
+            // human to read `ip addr` and copy one across.
+            "reachable_addresses": addresses.as_ref().ok().map(|found| {
+                found.iter().map(ToString::to_string).collect::<Vec<_>>()
+            }),
+            "reachable_addresses_error": addresses.as_ref().err().map(ToString::to_string),
         });
         render_json(out, &value);
         return;
@@ -356,6 +364,33 @@ fn sysinfo(out: &mut String, json: bool) {
                 snapshot.pressure() * 100.0
             );
         }
+        Err(err) => line!(out, "  unavailable: {err}"),
+    }
+
+    // Answering "what do I pass to --host?" without making the operator go and
+    // read `ip addr`. It is the question the remote path turns on, and getting
+    // it wrong is silent: a name that resolves to loopback binds successfully
+    // and serves nobody.
+    line!(out, "\nNetwork");
+    match &addresses {
+        Ok(found) if !found.is_empty() => {
+            for (index, address) in found.iter().enumerate() {
+                line!(
+                    out,
+                    "  {:<17}{address}",
+                    if index == 0 { "Reachable at" } else { "" }
+                );
+            }
+            line!(
+                out,
+                "  {:<17}serve these with `--host <address>`; a key is then required",
+                ""
+            );
+        }
+        Ok(_) => line!(
+            out,
+            "  Reachable at     loopback only - no other machine can reach this one"
+        ),
         Err(err) => line!(out, "  unavailable: {err}"),
     }
 }

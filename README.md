@@ -130,8 +130,54 @@ hermes serve model.gguf --host <lan-name> --host <mesh-name> --port 8737
 
 `--host` takes an address in either family or a **name**, resolved at startup.
 Prefer the name: an overlay network can reissue an address, and a name usually
-survives it. Check what the name resolves to first — many systems map the local
-hostname to a loopback address in `/etc/hosts`, which serves nobody else.
+survives it.
+
+Ask the machine what it can be reached at rather than guessing:
+
+```sh
+hermes sysinfo            # the Network section lists every bindable address
+hermes sysinfo --json     # same, under "reachable_addresses", for scripts
+```
+
+### The one that catches everyone
+
+`hermes serve --host "$(hostname)"` is the obvious way to ask for remote access,
+and on most Linux installs it serves **nobody**. Debian and Ubuntu write
+`127.0.1.1 <hostname>` into `/etc/hosts` at install time, and that entry beats
+whatever a LAN or an overlay network publishes for the same name. Every signal
+then reads as success — the name resolves, the bind succeeds, the gateway prints
+that it is serving — while authentication is silently *off*, because the bind
+really is local. The only symptom is that the other machine cannot connect,
+which looks like a firewall or a port long before it looks like the name.
+
+So the gateway now says so, on stderr, right where it prints what it is serving:
+
+```
+warning: --host "hermes" resolved only to 127.0.1.1, which is loopback.
+  Only this machine can reach the gateway, and authentication stays off because
+  nothing is exposed. Many Linux installs map the hostname to a loopback address
+  in /etc/hosts, and that entry wins over any name the network publishes for it.
+
+  Addresses another machine could reach this one at:
+    --host 192.0.2.10
+    --host 198.51.100.4
+
+  Bind one of those, or a name that resolves to one, and set HERMES_API_KEY.
+```
+
+It warns rather than refuses: a name that resolves to loopback is unusual but
+not invalid, and breaking a configuration somebody has working is too high a
+price for making a point. `--host localhost`, anything under `.localhost`, and a
+literal address are never second-guessed — a literal is what it says it is, and
+`localhost` is an explicit request for loopback.
+
+A second trap sits next to it, and no software can detect this one for you: the
+name your **overlay network** knows a machine by is not necessarily its local
+hostname. If the name was already taken in the network, the machine will have
+been given another — a host whose `hostname` is `hermes` can be `hermes-1` on
+the mesh, with `hermes` belonging to somebody else entirely. `hermes sysinfo`
+reports addresses, which are unambiguous; check the name against the network's
+own listing before trusting it.
 
 Without a key, a bind that other machines can reach is refused rather than
 silently exposed, and the refusal prints a generated key to use. An

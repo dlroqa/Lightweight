@@ -16,6 +16,7 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M2** Engine acquisition and supervision | **done** | pinned runtime manifest with per-platform digests, download with resume + streamed sha256, archive extraction, `InferenceBackend` trait, supervised `llama-server` child process, crash classification, `hermes serve` |
 | **M3** Vertical slice: the gateway | **done** | SSE codec, generation events, upstream HTTP/SSE adapter, `MockBackend`, `hermes-api` DTOs, `hermes-gateway` serving `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/props`, `/version`, permissive auth, `Semaphore(1)`, cancellation, openai-SDK contract suite |
 | **M3.5** Remote access | **done** | serving any non-loopback address (LAN or overlay), repeatable name-resolving `--host`, key from the environment, metadata redaction for unauthenticated callers, engine key out of `argv`, secrets/address gate |
+| **M3.55** The remote leg | **done** | `hermes sysinfo` reports every bindable address; a `--host` name that resolves only to loopback is diagnosed instead of served silently |
 | **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
 | M4 | next | tool calls end to end in an agent loop, `tools` in the request, the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
 | M5 | pending | scheduler, metrics, queue fairness, per-token timings |
@@ -90,6 +91,41 @@ Remote access, against the same engine serving a real model
   its id, model and prompt token count. What it does not record, checked by
   grep after a real request: the API key, the bound address, and the prompt.
 
+The remote leg, after finding that its quietest failure was still there:
+
+- **A name that collapses to loopback is now diagnosed.** `hermes serve --host
+  "$(hostname)"` is the obvious way to ask for remote access, and on Debian and
+  Ubuntu it serves nobody: `/etc/hosts` maps the hostname to `127.0.1.1` at
+  install time, and that entry beats anything the network publishes. Every
+  signal read as success — name resolved, bind succeeded, "serving" printed —
+  while auth was silently off, because the bind really was local. Reproduced on
+  this machine, then fixed: the gateway names the value, the loopback address it
+  got, the cause, and the addresses this machine can actually be reached at.
+- **It warns rather than refuses.** A name resolving to loopback is unusual, not
+  invalid, and refusing would break a working configuration to make a point.
+  `--host localhost`, `.localhost` names and literal addresses are never
+  second-guessed — asserted in tests, so the warning stays worth reading.
+- **`hermes sysinfo` gained a Network section**, which is where the question
+  "what do I pass to `--host`?" now gets answered. On this machine it lists the
+  LAN address, the overlay address and the overlay's unique-local IPv6 address,
+  and `--json` carries them under `reachable_addresses` so a script need not
+  parse `ip addr`.
+- **The address probe is honest about what it does not know.** It reads
+  `/proc/net/fib_trie`'s local table and `/proc/net/if_inet6` — no `unsafe`, so
+  the crate keeps its `forbid(unsafe_code)` — filters out loopback, link-local
+  and broadcast (a link-local address cannot be bound without a scope id, so
+  offering one would swap one confusing failure for another), and returns
+  `UnsupportedPlatform` off Linux rather than an empty list, because "nothing to
+  reach this machine at" and "I did not look" are opposite answers.
+- **A name is not an address, and the network gets the final say.** The machine
+  this was found on has `hostname` `hermes` and is `hermes-1` on its overlay,
+  where `hermes` is a *different* machine — nothing is listening there. No
+  software can detect that for you, which is why `sysinfo` reports addresses.
+- Verified by running it: `--host "$(hostname)"` prints the warning and the
+  three real addresses; `--host localhost` and `--host 127.0.0.1` print nothing;
+  and a real model served over the overlay address answered `/v1/models` 200
+  with the key and 401 without, on the same socket.
+
 Thinking models, now covered deliberately rather than by accident:
 
 - `reasoning_effort` and `chat_template_kwargs` are typed request fields, carried
@@ -108,8 +144,8 @@ Thinking models, now covered deliberately rather than by accident:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 367 | no network, no model downloads |
-| openai-SDK contract (`scripts/contract-test.sh`) | 14 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
+| Default (`cargo test --workspace`) | 406 | no network, no model downloads |
+| openai-SDK contract (`scripts/contract-test.sh`) | 19 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 6 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
 

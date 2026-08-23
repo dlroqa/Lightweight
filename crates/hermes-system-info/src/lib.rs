@@ -10,8 +10,10 @@
 
 pub mod cpu;
 pub mod memory;
+pub mod network;
 pub mod paths;
 
 pub use cpu::{CpuInfo, IsaFeature};
 pub use memory::{FixedMemoryProbe, MemoryError, MemoryProbe, MemorySnapshot, SystemMemoryProbe};
+pub use network::{NetworkError, reachable_addresses};
 pub use paths::{DataPaths, PathsError};
