@@ -2,6 +2,20 @@
 # Everything CI runs. Kept as a script so it is identical locally and in CI.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# cargo is absent from PATH in a non-login shell, where rustup's installer line
+# is never read - the script then dies as "command not found" before a single
+# check has run. Sourcing rustup's own env file is idempotent and a no-op when
+# ~/.cargo/bin is already on PATH, so a working shell and a CI runner with a
+# toolchain action are both left untouched. If it is still missing, say which
+# tool and why, rather than leaving the caller to decode exit 127.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "${HOME:-}/.cargo/env" ]; then
+  . "${HOME:-}/.cargo/env"
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found. Install rustup, or put ~/.cargo/bin on PATH." >&2
+  exit 1
+fi
 echo "== fmt ==";     cargo fmt --all --check
 echo "== clippy ==";  cargo clippy --workspace --all-targets -- -D warnings
 echo "== test ==";    cargo test --workspace
