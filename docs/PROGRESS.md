@@ -16,7 +16,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M2** Engine acquisition and supervision | **done** | pinned runtime manifest with per-platform digests, download with resume + streamed sha256, archive extraction, `InferenceBackend` trait, supervised `llama-server` child process, crash classification, `hermes serve` |
 | **M3** Vertical slice: the gateway | **done** | SSE codec, generation events, upstream HTTP/SSE adapter, `MockBackend`, `hermes-api` DTOs, `hermes-gateway` serving `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/props`, `/version`, permissive auth, `Semaphore(1)`, cancellation, openai-SDK contract suite |
 | **M3.5** Remote access | **done** | serving any non-loopback address (LAN or overlay), repeatable name-resolving `--host`, key from the environment, metadata redaction for unauthenticated callers, engine key out of `argv`, secrets/address gate |
-| M4 | next | tool calls end to end in an agent loop, request-option passthrough (`chat_template_kwargs`, `reasoning_effort`, `tools`), the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
+| **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
+| M4 | next | tool calls end to end in an agent loop, `tools` in the request, the full section 27 taxonomy as OpenAI bodies, `/v1/completions` |
 | M5 | pending | scheduler, metrics, queue fairness, per-token timings |
 | M6 | pending | model manager, Electron shell + SPA |
 
@@ -162,7 +163,15 @@ Found while verifying remote access, and fixed rather than deferred:
   against a real thinking model, `reasoning_effort: "none"` produces content and
   no reasoning at all. `tools` remains M4's work.
 
-Found by pointing a real agent harness at the gateway, and left for M5:
+**The acceptance test passed: a real agent harness ran a full session against
+the gateway.** Run in a throwaway `HERMES_HOME` so the user's own configuration
+was never touched, the harness initialized against `/v1/models`, sent a
+5,596-token agent system prompt, streamed the reply, and answered correctly —
+`pong`, from a 135M model — exiting cleanly after 8 minutes 7 seconds, most of
+it prefill on this CPU. No `EmptyStreamError`, no truncated stream, and the
+gateway served five requests across the session.
+
+Found by that same run, and left for M5:
 
 - **A harness issues auxiliary requests alongside the main turn.** While a
   5,596-token agent prompt was prefilling, the harness sent a small
@@ -204,14 +213,15 @@ Still open:
 - **Calibration**: the estimator's compute and overhead terms are still the
   shipped conservative defaults, so estimates report `Confidence::Coarse`.
   Fitting them from observed peak RSS is M9.
-- **The Hermes cutover** is a one-line change to `~/.hermes/config.yaml`
-  (`base_url` pointing at this gateway) and has **not** been made: that file is
-  protected and the change needs explicit permission. Everything the cutover
-  depends on has been proven against the same client library Hermes uses,
-  locally and over a non-loopback bind.
+- **The live harness cutover** — pointing the user's own `~/.hermes/config.yaml`
+  at this gateway — has **not** been made and still needs explicit permission;
+  that file is protected. It is no longer needed for evidence: the same
+  cutover, in a throwaway `HERMES_HOME`, ran a complete agent session (above).
+  Its md5 was checked before and after and is unchanged.
 - **A second machine has not been driven from here.** Everything on this side
-  is verified; the remote leg — a client on another host completing a session —
-  needs a command run on that host.
+  is verified, including a non-loopback bind with auth; the remaining leg is a
+  client on *another* host completing a session, which needs either a command
+  run there or a way in. SSH from here is refused by key.
 
 ## Next step
 
