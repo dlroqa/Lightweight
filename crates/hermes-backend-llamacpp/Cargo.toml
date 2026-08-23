@@ -29,6 +29,7 @@ tokio-util.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+bytes.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 hex.workspace = true

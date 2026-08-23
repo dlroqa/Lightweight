@@ -24,5 +24,16 @@ else
   echo "== test (real engine) == skipped: set HERMES_TEST_MODEL to a .gguf to include"
 fi
 
+# The openai-SDK contract suite: the real client library against a real
+# gateway, asserting what the client ends up with rather than what we sent.
+# Needs python3 and one package from PyPI, so it is allowed to be absent - but
+# it says so, rather than passing quietly.
+if command -v python3 >/dev/null 2>&1; then
+  echo "== test (openai contract suite) =="
+  ./scripts/contract-test.sh
+else
+  echo "== test (openai contract suite) == skipped: python3 unavailable"
+fi
+
 echo "== deps ==";    ./scripts/check-deps.sh
 echo "All checks passed."

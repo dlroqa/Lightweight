@@ -6,6 +6,9 @@ members = [
     "crates/hermes-memory",
     "crates/hermes-inference",
     "crates/hermes-backend-llamacpp",
+    "crates/hermes-backend-mock",
+    "crates/hermes-api",
+    "crates/hermes-gateway",
     "crates/hermes-cli",
     "crates/hermes-system-info",
     "crates/hermes-observability",
@@ -63,8 +66,15 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 # `rustls-no-provider` is deliberate: the default `rustls` feature selects
 # aws-lc-rs, whose build requires cmake. We install the `ring` provider
 # ourselves instead. See the dependency policy above.
+# `axum` 0.8 brings hyper and tower; no build scripts, no cmake, no OpenSSL.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "matched-path", "original-uri", "tracing"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "http2", "charset", "json", "stream"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# --- bytes ---
+# Already in the tree via reqwest/hyper; named explicitly because the upstream
+# SSE translator has to spell out the stream's item type.
+bytes = "1.12.1"
 
 # --- archives and digests ---
 sha2 = "0.11.0"
@@ -83,6 +93,9 @@ hermes-gguf = { path = "crates/hermes-gguf" }
 hermes-memory = { path = "crates/hermes-memory" }
 hermes-inference = { path = "crates/hermes-inference" }
 hermes-backend-llamacpp = { path = "crates/hermes-backend-llamacpp" }
+hermes-backend-mock = { path = "crates/hermes-backend-mock" }
+hermes-api = { path = "crates/hermes-api" }
+hermes-gateway = { path = "crates/hermes-gateway" }
 hermes-system-info = { path = "crates/hermes-system-info" }
 hermes-observability = { path = "crates/hermes-observability" }
 

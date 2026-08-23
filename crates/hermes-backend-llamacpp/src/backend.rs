@@ -13,9 +13,10 @@ use std::time::{Duration, SystemTime};
 
 use hermes_core::{InstanceId, ModelId, RuntimeParams, units::Bytes};
 use hermes_gguf::architecture;
+use hermes_inference::generation::GenerationRequest;
 use hermes_inference::{
-    BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, InferenceBackend,
-    LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
+    BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, GenerationStream,
+    InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
 };
 use hermes_observability::targets;
 use hermes_system_info::CpuInfo;
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acquire::RuntimeInstaller;
 use crate::supervisor::{self, ALLOWED_KV_CACHE_TYPES, Engine, EngineConfig, ExitClassification};
+use crate::upstream::UpstreamClient;
 
 /// Identifies this backend.
 pub const BACKEND_ID: BackendId = BackendId("llamacpp-process");
@@ -42,6 +44,10 @@ struct Running {
     instance: InstanceId,
     model: ModelId,
     engine: Engine,
+    /// Built once at load rather than per request: it holds a connection pool,
+    /// and a new client per token-generating request would open a new TCP
+    /// connection for every turn.
+    client: UpstreamClient,
     effective: RuntimeParams,
     loaded_at: SystemTime,
 }
@@ -233,10 +239,13 @@ impl InferenceBackend for ProcessBackend {
             "model loaded"
         );
 
+        let client = UpstreamClient::new(engine.base_url(), engine.api_key())?;
+
         *self.running.lock().await = Some(Running {
             instance,
             model: request.model.clone(),
             engine,
+            client,
             effective,
             loaded_at,
         });
@@ -267,6 +276,30 @@ impl InferenceBackend for ProcessBackend {
             let _ = state.engine.shutdown().await;
         }
         Ok(())
+    }
+
+    async fn generate(
+        &self,
+        instance: InstanceId,
+        request: GenerationRequest,
+        cancel: CancellationToken,
+    ) -> Result<GenerationStream, BackendError> {
+        // The client is cloned out from under the lock before the request is
+        // sent. Holding it across the whole generation would serialize every
+        // other operation on the backend behind a completion that can run for
+        // minutes - including the health check that would notice the engine
+        // dying mid-stream.
+        let client = self.client_for(instance).await?;
+        client.generate(request, cancel).await
+    }
+
+    async fn count_prompt_tokens(
+        &self,
+        instance: InstanceId,
+        request: &GenerationRequest,
+    ) -> Result<u32, BackendError> {
+        let client = self.client_for(instance).await?;
+        client.count_prompt_tokens(request).await
     }
 
     async fn health(&self) -> BackendHealth {
@@ -308,6 +341,32 @@ impl InferenceBackend for ProcessBackend {
 }
 
 impl ProcessBackend {
+    /// The upstream client for a resident instance.
+    ///
+    /// The instance check is the point: a request queued against a model that
+    /// has since been unloaded and replaced must fail rather than silently
+    /// running against whatever is loaded now.
+    async fn client_for(&self, instance: InstanceId) -> Result<UpstreamClient, BackendError> {
+        let running = self.running.lock().await;
+        let state = running.as_ref().ok_or(BackendError::NoModelLoaded)?;
+        if state.instance != instance {
+            return Err(BackendError::NoModelLoaded);
+        }
+        Ok(state.client.clone())
+    }
+
+    /// The engine's own properties, read from the running child.
+    ///
+    /// Used by the gateway's `/props`, so what is reported is what the engine
+    /// is actually running rather than what it was asked for.
+    pub async fn engine_props(&self) -> Result<serde_json::Value, BackendError> {
+        let running = self.running.lock().await;
+        let state = running.as_ref().ok_or(BackendError::NoModelLoaded)?;
+        let client = state.client.clone();
+        drop(running);
+        client.props().await
+    }
+
     /// The resident model, if any.
     pub async fn resident(&self) -> Option<(ModelId, InstanceId, RuntimeParams, SystemTime)> {
         let running = self.running.lock().await;

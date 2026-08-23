@@ -161,3 +161,84 @@ The KV cache type is also validated before launch. Only nine ggml types are
 accepted there — `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` — so `q6_K`,
 which is perfectly good for weights, is refused with the list of alternatives
 rather than surfacing as an opaque engine exit.
+
+## Why the gateway re-emits its own chunks
+
+The engine already speaks an OpenAI-compatible dialect, so forwarding its SSE
+bytes would have been less code. It is the wrong trade.
+
+The engine's chunks carry its own `model` field — the *file path* of the GGUF —
+and the client reads `chunk.model` back and keys its context cache on it. They
+also carry `system_fingerprint`, a `timings` object shaped to llama.cpp, and
+whatever the next release adds or renames.
+
+Re-emitting means an upstream change breaks a test in `hermes-api` rather than
+breaking a conversation. The translation is one file (`upstream.rs`), its
+inputs are a captured transcript from the pinned build, and the output side is
+pinned by byte-exact golden files.
+
+## Why the effective context is advertised, and the ceiling is hidden
+
+Hermes scans `/v1/models` rows *recursively* for the first key it recognizes
+out of twelve — `context_length`, `n_ctx`, `max_context_length`,
+`max_model_len`, and so on (`agent/model_metadata.py:1119-1132`) — and then
+sizes every prompt to what it finds.
+
+So a model that supports 128K but is loaded at 8192 must report **8192**.
+Reporting the ceiling would guarantee that every long conversation overflows a
+window that does not exist.
+
+The true ceiling is still useful — the UI offers it as a context preset — so it
+is reported as `hermes.model_max_context_length`. The `model_` prefix is
+load-bearing: `max_context_length` is in the scanner's key set, and naming it
+that would have undone the whole point.
+
+## Why cancellation is a `Drop` guard rather than a callback
+
+The SSE response body owns a `RequestGuard` holding the job's cancellation
+token and its scheduler permit. hyper drops the body when the client
+disconnects; the guard's `Drop` cancels the token, which drops the upstream
+`reqwest` response, which closes the TCP connection to the engine, which makes
+the engine's own response reader cancel its task (`server-queue.h:218` at the
+pinned build).
+
+Nothing has to *detect* a disconnect, and no path can leak a slot, because
+there is no path that skips `Drop`. Measured against the real engine: CPU time
+consumed after the client walked away was **zero ticks**, and the next request
+was served immediately.
+
+## Why the prompt is counted by the engine
+
+The pre-flight check that turns "this conversation outgrew the window" into a
+parsable 400 needs an exact token count *with the model's chat template
+applied*. The template lives in the GGUF and is applied by the engine, so the
+count comes from the engine too — `POST /v1/chat/completions/input_tokens`,
+which returns `{"input_tokens":N}` without generating anything.
+
+Rendering the template a second time in Rust would be both a reimplementation
+of what section 37 says to delegate and a source of silent drift: our count and
+the engine's would disagree by exactly the tokens we got wrong.
+
+## Why authentication is off by default, and forced when it matters
+
+Hermes *always* sends an `Authorization` header, and when no key is configured
+it sends the literal string `Bearer no-key-required`
+(`agent/runtime_provider.py:1144`). A gateway that validated that would reject
+every request from a correctly configured client.
+
+The security boundary on a loopback bind is the network stack, not a token
+nobody kept secret. So `AuthPolicy::Disabled` accepts any value and a missing
+header alike — and `AuthPolicy::for_bind` refuses to start on a non-loopback
+address without a real key, so exposure past this machine cannot happen by
+accident.
+
+## Why `max_tokens` is clamped and never rejected
+
+Hermes defaults `max_tokens` to 65536 for a custom provider
+(`agent/run_agent.py:1673`), which exceeds every context this gateway can
+load. Rejecting it would break every request it makes, so the value is clamped
+to `n_ctx - prompt_tokens - 1`, floored at one.
+
+Flooring at one matters: a budget of zero produces an empty completion, and an
+empty completion is exactly the `EmptyStreamError` that makes the client retry
+blindly.

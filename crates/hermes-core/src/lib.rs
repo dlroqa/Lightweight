@@ -31,6 +31,7 @@ pub mod ggml;
 pub mod ids;
 pub mod privacy;
 pub mod runtime;
+pub mod sse;
 pub mod units;
 
 pub use error::{Actionable, ErrorKind, ErrorReport, Remedy, RemedyAction, SettingsSection};
@@ -38,4 +39,5 @@ pub use ggml::GgmlType;
 pub use ids::{ClientKey, InstanceId, JobId, ModelId};
 pub use privacy::Private;
 pub use runtime::RuntimeParams;
+pub use sse::{SseDecodeError, SseDecoder, SseEvent};
 pub use units::Bytes;

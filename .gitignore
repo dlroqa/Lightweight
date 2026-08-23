@@ -8,3 +8,7 @@
 *.gguf
 .env
 /fixtures/real-headers
+
+# Python bytecode from the contract suite
+__pycache__/
+.pytest_cache/

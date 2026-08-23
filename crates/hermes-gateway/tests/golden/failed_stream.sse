@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-GOLDEN","object":"chat.completion.chunk","created":0,"model":"mock-model@4k","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-GOLDEN","object":"chat.completion.chunk","created":0,"model":"mock-model@4k","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-GOLDEN","object":"chat.completion.chunk","created":0,"model":"mock-model@4k","choices":[{"index":0,"delta":{},"finish_reason":"error"}],"error":{"code":"engine_crashed","message":"the engine stopped unexpectedly (killed (signal 9))","type":"server_error"}}
+
+data: [DONE]
+

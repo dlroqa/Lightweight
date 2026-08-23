@@ -13,9 +13,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
 use hermes_backend_llamacpp::backend::ProcessBackend;
 use hermes_core::{Actionable, GgmlType, ModelId, RuntimeParams};
 use hermes_gguf::{GgufFile, ModelMetadata};
+use hermes_inference::generation::{
+    ChatMessage, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
+};
 use hermes_inference::{BackendHealth, InferenceBackend, LoadRequest};
 use hermes_system_info::MemoryProbe as _;
 use tokio::sync::mpsc;
@@ -231,4 +235,182 @@ async fn a_kv_cache_type_the_engine_rejects_is_refused_before_launching() {
         !err.remedies().is_empty(),
         "the refusal should list alternatives"
     );
+}
+
+#[tokio::test]
+async fn the_real_engine_streams_a_completion_and_reports_its_tokens() {
+    // The translation from llama.cpp's SSE to our events is unit-tested against
+    // a captured transcript. This is the other half: that the transcript is
+    // still what a live engine produces at the pinned build.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("generate");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams::default().with_context(2048);
+    let (tx, _rx) = mpsc::channel(64);
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("load");
+
+    let generation = GenerationRequest {
+        messages: vec![
+            ChatMessage::system("Answer in one short sentence."),
+            ChatMessage::user("Name a colour."),
+        ],
+        max_tokens: Some(24),
+        sampling: SamplingParams {
+            // Pinned so the test is about the contract rather than about what
+            // a 135M model feels like saying today.
+            temperature: Some(0.0),
+            seed: Some(7),
+            ..SamplingParams::default()
+        },
+    };
+
+    // Counted with the model's own chat template applied, which is the whole
+    // reason this goes to the engine rather than being estimated here.
+    let prompt_tokens = backend
+        .count_prompt_tokens(loaded.instance, &generation)
+        .await
+        .expect("prompt token count");
+    assert!(
+        prompt_tokens > 0 && prompt_tokens < params.n_ctx,
+        "implausible prompt token count: {prompt_tokens}"
+    );
+
+    let mut events = backend
+        .generate(loaded.instance, generation, CancellationToken::new())
+        .await
+        .expect("generation");
+
+    let mut content = String::new();
+    let mut started = false;
+    let mut finished = None;
+    let mut timings = None;
+    while let Some(event) = events.next().await {
+        match event.expect("no error mid-stream") {
+            GenerationEvent::Started { .. } => started = true,
+            GenerationEvent::ContentDelta { text } => content.push_str(&text),
+            GenerationEvent::Timings(measured) => timings = Some(measured),
+            GenerationEvent::Finished {
+                finish_reason,
+                usage,
+            } => finished = Some((finish_reason, usage)),
+            _ => {}
+        }
+    }
+
+    assert!(started, "no start event arrived");
+    assert!(!content.is_empty(), "the engine produced no content at all");
+    let (finish_reason, usage) = finished.expect("the stream ended without a finish event");
+    assert!(matches!(
+        finish_reason,
+        FinishReason::Stop | FinishReason::Length
+    ));
+    // The counts must agree with the pre-flight count, or the gateway's
+    // context arithmetic is being done against a different prompt.
+    assert_eq!(usage.prompt_tokens, prompt_tokens);
+    assert!(usage.completion_tokens > 0);
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens
+    );
+    let timings = timings.expect("the engine reports timings on its usage chunk");
+    assert!(timings.predicted_n > 0);
+
+    backend.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dropping_the_stream_stops_the_engine_decoding() {
+    // The property every cancellation path depends on: the pinned build's
+    // response reader cancels its task when the request goes away
+    // (server-queue.h:218). If that ever stopped being true, a disconnected
+    // client would leave the engine generating to nobody.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("cancel");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams::default().with_context(2048);
+    let (tx, _rx) = mpsc::channel(64);
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("load");
+    let pid = backend
+        .resource_usage()
+        .await
+        .expect("usage")
+        .expect("an engine is running");
+    assert!(pid.rss.get() > 0);
+
+    let cancel = CancellationToken::new();
+    let mut events = backend
+        .generate(
+            loaded.instance,
+            GenerationRequest {
+                messages: vec![ChatMessage::user("Write a long story about a robot.")],
+                max_tokens: Some(500),
+                sampling: SamplingParams::default(),
+            },
+            cancel.clone(),
+        )
+        .await
+        .expect("generation");
+
+    // Read a little, then walk away exactly as a disconnecting client does.
+    let first = tokio::time::timeout(Duration::from_secs(120), events.next())
+        .await
+        .expect("the engine should produce something within two minutes");
+    assert!(first.is_some());
+    cancel.cancel();
+    drop(events);
+
+    // The engine must go idle. Measured from its own CPU time rather than by
+    // waiting a fixed period and hoping.
+    let cpu_time = |pid: u32| -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields: Vec<&str> = stat.rsplit(')').next()?.split_whitespace().collect();
+        // utime and stime are fields 14 and 15 of `stat`, which are 11 and 12
+        // after the comm field has been split off.
+        Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+    };
+    let Some(engine_pid) = engine_pid(&backend).await else {
+        backend.shutdown().await.expect("shutdown");
+        return;
+    };
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = cpu_time(engine_pid).unwrap_or(0);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = cpu_time(engine_pid).unwrap_or(0);
+    assert!(
+        after.saturating_sub(before) <= 2,
+        "the engine kept burning CPU after the client disconnected: {} ticks",
+        after - before
+    );
+
+    backend.shutdown().await.expect("shutdown");
+}
+
+/// The engine's pid, read through the backend's own resource reporting.
+async fn engine_pid(backend: &ProcessBackend) -> Option<u32> {
+    // `resource_usage` proves an engine is running; the pid itself comes from
+    // the only place that has it.
+    backend.resource_usage().await.ok().flatten()?;
+    std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .find(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|cmdline| cmdline.contains("llama-server"))
+        })
 }

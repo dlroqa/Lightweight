@@ -11,13 +11,14 @@
 //! handle, and its wire format. A caller that could reach either would couple
 //! itself to llama.cpp, and the boundary would stop being a boundary.
 //!
-//! This milestone defines the **lifecycle** half — acquire, load, observe,
-//! unload. Generation is added next, on top of the same instance handle.
+//! The trait covers the lifecycle — acquire, load, observe, unload — and
+//! generation on top of the same instance handle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use futures_util::stream::BoxStream;
 use hermes_core::{GgmlType, InstanceId, ModelId, RuntimeParams, units::Bytes};
 use hermes_gguf::ModelMetadata;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::BackendError;
+use crate::generation::{GenerationEvent, GenerationRequest};
+
+/// A stream of generation events.
+///
+/// Boxed rather than an associated type so that [`InferenceBackend`] stays
+/// object-safe: the gateway holds `Arc<dyn InferenceBackend>` and must be able
+/// to swap engines at runtime, which an associated stream type would make
+/// impossible.
+pub type GenerationStream = BoxStream<'static, Result<GenerationEvent, BackendError>>;
 
 /// Names a backend implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -184,6 +194,38 @@ pub trait InferenceBackend: Send + Sync + 'static {
     /// Idempotent: unloading an instance that is already gone succeeds, so a
     /// caller recovering from a crash does not have to distinguish the cases.
     async fn unload(&self, instance: InstanceId) -> Result<(), BackendError>;
+
+    /// Generate a completion, streaming events as they happen.
+    ///
+    /// Always a stream, even when the caller wants one whole response: the
+    /// engine produces tokens over tens of seconds on a CPU, and a
+    /// non-streaming API is the streaming one with an accumulator on the end.
+    /// The reverse — synthesizing a stream from a completed response — would
+    /// throw away the timing information that time-to-first-token and
+    /// tokens-per-second are computed from.
+    ///
+    /// Dropping the returned stream must stop the work. That is what makes a
+    /// disconnected client stop costing CPU, and it is why cancellation is a
+    /// token rather than a method: a `Drop` can cancel a token, but it cannot
+    /// call an async method.
+    async fn generate(
+        &self,
+        instance: InstanceId,
+        request: GenerationRequest,
+        cancel: CancellationToken,
+    ) -> Result<GenerationStream, BackendError>;
+
+    /// How many tokens the prompt occupies, before generating anything.
+    ///
+    /// The pre-flight check that turns "the prompt filled the window" into a
+    /// 400 the client can parse and act on, rather than an empty stream it
+    /// retries blindly. It must apply the model's own chat template, because
+    /// the template's own tokens are part of the count.
+    async fn count_prompt_tokens(
+        &self,
+        instance: InstanceId,
+        request: &GenerationRequest,
+    ) -> Result<u32, BackendError>;
 
     async fn health(&self) -> BackendHealth;
 

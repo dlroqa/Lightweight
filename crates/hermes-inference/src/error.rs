@@ -53,6 +53,13 @@ pub enum BackendError {
     )]
     InvalidContextLength { requested: u32, max: u32 },
 
+    #[error(
+        "this model's maximum context length is {n_ctx} tokens, however your messages resulted in \
+         {prompt_tokens} tokens. Please reduce the length of the messages or lower the configured \
+         context length."
+    )]
+    ContextOverflow { prompt_tokens: u32, n_ctx: u32 },
+
     #[error("the engine does not accept {requested:?} as a KV cache type")]
     UnsupportedKvCacheType {
         requested: String,
@@ -92,6 +99,14 @@ pub enum BackendError {
     #[error("the engine is not running")]
     EngineUnavailable,
 
+    /// The engine accepted the request and then refused or failed it.
+    ///
+    /// Distinct from a crash: the process is alive and will serve the next
+    /// request, so the gateway reports the failure without tearing anything
+    /// down.
+    #[error("the engine could not complete the request: {detail}")]
+    GenerationFailed { detail: String },
+
     #[error("no model is loaded")]
     NoModelLoaded,
 
@@ -118,12 +133,15 @@ impl Actionable for BackendError {
             Self::UnsupportedArchitecture { .. } => "unsupported_architecture",
             Self::InvalidContextLength { .. } => "invalid_context_length",
             Self::UnsupportedKvCacheType { .. } => "unsupported_kv_cache_type",
+            // The code OpenAI clients already recognize for this condition.
+            Self::ContextOverflow { .. } => "context_length_exceeded",
             Self::InsufficientMemory { .. } => "insufficient_memory",
             Self::StartTimeout { .. } => "engine_start_timeout",
             Self::EngineCrashed { .. } => "engine_crashed",
             Self::EngineOom { .. } => "engine_out_of_memory",
             Self::UnsupportedCpuInstruction { .. } => "unsupported_cpu_instruction",
             Self::EngineUnavailable => "engine_unavailable",
+            Self::GenerationFailed { .. } => "generation_failed",
             Self::NoModelLoaded => "no_model_loaded",
             Self::Cancelled => "cancelled",
             Self::Io { .. } => "io_error",
@@ -135,6 +153,7 @@ impl Actionable for BackendError {
             Self::ModelNotFound { .. } => ErrorKind::NotFound,
             Self::UnsupportedArchitecture { .. }
             | Self::InvalidContextLength { .. }
+            | Self::ContextOverflow { .. }
             | Self::UnsupportedKvCacheType { .. } => ErrorKind::InvalidRequest,
             Self::LowDisk { .. } | Self::InsufficientMemory { .. } | Self::EngineOom { .. } => {
                 ErrorKind::ResourceExhausted
@@ -156,6 +175,20 @@ impl Actionable for BackendError {
                     supported: supported.clone(),
                 },
             )],
+            // The prompt, not the configuration, is what is too long - so the
+            // remedy is to send less, and only secondarily to reconfigure.
+            Self::ContextOverflow { n_ctx, .. } => vec![
+                Remedy::new(
+                    "Shorten the conversation, or start a new one",
+                    RemedyAction::ReduceContext { to_tokens: *n_ctx },
+                ),
+                Remedy::new(
+                    "Load the model with a larger context, if this machine has the memory",
+                    RemedyAction::OpenSettings {
+                        section: SettingsSection::Inference,
+                    },
+                ),
+            ],
             Self::InvalidContextLength { max, .. } => vec![Remedy::new(
                 format!("Reduce the context to {max} tokens or fewer"),
                 RemedyAction::ReduceContext { to_tokens: *max },
@@ -310,6 +343,44 @@ mod tests {
         ] {
             assert!(!case.remedies().is_empty(), "{} has no remedy", case.code());
         }
+    }
+
+    #[test]
+    fn an_overlong_prompt_names_the_window_and_the_prompt() {
+        // The wording is a contract, not prose: Hermes lowercases the message
+        // and pulls the limit out of it with
+        // `(?:max(?:imum)?|limit)\s*(?:context\s*)?(?:length|size|window)?\s*(?:is|of|:)?\s*(\d{4,})`
+        // (agent/model_metadata.py:1587). The context must appear *before* the
+        // prompt size, or the client caches the wrong number and re-plans
+        // every future turn against it.
+        let err = BackendError::ContextOverflow {
+            prompt_tokens: 41_022,
+            n_ctx: 32_768,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("maximum context length is 32768"),
+            "wording changed, which breaks the client's limit parser: {message}"
+        );
+        assert!(message.contains("41022"), "{message}");
+        assert!(
+            message.find("32768") < message.find("41022"),
+            "the window must be the first four-digit number in the message: {message}"
+        );
+        assert_eq!(err.code(), "context_length_exceeded");
+        assert_eq!(err.http_status(), 400);
+        assert!(!err.remedies().is_empty());
+    }
+
+    #[test]
+    fn a_failed_generation_leaves_the_engine_alive() {
+        // Distinct from a crash on purpose: the process is still serving, so
+        // nothing should be torn down or restarted because of it.
+        let err = BackendError::GenerationFailed {
+            detail: "slot unavailable".into(),
+        };
+        assert_eq!(err.code(), "generation_failed");
+        assert!(!err.is_transient());
     }
 
     #[test]

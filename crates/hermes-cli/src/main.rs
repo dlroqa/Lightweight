@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -50,10 +51,11 @@ enum Command {
         #[arg(long)]
         header_only: bool,
     },
-    /// Acquire the engine, load a model and hold it resident.
+    /// Load a model and serve the OpenAI-compatible API.
     ///
-    /// The OpenAI-compatible API arrives in the next milestone; this proves the
-    /// engine acquisition, admission and supervision path end to end.
+    /// Acquires the engine, admits the model against this machine's free
+    /// memory, loads it, and serves `/v1/chat/completions`, `/v1/models`,
+    /// `/health` and `/props` until interrupted.
     Serve {
         model: PathBuf,
         /// Context length in tokens.
@@ -72,6 +74,22 @@ enum Command {
         /// Load even if the RAM estimate says it will not fit.
         #[arg(long)]
         force: bool,
+        /// Address to bind.
+        ///
+        /// Loopback by default: the gateway is a local service, and section 23
+        /// makes exposure beyond this machine a deliberate act rather than
+        /// something a user can end up with by accident.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: IpAddr,
+        /// Port to bind. `0` picks a free one and prints it.
+        #[arg(long, default_value_t = 8737)]
+        port: u16,
+        /// Require this key on every request.
+        ///
+        /// Optional on loopback and mandatory otherwise; binding a non-loopback
+        /// address without one is refused rather than silently exposed.
+        #[arg(long)]
+        api_key: Option<String>,
     },
     /// Estimate what a model would cost to load, and whether it fits.
     Estimate {
@@ -147,6 +165,9 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             threads,
             kv_type,
             force,
+            host,
+            port,
+            api_key,
         } => {
             // Only this command needs an async runtime, so it is built here
             // rather than wrapping every command in one.
@@ -160,6 +181,9 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 threads: *threads,
                 kv_type: kv_type.clone(),
                 force: *force,
+                host: *host,
+                port: *port,
+                api_key: api_key.clone(),
             }))?;
             Ok(ExitCode::SUCCESS)
         }

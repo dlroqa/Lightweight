@@ -1,0 +1,38 @@
+[package]
+name = "hermes-gateway"
+description = "The OpenAI-compatible HTTP surface: routes, auth, streaming."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The mock gateway binary, used by the contract suite. Off by default so the
+# shipped gateway carries no test scaffolding.
+mock = ["dep:hermes-backend-mock"]
+
+[dependencies]
+hermes-core.workspace = true
+hermes-api.workspace = true
+hermes-inference.workspace = true
+hermes-observability.workspace = true
+hermes-backend-mock = { workspace = true, optional = true }
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+hermes-backend-mock.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+
+[[bin]]
+name = "hermes-mock-gateway"
+required-features = ["mock"]

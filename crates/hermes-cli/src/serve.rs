@@ -1,22 +1,26 @@
-//! The `serve` command: acquire the engine, admit a model, load it, hold it.
+//! The `serve` command: acquire the engine, admit a model, load it, serve it.
 //!
-//! This is the milestone-2 shape of the command. It proves the whole lower
-//! stack end to end — engine acquisition, RAM admission, process supervision,
-//! resource reporting and clean shutdown — but it does not yet expose an
-//! OpenAI-compatible API. That is the next milestone, and it plugs into the
-//! same loaded instance.
+//! The whole stack in one command — engine acquisition, RAM admission, process
+//! supervision, and the OpenAI-compatible gateway on top of the loaded
+//! instance.
 //!
-//! The admission check is the part worth noticing. The model is measured
+//! Two things are worth noticing. The admission check measures the model
 //! against this machine's free memory *before* anything is launched, so a load
 //! that cannot fit is refused with numbers and suggestions rather than
-//! discovered as an OOM kill thirty seconds later.
+//! discovered as an OOM kill thirty seconds later. And the gateway advertises
+//! the context the model was actually loaded with, under an id that encodes
+//! it — which is what keeps a client from sizing prompts to a window that does
+//! not exist.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hermes_backend_llamacpp::backend::ProcessBackend;
 use hermes_core::{Actionable, ModelId, RuntimeParams, units::Bytes};
+use hermes_gateway::catalog::{Catalog, ResidentModel};
+use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::{InferenceBackend, LoadProgress, LoadRequest};
 use hermes_memory::{Estimator, Verdict};
@@ -38,6 +42,12 @@ pub struct ServeOptions {
     /// benchmark has run. A user who knows their model better than we do
     /// should be able to say so — and be told plainly what they are overriding.
     pub force: bool,
+    /// Address to bind the gateway to.
+    pub host: IpAddr,
+    /// Port to bind. `0` picks a free one.
+    pub port: u16,
+    /// Key required on every request. Mandatory for a non-loopback bind.
+    pub api_key: Option<String>,
 }
 
 /// Run the command. Returns once the engine has been shut down.
@@ -153,6 +163,14 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         }
     });
 
+    // Captured before the metadata is moved into the load request: the catalog
+    // reports what the model *is*, and the gateway answers `/v1/models` from
+    // that rather than by asking the engine, which only knows a file path.
+    let architecture = metadata.architecture.clone();
+    let param_count = metadata.param_count;
+    let quantization = Some(metadata.quantization_label());
+    let model_max_context_length = metadata.context_length;
+
     let request = LoadRequest {
         model: ModelId::with_context(
             options
@@ -187,11 +205,79 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         report_estimate_accuracy(estimate.total, usage.peak_rss);
     }
 
+    // The auth policy is decided by where we are binding, not by preference.
+    // Loopback keeps whatever the user configured, including nothing; anything
+    // else demands a key rather than being silently exposed.
+    let auth = AuthPolicy::for_bind(options.host, options.api_key.clone()).map_err(|_| {
+        format!(
+            "binding to {} would expose this gateway to the network; pass --api-key to allow it",
+            options.host
+        )
+    })?;
+
+    let backend = Arc::new(backend);
+    let catalog = Arc::new(Catalog::with_resident(ResidentModel {
+        id: loaded.model.clone(),
+        instance: loaded.instance,
+        // The *effective* context, which is what every endpoint advertises. A
+        // client sizes its prompts to this number.
+        n_ctx: loaded.effective.n_ctx,
+        architecture,
+        param_count,
+        quantization,
+        model_max_context_length,
+        ram_verdict: Some(estimate.verdict.label().to_owned()),
+        backend: Some(backend.id().to_string()),
+        model_path: options.model.display().to_string(),
+    }));
+
+    let state = Arc::new(GatewayState::new(
+        Arc::clone(&backend) as Arc<dyn InferenceBackend>,
+        catalog,
+        GatewayConfig {
+            auth,
+            ..GatewayConfig::default()
+        },
+    ));
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(options.host, options.port))
+        .await
+        .map_err(|err| format!("could not bind {}:{}: {err}", options.host, options.port))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|err| format!("could not read the bound address: {err}"))?;
+
+    println!("\nserving  http://{bound}/v1");
+    println!("  model    {}", loaded.model);
+    println!("  context  {} tokens", loaded.effective.n_ctx);
+    println!(
+        "  auth     {}",
+        if state.config.auth.is_enabled() {
+            "api key required"
+        } else {
+            "disabled (loopback only)"
+        }
+    );
     println!("\nPress Ctrl-C to stop.");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\nstopping"),
-        () = watch_for_death(&backend) => {}
-    }
+
+    // Two ways to stop, and both must leave nothing behind: the user asking,
+    // and the engine dying under us. The second is why the engine is a child
+    // process at all - it is an event we can observe and report rather than
+    // something that takes this process with it.
+    let shutdown_state = Arc::clone(&state);
+    let death_watch = Arc::clone(&backend);
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => println!("\nstopping"),
+            () = watch_for_death(&death_watch) => {}
+        }
+        shutdown_state.shutdown();
+    };
+
+    axum::serve(listener, hermes_gateway::app(Arc::clone(&state)))
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|err| format!("the gateway stopped: {err}"))?;
 
     backend.shutdown().await.map_err(describe)?;
     println!("engine stopped");

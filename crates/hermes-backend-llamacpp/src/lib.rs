@@ -8,3 +8,4 @@ pub mod backend;
 pub mod manifest;
 pub mod supervisor;
 pub mod tls;
+pub mod upstream;
