@@ -370,9 +370,20 @@ function EstimatePanel({ estimate }: { estimate: Estimate }) {
       <div style={{ marginTop: 12 }}>
         <Row label="Total required">{bytes(estimate.total)}</Row>
         <Row label="Available to spend">{bytes(estimate.budget)}</Row>
+        {estimate.reclaimable > 0 && (
+          <Row label="Of which reclaimable">
+            {bytes(estimate.reclaimable)} held by the model this would replace
+          </Row>
+        )}
         <Row label="Confidence">{estimate.confidence}</Row>
       </div>
 
+      {estimate.verdict === "tight" && (
+        <div className="notice notice--warn" style={{ marginTop: 12 }}>
+          This fits, but inside the safety margin. It will probably work;
+          another application growing could push it into an OOM kill.
+        </div>
+      )}
       {estimate.confidence !== "measured" && (
         <div className="notice notice--info" style={{ marginTop: 12 }}>
           This estimate uses the shipped coefficients rather than a measurement

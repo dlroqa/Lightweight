@@ -167,6 +167,18 @@ pub struct ResourceSnapshot {
     pub rss: Bytes,
     /// High-water mark since the process started.
     pub peak_rss: Bytes,
+    /// The part of `rss` that is anonymous, and so genuinely returned to the
+    /// free pool when this process exits.
+    ///
+    /// The engine mmaps the model file, so most of `rss` is file-backed page
+    /// cache that the kernel already counts as available. Only this figure is
+    /// new headroom for whatever loads next — which makes it the one number a
+    /// model swap may spend, and the reason it is separated out here rather
+    /// than left for a caller to guess at.
+    ///
+    /// `None` where the kernel did not publish it or the platform has no probe.
+    /// Never zero standing in for a reading: zero is a real answer.
+    pub anon_rss: Option<Bytes>,
     /// CPU use since the previous sample, as a percentage of one core.
     pub cpu_percent: Option<f64>,
 }

@@ -120,6 +120,19 @@ export interface Metrics {
     interactive_prompt_tokens: number;
     interactive_output_tokens: number;
   };
+  engine: Probed<EngineMemory>;
+}
+
+/**
+ * What the engine process is holding.
+ *
+ * The number that makes a `coarse` estimate checkable: what a load actually
+ * took, beside what it was predicted to take.
+ */
+export interface EngineMemory {
+  rss: number;
+  peak_rss: number;
+  anon_rss?: number;
 }
 
 export interface Listener {
@@ -190,6 +203,11 @@ export interface Estimate {
   kv_bytes_per_token: number;
   max_context_that_fits: number | null;
   missing: string[];
+  /**
+   * The part of `budget` that is not free yet, because a model this load would
+   * replace is still holding it. Zero for every load that replaces nothing.
+   */
+  reclaimable: number;
   params: { n_ctx: number; n_batch: number; n_ubatch: number; n_parallel: number };
 }
 

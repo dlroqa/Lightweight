@@ -34,6 +34,10 @@ export function Dashboard() {
   const times = wasRead(system.data?.cpu_times) ? system.data.cpu_times : null;
   const utilization = useUtilization(times);
   const memory = wasRead(system.data?.memory) ? system.data.memory : null;
+  // What the engine is holding, when there is one and this platform can say.
+  // Shown beside the machine's total because a Coarse estimate is only
+  // checkable against the number it was trying to predict.
+  const engine = wasRead(metrics.data?.engine) ? metrics.data.engine : null;
   const disk = wasRead(system.data?.disk) ? system.data.disk : null;
   const diskModels = wasRead(disk?.models) ? disk.models : null;
 
@@ -89,7 +93,13 @@ export function Dashboard() {
             tint="var(--series-2)"
             label="RAM Usage"
             value={memory ? bytes(memory.used) : "—"}
-            sub={memory ? `of ${bytes(memory.total)}` : "not measured"}
+            sub={
+              engine
+                ? `engine ${bytes(engine.rss)} of ${bytes(memory?.total ?? 0)}`
+                : memory
+                  ? `of ${bytes(memory.total)}`
+                  : "not measured"
+            }
             series={ramSeries}
           />
           <StatTile

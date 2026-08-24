@@ -390,6 +390,15 @@ impl ProcessBackend {
 #[cfg(target_os = "linux")]
 fn read_process_memory(pid: u32) -> Option<ResourceSnapshot> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    parse_process_status(&status)
+}
+
+/// Pull the memory fields out of a `/proc/<pid>/status` body.
+///
+/// Split from the file read for the same reason `parse_meminfo` is: a captured
+/// sample can then be asserted on exactly, without a live process to read.
+#[cfg(target_os = "linux")]
+fn parse_process_status(status: &str) -> Option<ResourceSnapshot> {
     let field = |name: &str| -> Option<Bytes> {
         status.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -404,6 +413,10 @@ fn read_process_memory(pid: u32) -> Option<ResourceSnapshot> {
         // The high-water mark is the number that matters for calibration: the
         // peak is what would have triggered an OOM kill, not the current value.
         peak_rss: field("VmHWM").unwrap_or_default(),
+        // Absent before Linux 4.5. `None` rather than a default, because a
+        // swap spends this number: a zero would be silently correct and an
+        // absent reading treated as zero would silently refuse the swap.
+        anon_rss: field("RssAnon"),
         cpu_percent: None,
     })
 }
@@ -416,3 +429,58 @@ fn read_process_memory(_pid: u32) -> Option<ResourceSnapshot> {
 }
 
 use std::path::Path;
+
+#[cfg(all(test, target_os = "linux"))]
+mod status_tests {
+    use super::*;
+
+    /// Captured from a running `llama-server` on the development machine.
+    const SAMPLE: &str = "\
+Name:\tllama-server
+State:\tS (sleeping)
+Threads:\t4
+VmPeak:\t 1843204 kB
+VmSize:\t 1712132 kB
+VmHWM:\t  804128 kB
+VmRSS:\t  803916 kB
+RssAnon:\t  198432 kB
+RssFile:\t  605484 kB
+RssShmem:\t       0 kB
+";
+
+    #[test]
+    fn a_captured_proc_status_yields_rss_hwm_and_anon() {
+        let usage = parse_process_status(SAMPLE).expect("VmRSS is present");
+        assert_eq!(usage.rss, Bytes::from_kib(803_916));
+        assert_eq!(usage.peak_rss, Bytes::from_kib(804_128));
+        assert_eq!(usage.anon_rss, Some(Bytes::from_kib(198_432)));
+        // The reason a swap may not credit the whole resident set: three
+        // quarters of it here is the mmapped model file, which the kernel
+        // already counts as available.
+        assert!(
+            usage.anon_rss.expect("anon") < usage.rss,
+            "an mmapped engine's anonymous set must be the smaller figure"
+        );
+    }
+
+    #[test]
+    fn a_status_without_rssanon_reports_none_not_zero() {
+        // Before Linux 4.5 the kernel does not publish it. Zero would be a
+        // legitimate reading, so the absence has to be a different answer -
+        // otherwise a swap silently declines to credit anything and refuses
+        // itself for memory that is about to be free.
+        let without = SAMPLE
+            .lines()
+            .filter(|line| !line.starts_with("RssAnon"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let usage = parse_process_status(&without).expect("VmRSS is still present");
+        assert_eq!(usage.anon_rss, None);
+        assert_eq!(usage.rss, Bytes::from_kib(803_916));
+    }
+
+    #[test]
+    fn a_status_with_no_resident_set_is_not_a_reading_at_all() {
+        assert!(parse_process_status("Name:\tllama-server\n").is_none());
+    }
+}

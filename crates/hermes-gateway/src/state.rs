@@ -9,6 +9,8 @@ use crate::auth::AuthPolicy;
 use crate::catalog::Catalog;
 use crate::metrics::{Metrics, MetricsSnapshot, ModelSnapshot};
 use crate::scheduler::{Band, Scheduler, SchedulerConfig, SlotPermit, Ticket};
+use crate::system::Probed;
+use hermes_core::Actionable as _;
 
 /// How the gateway behaves.
 #[derive(Clone, Debug)]
@@ -107,6 +109,15 @@ pub struct GatewayState {
     /// job's own token is a child, so nothing can outlive the process it
     /// belongs to.
     shutdown: CancellationToken,
+    /// How this gateway reads the machine's memory.
+    ///
+    /// Held rather than constructed where it is needed. `MemoryProbe` has been
+    /// a trait since M1 precisely so a test can supply fixed numbers, and
+    /// `FixedMemoryProbe` ships for it; the gateway was the only place that
+    /// ignored both and built a `SystemMemoryProbe` inline. That made every
+    /// admission verdict over HTTP depend on how much RAM the machine running
+    /// the test happened to have free.
+    memory: Arc<dyn hermes_system_info::MemoryProbe + Send + Sync>,
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -137,6 +148,7 @@ impl GatewayState {
             manager: None,
             jobs: Arc::new(crate::jobs::Jobs::new()),
             shutdown: CancellationToken::new(),
+            memory: Arc::new(hermes_system_info::SystemMemoryProbe),
         }
     }
 
@@ -153,6 +165,38 @@ impl GatewayState {
     /// The model manager, when this gateway has one.
     pub fn manager(&self) -> Option<&Arc<crate::manager::ModelManager>> {
         self.manager.as_ref()
+    }
+
+    /// Read this gateway's memory through the probe it was given.
+    ///
+    /// Every admission verdict spends the number this returns, so it is the one
+    /// seam a test needs in order to assert on a verdict at all.
+    pub fn memory_snapshot(
+        &self,
+    ) -> Result<hermes_system_info::MemorySnapshot, hermes_system_info::MemoryError> {
+        self.memory.snapshot()
+    }
+
+    /// The probe itself, for a caller that must read on a blocking thread.
+    ///
+    /// `Arc` rather than `&dyn`: the model detail reads the header and the
+    /// machine together inside one `spawn_blocking`, and a borrow cannot cross
+    /// that boundary.
+    pub fn memory_probe(&self) -> Arc<dyn hermes_system_info::MemoryProbe + Send + Sync> {
+        Arc::clone(&self.memory)
+    }
+
+    /// Measure this gateway against a machine of the caller's choosing.
+    ///
+    /// Additive, in the manner of [`GatewayState::with_manager`]: every
+    /// existing caller keeps the real probe without saying so.
+    #[must_use]
+    pub fn with_memory_probe(
+        mut self,
+        probe: Arc<dyn hermes_system_info::MemoryProbe + Send + Sync>,
+    ) -> Self {
+        self.memory = probe;
+        self
     }
 
     /// Where this gateway keeps conversations, when it has a data directory.
@@ -202,7 +246,43 @@ impl GatewayState {
                 interactive_prompt_tokens: limits.prompt_tokens,
                 interactive_output_tokens: limits.output_tokens,
             },
+            self.engine_memory().await,
         )
+    }
+
+    /// What the engine process is holding, or why that is not knowable.
+    ///
+    /// Read on demand, once per pull. There is no sampler and no retained
+    /// reading: `rss` is a level, so a single read is a complete answer, and
+    /// the argument against inventing rates from one sample is
+    /// `hermes_system_info::load`'s rather than a new one.
+    ///
+    /// The backend trait returns `Ok(None)` both for "nothing is running" and
+    /// for "this platform has no probe". Those need different words on screen,
+    /// so they are told apart here by asking the engine whether it is up -
+    /// which is cheaper than widening the trait for one caller.
+    async fn engine_memory(&self) -> Probed<crate::metrics::EngineMemory> {
+        match self.backend.resource_usage().await {
+            Ok(Some(usage)) => Probed::Read {
+                reading: crate::metrics::EngineMemory {
+                    rss: usage.rss,
+                    peak_rss: usage.peak_rss,
+                    anon_rss: usage.anon_rss,
+                },
+            },
+            Ok(None) if !self.backend.health().await.is_ready() => Probed::Unavailable {
+                code: "no_engine_running",
+                message: "no engine is running, so it is holding nothing".to_owned(),
+            },
+            Ok(None) => Probed::Unavailable {
+                code: "engine_memory_probe_unsupported",
+                message: "this platform does not publish a process's resident set".to_owned(),
+            },
+            Err(err) => Probed::Unavailable {
+                code: err.code(),
+                message: err.to_string(),
+            },
+        }
     }
 
     /// A permit to run one request, waited for up to the queue timeout.

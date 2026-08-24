@@ -518,8 +518,11 @@ pub async fn model_detail(
     let last_n_ctx = row.model.last_n_ctx;
 
     // Reading a header and probing memory are both blocking.
-    let probed =
-        tokio::task::spawn_blocking(move || describe_file(&path, defaults, last_n_ctx)).await;
+    let memory = state.memory_probe();
+    let probed = tokio::task::spawn_blocking(move || {
+        describe_file(&path, defaults, last_n_ctx, memory.as_ref())
+    })
+    .await;
     let (header, estimate) = match probed {
         Ok(described) => described,
         Err(err) => {
@@ -568,6 +571,7 @@ fn describe_file(
     path: &std::path::Path,
     defaults: manager::RuntimeDefaults,
     last_n_ctx: Option<u32>,
+    memory: &dyn hermes_system_info::MemoryProbe,
 ) -> (
     Option<HeaderDetail>,
     Option<Probed<hermes_memory::Estimate>>,
@@ -579,11 +583,7 @@ fn describe_file(
     };
     let detail = HeaderDetail::from(&metadata);
 
-    // The trait the probe's `snapshot` lives on, named here rather than at the
-    // top of the module: this is the only function in it that reads memory.
-    use hermes_system_info::MemoryProbe as _;
-
-    let snapshot = match hermes_system_info::SystemMemoryProbe.snapshot() {
+    let snapshot = match memory.snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) => {
             // The header is still worth having; only the verdict needs the

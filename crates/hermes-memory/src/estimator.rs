@@ -4,7 +4,7 @@ use hermes_core::units::Bytes;
 use hermes_gguf::ModelMetadata;
 use hermes_system_info::{MemoryProbe, MemorySnapshot};
 
-use crate::estimate::{ComputeModel, Confidence, Estimate, Verdict};
+use crate::estimate::{Budget, ComputeModel, Confidence, Estimate, Verdict};
 use hermes_core::{GgmlType, RuntimeParams};
 
 /// Minimum headroom above the estimate for a [`Verdict::Safe`].
@@ -46,12 +46,26 @@ impl Estimator {
     }
 
     /// Estimate against a specific memory reading.
+    ///
+    /// Delegates to [`Estimator::estimate_against`] with nothing to reclaim,
+    /// which is every caller except a model swap.
     pub fn estimate(
         &self,
         metadata: &ModelMetadata,
         params: RuntimeParams,
         snapshot: MemorySnapshot,
     ) -> Estimate {
+        self.estimate_against(metadata, params, Budget::of(snapshot))
+    }
+
+    /// Estimate against a budget that may include memory about to be released.
+    pub fn estimate_against(
+        &self,
+        metadata: &ModelMetadata,
+        params: RuntimeParams,
+        budget_for: Budget,
+    ) -> Estimate {
+        let snapshot = budget_for.snapshot;
         let mut missing = Vec::new();
 
         let weights = match metadata.weight_bytes {
@@ -74,7 +88,7 @@ impl Estimator {
             .saturating_add(compute)
             .saturating_add(overhead);
 
-        let budget = snapshot.available;
+        let budget = budget_for.spendable();
         let margin = margin_for(budget);
 
         let verdict = if total.saturating_add(margin) <= budget {
@@ -114,6 +128,7 @@ impl Estimator {
             overhead,
             total,
             budget,
+            reclaimable: budget_for.reclaimable,
             margin,
             verdict,
             confidence,
@@ -568,6 +583,85 @@ mod tests {
     // ---- the budget ----
 
     #[test]
+    fn a_reclaimable_credit_raises_the_budget_and_nothing_else() {
+        // A swap is judged while the outgoing model is still resident. Without
+        // the credit it is refused for memory that engine is about to hand
+        // back; with it the verdict is the one that will be true a moment
+        // later. What must not change is the reading itself: `snapshot` is what
+        // the machine said, and stays what the machine said.
+        let metadata = model(32, 32, vec![8], 128);
+        // 16K of context on this geometry is a 2 GiB KV cache, against a
+        // machine with 1 GiB free: refused, and comfortably so.
+        let params = RuntimeParams::default().with_context(16_384);
+        let snapshot = machine(1);
+
+        let without = bare_estimator().estimate(&metadata, params, snapshot);
+        assert_eq!(without.verdict, Verdict::Insufficient);
+        assert_eq!(without.reclaimable, Bytes::ZERO);
+
+        let with = bare_estimator().estimate_against(
+            &metadata,
+            params,
+            Budget::of(snapshot).reclaiming(Bytes::from_gib(4)),
+        );
+        assert_eq!(with.verdict, Verdict::Safe);
+        assert_eq!(with.reclaimable, Bytes::from_gib(4));
+        assert_eq!(
+            with.snapshot.available, without.snapshot.available,
+            "the credit must not rewrite what the machine reported"
+        );
+        assert_eq!(
+            with.budget,
+            snapshot.available.saturating_add(with.reclaimable)
+        );
+    }
+
+    #[test]
+    fn a_context_search_spends_the_same_budget_the_verdict_does() {
+        // The search and the estimate that judges its answer have to agree
+        // about how much there is, or the search can pick a context the
+        // estimate immediately refuses.
+        let metadata = model(32, 32, vec![8], 128);
+        let budget = Budget::of(machine(2)).reclaiming(Bytes::from_gib(8));
+        let estimator = bare_estimator();
+
+        let chosen = estimator
+            .largest_safe_context_against(&metadata, RuntimeParams::default(), budget, None)
+            .expect("something fits once the credit is counted");
+        let verdict = estimator
+            .estimate_against(
+                &metadata,
+                RuntimeParams::default().with_context(chosen),
+                budget,
+            )
+            .verdict;
+        assert_eq!(verdict, Verdict::Safe);
+    }
+
+    #[test]
+    fn a_tight_verdict_still_offers_no_remedies_and_is_still_admissible() {
+        // M7.2 gave `Tight` a warning in the log and a sentence on screen, and
+        // deliberately changed no policy. It stays admissible - gating it would
+        // demand --force for loads that work today - and it stays outside
+        // `remedies`, which is contracted to speak only for refusals.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimate = bare_estimator().estimate(
+            &metadata,
+            // Half a gigabyte of KV plus logits against 1 GiB free: it fits,
+            // and what is left is inside the safety margin.
+            RuntimeParams::default().with_context(4096),
+            machine(1),
+        );
+        assert_eq!(estimate.verdict, Verdict::Tight);
+        assert!(estimate.verdict.is_admissible());
+        assert!(
+            estimate.remedies().is_empty(),
+            "remedies speak for refusals only: {:?}",
+            estimate.remedies()
+        );
+    }
+
+    #[test]
     fn the_budget_is_available_memory_not_total() {
         // A verdict computed against total memory would approve loads that
         // cannot possibly fit alongside everything already running.
@@ -898,13 +992,31 @@ impl Estimator {
         snapshot: MemorySnapshot,
         ceiling: Option<u32>,
     ) -> Option<u32> {
+        self.largest_safe_context_against(metadata, base, Budget::of(snapshot), ceiling)
+    }
+
+    /// The same search, against a budget that may include memory about to be
+    /// released.
+    ///
+    /// A swap has to size its window against the memory it will have, not the
+    /// memory it has while the outgoing engine is still holding some — the same
+    /// argument as [`Budget`], applied to the choice of context rather than to
+    /// the verdict on it. The two must agree, or a context this search picked
+    /// could be refused by the estimate that follows it.
+    pub fn largest_safe_context_against(
+        &self,
+        metadata: &ModelMetadata,
+        base: RuntimeParams,
+        budget: Budget,
+        ceiling: Option<u32>,
+    ) -> Option<u32> {
         let mut presets = RuntimeParams::context_presets_for(metadata.context_length);
         if let Some(ceiling) = ceiling {
             presets.retain(|&preset| preset <= ceiling);
         }
         // Largest first: the answer is the first that fits.
         presets.into_iter().rev().find(|&n_ctx| {
-            self.estimate(metadata, base.with_context(n_ctx), snapshot)
+            self.estimate_against(metadata, base.with_context(n_ctx), budget)
                 .verdict
                 == Verdict::Safe
         })

@@ -689,7 +689,15 @@ mod tests {
         }
         drop(body);
 
-        let snapshot = metrics.snapshot(Default::default(), None, Default::default());
+        let snapshot = metrics.snapshot(
+            Default::default(),
+            None,
+            Default::default(),
+            crate::system::Probed::Unavailable {
+                code: "no_engine_running",
+                message: "this test has no engine".to_owned(),
+            },
+        );
         assert_eq!(
             snapshot.tokens.decoded, 20,
             "the last timing is the one that counts"

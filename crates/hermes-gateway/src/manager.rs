@@ -32,7 +32,7 @@ use hermes_core::{
 use hermes_inference::{BackendError, LoadProgress, LoadRequest};
 use hermes_memory::{Estimator, Verdict};
 use hermes_observability::targets;
-use hermes_system_info::{CpuInfo, MemoryProbe, SystemMemoryProbe};
+use hermes_system_info::CpuInfo;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::catalog::ResidentModel;
@@ -493,7 +493,35 @@ pub async fn load_model(
     // Admission control, exactly as `hermes serve` does it: never promise a
     // model will run because its weights fit.
     let estimator = Estimator::headless();
-    let snapshot = SystemMemoryProbe.snapshot()?;
+    let snapshot = state.memory_snapshot()?;
+
+    // What the outgoing engine is about to hand back, if there is one.
+    //
+    // This load is judged before the old engine is stopped, because it is
+    // stopped only once the load has been admitted - a refusal must never cost
+    // the user the model they already had. Judging it against memory the
+    // outgoing engine still holds refuses swaps for a shortage that will not
+    // exist by the time it matters.
+    //
+    // Only the anonymous part is credited. The engine mmaps the weights, so
+    // most of its resident set is file-backed page cache already inside
+    // `MemAvailable`; crediting the whole of it would count the weights twice
+    // and the error would be the optimistic one that ends in an OOM kill. A
+    // probe that could not read reports `None`, and `None` credits nothing.
+    let reclaimable = if state.catalog.resident().await.is_some() {
+        state
+            .backend
+            .resource_usage()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|usage| usage.anon_rss)
+            .unwrap_or(hermes_core::units::Bytes::ZERO)
+    } else {
+        hermes_core::units::Bytes::ZERO
+    };
+    let budget = hermes_memory::Budget::of(snapshot).reclaiming(reclaimable);
+
     // The request first, then the user's stored default, then the largest this
     // machine can safely give it. A stored default only ever *replaces the
     // guess*: the estimate below still judges it, so setting one can make a
@@ -504,11 +532,11 @@ pub async fn load_model(
     let n_ctx = match requested {
         Some(requested) => requested,
         None => estimator
-            .largest_safe_context(&metadata, base, snapshot, None)
+            .largest_safe_context_against(&metadata, base, budget, None)
             .unwrap_or(base.n_ctx),
     };
     let params = base.with_context(n_ctx);
-    let estimate = estimator.estimate(&metadata, params, snapshot);
+    let estimate = estimator.estimate_against(&metadata, params, budget);
 
     // Every admission decision is recorded, admitted or refused. An OOM kill
     // twenty minutes from now is classified by the supervisor but has no
@@ -526,6 +554,7 @@ pub async fn load_model(
             total = %estimate.total,
             budget = %estimate.budget,
             margin = %estimate.margin,
+            reclaimable = %estimate.reclaimable,
             "admitting a load that leaves less headroom than the safety margin"
         );
     } else {
@@ -539,6 +568,7 @@ pub async fn load_model(
             total = %estimate.total,
             budget = %estimate.budget,
             margin = %estimate.margin,
+            reclaimable = %estimate.reclaimable,
             forced = options.force,
             "admission verdict"
         );

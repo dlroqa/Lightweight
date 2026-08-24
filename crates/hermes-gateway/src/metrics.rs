@@ -31,6 +31,8 @@ use hermes_inference::generation::FinishReason;
 use serde::Serialize;
 
 use crate::scheduler::QueueSnapshot;
+use crate::system::Probed;
+use hermes_core::units::Bytes;
 
 /// Which endpoint served a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,6 +410,7 @@ impl Metrics {
         queue: QueueSnapshot,
         model: Option<ModelSnapshot>,
         bands: BandSnapshot,
+        engine: Probed<EngineMemory>,
     ) -> MetricsSnapshot {
         let mut requests = Vec::with_capacity(Endpoint::ALL.len() * Outcome::ALL.len());
         for endpoint in Endpoint::ALL {
@@ -445,6 +448,7 @@ impl Metrics {
             queue,
             model,
             bands,
+            engine,
         }
     }
 }
@@ -511,6 +515,34 @@ pub struct MetricsSnapshot {
     /// policy: without them, "why did that request queue behind this one?" is
     /// unanswerable from outside.
     pub bands: BandSnapshot,
+    /// What the engine process is holding.
+    ///
+    /// `Probed` rather than `Option`, because "there is no engine" and "this
+    /// platform cannot read one" are different answers and the panel shows
+    /// them differently. The backend trait collapses both into `Ok(None)`, so
+    /// the gateway tells them apart from the engine's health rather than by
+    /// changing the trait.
+    pub engine: Probed<EngineMemory>,
+}
+
+/// What the engine process is holding, right now.
+///
+/// A reading rather than a rate, which is why it can be answered honestly from
+/// a single pull: `rss` is a level, and a level at an instant is a fact. See
+/// [`hermes_system_info::load`] for why the figures that *are* rates are not
+/// turned into percentages here.
+///
+/// `anon_rss` is separated out because it is the only part a model swap may
+/// spend: the weights are mmapped, so the rest is file-backed page cache the
+/// kernel already counts as available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct EngineMemory {
+    pub rss: Bytes,
+    /// High-water mark since the engine started. The number a `Coarse`
+    /// estimate is checked against.
+    pub peak_rss: Bytes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anon_rss: Option<Bytes>,
 }
 
 /// The ceilings that decide which band a request lands in.
@@ -730,6 +762,30 @@ impl MetricsSnapshot {
                 "hermes_model_context_length{{model=\"{}\"}} {}",
                 escape_label(&model.id),
                 model.n_ctx
+            );
+        }
+
+        // Emitted only when they were read. A scraper seeing no series knows
+        // nothing was measured; a scraper seeing zero would record an engine
+        // holding no memory, which is never true of a running one.
+        if let Probed::Read { reading } = &self.engine {
+            header(
+                &mut out,
+                "hermes_engine_resident_bytes",
+                "Resident set of the engine process.",
+                "gauge",
+            );
+            let _ = writeln!(out, "hermes_engine_resident_bytes {}", reading.rss.get());
+            header(
+                &mut out,
+                "hermes_engine_peak_resident_bytes",
+                "High-water mark of the engine process since it started.",
+                "gauge",
+            );
+            let _ = writeln!(
+                out,
+                "hermes_engine_peak_resident_bytes {}",
+                reading.peak_rss.get()
             );
         }
 

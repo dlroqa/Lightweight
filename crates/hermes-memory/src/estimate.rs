@@ -137,6 +137,59 @@ impl ComputeModel {
     }
 }
 
+/// What a load may spend: what the machine has free, plus what it is about to
+/// release.
+///
+/// The second term exists for exactly one caller. A model swap is estimated
+/// while the outgoing model is still resident, because the engine is stopped
+/// only once the new load has been admitted — a refusal must never cost the
+/// user the model they already had. Without a credit the swap is judged against
+/// memory the outgoing engine is about to hand back, and refused for a shortage
+/// that will not exist by the time it matters.
+///
+/// The credit is deliberately narrow. It is the *anonymous* resident set, not
+/// the whole of it: the engine mmaps the model file, so most of its RSS is
+/// file-backed page cache the kernel already counts inside `MemAvailable`, and
+/// crediting that would count the weights twice. Being wrong optimistically
+/// here ends in an OOM kill, which is the one direction the memory probe and
+/// the disk probe both refuse to be wrong in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// What the machine reported.
+    pub snapshot: MemorySnapshot,
+    /// What a process this load replaces is about to give back. Zero for every
+    /// load that replaces nothing, which is most of them.
+    pub reclaimable: Bytes,
+}
+
+impl Budget {
+    /// A budget with nothing to reclaim: the ordinary case.
+    pub const fn of(snapshot: MemorySnapshot) -> Self {
+        Self {
+            snapshot,
+            reclaimable: Bytes::ZERO,
+        }
+    }
+
+    /// Credit memory a process this load replaces is about to release.
+    #[must_use]
+    pub const fn reclaiming(mut self, reclaimable: Bytes) -> Self {
+        self.reclaimable = reclaimable;
+        self
+    }
+
+    /// What this load may actually spend.
+    pub const fn spendable(&self) -> Bytes {
+        self.snapshot.available.saturating_add(self.reclaimable)
+    }
+}
+
+impl From<MemorySnapshot> for Budget {
+    fn from(snapshot: MemorySnapshot) -> Self {
+        Self::of(snapshot)
+    }
+}
+
 /// A full accounting of what a load would cost and whether it fits.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Estimate {
@@ -150,8 +203,15 @@ pub struct Estimate {
     pub overhead: Bytes,
     /// The sum of the four.
     pub total: Bytes,
-    /// `MemAvailable`. Swap is excluded.
+    /// What this load may spend: `MemAvailable` plus `reclaimable`. Swap is
+    /// excluded from both.
     pub budget: Bytes,
+    /// The part of `budget` that is not free yet, because it belongs to a
+    /// process this load replaces. Zero for every load that replaces nothing.
+    ///
+    /// Carried so that `budget` exceeding `snapshot.available` reads as the
+    /// deliberate credit it is rather than as a corrupt pair of numbers.
+    pub reclaimable: Bytes,
     /// Headroom required above `total` for a [`Verdict::Safe`].
     pub margin: Bytes,
     pub verdict: Verdict,

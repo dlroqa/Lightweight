@@ -97,6 +97,13 @@ pub struct MockConfig {
     pub load_error: Option<String>,
     /// The context the loaded instance claims to have.
     pub n_ctx: u32,
+    /// The anonymous part of the engine's resident set.
+    ///
+    /// Configurable because a model swap spends this number: a test that wants
+    /// to prove a swap was judged against the memory it is about to release has
+    /// to be able to say how much that is. `None` stands for a kernel or a
+    /// platform that does not publish it.
+    pub anon_rss: Option<Bytes>,
 }
 
 impl Default for MockConfig {
@@ -108,6 +115,9 @@ impl Default for MockConfig {
             prompt_tokens: 11,
             load_error: None,
             n_ctx: RuntimeParams::default().n_ctx,
+            // Most of the 512 MiB below, but not all of it: the weights are
+            // mmapped and so file-backed, exactly as with a real engine.
+            anon_rss: Some(Bytes::from_mib(384)),
         }
     }
 }
@@ -294,6 +304,7 @@ impl InferenceBackend for MockBackend {
         Ok(Some(ResourceSnapshot {
             rss: Bytes::from_mib(512),
             peak_rss: Bytes::from_mib(600),
+            anon_rss: self.config.lock().await.anon_rss,
             cpu_percent: Some(0.0),
         }))
     }
