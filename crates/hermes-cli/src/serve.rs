@@ -148,7 +148,13 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     };
 
     let backend = Arc::new(backend);
-    let n_ctx = loaded.as_ref().map_or(0, |model| model.n_ctx);
+    // Ceilings from the context this model was actually loaded with, which was
+    // itself chosen from this machine's free memory. A constant here would
+    // describe whichever machine it was written on. With nothing loaded the
+    // defaults stand until the first load re-derives them.
+    let bands = loaded.as_ref().map_or_else(BandLimits::default, |model| {
+        BandLimits::for_context(model.n_ctx)
+    });
     let catalog = hermes_gateway::catalog::shared(loaded.clone());
 
     // The catalog is opened whether or not a model was named, so
@@ -162,17 +168,8 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             GatewayConfig {
                 auth,
                 max_concurrent_requests: concurrency,
-                // Band ceilings from the context this model was actually loaded
-                // with, which was itself chosen from this machine's free
-                // memory. A constant here would describe whichever machine it
-                // was written on. With nothing loaded the defaults stand until
-                // the first load re-derives them.
                 scheduler: SchedulerConfig {
-                    interactive: if n_ctx > 0 {
-                        BandLimits::for_context(n_ctx)
-                    } else {
-                        BandLimits::default()
-                    },
+                    interactive: bands,
                     ..SchedulerConfig::default()
                 },
                 ..GatewayConfig::default()

@@ -31,6 +31,13 @@ use crate::manifest::{self, CatalogModel};
 use crate::record::{InstalledModel, Integrity, Source, slug_for};
 use crate::store::CatalogStore;
 
+/// `EXDEV`: a rename across filesystems.
+///
+/// `std::io::ErrorKind::CrossesDevices` is still unstable, so the raw code is
+/// matched, exactly as the download layer matches `ENOSPC`. Windows reports
+/// `ERROR_NOT_SAME_DEVICE`.
+const CROSS_DEVICE_ERRNO: i32 = if cfg!(windows) { 17 } else { 18 };
+
 /// What stage an install has reached.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
@@ -91,69 +98,28 @@ impl Installer {
     ///
     /// The file is left where it is. What this costs is one full read to
     /// compute the digest, which is what makes a later corruption detectable.
+    /// Register a model that is already on this machine.
+    ///
+    /// Composes [`Installer::scan_local`] and [`Installer::commit`]. Callers
+    /// that hold the catalog behind a lock should use those two directly, so
+    /// the lock is not held across the hashing — see the note on
+    /// [`Installer::fetch`].
     pub async fn import(
         &self,
         store: &mut CatalogStore,
         path: impl AsRef<Path>,
         progress: &mpsc::Sender<InstallProgress>,
     ) -> Result<InstalledModel, CatalogError> {
-        let path = path.as_ref().to_path_buf();
-        if !path.is_file() {
-            return Err(CatalogError::FileNotFound { path });
-        }
-        // Absolute, so the record still resolves if the process later runs from
-        // a different working directory.
-        let path = path.canonicalize().unwrap_or(path);
-
-        let sink = progress.clone();
-        let hash_path = path.clone();
-        let (sha256, bytes) = tokio::task::spawn_blocking(move || {
-            hermes_download::hash_file(&hash_path, &move |done, total| {
-                let _ = sink.try_send(InstallProgress::Hashing {
-                    done,
-                    total: total.unwrap_or(done),
-                });
-            })
-        })
-        .await
-        .map_err(|err| CatalogError::io("hashing the model", std::io::Error::other(err)))??;
-
-        // The same bytes twice is not an error, and installing them twice under
-        // two ids would be. Report what is already there.
-        if let Some(existing) = store.by_digest(&sha256) {
-            return Ok(existing.clone());
-        }
-
-        let _ = progress.try_send(InstallProgress::Reading);
-        let metadata = read_header(&path)?;
-
-        let id = store.free_id(&slug_for(&path));
-        let record = InstalledModel::new(
-            id,
-            &path,
-            bytes,
-            sha256,
-            Integrity::Imported,
-            Source::Import {
-                original_path: path.clone(),
-            },
-            &metadata,
-        );
-        store.insert(record.clone())?;
-        store.save()?;
-
-        tracing::info!(
-            target: targets::MODEL,
-            id = %record.id,
-            architecture = %record.architecture,
-            bytes = record.bytes,
-            "model imported"
-        );
+        let scanned = self.scan_local(path, progress).await?;
+        let record = Self::commit(store, scanned)?;
         let _ = progress.try_send(InstallProgress::Done);
         Ok(record)
     }
 
     /// Fetch a model and register it.
+    ///
+    /// Composes [`Installer::plan`], [`Installer::already_installed`],
+    /// [`Installer::fetch`] and [`Installer::commit`].
     pub async fn add(
         &self,
         store: &mut CatalogStore,
@@ -163,18 +129,94 @@ impl Installer {
     ) -> Result<InstalledModel, CatalogError> {
         let _ = progress.try_send(InstallProgress::Resolving);
         let plan = self.plan(request).await?;
-
-        if let Some(existing) = store.get(&plan.id)
-            && existing.is_present()
-            && existing
-                .sha256
-                .eq_ignore_ascii_case(plan.expected_sha256.as_deref().unwrap_or(""))
-        {
-            // Already have exactly this file. Re-fetching a gigabyte to arrive
-            // at bytes we can prove we already hold would be pure waste.
-            return Ok(existing.clone());
+        if let Some(existing) = Self::already_installed(store, &plan) {
+            let _ = progress.try_send(InstallProgress::Done);
+            return Ok(existing);
         }
+        let scanned = self.fetch(&plan, progress, cancel).await?;
+        let record = Self::commit(store, scanned)?;
+        let _ = progress.try_send(InstallProgress::Done);
+        Ok(record)
+    }
 
+    /// Hash a local file and read its header. **Touches no catalog.**
+    pub async fn scan_local(
+        &self,
+        path: impl AsRef<Path>,
+        progress: &mpsc::Sender<InstallProgress>,
+    ) -> Result<Scanned, CatalogError> {
+        let path = path.as_ref().to_path_buf();
+        if !path.is_file() {
+            return Err(CatalogError::FileNotFound { path });
+        }
+        // Absolute, so the record still resolves if the process later runs from
+        // a different working directory. Reported rather than quietly falling
+        // back to what was given: a catalog entry whose path only works from
+        // one directory is a model that goes missing later, for a reason nobody
+        // will connect to the import.
+        let path = path
+            .canonicalize()
+            .map_err(|err| CatalogError::io("resolving the model's path", err))?;
+
+        let sink = progress.clone();
+        let hash_path = path.clone();
+        let (sha256, bytes) = tokio::task::spawn_blocking(move || {
+            hermes_download::hash_file(&hash_path, &move |done, total| {
+                // `hash_file` reads the size before it starts, so the total is
+                // always known here; `done` is the honest fallback if that ever
+                // changes, since it never reports more than has been read.
+                let _ = sink.try_send(InstallProgress::Hashing {
+                    done,
+                    total: total.unwrap_or(done),
+                });
+            })
+        })
+        .await
+        .map_err(|err| CatalogError::io("hashing the model", std::io::Error::other(err)))??;
+
+        let _ = progress.try_send(InstallProgress::Reading);
+        let metadata = read_header(&path)?;
+
+        Ok(Scanned {
+            // An import has no id yet: it is derived from the file name when
+            // the catalog is locked, because that is when a free one can be
+            // chosen.
+            id: None,
+            source: Source::Import {
+                original_path: path.clone(),
+            },
+            path,
+            bytes,
+            sha256,
+            integrity: Integrity::Imported,
+            metadata,
+        })
+    }
+
+    /// Whether this exact file is already installed under the planned id.
+    ///
+    /// Only ever true when the plan carries a digest to compare against:
+    /// without one there is nothing to prove the file on disk is the file the
+    /// URL now points at, so it is fetched again.
+    pub fn already_installed(store: &CatalogStore, plan: &Plan) -> Option<InstalledModel> {
+        let expected = plan.expected_sha256.as_deref()?;
+        let existing = store.get(&plan.id)?;
+        (existing.is_present() && existing.sha256.eq_ignore_ascii_case(expected))
+            .then(|| existing.clone())
+    }
+
+    /// Download, verify, and read the header. **Touches no catalog.**
+    ///
+    /// Deliberately takes no store: this is the long part — minutes for a
+    /// gigabyte — and a caller holding a lock across it would block every read
+    /// of the catalog for the duration, including the listing a UI uses to show
+    /// the download's own progress.
+    pub async fn fetch(
+        &self,
+        plan: &Plan,
+        progress: &mpsc::Sender<InstallProgress>,
+        cancel: &CancellationToken,
+    ) -> Result<Scanned, CatalogError> {
         std::fs::create_dir_all(&self.downloads_dir)
             .map_err(|err| CatalogError::io("creating the downloads directory", err))?;
         std::fs::create_dir_all(&self.models_dir)
@@ -213,34 +255,85 @@ impl Installer {
         let destination = self.models_dir.join(&plan.file_name);
         move_into_place(&staged, &destination)?;
 
-        let record = InstalledModel::new(
-            plan.id.clone(),
-            &destination,
-            fetched.bytes,
-            fetched.sha256,
-            plan.integrity,
-            plan.source,
-            &metadata,
+        tracing::info!(
+            target: targets::MODEL,
+            id = %plan.id,
+            // The host, never the whole link: a URL can carry a token in its
+            // query string, and a log file is exactly where that must not go.
+            host = %host_of(&plan.url),
+            integrity = ?plan.integrity,
+            bytes = fetched.bytes,
+            "model downloaded"
         );
-        store.replace(record.clone());
+
+        Ok(Scanned {
+            id: Some(plan.id.clone()),
+            path: destination,
+            bytes: fetched.bytes,
+            sha256: fetched.sha256,
+            integrity: plan.integrity,
+            source: plan.source.clone(),
+            metadata,
+        })
+    }
+
+    /// Put a scanned file into the catalog and persist it.
+    ///
+    /// The only phase that needs the catalog, and it is all local work.
+    pub fn commit(
+        store: &mut CatalogStore,
+        scanned: Scanned,
+    ) -> Result<InstalledModel, CatalogError> {
+        // The same bytes twice is not an error, and installing them twice under
+        // two ids would be. Only applies to an import: a download already knows
+        // the id it is replacing.
+        if scanned.id.is_none()
+            && let Some(existing) = store.by_digest(&scanned.sha256)
+        {
+            return Ok(existing.clone());
+        }
+
+        let id = match &scanned.id {
+            Some(id) => id.clone(),
+            None => store.free_id(&slug_for(&scanned.path)),
+        };
+        let replacing = scanned.id.is_some();
+        let record = InstalledModel::new(
+            id,
+            &scanned.path,
+            scanned.bytes,
+            &scanned.sha256,
+            scanned.integrity,
+            scanned.source,
+            &scanned.metadata,
+        );
+
+        if replacing {
+            // A re-download is new bytes under a known id, so the old record
+            // describes a file that is gone.
+            store.replace(record.clone());
+        } else {
+            store.insert(record.clone())?;
+        }
         store.save()?;
 
         tracing::info!(
             target: targets::MODEL,
             id = %record.id,
-            // The host, never the whole link: a URL can carry a token in its
-            // query string, and a log file is exactly where that must not go.
-            host = %host_of(&plan.url),
-            integrity = ?record.integrity,
+            architecture = %record.architecture,
             bytes = record.bytes,
-            "model downloaded"
+            integrity = ?record.integrity,
+            "model added to the catalog"
         );
-        let _ = progress.try_send(InstallProgress::Done);
         Ok(record)
     }
 
     /// Work out what to fetch, and what can be promised about it.
-    async fn plan(&self, request: &AddModel) -> Result<Plan, CatalogError> {
+    ///
+    /// May make one small metadata request (the HuggingFace digest lookup), so
+    /// it is async — and takes no catalog, so that call is not made under a
+    /// lock either.
+    pub async fn plan(&self, request: &AddModel) -> Result<Plan, CatalogError> {
         match request {
             AddModel::Pinned { id } => {
                 let model: &CatalogModel = manifest::by_id(id)
@@ -313,20 +406,44 @@ impl Installer {
     }
 }
 
-/// What one install is going to do.
-#[derive(Debug)]
-struct Plan {
-    id: String,
-    file_name: String,
-    url: String,
-    expected_sha256: Option<String>,
-    total_size: Option<u64>,
-    integrity: Integrity,
-    source: Source,
+/// What one download is going to do, decided before any bytes move.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    /// The catalog id this will be installed under.
+    pub id: String,
+    /// The file name it is stored as, taken from the URL but never trusted.
+    pub file_name: String,
+    pub url: String,
+    /// The digest to check against, when one could be established.
+    pub expected_sha256: Option<String>,
+    pub total_size: Option<u64>,
+    pub integrity: Integrity,
+    pub source: Source,
+}
+
+/// A file that is on disk, hashed, and confirmed to be a GGUF.
+///
+/// The result of the long phase, and everything [`Installer::commit`] needs. It
+/// exists so that the hashing and the downloading happen with no catalog lock
+/// held.
+#[derive(Clone, Debug)]
+pub struct Scanned {
+    /// The id a download already chose; `None` for an import, whose id is
+    /// derived when the catalog is locked.
+    pub id: Option<String>,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+    pub integrity: Integrity,
+    pub source: Source,
+    pub metadata: ModelMetadata,
 }
 
 /// Read a GGUF header, reporting a file that is not one as such.
-fn read_header(path: &Path) -> Result<ModelMetadata, CatalogError> {
+///
+/// Public because the load path asks the same question of the same file, and a
+/// second copy of "is this a model?" is a second answer waiting to disagree.
+pub fn read_header(path: &Path) -> Result<ModelMetadata, CatalogError> {
     let file = GgufFile::open(path).map_err(|err| CatalogError::NotAGguf {
         path: path.to_path_buf(),
         reason: err.to_string(),
@@ -346,12 +463,32 @@ fn read_header(path: &Path) -> Result<ModelMetadata, CatalogError> {
 fn move_into_place(staged: &Path, destination: &Path) -> Result<(), CatalogError> {
     match std::fs::rename(staged, destination) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(staged, destination)
-                .map_err(|err| CatalogError::io("moving the model into place", err))?;
+        // `EXDEV` and nothing else. Falling back to a copy on *any* rename
+        // failure would turn a permissions problem into a second, misleading
+        // error about copying, and hide the first.
+        Err(err) if err.raw_os_error() == Some(CROSS_DEVICE_ERRNO) => {
+            std::fs::copy(staged, destination).map_err(|err| {
+                CatalogError::io(
+                    format!("copying the model to {}", destination.display()),
+                    err,
+                )
+            })?;
+            // Best effort: the copy succeeded, so the model is installed. A
+            // staged file that will not delete is wasted disk, not a failure.
             let _ = std::fs::remove_file(staged);
             Ok(())
         }
+        // The file is downloaded and verified; it is only in the wrong place.
+        // Naming it is what lets someone move it by hand rather than fetch a
+        // gigabyte again.
+        Err(err) => Err(CatalogError::io(
+            format!(
+                "moving the verified model from {} to {}",
+                staged.display(),
+                destination.display()
+            ),
+            err,
+        )),
     }
 }
 
@@ -442,6 +579,112 @@ mod tests {
             "huggingface.co"
         );
         assert_eq!(host_of("nonsense"), "unknown");
+    }
+
+    /// A file that exists no matter where the test is run from.
+    const REAL_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/install.rs");
+
+    /// A store holding one model, for the phase tests.
+    ///
+    /// The record is built directly rather than through
+    /// [`InstalledModel::new`], which would need a whole `ModelMetadata`: these
+    /// tests are about the id, the digest and whether the file is there.
+    fn store_with(id: &str, sha256: &str, path: &Path) -> CatalogStore {
+        let mut store = CatalogStore::in_memory();
+        store
+            .insert(InstalledModel {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                path: path.to_path_buf(),
+                bytes: 10,
+                sha256: sha256.to_owned(),
+                integrity: Integrity::Manifest,
+                source: Source::Link {
+                    url: "https://example.com/m.gguf".into(),
+                },
+                architecture: "llama".into(),
+                supported: true,
+                param_count: None,
+                quantization: None,
+                context_length: Some(4096),
+                weight_bytes: None,
+                added_at: 0,
+                last_loaded_at: None,
+                last_n_ctx: None,
+            })
+            .expect("insert");
+        store
+    }
+
+    #[test]
+    fn a_file_we_can_prove_we_already_hold_is_not_fetched_again() {
+        let plan = Plan {
+            id: "m".into(),
+            file_name: "m.gguf".into(),
+            url: "https://example.com/m.gguf".into(),
+            expected_sha256: Some("aa".into()),
+            total_size: None,
+            integrity: Integrity::Manifest,
+            source: Source::Link {
+                url: "https://example.com/m.gguf".into(),
+            },
+        };
+
+        // The file has to exist for the record to count as present, so the
+        // check is made against a file that certainly does. Not `file!()`,
+        // which is relative to the workspace root while a test runs in the
+        // crate directory - the first version of this test asserted a `cwd`
+        // instead of a behaviour.
+        let real = Path::new(REAL_FILE);
+        let store = store_with("m", "AA", real);
+        assert!(
+            Installer::already_installed(&store, &plan).is_some(),
+            "a digest match is not case-sensitive"
+        );
+
+        // Different bytes under the same id: fetch it.
+        let other = store_with("m", "bb", real);
+        assert!(Installer::already_installed(&other, &plan).is_none());
+    }
+
+    #[test]
+    fn without_a_digest_nothing_can_be_proven_so_the_file_is_fetched() {
+        // The case that a comparison against an empty string used to handle by
+        // accident. With no expected digest there is nothing to show that the
+        // bytes on disk are the bytes this URL serves now.
+        let plan = Plan {
+            id: "m".into(),
+            file_name: "m.gguf".into(),
+            url: "https://example.com/m.gguf".into(),
+            expected_sha256: None,
+            total_size: None,
+            integrity: Integrity::Recorded,
+            source: Source::Link {
+                url: "https://example.com/m.gguf".into(),
+            },
+        };
+        let store = store_with("m", "aa", Path::new(REAL_FILE));
+        assert!(Installer::already_installed(&store, &plan).is_none());
+    }
+
+    #[test]
+    fn a_record_whose_file_is_gone_is_fetched_again() {
+        let plan = Plan {
+            id: "m".into(),
+            file_name: "m.gguf".into(),
+            url: "https://example.com/m.gguf".into(),
+            expected_sha256: Some("aa".into()),
+            total_size: None,
+            integrity: Integrity::Manifest,
+            source: Source::Link {
+                url: "https://example.com/m.gguf".into(),
+            },
+        };
+        let store = store_with("m", "aa", Path::new("/definitely/not/here.gguf"));
+        assert!(
+            Installer::already_installed(&store, &plan).is_none(),
+            "a catalog entry with no file must not stop a re-download"
+        );
     }
 
     #[tokio::test]

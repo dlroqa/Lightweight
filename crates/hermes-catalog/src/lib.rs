@@ -28,7 +28,7 @@ pub mod record;
 pub mod store;
 
 pub use error::CatalogError;
-pub use install::{AddModel, InstallProgress, Installer};
+pub use install::{AddModel, InstallProgress, Installer, Plan, Scanned, read_header};
 pub use manifest::CatalogModel;
 pub use record::{InstalledModel, Integrity, Source};
 pub use store::CatalogStore;

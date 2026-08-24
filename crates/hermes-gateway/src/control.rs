@@ -323,10 +323,12 @@ pub async fn remove(
         .remove(&id, query.delete_file, resident.as_ref().map(|m| &m.id))
         .await
     {
-        Ok(removed) => axum::Json(json!({
-            "removed": removed.id,
-            "file_deleted": query.delete_file
-                && !matches!(removed.source, hermes_catalog::Source::Import { .. }),
+        // What is reported is what the manager actually did, not the same
+        // predicate evaluated a second time here. Two copies of "was this file
+        // ours to delete?" are two answers waiting to disagree.
+        Ok(removal) => axum::Json(json!({
+            "removed": removal.model.id,
+            "file_deleted": removal.file_deleted,
         }))
         .into_response(),
         Err(err) => error_response(&err),
@@ -488,8 +490,18 @@ const fn next_phase(terminal: bool) -> Phase {
 }
 
 fn sse_frame(state: &JobState) -> axum::body::Bytes {
-    let payload =
-        serde_json::to_string(state).unwrap_or_else(|_| r#"{"state":"failed"}"#.to_owned());
+    // A `JobState` cannot fail to serialize — it is plain owned data with no
+    // map keys and no non-finite numbers. If that ever stops being true, say so
+    // rather than inventing a "failed" state the job never reached, which would
+    // report a completed download as an error.
+    let payload = serde_json::to_string(state).unwrap_or_else(|err| {
+        tracing::error!(
+            target: hermes_observability::targets::API,
+            error = %err,
+            "a job state could not be encoded"
+        );
+        r#"{"state":"running","stage":{"of":"queued"}}"#.to_owned()
+    });
     axum::body::Bytes::from(format!("data: {payload}\n\n"))
 }
 

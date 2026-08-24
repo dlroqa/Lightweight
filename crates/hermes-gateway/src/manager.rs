@@ -29,7 +29,6 @@ use hermes_catalog::{CatalogError, CatalogStore, InstalledModel};
 use hermes_core::{
     Actionable, ErrorKind, GgmlType, ModelId, Remedy, RemedyAction, RuntimeParams, SettingsSection,
 };
-use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::{BackendError, LoadProgress, LoadRequest};
 use hermes_memory::{Estimator, Verdict};
 use hermes_observability::targets;
@@ -91,6 +90,9 @@ pub enum ManagerError {
     #[error("another model operation is already running")]
     Busy,
 
+    #[error("this gateway was started without a model catalog")]
+    NoCatalog,
+
     #[error("the engine did not become idle within {seconds} seconds")]
     DrainTimedOut { seconds: u64 },
 
@@ -104,6 +106,7 @@ impl Actionable for ManagerError {
             Self::Catalog(err) => err.code(),
             Self::Backend(err) => err.code(),
             Self::Busy => "model_operation_in_progress",
+            Self::NoCatalog => "no_model_catalog",
             Self::DrainTimedOut { .. } => "drain_timed_out",
             Self::FileMissing { .. } => "model_file_not_found",
         }
@@ -116,6 +119,9 @@ impl Actionable for ManagerError {
             // Retrying is exactly right here, and the operation ahead is
             // usually seconds away from finishing.
             Self::Busy => ErrorKind::RateLimited,
+            // Not a transient condition and not the caller's mistake: this
+            // build of the gateway simply has no catalog attached.
+            Self::NoCatalog => ErrorKind::Internal,
             Self::DrainTimedOut { .. } => ErrorKind::Unavailable,
             Self::FileMissing { .. } => ErrorKind::NotFound,
         }
@@ -129,6 +135,7 @@ impl Actionable for ManagerError {
                 "Wait for the current model operation to finish",
                 RemedyAction::RetryAfter { seconds: 5 },
             )],
+            Self::NoCatalog => Vec::new(),
             Self::DrainTimedOut { .. } => vec![Remedy::new(
                 "Wait for the running request to finish, or stop the client",
                 RemedyAction::RetryAfter { seconds: 30 },
@@ -141,6 +148,17 @@ impl Actionable for ManagerError {
             )],
         }
     }
+}
+
+/// What removing a model actually did.
+///
+/// Carries the outcome rather than leaving each caller to re-derive it: whether
+/// the file was deleted depends on where it came from *and* on whether the
+/// delete succeeded, and only this function knows both.
+#[derive(Clone, Debug)]
+pub struct Removal {
+    pub model: InstalledModel,
+    pub file_deleted: bool,
 }
 
 /// The catalog, and the operations that change it.
@@ -181,6 +199,11 @@ impl ModelManager {
     }
 
     /// Download or link a model, reporting into `job`.
+    ///
+    /// The catalog lock is taken twice, briefly, and **never across the
+    /// transfer**: a download runs for minutes, and holding it would block
+    /// `GET /api/v1/models` — the very listing a UI refreshes while watching
+    /// the download it started.
     pub async fn install(
         &self,
         request: &AddModel,
@@ -188,17 +211,45 @@ impl ModelManager {
     ) -> Result<InstalledModel, ManagerError> {
         let _busy = self.operation.try_lock().map_err(|_| ManagerError::Busy)?;
         let (progress, pump) = install_progress(job);
-        let mut catalog = self.catalog.lock().await;
-        let result = self
-            .installer
-            .add(&mut catalog, request, &progress, &job.cancel_token())
-            .await;
+
+        let outcome = self.install_phases(request, &progress, job).await;
+
         drop(progress);
         let _ = pump.await;
-        Ok(result?)
+        outcome
+    }
+
+    /// The three phases of an install, so the lock discipline above is legible.
+    async fn install_phases(
+        &self,
+        request: &AddModel,
+        progress: &mpsc::Sender<InstallProgress>,
+        job: &Arc<Job>,
+    ) -> Result<InstalledModel, ManagerError> {
+        let _ = progress.try_send(InstallProgress::Resolving);
+        let plan = self.installer.plan(request).await?;
+
+        if let Some(existing) = {
+            let catalog = self.catalog.lock().await;
+            Installer::already_installed(&catalog, &plan)
+        } {
+            return Ok(existing);
+        }
+
+        // No lock held here. This is the part that takes minutes.
+        let scanned = self
+            .installer
+            .fetch(&plan, progress, &job.cancel_token())
+            .await?;
+
+        let mut catalog = self.catalog.lock().await;
+        Ok(Installer::commit(&mut catalog, scanned)?)
     }
 
     /// Register a model already on this machine, reporting into `job`.
+    ///
+    /// Same discipline: hashing a multi-gigabyte file happens with no lock
+    /// held, and the catalog is taken only to insert the result.
     pub async fn import(
         &self,
         path: PathBuf,
@@ -206,11 +257,17 @@ impl ModelManager {
     ) -> Result<InstalledModel, ManagerError> {
         let _busy = self.operation.try_lock().map_err(|_| ManagerError::Busy)?;
         let (progress, pump) = install_progress(job);
-        let mut catalog = self.catalog.lock().await;
-        let result = self.installer.import(&mut catalog, path, &progress).await;
+
+        let outcome = async {
+            let scanned = self.installer.scan_local(path, &progress).await?;
+            let mut catalog = self.catalog.lock().await;
+            Installer::commit(&mut catalog, scanned)
+        }
+        .await;
+
         drop(progress);
         let _ = pump.await;
-        Ok(result?)
+        Ok(outcome?)
     }
 
     /// Forget a model, and optionally delete the file.
@@ -222,7 +279,7 @@ impl ModelManager {
         id: &str,
         delete_file: bool,
         resident: Option<&ModelId>,
-    ) -> Result<InstalledModel, ManagerError> {
+    ) -> Result<Removal, ManagerError> {
         let mut catalog = self.catalog.lock().await;
         let Some(model) = catalog.get(id) else {
             return Err(CatalogError::UnknownModel { id: id.to_owned() }.into());
@@ -243,11 +300,17 @@ impl ModelManager {
             removed.source,
             hermes_catalog::Source::Manifest { .. } | hermes_catalog::Source::Link { .. }
         );
-        if delete_file && ours {
-            let _ = std::fs::remove_file(&removed.path);
-        }
-        tracing::info!(target: targets::MODEL, id = %removed.id, deleted = delete_file && ours, "model removed from the catalog");
-        Ok(removed)
+        let file_deleted = delete_file && ours && std::fs::remove_file(&removed.path).is_ok();
+        tracing::info!(
+            target: targets::MODEL,
+            id = %removed.id,
+            file_deleted,
+            "model removed from the catalog"
+        );
+        Ok(Removal {
+            model: removed,
+            file_deleted,
+        })
     }
 
     /// Add the model named on the command line to the catalog.
@@ -257,9 +320,17 @@ impl ModelManager {
     /// reported as a failure of the thing the user actually asked for. The
     /// installer already treats identical bytes as the model it already has.
     pub async fn register_at_startup(&self, path: PathBuf) -> Result<InstalledModel, ManagerError> {
-        let (progress, _rx) = mpsc::channel(8);
+        // A drained receiver, so progress is discarded rather than filling a
+        // channel nobody reads. The sends are `try_send` regardless.
+        let (progress, mut updates) = mpsc::channel(8);
+        let drain = tokio::spawn(async move { while updates.recv().await.is_some() {} });
+
+        let scanned = self.installer.scan_local(path, &progress).await;
+        drop(progress);
+        let _ = drain.await;
+
         let mut catalog = self.catalog.lock().await;
-        Ok(self.installer.import(&mut catalog, path, &progress).await?)
+        Ok(Installer::commit(&mut catalog, scanned?)?)
     }
 
     /// Record that a model was loaded, for the default context next time.
@@ -359,7 +430,7 @@ pub async fn load_model(
     options: LoadOptions,
     job: &Arc<Job>,
 ) -> Result<ResidentModel, ManagerError> {
-    let manager = state.manager().ok_or(ManagerError::Busy)?;
+    let manager = state.manager().ok_or(ManagerError::NoCatalog)?;
     let _busy = manager
         .operation
         .try_lock()
@@ -376,7 +447,9 @@ pub async fn load_model(
         });
     }
 
-    let metadata = read_metadata(&model.path)?;
+    // The catalog's own reader, not a second copy: "is this a model?" must
+    // have one answer.
+    let metadata = hermes_catalog::read_header(&model.path)?;
     let defaults = manager.defaults();
     let cache_type = options.kv_type.unwrap_or(defaults.kv_type);
     let cpu = CpuInfo::detect();
@@ -524,23 +597,93 @@ fn load_progress(job: &Arc<Job>) -> (mpsc::Sender<LoadProgress>, tokio::task::Jo
     (tx, pump)
 }
 
-fn read_metadata(path: &std::path::Path) -> Result<ModelMetadata, ManagerError> {
-    let file = GgufFile::open(path).map_err(|err| CatalogError::NotAGguf {
-        path: path.to_path_buf(),
-        reason: err.to_string(),
-    })?;
-    ModelMetadata::from_file(&file).map_err(|err| {
-        CatalogError::NotAGguf {
-            path: path.to_path_buf(),
-            reason: err.to_string(),
-        }
-        .into()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::jobs::{JobKind, Jobs};
+    use hermes_catalog::CatalogStore;
+    use hermes_catalog::install::Installer;
+    use tokio_util::sync::CancellationToken;
+
+    fn manager() -> ModelManager {
+        let root = std::env::temp_dir().join(format!(
+            "hermes-manager-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        ModelManager::new(
+            CatalogStore::in_memory(),
+            Installer::new(root.join("models"), root.join("downloads")).expect("installer"),
+            RuntimeDefaults::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_second_operation_is_refused_while_one_is_running() {
+        // One at a time: two clients loading two models at once would race the
+        // engine, and two downloads would fight over one partial file.
+        //
+        // The guard is taken directly rather than by starting a real install.
+        // An earlier version of this test raced two installs and, when the
+        // first failed fast, the second went to the network and downloaded a
+        // 100 MB model *inside a unit test* — the suite promises no network and
+        // no model downloads, and the test proved nothing either way.
+        let manager = manager();
+        let jobs = Jobs::new();
+        let job = jobs.start(JobKind::Download, &CancellationToken::new());
+
+        let held = manager
+            .operation
+            .try_lock()
+            .expect("nothing else is running");
+
+        let refused = manager
+            .install(
+                &AddModel::Pinned {
+                    id: "smollm2-135m-instruct-q4_k_m".into(),
+                },
+                &job,
+            )
+            .await;
+        match refused {
+            Err(ManagerError::Busy) => {}
+            other => panic!("a concurrent install was not refused: {other:?}"),
+        }
+
+        // And it is a wait, not a wall: the next one goes through.
+        drop(held);
+        assert!(
+            manager.operation.try_lock().is_ok(),
+            "the operation lock was not released"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_import_of_a_file_that_is_not_there_says_so_without_touching_the_catalog() {
+        let manager = manager();
+        let jobs = Jobs::new();
+        let job = jobs.start(JobKind::Import, &CancellationToken::new());
+
+        let err = manager
+            .import(PathBuf::from("/definitely/not/here.gguf"), &job)
+            .await
+            .expect_err("a missing file must not be imported");
+        assert_eq!(err.code(), "model_file_not_found");
+        assert!(manager.models().await.is_empty());
+    }
+
+    #[test]
+    fn a_gateway_with_no_catalog_says_so_rather_than_claiming_to_be_busy() {
+        // These are different things, and a client retrying a "busy" that will
+        // never clear is the cost of confusing them.
+        let err = ManagerError::NoCatalog;
+        assert_eq!(err.code(), "no_model_catalog");
+        assert_ne!(err.code(), ManagerError::Busy.code());
+        assert!(!err.kind().is_retryable());
+    }
 
     #[test]
     fn a_busy_manager_asks_the_caller_to_come_back_rather_than_failing() {

@@ -519,3 +519,19 @@ leave it waiting forever.
 Progress is throttled to one update per whole percent. Unthrottled, a 16 MB
 engine download produced 1,010 SSE frames per watcher, and a gigabyte model
 would produce around 65,000 — measurable CPU on a box that has none to spare.
+
+## Why an install is three phases
+
+`plan`, `fetch`, `commit`. Only the last touches the catalog, and it does
+nothing but local work.
+
+The shape exists because the obvious version was wrong: locking the catalog and
+then downloading inside the lock. A transfer runs for minutes, and every reader
+of the catalog waits behind it — including `GET /api/v1/models`, which is what a
+UI polls while showing the progress of the download it just started. Splitting
+the phases makes the lock impossible to hold across the transfer rather than
+merely discouraged: `fetch` has no catalog parameter to hold.
+
+The one-at-a-time guarantee is separate, and is a second lock: two clients
+loading two models at once would race the engine, and two downloads of the same
+model would fight over one partial file.

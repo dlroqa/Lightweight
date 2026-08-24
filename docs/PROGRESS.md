@@ -347,15 +347,53 @@ Found by running M6a, and fixed:
   costing CPU — with the honest shape: it stops within a second or two, rather
   than instantly.
 
+Found by reviewing M6a against the project's own standard — no guesswork, no
+assumptions, no workarounds — rather than by running it:
+
+- **The catalog lock was held for the length of a download.** `install` locked
+  the store and then ran the transfer inside it, so `GET /api/v1/models` waited
+  for the whole thing — the listing a UI refreshes while watching the very
+  download it started. The installer is now three phases: `plan` and `fetch`
+  take no catalog at all, and the lock is taken twice for microseconds, to check
+  for an existing copy and to commit the result. Pinned by a test that lists the
+  catalog throughout a real 100 MB download: **103 listings, slowest 47 µs**.
+  The test was checked against the defect it exists for — reintroduce the lock
+  and it fails on a five-second timeout.
+- **A test of mine downloaded 100 MB from the network inside `cargo test`.** It
+  raced two installs to prove they exclude each other; when the first failed
+  fast, the second went to HuggingFace. The default suite promises no network
+  and no model downloads, and it had quietly stopped being true. The guard is
+  now tested by taking the lock directly, and the promise is **verified rather
+  than assumed**: the whole suite passes with outbound HTTP blocked
+  (`HTTPS_PROXY=127.0.0.1:1`, loopback exempted, 562 tests).
+- **A failed `rename` fell back to copying the file.** Any error, not just a
+  cross-filesystem one — so a permissions problem became a second, misleading
+  error about copying and hid the first. It now falls back only on `EXDEV`, the
+  way the download layer already matches `ENOSPC`, and the error names the
+  verified file it left behind so it can be moved by hand rather than fetched
+  again.
+- **An unresolvable path was silently accepted.** `canonicalize().unwrap_or(path)`
+  on import would store a relative path, and the model would go missing later
+  for a reason nobody would connect to the import. It is an error now.
+- **"No catalog attached" was reported as "busy".** A client retrying a busy
+  that will never clear is the cost of confusing a transient condition with a
+  permanent one; `no_model_catalog` is its own error.
+- **Two places decided whether a file was ours to delete**, and two places
+  answering the same question is two answers waiting to disagree. `remove` now
+  returns what it actually did, including whether the delete succeeded, and the
+  route reports that.
+- **Two copies of "is this a GGUF?"** — the catalog's reader and a second one in
+  the gateway's load path. There is one now.
+
 ## Test counts
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 556 | no network, no model downloads |
+| Default (`cargo test --workspace`) | 562 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
-| Model downloads | 6 | needs `HERMES_TEST_NETWORK=1`; fetches a real 100 MB model from HuggingFace |
+| Model downloads | 8 | needs `HERMES_TEST_NETWORK=1`; fetches a real 100 MB model from HuggingFace |
 
 Measured on this machine, and recorded as a property of *this* box rather than
 of the build: Qwen3-1.7B Q4_K_M decodes at roughly 0.7 tokens per second on
