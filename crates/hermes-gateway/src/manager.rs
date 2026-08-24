@@ -445,6 +445,70 @@ impl Throttle {
     }
 }
 
+/// Where the context a load will use came from.
+///
+/// Reported so the panel can say the same sentence `hermes serve` prints, and
+/// so "why that number?" is answerable without reading the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSource {
+    /// The caller named it.
+    Requested,
+    /// The user's stored default context length.
+    Setting,
+    /// The largest this machine can safely give the model.
+    Fitted,
+}
+
+/// A context, and why it is that one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextChoice {
+    pub n_ctx: u32,
+    pub source: ContextSource,
+}
+
+/// Decide what context a load gets.
+///
+/// One function, called by the load path and by the endpoint that shows what a
+/// load *would* cost. They disagreed before this existed — the load path read
+/// the stored default and never `last_n_ctx`, the detail read `last_n_ctx` and
+/// never the stored default — so the estimate on screen could be for a context
+/// no button produced. Two rules for one decision is the kind of drift that
+/// comes back; one function cannot drift from itself.
+///
+/// The order is the request, then the user's stored default, then the machine.
+/// A stored default only ever *replaces the guess*: the estimate still judges
+/// it, so setting one can make a load smaller than it might have been, never
+/// larger than it should be. A context the model was previously loaded with is
+/// deliberately not consulted; see `InstalledModel::last_n_ctx`.
+pub fn choose_context(
+    requested: Option<u32>,
+    stored_default: Option<u32>,
+    metadata: &hermes_gguf::ModelMetadata,
+    base: RuntimeParams,
+    budget: hermes_memory::Budget,
+    estimator: &Estimator,
+) -> ContextChoice {
+    if let Some(n_ctx) = requested {
+        return ContextChoice {
+            n_ctx,
+            source: ContextSource::Requested,
+        };
+    }
+    if let Some(n_ctx) = stored_default {
+        return ContextChoice {
+            n_ctx,
+            source: ContextSource::Setting,
+        };
+    }
+    ContextChoice {
+        n_ctx: estimator
+            .largest_safe_context_against(metadata, base, budget, None)
+            .unwrap_or(base.n_ctx),
+        source: ContextSource::Fitted,
+    }
+}
+
 /// Make a model resident, replacing whatever is loaded now.
 ///
 /// See the module note for why the steps are in this order.
@@ -522,20 +586,15 @@ pub async fn load_model(
     };
     let budget = hermes_memory::Budget::of(snapshot).reclaiming(reclaimable);
 
-    // The request first, then the user's stored default, then the largest this
-    // machine can safely give it. A stored default only ever *replaces the
-    // guess*: the estimate below still judges it, so setting one can make a
-    // load smaller than it might have been, never larger than it should be.
-    let requested = options
-        .n_ctx
-        .or_else(|| crate::store_api::gateway_settings(state).default_n_ctx);
-    let n_ctx = match requested {
-        Some(requested) => requested,
-        None => estimator
-            .largest_safe_context_against(&metadata, base, budget, None)
-            .unwrap_or(base.n_ctx),
-    };
-    let params = base.with_context(n_ctx);
+    let chosen = choose_context(
+        options.n_ctx,
+        crate::store_api::gateway_settings(state).default_n_ctx,
+        &metadata,
+        base,
+        budget,
+        &estimator,
+    );
+    let params = base.with_context(chosen.n_ctx);
     let estimate = estimator.estimate_against(&metadata, params, budget);
 
     // Every admission decision is recorded, admitted or refused. An OOM kill
@@ -549,7 +608,8 @@ pub async fn load_model(
             model = %model.id,
             verdict = estimate.verdict.label(),
             confidence = ?estimate.confidence,
-            n_ctx,
+            n_ctx = chosen.n_ctx,
+            context_source = ?chosen.source,
             kv_type = %params.cache_type_k,
             total = %estimate.total,
             budget = %estimate.budget,
@@ -563,7 +623,8 @@ pub async fn load_model(
             model = %model.id,
             verdict = estimate.verdict.label(),
             confidence = ?estimate.confidence,
-            n_ctx,
+            n_ctx = chosen.n_ctx,
+            context_source = ?chosen.source,
             kv_type = %params.cache_type_k,
             total = %estimate.total,
             budget = %estimate.budget,

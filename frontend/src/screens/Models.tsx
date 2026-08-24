@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Download, HardDriveDownload, MoreVertical, RefreshCw } from "lucide-react";
 
-import { api, ApiError } from "../api/client";
+import { api, ApiError, followJob } from "../api/client";
 import { bytes, contextLength, parameters } from "../api/format";
 import type { CatalogRow, Estimate, ModelDetail, PinnedModel } from "../api/types";
 import { wasRead } from "../api/types";
@@ -16,13 +16,30 @@ export function Models() {
   const [detail, setDetail] = useState<ModelDetail | null>(null);
   const [detailError, setDetailError] = useState<ApiError | null>(null);
   const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<string | null>(null);
+  // An `ApiError` rather than a string, so the remedies the gateway sends
+  // reach the screen. A refused load is the case that matters: it arrives with
+  // "Reduce the context to N tokens" and "Quantize the KV cache" attached.
+  const [failure, setFailure] = useState<ApiError | null>(null);
   const [adding, setAdding] = useState(false);
 
   // The list is polled; the detail is fetched only for the row in hand. That
   // split is the whole reason the detail endpoint exists — it opens the GGUF,
   // and doing that per row per poll would make watching the list cost more than
   // using it.
+  // What the user is weighing. Both are per-load: a context is judged by the
+  // estimate beside it, and a KV type trades output quality, which no estimate
+  // judges — so neither is stored as a gateway-wide default here.
+  const [wanted, setWanted] = useState<{ ctx?: number; kv_type?: string }>({});
+
+  // What this engine accepts, and what a load would use if asked nothing. Both
+  // come from the gateway rather than from a list kept here: the engine's real
+  // set is read from its own `--help` at the pinned build, and a copy in the
+  // panel would be a second answer waiting to go stale.
+  const gateway = usePoll(api.gateway, 0);
+  const kvTypes = gateway.data?.engine_capabilities.kv_cache_types ?? [];
+  const refused =
+    wasRead(detail?.estimate) && detail.estimate.verdict === "insufficient";
+
   useEffect(() => {
     if (!selected) {
       setDetail(null);
@@ -31,13 +48,17 @@ export function Models() {
     let cancelled = false;
     setDetailError(null);
     void api
-      .model(selected)
+      .model(selected, wanted)
       .then((loaded) => !cancelled && setDetail(loaded))
       .catch((cause: ApiError) => !cancelled && setDetailError(cause));
     return () => {
       cancelled = true;
     };
-  }, [selected]);
+  }, [selected, wanted]);
+
+  // A different model is a different set of choices; carrying the last one over
+  // would price a context this model may not support.
+  useEffect(() => setWanted({}), [selected]);
 
   async function act(work: () => Promise<unknown>) {
     setBusy(true);
@@ -45,9 +66,18 @@ export function Models() {
     try {
       await work();
       models.refresh();
-      if (selected) setDetail(await api.model(selected).catch(() => null));
+      if (selected) setDetail(await api.model(selected, wanted).catch(() => null));
     } catch (cause) {
-      setFailure(cause instanceof Error ? cause.message : String(cause));
+      setFailure(
+        cause instanceof ApiError
+          ? cause
+          : new ApiError(
+              0,
+              "unexpected",
+              cause instanceof Error ? cause.message : String(cause),
+              [],
+            ),
+      );
     } finally {
       setBusy(false);
     }
@@ -81,7 +111,11 @@ export function Models() {
       />
 
       <div className="page">
-        {failure && <div className="notice notice--danger">{failure}</div>}
+        {failure && (
+          <div className="notice notice--danger">
+            <ErrorState error={failure} />
+          </div>
+        )}
         {adding && <AddModel onDone={() => { setAdding(false); models.refresh(); }} />}
 
         <Card flush>
@@ -142,14 +176,43 @@ export function Models() {
                   Unload model
                 </button>
               ) : (
-                <button
-                  type="button"
-                  className="btn btn--primary"
-                  disabled={busy || detail?.state === "missing"}
-                  onClick={() => void act(() => api.loadModel(selected))}
-                >
-                  {busy ? "Working…" : "Load model"}
-                </button>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {refused && (
+                    // Only when the estimate says it will not fit. A control
+                    // that is never needed is never shown.
+                    <button
+                      type="button"
+                      className="btn btn--danger"
+                      disabled={busy}
+                      onClick={() =>
+                        void act(async () => {
+                          const job = await api.loadModel(selected, {
+                            ...wanted,
+                            force: true,
+                          });
+                          await followJob(job.job);
+                        })
+                      }
+                    >
+                      Load anyway
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn--primary"
+                    disabled={busy || detail?.state === "missing"}
+                    onClick={() =>
+                      void act(async () => {
+                        // Followed to the end: the 202 only says the job
+                        // started, and a refusal arrives inside it.
+                        const job = await api.loadModel(selected, wanted);
+                        await followJob(job.job);
+                      })
+                    }
+                  >
+                    {busy ? "Working…" : "Load model"}
+                  </button>
+                </div>
               )
             }
           >
@@ -158,7 +221,13 @@ export function Models() {
             ) : !detail ? (
               <Loading what="the model" />
             ) : (
-              <ModelDetailBody detail={detail} />
+              <ModelDetailBody
+                detail={detail}
+                wanted={wanted}
+                onWant={setWanted}
+                kvTypes={kvTypes}
+                defaultKvType={gateway.data?.defaults.kv_type}
+              />
             )}
           </Card>
         )}
@@ -212,7 +281,23 @@ function ModelRow({
   );
 }
 
-function ModelDetailBody({ detail }: { detail: ModelDetail }) {
+function ModelDetailBody({
+  detail,
+  wanted,
+  onWant,
+  kvTypes,
+  defaultKvType,
+}: {
+  detail: ModelDetail;
+  wanted: { ctx?: number; kv_type?: string };
+  onWant: (wanted: { ctx?: number; kv_type?: string }) => void;
+  kvTypes: string[];
+  defaultKvType?: string;
+}) {
+  const presets = detail.header?.context_presets ?? [];
+  const chosenCtx = wasRead(detail.estimate)
+    ? detail.estimate.params.n_ctx
+    : undefined;
   return (
     <>
       <div
@@ -278,6 +363,67 @@ function ModelDetailBody({ detail }: { detail: ModelDetail }) {
           <Row label="Integrity">{detail.integrity_label}</Row>
         </div>
       </div>
+
+      {(presets.length > 0 || kvTypes.length > 0) && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: 12,
+            marginTop: 16,
+          }}
+        >
+          {presets.length > 0 && (
+            <div className="field">
+              <label className="field__label" htmlFor="load-ctx">
+                Context
+              </label>
+              <select
+                id="load-ctx"
+                className="select tnum"
+                value={wanted.ctx ?? ""}
+                onChange={(event) =>
+                  onWant({
+                    ...wanted,
+                    ctx: event.target.value ? Number(event.target.value) : undefined,
+                  })
+                }
+              >
+                <option value="">
+                  {sourceLabel(detail.context_source, chosenCtx)}
+                </option>
+                {presets.map((preset) => (
+                  <option key={preset} value={preset}>
+                    {contextLength(preset)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {kvTypes.length > 0 && (
+            <div className="field">
+              <label className="field__label" htmlFor="load-kv">
+                KV cache type
+              </label>
+              <select
+                id="load-kv"
+                className="select"
+                value={wanted.kv_type ?? ""}
+                onChange={(event) =>
+                  onWant({ ...wanted, kv_type: event.target.value || undefined })
+                }
+              >
+                <option value="">{defaultKvType ?? "default"} (default)</option>
+                {kvTypes.map((kind) => (
+                  <option key={kind} value={kind}>
+                    {kind}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      )}
 
       {wasRead(detail.estimate) ? (
         <EstimatePanel estimate={detail.estimate} />
@@ -397,6 +543,27 @@ function EstimatePanel({ estimate }: { estimate: Estimate }) {
       )}
     </div>
   );
+}
+
+/**
+ * Why the context on offer is the one on offer.
+ *
+ * The same three sentences `hermes serve` prints, so the CLI and the panel
+ * cannot describe the same decision differently.
+ */
+function sourceLabel(
+  source: ModelDetail["context_source"],
+  n_ctx?: number,
+): string {
+  const size = n_ctx === undefined ? "" : ` (${contextLength(n_ctx)})`;
+  switch (source) {
+    case "setting":
+      return `Your default context length${size}`;
+    case "requested":
+      return `As requested${size}`;
+    default:
+      return `Fit to this machine${size}`;
+  }
 }
 
 /** Adding a model: the pinned list, a direct link, or a file already here. */

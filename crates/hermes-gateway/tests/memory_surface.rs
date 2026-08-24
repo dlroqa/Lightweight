@@ -53,7 +53,12 @@ async fn gateway(
         GatewayState::new(
             Arc::new(backend),
             hermes_gateway::catalog::shared(None),
-            GatewayConfig::default(),
+            GatewayConfig {
+                // A data directory of its own, so a test can store a setting
+                // and then watch a load obey it.
+                paths: Some(hermes_system_info::DataPaths::rooted_at(dir.path())),
+                ..GatewayConfig::default()
+            },
         )
         .with_manager(Arc::clone(&manager))
         .with_memory_probe(machine(available_mib)),
@@ -101,6 +106,17 @@ impl Server {
             .text()
             .await
             .expect("body")
+    }
+
+    async fn put(&self, path: &str, body: Value) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .put(format!("{}{path}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
@@ -295,4 +311,129 @@ async fn the_prometheus_text_carries_the_engine_only_once_it_is_measured() {
     ] {
         assert!(busy.contains(&format!("# TYPE {gauge} gauge")), "{busy}");
     }
+}
+
+#[tokio::test]
+async fn the_estimate_on_the_detail_is_for_the_context_a_bare_load_would_pick() {
+    ensure_provider();
+
+    // These were two rules that disagreed: the load path read the stored
+    // default and never `last_n_ctx`; the detail read `last_n_ctx` and never
+    // the stored default. So the estimate on screen could be for a context no
+    // button produced. One function decides now, and this is what proves it.
+    let (_dir, state, id) = gateway("ctx-agree", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let (status, saved) = server
+        .put(
+            "/api/v1/settings",
+            serde_json::json!({ "gateway": { "default_n_ctx": 2048 } }),
+        )
+        .await;
+    assert!(status == 200 || status == 204, "{saved}");
+
+    let (_, detail) = server.get(&format!("/api/v1/models/{id}")).await;
+    let shown = detail["estimate"]["params"]["n_ctx"]
+        .as_u64()
+        .expect("a context");
+    assert_eq!(detail["context_source"], "setting", "{detail}");
+
+    let loaded = server.load(&id, serde_json::json!({})).await;
+    assert_eq!(loaded["state"], "succeeded", "{loaded}");
+    let (_, metrics) = server.get("/api/v1/metrics").await;
+    assert_eq!(
+        metrics["model"]["n_ctx"].as_u64(),
+        Some(shown),
+        "the detail promised {shown} and the load used {}",
+        metrics["model"]["n_ctx"]
+    );
+}
+
+#[tokio::test]
+async fn a_previous_context_does_not_steer_the_next_load() {
+    ensure_provider();
+
+    // `last_n_ctx` is history. Honouring it would quietly disable sizing the
+    // window to the machine, which is the whole argument for measuring rather
+    // than defaulting.
+    let (_dir, state, id) = gateway("ctx-history", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let first = server.load(&id, serde_json::json!({ "ctx": 1024 })).await;
+    assert_eq!(first["state"], "succeeded", "{first}");
+
+    let (_, detail) = server.get(&format!("/api/v1/models/{id}")).await;
+    assert_eq!(detail["last_n_ctx"], 1024, "the history is recorded");
+    assert_eq!(
+        detail["context_source"], "fitted",
+        "with no request and no setting, the machine decides: {detail}"
+    );
+    assert_ne!(
+        detail["estimate"]["params"]["n_ctx"], 1024,
+        "a 32 GiB machine can give this fixture more than it last used"
+    );
+}
+
+#[tokio::test]
+async fn the_estimate_follows_the_options_the_caller_is_weighing() {
+    ensure_provider();
+
+    // The panel has to be able to price a choice before making it. Doing the
+    // arithmetic client-side would mean a second implementation of ggml block
+    // geometry, waiting to disagree with what the engine allocates.
+    let (_dir, state, id) = gateway("ctx-weigh", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let kv_at = |body: &Value| body["estimate"]["kv_cache"].as_u64().expect("kv");
+
+    let (_, small) = server.get(&format!("/api/v1/models/{id}?ctx=1024")).await;
+    let (_, large) = server.get(&format!("/api/v1/models/{id}?ctx=2048")).await;
+    assert_eq!(
+        kv_at(&large),
+        kv_at(&small) * 2,
+        "the KV cache is linear in context"
+    );
+    assert_eq!(small["context_source"], "requested");
+
+    let (_, quantized) = server
+        .get(&format!("/api/v1/models/{id}?ctx=2048&kv_type=q8_0"))
+        .await;
+    // The same identity the unit tier pins, now proven through HTTP: q8_0 is
+    // 34 bytes per 32 elements against f16's 64, not half.
+    assert_eq!(kv_at(&quantized) * 64, kv_at(&large) * 34);
+}
+
+#[tokio::test]
+async fn a_rejected_kv_type_names_the_endpoint_that_lists_them() {
+    ensure_provider();
+
+    // The 400 used to point at /health, which has never listed them. A message
+    // naming an endpoint is only worth having if the endpoint answers, so this
+    // checks both halves — and would fail again if either drifted.
+    let (_dir, state, id) = gateway("kv-list", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let (status, refused) = server
+        .post(
+            &format!("/api/v1/models/{id}/load"),
+            serde_json::json!({ "kv_type": "q8_o" }),
+        )
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("/api/v1/gateway"),
+        "the refusal must name where to look: {message}"
+    );
+
+    let (_, report) = server.get("/api/v1/gateway").await;
+    let offered = report["engine_capabilities"]["kv_cache_types"]
+        .as_array()
+        .expect("the endpoint the message names must answer");
+    assert!(!offered.is_empty());
+    assert!(
+        offered.iter().any(|kind| kind == "f16"),
+        "the offered list must contain a type a load would accept: {offered:?}"
+    );
+    assert!(report["defaults"]["kv_type"].is_string());
 }

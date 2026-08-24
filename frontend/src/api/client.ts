@@ -44,6 +44,29 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Wait for a long operation to finish, and throw what it failed with.
+ *
+ * `POST .../load` answers 202 and a refusal lands in the *job*, not in the
+ * response. A caller that stopped at the status code counted every refusal as a
+ * success — which is how `insufficient_memory`, the one condition the whole RAM
+ * estimator exists to report, stayed invisible on screen until M7.3.
+ */
+export async function followJob(id: number): Promise<void> {
+  for (;;) {
+    const job = await api.job(id);
+    if (job.status.state === "succeeded") return;
+    if (job.status.state === "cancelled") {
+      throw new ApiError(0, "job_cancelled", "The operation was cancelled.", []);
+    }
+    if (job.status.state === "failed") {
+      const { code, message, remedies } = job.status.error;
+      throw new ApiError(0, code, message, remedies ?? []);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -106,12 +129,29 @@ export const api = {
 
   models: () =>
     request<ListBody<CatalogRow>>("/api/v1/models").then((body) => body.data),
-  model: (id: string) =>
-    request<ModelDetail>(`/api/v1/models/${encodeURIComponent(id)}`),
+  /**
+   * One model in full, optionally priced for options the user is weighing.
+   *
+   * The arithmetic stays on the gateway: changing the KV type changes bytes per
+   * token, and doing that here would mean a second implementation of ggml block
+   * geometry waiting to disagree with what the engine allocates.
+   */
+  model: (id: string, options: { ctx?: number; kv_type?: string } = {}) => {
+    const query = new URLSearchParams();
+    if (options.ctx !== undefined) query.set("ctx", String(options.ctx));
+    if (options.kv_type !== undefined) query.set("kv_type", options.kv_type);
+    const suffix = query.size > 0 ? `?${query}` : "";
+    return request<ModelDetail>(
+      `/api/v1/models/${encodeURIComponent(id)}${suffix}`,
+    );
+  },
   catalog: () =>
     request<ListBody<PinnedModel>>("/api/v1/catalog").then((body) => body.data),
 
-  loadModel: (id: string, options: { ctx?: number; force?: boolean } = {}) =>
+  loadModel: (
+    id: string,
+    options: { ctx?: number; kv_type?: string; force?: boolean } = {},
+  ) =>
     request<{ job: number; events: string }>(
       `/api/v1/models/${encodeURIComponent(id)}/load`,
       { method: "POST", body: JSON.stringify(options) },
@@ -137,6 +177,7 @@ export const api = {
     }),
 
   jobs: () => request<ListBody<Job>>("/api/v1/jobs").then((body) => body.data),
+  job: (id: number) => request<Job>(`/api/v1/jobs/${id}`),
 
   logs: (query: {
     level?: string;

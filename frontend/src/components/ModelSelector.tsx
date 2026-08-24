@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 
-import { api } from "../api/client";
+import { api, followJob } from "../api/client";
 import type { CatalogRow } from "../api/types";
 
 /**
@@ -32,7 +32,11 @@ export function ModelSelector({
     setFailure(null);
     setOpen(false);
     try {
-      await api.loadModel(id);
+      // Followed to the end. The 202 says only that the job started; a load
+      // refused for memory fails inside it, and stopping at the status code
+      // reported that refusal as a success.
+      const job = await api.loadModel(id);
+      await followJob(job.job);
       onChanged();
     } catch (cause) {
       setFailure(cause instanceof Error ? cause.message : String(cause));

@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use hermes_api::error::ErrorEnvelope;
@@ -288,7 +288,7 @@ pub async fn load(
         Some(Err(_)) => {
             return bad_request(
                 "kv_type",
-                "unknown KV cache type; /health lists what this engine accepts",
+                "unknown KV cache type; GET /api/v1/gateway lists what this engine accepts",
             );
         }
     };
@@ -421,8 +421,30 @@ pub struct GatewayReport {
     restart_required: Vec<&'static str>,
     auth: AuthReport,
     concurrency: ConcurrencyReport,
+    /// What this engine accepts, straight from the backend.
+    ///
+    /// Here rather than on `/health`, which is probed by health checks and by
+    /// the desktop shell and is deliberately left alone. It was advertised on
+    /// the backend trait since M2 and serialized by no route, while a 400 told
+    /// the user to look for it somewhere it had never been.
+    engine_capabilities: hermes_inference::BackendCapabilities,
+    /// The values a load uses when a request names none.
+    ///
+    /// Without these the panel cannot pre-select what the gateway would
+    /// actually do, and would have to show a control whose starting position
+    /// is a guess.
+    defaults: DefaultsReport,
     queue: crate::scheduler::QueueSnapshot,
     paths: Option<PathsReport>,
+}
+
+/// The load defaults this gateway was started with.
+#[derive(Debug, Serialize)]
+pub struct DefaultsReport {
+    kv_type: GgmlType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads: Option<u32>,
+    concurrency: u32,
 }
 
 /// What the GGUF header says, beyond what the catalog keeps.
@@ -445,6 +467,13 @@ pub struct HeaderDetail {
     sliding_window: Option<u64>,
     tensor_count: u64,
     gguf_version: u32,
+    /// The context sizes this model can be loaded at, smallest first.
+    ///
+    /// Serialized rather than derived by the caller: the ladder is a decision
+    /// about which windows are worth offering, and a second copy of it in the
+    /// panel would be a second answer to the same question. It ends at what the
+    /// model was trained for, so nothing here is a size the engine would refuse.
+    context_presets: Vec<u32>,
     /// Keys that were looked for and not found. Anything here means the
     /// estimate beside it is incomplete rather than wrong.
     missing: Vec<String>,
@@ -464,6 +493,9 @@ impl From<&hermes_gguf::ModelMetadata> for HeaderDetail {
             sliding_window: metadata.sliding_window,
             tensor_count: metadata.tensor_count,
             gguf_version: metadata.gguf_version,
+            context_presets: hermes_core::RuntimeParams::context_presets_for(
+                metadata.context_length,
+            ),
             missing: metadata.missing.clone(),
         }
     }
@@ -484,6 +516,7 @@ impl From<&hermes_gguf::ModelMetadata> for HeaderDetail {
 pub async fn model_detail(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
+    Query(query): Query<DetailQuery>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
@@ -491,6 +524,17 @@ pub async fn model_detail(
     }
     let Some(manager) = state.manager() else {
         return no_manager();
+    };
+
+    let kv_type = match query.kv_type.as_deref().map(str::parse::<GgmlType>) {
+        None => None,
+        Some(Ok(parsed)) => Some(parsed),
+        Some(Err(_)) => {
+            return bad_request(
+                "kv_type",
+                "unknown KV cache type; GET /api/v1/gateway lists what this engine accepts",
+            );
+        }
     };
 
     let Some(model) = manager.get(&id).await else {
@@ -509,21 +553,28 @@ pub async fn model_detail(
             row,
             header: None,
             estimate: None,
+            context_source: None,
         })
         .into_response();
     }
 
     let defaults = manager.defaults();
     let path = row.model.path.clone();
-    let last_n_ctx = row.model.last_n_ctx;
+    // Exactly the inputs `load` uses, so the number on screen is the number
+    // that request would produce. `last_n_ctx` is not among them.
+    let stored_default = crate::store_api::gateway_settings(&state).default_n_ctx;
+    let asked = DetailOptions {
+        n_ctx: query.ctx,
+        kv_type,
+        stored_default,
+    };
 
     // Reading a header and probing memory are both blocking.
     let memory = state.memory_probe();
-    let probed = tokio::task::spawn_blocking(move || {
-        describe_file(&path, defaults, last_n_ctx, memory.as_ref())
-    })
-    .await;
-    let (header, estimate) = match probed {
+    let probed =
+        tokio::task::spawn_blocking(move || describe_file(&path, defaults, asked, memory.as_ref()))
+            .await;
+    let (header, estimate, context_source) = match probed {
         Ok(described) => described,
         Err(err) => {
             return (
@@ -544,6 +595,7 @@ pub async fn model_detail(
         row,
         header,
         estimate,
+        context_source,
     })
     .into_response()
 }
@@ -560,6 +612,33 @@ pub struct ModelDetail {
     /// that could not be *computed* says why instead of going missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     estimate: Option<Probed<hermes_memory::Estimate>>,
+    /// Why the estimate is for the context it is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_source: Option<manager::ContextSource>,
+}
+
+/// What the caller is weighing, as query parameters.
+///
+/// Absent, the response is byte-identical to what it was before they existed,
+/// so no client that already reads this endpoint changes.
+///
+/// `threads` is deliberately not here. It appears nowhere in the estimator's
+/// compute arithmetic, so a threads parameter would report a memory effect it
+/// does not have — the same reason the panel shows no batch-size slider.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DetailQuery {
+    /// Estimate for this context rather than the one a load would pick.
+    pub ctx: Option<u32>,
+    /// Estimate for this KV cache type rather than the gateway's default.
+    pub kv_type: Option<String>,
+}
+
+/// The inputs the estimate is computed from, resolved.
+#[derive(Debug, Clone, Copy, Default)]
+struct DetailOptions {
+    n_ctx: Option<u32>,
+    kv_type: Option<GgmlType>,
+    stored_default: Option<u32>,
 }
 
 /// Read the header and estimate what loading it would cost.
@@ -570,16 +649,17 @@ pub struct ModelDetail {
 fn describe_file(
     path: &std::path::Path,
     defaults: manager::RuntimeDefaults,
-    last_n_ctx: Option<u32>,
+    asked: DetailOptions,
     memory: &dyn hermes_system_info::MemoryProbe,
 ) -> (
     Option<HeaderDetail>,
     Option<Probed<hermes_memory::Estimate>>,
+    Option<manager::ContextSource>,
 ) {
     // The catalog's own reader, not a second copy: "is this a model?" must have
     // one answer.
     let Ok(metadata) = hermes_catalog::read_header(path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let detail = HeaderDetail::from(&metadata);
 
@@ -589,11 +669,11 @@ fn describe_file(
             // The header is still worth having; only the verdict needs the
             // machine. But "no verdict" and "no verdict, and here is why" are
             // different answers, and the panel can only act on the second.
-            return (Some(detail), Some(Probed::from_probe(Err(err))));
+            return (Some(detail), Some(Probed::from_probe(Err(err))), None);
         }
     };
 
-    let cache_type = defaults.kv_type;
+    let cache_type = asked.kv_type.unwrap_or(defaults.kv_type);
     let base = hermes_core::RuntimeParams {
         cache_type_k: cache_type,
         cache_type_v: cache_type,
@@ -606,16 +686,25 @@ fn describe_file(
         ..hermes_core::RuntimeParams::default()
     };
 
-    // Exactly how `load` chooses, so the number on screen is the number that
-    // request would produce.
+    // Exactly how `load` chooses, through the same function it calls, so the
+    // number on screen is the number that request would produce.
     let estimator = hermes_memory::Estimator::headless();
-    let n_ctx = last_n_ctx.unwrap_or_else(|| {
-        estimator
-            .largest_safe_context(&metadata, base, snapshot, None)
-            .unwrap_or(base.n_ctx)
-    });
-    let estimate = estimator.estimate(&metadata, base.with_context(n_ctx), snapshot);
-    (Some(detail), Some(Probed::Read { reading: estimate }))
+    let chosen = manager::choose_context(
+        asked.n_ctx,
+        asked.stored_default,
+        &metadata,
+        base,
+        // Nothing is reclaimed here: this describes a load, and a description
+        // must not promise memory that only a real swap would release.
+        hermes_memory::Budget::of(snapshot),
+        &estimator,
+    );
+    let estimate = estimator.estimate(&metadata, base.with_context(chosen.n_ctx), snapshot);
+    (
+        Some(detail),
+        Some(Probed::Read { reading: estimate }),
+        Some(chosen.source),
+    )
 }
 
 /// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.
@@ -670,6 +759,20 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
         concurrency: ConcurrencyReport {
             max_concurrent_requests: config.max_concurrent_requests,
             queue_timeout_seconds: config.queue_timeout.as_secs(),
+        },
+        engine_capabilities: state.backend.capabilities(),
+        defaults: {
+            // The manager owns them; a gateway without one has none to report,
+            // and the shipped defaults are what a load would use anyway.
+            let defaults = state
+                .manager()
+                .map(|manager| manager.defaults())
+                .unwrap_or_default();
+            DefaultsReport {
+                kv_type: defaults.kv_type,
+                threads: defaults.threads,
+                concurrency: defaults.concurrency,
+            }
         },
         queue: state.scheduler().snapshot(),
         paths: config.paths.as_ref().map(|paths| PathsReport {

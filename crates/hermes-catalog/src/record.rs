@@ -110,7 +110,14 @@ pub struct InstalledModel {
     pub added_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_loaded_at: Option<u64>,
-    /// The context it was last loaded with, offered as the default next time.
+    /// The context it was last loaded with.
+    ///
+    /// History, and only history: it is shown on the model detail and does not
+    /// steer the next load. It is usually not a value anyone chose — it is
+    /// whatever the machine could safely give at the time — so honouring it
+    /// would quietly disable sizing the window to the machine. A model loaded
+    /// at 32K when 8 GiB was free would keep asking for 32K at 2 GiB, and be
+    /// refused where fitting afresh would have succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_n_ctx: Option<u32>,
 }

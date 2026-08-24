@@ -152,6 +152,17 @@ export interface GatewayReport {
   concurrency: { max_concurrent_requests: number; queue_timeout_seconds: number };
   queue: QueueSnapshot;
   paths: { data: string; models: string; logs: string } | null;
+  /** What this engine accepts. The source of the KV type choices offered. */
+  engine_capabilities: {
+    device: string;
+    streaming: boolean;
+    tool_calls: boolean;
+    reasoning_content: boolean;
+    max_concurrent_requests: number;
+    kv_cache_types: string[];
+  };
+  /** What a load uses when a request names nothing. */
+  defaults: { kv_type: string; threads?: number; concurrency: number };
 }
 
 /** A row of `GET /api/v1/models`. */
@@ -187,6 +198,8 @@ export interface HeaderDetail {
   sliding_window: number | null;
   tensor_count: number;
   gguf_version: number;
+  /** Context sizes this model can be loaded at, smallest first. */
+  context_presets: number[];
   missing: string[];
 }
 
@@ -218,6 +231,8 @@ export type ModelDetail = CatalogRow & {
    * gateway could not *compute* arrives as `unavailable` with the reason.
    */
   estimate?: Probed<Estimate>;
+  /** Why the estimate is for the context it is for. */
+  context_source?: "requested" | "setting" | "fitted";
 };
 
 /** A pinned model from `GET /api/v1/catalog`. */
@@ -238,7 +253,10 @@ export interface PinnedModel {
 export type JobState =
   | { state: "running"; of: string; [key: string]: unknown }
   | { state: "succeeded"; model: string | null }
-  | { state: "failed"; error: { message?: string; code?: string; [k: string]: unknown } }
+  | {
+      state: "failed";
+      error: { message: string; code: string; remedies?: Remedy[] };
+    }
   | { state: "cancelled" };
 
 export interface Job {
