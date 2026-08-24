@@ -27,6 +27,7 @@ pub mod scheduler;
 pub mod state;
 pub mod stream;
 pub mod system;
+pub mod web;
 
 pub use auth::AuthPolicy;
 pub use catalog::{Catalog, ResidentModel};
@@ -63,7 +64,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/models/{id}/load", post(control::load))
         .route(
             "/api/v1/models/{id}",
-            axum::routing::delete(control::remove),
+            get(control::model_detail).delete(control::remove),
         )
         .route("/api/v1/catalog", get(control::pinned))
         .route("/api/v1/jobs", get(control::jobs))
@@ -73,6 +74,9 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/gateway", get(control::gateway))
         .route("/api/v1/events", get(control::events))
         .route("/api/v1/logs", get(logs::logs))
+        // Last, so that every route above is matched first: the panel's files
+        // can never shadow an endpoint, only fill in what no endpoint claimed.
+        .fallback(web::serve)
         // Wrapped around every route rather than written into each handler:
         // there are a dozen of them, and a gauge that a new endpoint can forget
         // to join is a gauge that quietly stops being true.

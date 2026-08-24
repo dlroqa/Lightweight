@@ -104,6 +104,14 @@ enum Command {
         /// honest.
         #[arg(long, default_value_t = 1)]
         concurrency: u32,
+        /// Serve the control panel's built files at `/`.
+        ///
+        /// The directory a `vite build` produced. Serving it from the gateway
+        /// keeps the page and the API on one origin, so no cross-origin policy
+        /// has to be written to let the panel talk to the gateway that served
+        /// it. Without this, `/` is a 404 and the API is unchanged.
+        #[arg(long, value_name = "DIR")]
+        web_root: Option<PathBuf>,
         /// Require this key on every request.
         ///
         /// Optional on loopback and mandatory as soon as any bind is reachable
@@ -287,6 +295,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             port,
             api_key,
             concurrency,
+            web_root,
         } => {
             // Only this command needs an async runtime, so it is built here
             // rather than wrapping every command in one.
@@ -304,6 +313,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 port: *port,
                 api_key: api_key.clone(),
                 concurrency: *concurrency,
+                web_root: web_root.clone(),
             }))?;
             Ok(ExitCode::SUCCESS)
         }

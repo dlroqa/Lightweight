@@ -21,7 +21,7 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
 | **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
-| **M6b.1** Backend seams | **in progress** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body |
+| **M6b.1** Backend seams | **done** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`, `GET /api/v1/models/{id}`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body; the panel served from the gateway, so no CORS layer exists |
 | M6b.2-4 | next | persistence, the SPA, the Electron shell |
 
 ## Verified by execution, not only by unit tests
@@ -407,7 +407,7 @@ assumptions, no workarounds — rather than by running it:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 599 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 616 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -631,11 +631,51 @@ M6b.1, second pass — the feed, the log and the gauge:
   would pin the gauge at one on an idle gateway and add one to every reading of
   it, including the reading being taken by the request doing the asking.
 
+M6b.1, third pass — the model detail and the panel's own files:
+
+- **`GET /api/v1/models/{id}` reads the file; the list still does not.** The
+  Models screen wants the shape of the network — layers, heads, KV heads, vocab
+  size — and a RAM estimate. Both need the GGUF header, and putting them on the
+  list would mean a header read per row on every poll, or copying the fields
+  into the catalog and migrating every catalog already on disk. The detail
+  endpoint pays for it once, when someone selects a model.
+- **The estimate is for the context a load would actually choose** — the
+  model's last context if it has one, otherwise the largest this machine can
+  safely give it, by the same call `load` makes. An estimate for any other
+  context would be a number no button on the screen produces. Asserted, along
+  with the four terms summing to the total.
+- **The list and the detail cannot disagree.** Both build their row through one
+  constructor, and a test compares the two answers field by field. Two copies of
+  "is this loaded, is its file there, was its digest checked?" is how a list and
+  a detail view come to contradict each other.
+- **A model whose file is gone is described without being read.** State
+  `missing`, no header, no estimate — rather than an I/O error or a verdict
+  about a file that could not be opened.
+- **The panel is served by the gateway that answers its calls, so no CORS layer
+  exists.** A cross-origin policy is a decision about who may call this gateway;
+  writing one to solve a question about where a file is served from would be
+  answering the wrong question. Same-origin in production by serving `/` from
+  `--web-root`, and same-origin in development because Vite proxies to here.
+- **A file can never shadow an endpoint.** The static handler is a `fallback`,
+  so every route is matched first — checked over a real socket, because it is a
+  property of the router rather than of any handler.
+- **Nothing outside the web root is reachable.** Path resolution is a whitelist:
+  every component must be an ordinary name, so `..` is refused rather than
+  resolved-then-checked, and so is the `.` that pads a traversal past a check
+  that only looks for `..`. Verified against a live gateway as well as in tests.
+- **A missing asset is a 404, not the document.** Client-side routes get
+  `index.html` so deep links work; a path whose last segment has an extension
+  does not, because answering a missing script with HTML produces an
+  unexplained syntax error instead of the 404 that says what happened.
+- **`index.html` is never cached and hashed assets always are.** The document
+  names the assets, so a stale copy points a browser at scripts a redeploy has
+  already removed.
+
 ## Next step
 
-The rest of M6b.1: the GGUF detail fields and the RAM estimate the Models
-screen shows, and static asset serving so the SPA is same-origin and no CORS
-layer is ever needed. Then M6b.2-4. The full plan is `docs/M6B-PLAN.md`.
+M6b.2: conversations under `conversations_dir()` and settings under
+`settings_file()`, both designed in M0 and never written to. Then M6b.3, the
+SPA, and M6b.4, the Electron shell. The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 

@@ -56,6 +56,12 @@ pub struct GatewayConfig {
     /// a second answer to "where are we serving?" that could disagree with the
     /// first. Empty when nobody has said, which is every in-process test.
     pub bound_addresses: Vec<std::net::SocketAddr>,
+    /// Where the control panel's built files are, when this deployment has
+    /// them.
+    ///
+    /// `None` means no panel is served and every unmatched path is a 404,
+    /// which is what every existing deployment and every test does today.
+    pub web_root: Option<std::path::PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -68,6 +74,7 @@ impl Default for GatewayConfig {
             scheduler: SchedulerConfig::default(),
             paths: None,
             bound_addresses: Vec::new(),
+            web_root: None,
         }
     }
 }

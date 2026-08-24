@@ -71,6 +71,13 @@ pub struct ServeOptions {
     /// Splitting it into separate settings would let a machine be configured to
     /// promise more concurrency than it budgeted for.
     pub concurrency: u32,
+    /// Directory of built control-panel files to serve at `/`.
+    ///
+    /// Absent means no panel, which is every deployment before M6b.3 exists.
+    /// Serving it from here rather than from a second web server is what keeps
+    /// the panel same-origin with the API, so no CORS policy has to be written
+    /// to let a page talk to the gateway it was served by.
+    pub web_root: Option<PathBuf>,
 }
 
 /// The environment variable holding the API key.
@@ -190,6 +197,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
                 // answering. Neither is discoverable from inside a handler.
                 paths: Some(paths.clone()),
                 bound_addresses: bound.clone(),
+                web_root: options.web_root.clone(),
                 ..GatewayConfig::default()
             },
         )

@@ -33,6 +33,10 @@ getrandom.workspace = true
 
 [dev-dependencies]
 hermes-backend-mock.workspace = true
+# The GGUF writer, so the detail endpoint can be tested against a real header
+# rather than a hand-rolled byte array. A dev-dependency only: nothing shipped
+# builds the fixtures feature.
+hermes-gguf = { workspace = true, features = ["fixtures"] }
 reqwest.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

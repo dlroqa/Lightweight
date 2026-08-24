@@ -43,6 +43,31 @@ pub struct CatalogRow {
     integrity_label: &'static str,
 }
 
+impl CatalogRow {
+    /// Describe one installed model, given whether it is the resident one.
+    ///
+    /// Shared by the list and the detail endpoint rather than written twice.
+    /// Two copies of "is this loaded, is its file there, was its digest
+    /// checked?" are two answers waiting to disagree, and the list and the
+    /// detail view of the same model disagreeing is the kind of thing a user
+    /// reports as the catalog being broken.
+    fn describe(model: InstalledModel, loaded: bool) -> Self {
+        Self {
+            state: if loaded {
+                "loaded"
+            } else if model.is_present() {
+                "available"
+            } else {
+                // Kept, not forgotten: the drive may not be mounted.
+                "missing"
+            },
+            verified: model.integrity.verified(),
+            integrity_label: model.integrity.label(),
+            model,
+        }
+    }
+}
+
 /// `GET /api/v1/models` — everything installed.
 pub async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
@@ -61,19 +86,7 @@ pub async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
             let loaded = resident
                 .as_ref()
                 .is_some_and(|current| current.id.slug() == model.id);
-            CatalogRow {
-                state: if loaded {
-                    "loaded"
-                } else if model.is_present() {
-                    "available"
-                } else {
-                    // Kept, not forgotten: the drive may not be mounted.
-                    "missing"
-                },
-                verified: model.integrity.verified(),
-                integrity_label: model.integrity.label(),
-                model,
-            }
+            CatalogRow::describe(model, loaded)
         })
         .collect();
 
@@ -409,6 +422,189 @@ pub struct GatewayReport {
     concurrency: ConcurrencyReport,
     queue: crate::scheduler::QueueSnapshot,
     paths: Option<PathsReport>,
+}
+
+/// What the GGUF header says, beyond what the catalog keeps.
+///
+/// The catalog stores what it needs to *list* a model — architecture, params,
+/// quantization, context. The Models screen shows the shape of the network as
+/// well, and those fields are read from the file rather than copied into the
+/// catalog: copying them would mean a migration for every catalog already on
+/// disk, and a second place for them to be wrong.
+#[derive(Debug, Serialize)]
+pub struct HeaderDetail {
+    block_count: Option<u64>,
+    embedding_length: Option<u64>,
+    feed_forward_length: Option<u64>,
+    head_count: Option<u64>,
+    head_count_kv: Option<Vec<u64>>,
+    vocab_size: Option<u64>,
+    context_length: Option<u64>,
+    rope_freq_base: Option<f64>,
+    sliding_window: Option<u64>,
+    tensor_count: u64,
+    gguf_version: u32,
+    /// Keys that were looked for and not found. Anything here means the
+    /// estimate beside it is incomplete rather than wrong.
+    missing: Vec<String>,
+}
+
+impl From<&hermes_gguf::ModelMetadata> for HeaderDetail {
+    fn from(metadata: &hermes_gguf::ModelMetadata) -> Self {
+        Self {
+            block_count: metadata.block_count,
+            embedding_length: metadata.embedding_length,
+            feed_forward_length: metadata.feed_forward_length,
+            head_count: metadata.head_count,
+            head_count_kv: metadata.head_count_kv.clone(),
+            vocab_size: metadata.vocab_size,
+            context_length: metadata.context_length,
+            rope_freq_base: metadata.rope_freq_base,
+            sliding_window: metadata.sliding_window,
+            tensor_count: metadata.tensor_count,
+            gguf_version: metadata.gguf_version,
+            missing: metadata.missing.clone(),
+        }
+    }
+}
+
+/// `GET /api/v1/models/{id}` — one model, in full.
+///
+/// The list endpoint stays a list: it answers from the catalog alone and opens
+/// no files, because a panel polls it and a header read per row per poll would
+/// make watching the model list cost more than using it. Everything that needs
+/// the file — the network's shape, and the RAM estimate — is here, where it is
+/// paid for once when someone actually selects a model.
+///
+/// The estimate is for the context this model would **actually** be loaded
+/// with: its last context if it has one, and otherwise the largest this machine
+/// can safely give it, exactly as `load` decides. An estimate for some other
+/// context would be a number that no button on the screen produces.
+pub async fn model_detail(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(manager) = state.manager() else {
+        return no_manager();
+    };
+
+    let Some(model) = manager.get(&id).await else {
+        return error_response(&hermes_catalog::CatalogError::UnknownModel { id });
+    };
+    let resident = state.catalog.resident().await;
+    let loaded = resident
+        .as_ref()
+        .is_some_and(|current| current.id.slug() == model.id);
+    let row = CatalogRow::describe(model, loaded);
+
+    // The file is only opened when it is there. A model on a drive that is not
+    // mounted is still a model, and saying so beats an I/O error.
+    if !row.model.is_present() {
+        return axum::Json(ModelDetail {
+            row,
+            header: None,
+            estimate: None,
+        })
+        .into_response();
+    }
+
+    let defaults = manager.defaults();
+    let path = row.model.path.clone();
+    let last_n_ctx = row.model.last_n_ctx;
+
+    // Reading a header and probing memory are both blocking.
+    let probed =
+        tokio::task::spawn_blocking(move || describe_file(&path, defaults, last_n_ctx)).await;
+    let (header, estimate) = match probed {
+        Ok(described) => described,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({
+                    "error": {
+                        "message": format!("the model file could not be read: {err}"),
+                        "type": "server_error",
+                        "code": "probe_unavailable",
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    axum::Json(ModelDetail {
+        row,
+        header,
+        estimate,
+    })
+    .into_response()
+}
+
+/// One model with everything known about it.
+#[derive(Debug, Serialize)]
+pub struct ModelDetail {
+    #[serde(flatten)]
+    row: CatalogRow,
+    /// `None` when the file is not there to be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    header: Option<HeaderDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimate: Option<hermes_memory::Estimate>,
+}
+
+/// Read the header and estimate what loading it would cost.
+///
+/// Both or neither: the estimate is computed *from* the header, so a header
+/// that could not be read leaves nothing to estimate against. Returning a
+/// verdict anyway would be a verdict about a model we could not open.
+fn describe_file(
+    path: &std::path::Path,
+    defaults: manager::RuntimeDefaults,
+    last_n_ctx: Option<u32>,
+) -> (Option<HeaderDetail>, Option<hermes_memory::Estimate>) {
+    // The catalog's own reader, not a second copy: "is this a model?" must have
+    // one answer.
+    let Ok(metadata) = hermes_catalog::read_header(path) else {
+        return (None, None);
+    };
+    let detail = HeaderDetail::from(&metadata);
+
+    // The trait the probe's `snapshot` lives on, named here rather than at the
+    // top of the module: this is the only function in it that reads memory.
+    use hermes_system_info::MemoryProbe as _;
+
+    let Ok(snapshot) = hermes_system_info::SystemMemoryProbe.snapshot() else {
+        // The header is still worth having; only the verdict needs the machine.
+        return (Some(detail), None);
+    };
+
+    let cache_type = defaults.kv_type;
+    let base = hermes_core::RuntimeParams {
+        cache_type_k: cache_type,
+        cache_type_v: cache_type,
+        threads: Some(
+            defaults
+                .threads
+                .unwrap_or_else(|| hermes_system_info::CpuInfo::detect().default_threads()),
+        ),
+        n_parallel: defaults.concurrency.max(1),
+        ..hermes_core::RuntimeParams::default()
+    };
+
+    // Exactly how `load` chooses, so the number on screen is the number that
+    // request would produce.
+    let estimator = hermes_memory::Estimator::headless();
+    let n_ctx = last_n_ctx.unwrap_or_else(|| {
+        estimator
+            .largest_safe_context(&metadata, base, snapshot, None)
+            .unwrap_or(base.n_ctx)
+    });
+    let estimate = estimator.estimate(&metadata, base.with_context(n_ctx), snapshot);
+    (Some(detail), Some(estimate))
 }
 
 /// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.
