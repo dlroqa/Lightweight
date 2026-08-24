@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "verbatimModuleSyntax": false,
+    "rewriteRelativeImportExtensions": false,
+    "allowImportingTsExtensions": false,
+    "outDir": "dist/.preload"
+  },
+  "include": [
+    "src/preload.ts"
+  ],
+  "exclude": []
+}

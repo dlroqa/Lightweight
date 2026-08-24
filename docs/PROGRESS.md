@@ -24,7 +24,7 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M6b.1** Backend seams | **done** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`, `GET /api/v1/models/{id}`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body; the panel served from the gateway, so no CORS layer exists |
 | **M6b.2** Persistence | **done** | `hermes-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
 | **M6b.3** The panel | **done** | React + TypeScript + Vite in `frontend/`, eight screens on the seams M6b.1 and M6b.2 opened, served same-origin by the gateway; no CORS layer exists anywhere |
-| M6b.4 | next | the Electron shell |
+| **M6b.4** The desktop shell | **done** | `apps/desktop`: attaches to a gateway already serving or starts one, stops only what it started, tray, key handling, packaging config |
 
 ## Verified by execution, not only by unit tests
 
@@ -764,11 +764,72 @@ appearance has been checked only by construction and against the reference
 design, never by looking at it. That is the one claim in this file with no run
 behind it.
 
+M6b.4, run against a real gateway on this machine:
+
+- **The supervisor is a plain module with no `electron` import**, so the four
+  decisions worth getting right can be tested without a display: is one already
+  running, is it *ours*, which binary, and how to stop what we started. Twenty‑five
+  tests, three of which drive the real `hermes` binary.
+- **It attaches rather than competing.** A gateway already serving is attached
+  to, not replaced. Two engines on a machine that can barely hold one is the
+  obvious cost; the subtler one is that a user who ran `hermes serve` themselves
+  has their own flags, model and bind, and overriding that would be the shell
+  overruling them.
+- **It only ever stops what it started**, and that is asserted directly: a
+  second supervisor attaches to the first one's gateway, is told to stop, and
+  the gateway is still answering afterwards. Proven with real processes — start,
+  serve, stop, and a `kill(pid, 0)` check that no orphan is left.
+- **An open port is not an invitation.** The probe requires a `/health` body
+  carrying both `status` and `backend` before attaching. Ollama also defaults to
+  11434, and attaching to it would point the panel at an API answering some of
+  the same paths with different meanings.
+- **A loopback gateway is given no key at all**, because the gateway requires
+  one only for a bind reachable from elsewhere. When a key is needed it is 32
+  random bytes passed in `HERMES_API_KEY` and never in `argv` — the same reason
+  M3.5 moved the engine's key out of its command line, applied to ours. A test
+  greps the built command line for the key.
+- **The window loads the panel over HTTP from the gateway**, not from a file, so
+  it is the same origin as the API and behaves exactly as it does in a browser.
+  One build of the panel, one set of behaviours.
+- **Closing the window leaves the gateway serving**, with the tray to bring it
+  back. A local service should keep answering the editor plugin or agent harness
+  using it after its window is closed.
+
+Three real defects, all found by running it rather than by building it:
+
+- **A startup failure was invisible.** The shell reported failures only through
+  a dialog, which needs a working display and a running message loop; when it
+  died before either existed it exited silently with status 0. Failures now go
+  to stderr as well.
+- **A failure said nothing useful.** "The gateway stopped before it began
+  serving" is exactly the unactionable sentence the error taxonomy exists to
+  prevent. The child's output is now captured and quoted, which turned that same
+  failure into `error: unexpected argument '--web-root' found` — the real cause,
+  a stale `target/release/hermes` from before M6b.1.
+- **The panel root was chosen by truthiness, not existence.**
+  `process.resourcesPath` is set in a checkout too, so the packaged path was
+  returned and the gateway was handed a directory that was not there.
+
+One diagnosis was **wrong and had to be undone**: `import { app } from
+"electron"` appeared to fail at run time, and a default-import "fix" was written
+for it. The real cause was `ELECTRON_RUN_AS_NODE=1` in this environment, which
+makes the Electron binary run as plain Node. Probed both forms inside a real
+Electron main process, confirmed named imports work, and reverted the change and
+its false comment.
+
+Electron is pinned at **43.4.1**. The version first reached for, 33, carried
+thirty‑four advisories; upgrading rather than accepting them leaves `npm audit`
+at zero.
+
+**Not verified: packaging.** `electron-builder` is configured but has never been
+run, and no installer has been produced or installed on any platform.
+
 ## Next step
 
-M6b.4: the Electron shell — spawning and supervising `hermes serve`, attaching
-to one already running, the tray, key handling and packaging, which joins
-`packaging/systemd/`. The full plan is `docs/M6B-PLAN.md`.
+M6b is complete. What remains of the approved plan is M7 onward. The deferrals
+recorded through M6b — batch size, Run Benchmark, live host/port editing, and
+the browser build never seeing the API key — are still deferred deliberately.
+The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 

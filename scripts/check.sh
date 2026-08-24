@@ -79,6 +79,18 @@ else
   echo "== frontend == skipped: npm unavailable"
 fi
 
+# The desktop shell. Its tests drive the real `hermes` binary - starting a
+# gateway, stopping it, and proving a second shell attaches instead of killing
+# the first one's - so they need the workspace built, which by this point it is.
+if [ -d apps/desktop/node_modules ]; then
+  echo "== desktop shell (typecheck, build and tests) =="
+  ( cd apps/desktop && npm run build )
+elif command -v npm >/dev/null 2>&1; then
+  echo "== desktop shell == skipped: run \`npm install\` in apps/desktop/ to include it"
+else
+  echo "== desktop shell == skipped: npm unavailable"
+fi
+
 echo "== deps ==";    ./scripts/check-deps.sh
 echo "== secrets =="; ./scripts/check-secrets.sh
 echo "All checks passed."
