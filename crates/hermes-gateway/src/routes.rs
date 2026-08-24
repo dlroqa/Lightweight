@@ -364,11 +364,14 @@ async fn serve_completions(
             ),
         )
     })?;
-    let mut guard =
-        RequestGuard::new(cancel, Some(permit)).reporting_to(Arc::clone(state.metrics()));
+    // The builder is made first so the guard can be told what it is accounting
+    // for. Naming it costs nothing and has no side effects.
+    let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
+    let mut guard = RequestGuard::new(cancel, Some(permit))
+        .reporting_to(Arc::clone(state.metrics()))
+        .describing(builder.id(), model.id.to_string());
     guard.waited(waiting_since.elapsed());
 
-    let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
     tracing::info!(
         target: targets::INFERENCE,
         id = builder.id(),
@@ -509,7 +512,8 @@ async fn serve_chat(
     // written to the client yet.
     if let Some(permit) = state.try_acquire_slot() {
         let guard = RequestGuard::new(cancel.clone(), Some(permit))
-            .reporting_to(Arc::clone(state.metrics()));
+            .reporting_to(Arc::clone(state.metrics()))
+            .describing(builder.id(), model.id.to_string());
         let events = state
             .backend
             .generate(model.instance, generation, cancel)
@@ -541,8 +545,9 @@ async fn serve_chat(
     if request.stream {
         let ticket = state.enqueue(band);
         let deadline = tokio::time::Instant::now() + state.config.queue_timeout;
-        let guard =
-            RequestGuard::new(cancel.clone(), None).reporting_to(Arc::clone(state.metrics()));
+        let guard = RequestGuard::new(cancel.clone(), None)
+            .reporting_to(Arc::clone(state.metrics()))
+            .describing(builder.id(), model.id.to_string());
         let backend = Arc::clone(&state.backend);
         let instance = model.instance;
         let start: StartGeneration = Box::new(move || {
@@ -569,8 +574,9 @@ async fn serve_chat(
             ),
         )
     })?;
-    let mut guard =
-        RequestGuard::new(cancel.clone(), Some(permit)).reporting_to(Arc::clone(state.metrics()));
+    let mut guard = RequestGuard::new(cancel.clone(), Some(permit))
+        .reporting_to(Arc::clone(state.metrics()))
+        .describing(builder.id(), model.id.to_string());
     guard.waited(waiting_since.elapsed());
 
     let events = state

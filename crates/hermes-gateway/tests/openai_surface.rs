@@ -108,6 +108,10 @@ impl Harness {
             .await
             .expect("request")
     }
+
+    async fn get_json(&self, path: &str) -> Value {
+        self.get(path).await.json().await.expect("json body")
+    }
 }
 
 /// Read a whole SSE response into decoded events.
@@ -1756,6 +1760,131 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
         .await
         .expect("request");
     assert_eq!(authorized.status(), 200);
+}
+
+#[tokio::test]
+async fn a_request_counts_as_in_flight_until_its_body_is_delivered() {
+    ensure_provider();
+    // The gauge exists to say what the gateway is doing right now, and what it
+    // is doing for almost all of a generation is *streaming a body*. A counter
+    // that stopped at the response head would read zero for the whole two
+    // minutes a real completion takes on this hardware.
+    // A token interval, so the stream is still open when it is asked about.
+    // With an instant mock the whole body arrives before the next request can
+    // be made, and the test would pass or fail on scheduling luck.
+    let harness = Harness::start(
+        MockConfig {
+            token_interval: std::time::Duration::from_millis(150),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    // Nothing in flight before, so anything seen during the stream is this
+    // request and not a leftover.
+    let idle: Value = harness.get_json("/api/v1/metrics").await;
+    assert_eq!(idle["in_flight"], 0);
+
+    let mut stream = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(stream.status(), 200);
+
+    // The head has arrived and the body has not been read to the end. The
+    // handler has therefore returned, and only the guard riding in the body
+    // keeps this counted.
+    let during: Value = harness.get_json("/api/v1/metrics").await;
+    assert!(
+        during["in_flight"].as_u64().unwrap_or_default() >= 1,
+        "a streamed response must still count as in flight: {during}"
+    );
+
+    // Drain it, and the count comes back down.
+    while stream.chunk().await.expect("read the stream").is_some() {}
+    drop(stream);
+
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let body: Value = harness.get_json("/api/v1/metrics").await;
+            if body["in_flight"] == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the gauge must come back down, not drift up"
+    );
+}
+
+#[tokio::test]
+async fn the_event_stream_reports_a_generation_the_client_abandoned() {
+    ensure_provider();
+    // The live feed's whole value is showing what just happened, and the
+    // hardest case is the one a publisher on the happy path would miss: a
+    // client that walks away mid-stream. It is published from the same `Drop`
+    // the counters are, so it cannot be missed here either.
+    let harness = Harness::start(
+        MockConfig {
+            token_interval: std::time::Duration::from_millis(100),
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let mut events = harness.get("/api/v1/events").await;
+    assert_eq!(events.status(), 200);
+
+    let abandoned = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(abandoned.status(), 200);
+    // Walk away without reading it.
+    drop(abandoned);
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(chunk) = events.chunk().await.expect("read the event stream") {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            if text.contains("\"model\"") {
+                return text;
+            }
+        }
+        String::new()
+    })
+    .await
+    .expect("an event within ten seconds");
+
+    let payload = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("an SSE data frame");
+    let event: Value = serde_json::from_str(payload).expect("the event is json");
+
+    assert_eq!(event["model"], "mock-model@4k");
+    assert!(event["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(event["at_unix_ms"].as_u64().unwrap_or_default() > 0);
+    assert!(event["total_ms"].as_u64().is_some());
+    // No finish reason: this generation ended because the client left, which is
+    // a deliberate act and not an error.
+    assert!(event["finish_reason"].is_null(), "{event}");
+
+    // The feed carries what the log carries, and no more.
+    assert!(
+        !payload.contains("hi"),
+        "the prompt must not be here: {payload}"
+    );
 }
 
 #[tokio::test]

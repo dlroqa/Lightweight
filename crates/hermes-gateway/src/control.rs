@@ -473,6 +473,87 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
     }
 }
 
+/// `GET /api/v1/events` — finished generations, as they finish.
+///
+/// One stream, deliberately. The Dashboard's live feed and the API Gateway
+/// screen's recent-requests list are the same data rendered twice, and two
+/// endpoints publishing it would be two chances to disagree about what a
+/// request did.
+///
+/// It carries what the closing log line carries and nothing more — the prompt,
+/// the completion and the key are as absent here as they are there. What this
+/// adds over reading the log is only timeliness.
+///
+/// Unlike a job's event stream, this one never ends on its own: a gateway
+/// always has more requests ahead of it. It ends when the client goes away or
+/// the gateway shuts down.
+pub async fn events(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+
+    let receiver = state.metrics().watch_requests();
+    let shutdown = state.shutdown_token();
+
+    let stream = futures_util::stream::unfold(
+        (receiver, shutdown),
+        |(mut receiver, shutdown)| async move {
+            loop {
+                let received = tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    received = receiver.recv() => received,
+                };
+                match received {
+                    Ok(event) => {
+                        let payload = serde_json::to_string(&event).unwrap_or_else(|err| {
+                            // A `RequestEvent` is plain owned data with no map
+                            // keys and no non-finite numbers, so this cannot
+                            // happen. Said rather than guessed at, because
+                            // inventing an event would put a request in the
+                            // feed that never ran.
+                            tracing::error!(
+                                target: hermes_observability::targets::API,
+                                error = %err,
+                                "a request event could not be encoded"
+                            );
+                            String::new()
+                        });
+                        if payload.is_empty() {
+                            continue;
+                        }
+                        return Some((
+                            Ok::<axum::body::Bytes, std::convert::Infallible>(
+                                axum::body::Bytes::from(format!("data: {payload}\n\n")),
+                            ),
+                            (receiver, shutdown),
+                        ));
+                    }
+                    // This watcher fell behind. Told rather than hidden: a feed
+                    // that silently skips is a feed whose gaps get read as idle
+                    // time.
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        return Some((
+                            Ok(axum::body::Bytes::from(format!(
+                                "data: {{\"missed\":{missed}}}\n\n"
+                            ))),
+                            (receiver, shutdown),
+                        ));
+                    }
+                    // The gateway is going away.
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 /// `GET /api/v1/jobs`.
 pub async fn jobs(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {

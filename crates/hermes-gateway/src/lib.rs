@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod completions;
 pub mod control;
 pub mod jobs;
+pub mod logs;
 pub mod manager;
 pub mod metrics;
 pub mod routes;
@@ -70,5 +71,71 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/jobs/{id}/events", get(control::job_events))
         .route("/api/v1/system", get(system::system))
         .route("/api/v1/gateway", get(control::gateway))
+        .route("/api/v1/events", get(control::events))
+        .route("/api/v1/logs", get(logs::logs))
+        // Wrapped around every route rather than written into each handler:
+        // there are a dozen of them, and a gauge that a new endpoint can forget
+        // to join is a gauge that quietly stops being true.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            count_in_flight,
+        ))
         .with_state(state)
+}
+
+/// Count a request as in flight until its response body has been delivered.
+///
+/// The guard is moved into the body rather than dropped when the handler
+/// returns, and that is the whole point. A handler here returns as soon as the
+/// response *head* is ready; on a streamed completion the body then runs for
+/// as long as the generation does. A gauge that stopped counting at the head
+/// would read zero throughout the two minutes this gateway is busiest, which
+/// is precisely when someone is looking at it.
+async fn count_in_flight(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use futures_util::StreamExt;
+
+    // Watching must not change what is watched. The panel polls the status
+    // surface every second and holds `/api/v1/events` open for as long as it is
+    // running, so counting those would pin this gauge at one on a gateway doing
+    // nothing and add one to every reading of it - including the reading being
+    // taken by the request doing the asking.
+    if is_monitoring(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let guard = state.metrics().enter_request();
+    let (parts, body) = next.run(request).await.into_parts();
+
+    // The guard rides along in the stream's state, so it is dropped when the
+    // body ends *or* when the client goes away and hyper drops it - the same
+    // mechanism `RequestGuard` already relies on for cancellation.
+    let counted = futures_util::stream::unfold(
+        (body.into_data_stream(), guard),
+        |(mut stream, guard)| async move { Some((stream.next().await?, (stream, guard))) },
+    );
+    axum::response::Response::from_parts(parts, axum::body::Body::from_stream(counted))
+}
+
+/// Whether a path is the gateway describing itself rather than doing work.
+///
+/// Listed explicitly rather than matched by prefix: `/api/v1/models/{id}/load`
+/// shares a prefix with `/api/v1/models` and is a multi-second engine restart,
+/// which is exactly the kind of work this gauge exists to show.
+fn is_monitoring(path: &str) -> bool {
+    matches!(
+        path,
+        "/health"
+            | "/version"
+            | "/props"
+            | "/metrics"
+            | "/api/v1/metrics"
+            | "/api/v1/system"
+            | "/api/v1/gateway"
+            | "/api/v1/logs"
+            | "/api/v1/events"
+    )
 }

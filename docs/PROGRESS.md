@@ -21,7 +21,7 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
 | **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
-| **M6b.1** Backend seams | **in progress** | `/api/v1/system` and `/api/v1/gateway`; disk space via `rustix` and processor time from `/proc/stat`, both as probes that say when they could not read |
+| **M6b.1** Backend seams | **in progress** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body |
 | M6b.2-4 | next | persistence, the SPA, the Electron shell |
 
 ## Verified by execution, not only by unit tests
@@ -407,7 +407,7 @@ assumptions, no workarounds — rather than by running it:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 589 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 599 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -599,14 +599,43 @@ M6b.1, against a real gateway serving no model on this machine:
   `PathBuf` this way since M6a, are now typed and serialized through
   `axum::Json`, where the same failure is a 500.
 
+M6b.1, second pass — the feed, the log and the gauge:
+
+- **One event stream, published where nothing can miss it.** `/api/v1/events`
+  is fed from `Metrics::record_generation`, which is the single point every
+  generation passes through. That matters for the case a publisher on the happy
+  path would drop: a client that walks away mid-stream. Asserted directly — the
+  test abandons a streamed completion and reads the event back, with a null
+  `finish_reason`, because ending because the client left is a deliberate act
+  and not an error.
+- **The feed carries what the log carries and no more.** The same test greps the
+  frame for the prompt it sent and requires its absence.
+- **`/api/v1/logs` reads the file that has existed since M3.5 and never been
+  readable.** Bounded on both sides: records stream through a ring buffer of
+  exactly the requested size, so memory is bounded by the answer rather than by
+  the file, and only the two newest rotated files are opened. A half-written
+  final line — routine while a record is being appended — costs only itself.
+  An unknown `level` is a 400 rather than a filter that silently matches
+  everything and lets someone believe they are looking at errors only.
+- **The in-flight gauge spans the response body, not the handler.** A handler
+  returns as soon as the response *head* is ready; on a streamed completion the
+  body then runs for as long as the generation does. The guard is moved into
+  the body, so the gauge is truthful for the two minutes this gateway is
+  busiest. Proved with a slow mock: the head arrives, the body is left unread,
+  and `/api/v1/metrics` still reports one in flight.
+- **It counts requests, not clients, and says so.** Counting connections would
+  mean owning the accept loop, which `axum::serve` owns; keep-alive means one
+  client holds one connection across many requests either way. The status and
+  monitoring surface is excluded from the count, because the panel polls it
+  every second and holds `/api/v1/events` open permanently — counting those
+  would pin the gauge at one on an idle gateway and add one to every reading of
+  it, including the reading being taken by the request doing the asking.
+
 ## Next step
 
-The rest of M6b.1, then M6b.2-4. Still to build on this stage:
-`/api/v1/events` (one SSE stream serving both the live feed and the
-recent-requests list), `/api/v1/logs`, the RAM estimate on each catalog row,
-the GGUF detail fields the Models screen shows, a connection gauge in
-`metrics.rs`, and static asset serving so the SPA is same-origin and no CORS
-layer is ever needed. The full plan is `docs/M6B-PLAN.md`.
+The rest of M6b.1: the GGUF detail fields and the RAM estimate the Models
+screen shows, and static asset serving so the SPA is same-origin and no CORS
+layer is ever needed. Then M6b.2-4. The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 

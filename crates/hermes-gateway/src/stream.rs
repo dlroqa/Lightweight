@@ -70,6 +70,10 @@ pub struct RequestGuard {
     permit: Option<SlotPermit>,
     metrics: Option<Arc<Metrics>>,
     record: GenerationRecord,
+    /// The completion id and model, for the live feed. Held here rather than
+    /// on the `Copy` record they describe.
+    id: Option<String>,
+    model: Option<String>,
     started: Instant,
 }
 
@@ -80,6 +84,8 @@ impl RequestGuard {
             permit,
             metrics: None,
             record: GenerationRecord::default(),
+            id: None,
+            model: None,
             started: Instant::now(),
         }
     }
@@ -88,6 +94,18 @@ impl RequestGuard {
     #[must_use]
     pub fn reporting_to(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Name the completion and the model this guard is accounting for.
+    ///
+    /// Additive: a guard that is never told stays exactly as useful for the
+    /// counters, and only loses the ability to be correlated with a client's
+    /// own logs in the live feed.
+    #[must_use]
+    pub fn describing(mut self, id: impl Into<String>, model: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self.model = Some(model.into());
         self
     }
 
@@ -133,7 +151,7 @@ impl Drop for RequestGuard {
         self.cancel.cancel();
         if let Some(metrics) = &self.metrics {
             self.record.total = self.started.elapsed();
-            metrics.record_generation(&self.record);
+            metrics.record_generation_as(&self.record, self.id.as_deref(), self.model.as_deref());
         }
         // Explicit, and last: the slot must not be handed to the next request
         // until this one has finished accounting for itself.

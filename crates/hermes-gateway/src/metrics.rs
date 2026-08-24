@@ -23,6 +23,7 @@
 //! rendered as either Prometheus text or JSON, so the scrape surface and the
 //! UI's surface cannot drift apart.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -158,10 +159,103 @@ impl TallySnapshot {
     }
 }
 
+/// One finished generation, as it is published to watchers.
+///
+/// The same facts the closing log line already carries, and no more: the
+/// prompt, the completion and the API key are absent here exactly as they are
+/// absent there. This is the record the Dashboard's live feed and the API
+/// Gateway screen's recent-requests list are both drawn from — one stream,
+/// because they are the same data twice.
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestEvent {
+    /// Milliseconds since the Unix epoch, so a client can place it on a clock
+    /// without knowing when this process started.
+    pub at_unix_ms: u64,
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_tokens: u32,
+    /// `None` is a generation the client walked away from, never an error.
+    pub finish_reason: Option<FinishReason>,
+    pub queue_wait_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
+    pub total_ms: u64,
+}
+
+impl RequestEvent {
+    /// Built from the measurements plus the two names only the caller knows.
+    ///
+    /// The names are passed in rather than carried on [`GenerationRecord`],
+    /// which is `Copy` and is meant to stay that way: it is written to on the
+    /// per-token path, and putting two heap allocations in it to serve one
+    /// display feed would be paying for the feed in the hot loop.
+    fn new(record: &GenerationRecord, id: Option<&str>, model: Option<&str>) -> Self {
+        Self {
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis() as u64)
+                .unwrap_or_default(),
+            id: id.map(str::to_owned),
+            model: model.map(str::to_owned),
+            prompt_tokens: record.prompt_tokens,
+            completion_tokens: record.completion_tokens,
+            cached_tokens: record.cached_tokens,
+            finish_reason: record.finish_reason,
+            queue_wait_ms: record.queue_wait.as_millis() as u64,
+            time_to_first_token_ms: record
+                .time_to_first_token
+                .map(|ttft| ttft.as_millis() as u64),
+            total_ms: record.total.as_millis() as u64,
+        }
+    }
+}
+
+/// Decrements the in-flight gauge when dropped.
+#[derive(Debug)]
+pub struct InFlightGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // Saturating: a decrement below zero would wrap to `u64::MAX` and
+        // report a gateway serving eighteen quintillion requests.
+        let _ =
+            self.metrics
+                .in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(1))
+                });
+    }
+}
+
+/// How many finished generations a slow watcher may fall behind before it is
+/// told it missed some.
+///
+/// Small on purpose. This is a live feed, not a log: a client that cannot keep
+/// up with sixty-four generations on a machine that produces one every several
+/// seconds is not going to be rescued by a larger buffer, and the log file is
+/// where the complete record already lives.
+const EVENT_BACKLOG: usize = 64;
+
 /// Every counter the gateway keeps.
 #[derive(Debug)]
 pub struct Metrics {
     started: Instant,
+    /// Publishes each finished generation. Never awaited on the recording
+    /// path: `send` on a broadcast channel does not block, and a send with no
+    /// receivers is a no-op rather than an error worth reporting.
+    events: tokio::sync::broadcast::Sender<RequestEvent>,
+    /// HTTP requests being served this instant, across every endpoint.
+    ///
+    /// **Requests, not connections, and the difference is not pedantry.** With
+    /// keep-alive one client holds one connection across many requests, and an
+    /// idle client holds a connection while this reads zero. Counting
+    /// connections would mean owning the accept loop, which `axum::serve` owns;
+    /// counting requests is what this process can actually observe, so it is
+    /// what is reported and what it is called.
+    in_flight: AtomicU64,
     requests: [[AtomicU64; 4]; 2],
     generations: AtomicU64,
     finish_stop: AtomicU64,
@@ -195,6 +289,8 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             started: Instant::now(),
+            events: tokio::sync::broadcast::Sender::new(EVENT_BACKLOG),
+            in_flight: AtomicU64::new(0),
             requests: Default::default(),
             generations: AtomicU64::new(0),
             finish_stop: AtomicU64::new(0),
@@ -220,7 +316,50 @@ impl Metrics {
     }
 
     /// Count one finished generation.
+    /// Watch finished generations as they happen.
+    pub fn watch_requests(&self) -> tokio::sync::broadcast::Receiver<RequestEvent> {
+        self.events.subscribe()
+    }
+
+    /// Count one request as being served until the returned guard is dropped.
+    ///
+    /// A guard rather than a pair of calls, so that a handler which returns
+    /// early - every `401`, every `400`, every `?` - still decrements. A
+    /// hand-balanced counter would drift upward on exactly the paths that are
+    /// hardest to notice, and a gauge that only ever climbs is worse than none.
+    pub fn enter_request(self: &Arc<Self>) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    /// Requests being served this instant.
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
     pub fn record_generation(&self, record: &GenerationRecord) {
+        self.record_generation_as(record, None, None);
+    }
+
+    /// Record a generation, naming the completion and the model it served.
+    ///
+    /// Additive: [`Self::record_generation`] is unchanged for every caller that
+    /// has nothing to add, and an unnamed generation still counts everywhere it
+    /// counted before.
+    pub fn record_generation_as(
+        &self,
+        record: &GenerationRecord,
+        id: Option<&str>,
+        model: Option<&str>,
+    ) {
+        // Published here rather than from the handlers, because this is the one
+        // place every generation passes through - including the ones that ended
+        // because the client walked away, which a publisher on the happy path
+        // would miss and which are the ones worth watching.
+        let _ = self.events.send(RequestEvent::new(record, id, model));
+
         self.generations.fetch_add(1, Ordering::Relaxed);
         match record.finish_reason {
             Some(FinishReason::Stop) => &self.finish_stop,
@@ -282,6 +421,7 @@ impl Metrics {
         }
         MetricsSnapshot {
             uptime_seconds: self.started.elapsed().as_secs(),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
             requests,
             generations: self.generations.load(Ordering::Relaxed),
             finish_reasons: FinishReasonCounts {
@@ -351,6 +491,9 @@ pub struct ModelSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct MetricsSnapshot {
     pub uptime_seconds: u64,
+    /// HTTP requests being served at the instant this was read. See
+    /// [`Metrics::in_flight`] for why this is not a count of clients.
+    pub in_flight: u64,
     pub requests: Vec<RequestCount>,
     pub generations: u64,
     pub finish_reasons: FinishReasonCounts,
