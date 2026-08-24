@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hermes — CPU Inference Gateway</title>
+    <!--
+      No web font is fetched.
+
+      This gateway is built for machines that may have no outbound network at
+      all - the dependency policy in the workspace manifest exists for exactly
+      that reason - and a panel whose type does not arrive until a font server
+      answers is a panel that renders wrongly on the machine it was made for.
+      The stack below prefers Inter where it is installed and falls back to the
+      platform's own UI face everywhere else.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

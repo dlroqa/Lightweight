@@ -65,6 +65,20 @@ else
   echo "== test (openai contract suite) == skipped: python3 unavailable"
 fi
 
+# The control panel. Type-checked and built, because a panel that does not
+# compile is a panel that cannot be served - and the gateway serves it from
+# `--web-root`, so a broken build is a broken product rather than a broken
+# convenience. Allowed to be absent, like every other optional tier: a Rust-only
+# checkout has no `node_modules`, and it says so rather than passing quietly.
+if [ -d frontend/node_modules ]; then
+  echo "== frontend (typecheck and build) =="
+  ( cd frontend && npm run build )
+elif command -v npm >/dev/null 2>&1; then
+  echo "== frontend == skipped: run \`npm install\` in frontend/ to include it"
+else
+  echo "== frontend == skipped: npm unavailable"
+fi
+
 echo "== deps ==";    ./scripts/check-deps.sh
 echo "== secrets =="; ./scripts/check-secrets.sh
 echo "All checks passed."

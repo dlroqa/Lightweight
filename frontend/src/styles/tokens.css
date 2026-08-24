@@ -1,0 +1,206 @@
+/*
+ * The panel's design tokens.
+ *
+ * Every colour is defined once on `:root` and redefined for dark in two places:
+ * the `prefers-color-scheme` block, guarded so an explicit light choice beats a
+ * dark OS, and the `[data-theme="dark"]` block so the toggle wins either way.
+ * Nothing below this file may use a raw colour; a value whose only definition
+ * sits inside a media query never applies in the un-stamped state.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* --- ground ------------------------------------------------------------ */
+  --ground-1: #dbe6f6;
+  --ground-2: #eef2fb;
+  --ground-3: #f6e9ec;
+  --ground-4: #cfe0f4;
+
+  /* --- surfaces ---------------------------------------------------------- */
+  --surface: rgba(255, 255, 255, 0.78);
+  --surface-solid: #ffffff;
+  --surface-raised: rgba(255, 255, 255, 0.92);
+  --surface-sunken: rgba(241, 245, 251, 0.72);
+  --surface-rail: rgba(255, 255, 255, 0.55);
+  --surface-shell: rgba(255, 255, 255, 0.42);
+  --surface-hover: rgba(255, 255, 255, 0.66);
+
+  /* --- lines and depth --------------------------------------------------- */
+  --border: rgba(255, 255, 255, 0.9);
+  --border-quiet: rgba(15, 42, 88, 0.08);
+  --rule: rgba(15, 42, 88, 0.07);
+  --shadow-sm: 0 1px 2px rgba(15, 42, 88, 0.04);
+  --shadow: 0 4px 16px rgba(15, 42, 88, 0.06);
+  --shadow-lg: 0 8px 32px rgba(15, 42, 88, 0.09);
+
+  /* --- text -------------------------------------------------------------- */
+  --text: #0f172a;
+  --text-soft: #475569;
+  --text-muted: #64748b;
+  --text-faint: #94a3b8;
+
+  /* --- accent ------------------------------------------------------------ */
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --accent-text: #ffffff;
+
+  /* --- semantic ---------------------------------------------------------- */
+  --ok: #16a34a;
+  --ok-soft: #dcfce7;
+  --warn: #b45309;
+  --warn-soft: #fef3c7;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+  --info: #7c3aed;
+  --info-soft: #ede9fe;
+  --neutral-soft: rgba(100, 116, 139, 0.12);
+
+  /* --- data series (the four sparkline colours in the reference) ---------- */
+  --series-1: #3b82f6;
+  --series-2: #22c55e;
+  --series-3: #8b5cf6;
+  --series-4: #f59e0b;
+
+  /* --- geometry ---------------------------------------------------------- */
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-shell: 26px;
+  --rail-width: 244px;
+
+  /* 8pt rhythm at dashboard density. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /*
+   * Inter when the machine has it, and the platform's own UI face otherwise.
+   * Nothing is fetched: see the note in index.html.
+   */
+  --font: "Inter", "Inter Variable", system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* Blur is used only where it earns its cost. See `--glass-blur` usage. */
+  --glass-blur: 18px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --ground-1: #0b1220;
+    --ground-2: #131c2e;
+    --ground-3: #1b1622;
+    --ground-4: #0d1526;
+
+    --surface: rgba(148, 163, 184, 0.1);
+    --surface-solid: #151d2e;
+    --surface-raised: rgba(148, 163, 184, 0.14);
+    --surface-sunken: rgba(2, 6, 23, 0.35);
+    --surface-rail: rgba(148, 163, 184, 0.07);
+    --surface-shell: rgba(148, 163, 184, 0.05);
+    --surface-hover: rgba(148, 163, 184, 0.16);
+
+    --border: rgba(255, 255, 255, 0.08);
+    --border-quiet: rgba(255, 255, 255, 0.06);
+    --rule: rgba(255, 255, 255, 0.07);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
+
+    --text: #f1f5f9;
+    --text-soft: #cbd5e1;
+    --text-muted: #94a3b8;
+    --text-faint: #64748b;
+
+    --accent: #60a5fa;
+    --accent-hover: #93c5fd;
+    --accent-soft: rgba(96, 165, 250, 0.16);
+    --accent-text: #0b1220;
+
+    --ok: #4ade80;
+    --ok-soft: rgba(34, 197, 94, 0.16);
+    --warn: #fbbf24;
+    --warn-soft: rgba(245, 158, 11, 0.16);
+    --danger: #f87171;
+    --danger-soft: rgba(239, 68, 68, 0.16);
+    --info: #c4b5fd;
+    --info-soft: rgba(139, 92, 246, 0.18);
+    --neutral-soft: rgba(148, 163, 184, 0.16);
+
+    --series-1: #60a5fa;
+    --series-2: #4ade80;
+    --series-3: #a78bfa;
+    --series-4: #fbbf24;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --ground-1: #0b1220;
+  --ground-2: #131c2e;
+  --ground-3: #1b1622;
+  --ground-4: #0d1526;
+
+  --surface: rgba(148, 163, 184, 0.1);
+  --surface-solid: #151d2e;
+  --surface-raised: rgba(148, 163, 184, 0.14);
+  --surface-sunken: rgba(2, 6, 23, 0.35);
+  --surface-rail: rgba(148, 163, 184, 0.07);
+  --surface-shell: rgba(148, 163, 184, 0.05);
+  --surface-hover: rgba(148, 163, 184, 0.16);
+
+  --border: rgba(255, 255, 255, 0.08);
+  --border-quiet: rgba(255, 255, 255, 0.06);
+  --rule: rgba(255, 255, 255, 0.07);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
+
+  --text: #f1f5f9;
+  --text-soft: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-faint: #64748b;
+
+  --accent: #60a5fa;
+  --accent-hover: #93c5fd;
+  --accent-soft: rgba(96, 165, 250, 0.16);
+  --accent-text: #0b1220;
+
+  --ok: #4ade80;
+  --ok-soft: rgba(34, 197, 94, 0.16);
+  --warn: #fbbf24;
+  --warn-soft: rgba(245, 158, 11, 0.16);
+  --danger: #f87171;
+  --danger-soft: rgba(239, 68, 68, 0.16);
+  --info: #c4b5fd;
+  --info-soft: rgba(139, 92, 246, 0.18);
+  --neutral-soft: rgba(148, 163, 184, 0.16);
+
+  --series-1: #60a5fa;
+  --series-2: #4ade80;
+  --series-3: #a78bfa;
+  --series-4: #fbbf24;
+}
+
+/*
+ * The transparency escape hatch the reference Settings screen already has.
+ *
+ * Translucency is where 4.5:1 quietly dies. Turning it off makes every surface
+ * opaque and drops the blur, rather than merely reducing it a little.
+ */
+:root[data-surfaces="solid"] {
+  --surface: var(--surface-solid);
+  --surface-raised: var(--surface-solid);
+  --surface-rail: var(--surface-solid);
+  --surface-shell: var(--surface-solid);
+  --glass-blur: 0px;
+}

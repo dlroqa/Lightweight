@@ -23,7 +23,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
 | **M6b.1** Backend seams | **done** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`, `GET /api/v1/models/{id}`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body; the panel served from the gateway, so no CORS layer exists |
 | **M6b.2** Persistence | **done** | `hermes-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
-| M6b.3-4 | next | the SPA, then the Electron shell |
+| **M6b.3** The panel | **done** | React + TypeScript + Vite in `frontend/`, eight screens on the seams M6b.1 and M6b.2 opened, served same-origin by the gateway; no CORS layer exists anywhere |
+| M6b.4 | next | the Electron shell |
 
 ## Verified by execution, not only by unit tests
 
@@ -718,11 +719,56 @@ M6b.2, against a real gateway on this machine:
   saved before the setting changed are still the user's; hiding them would leave
   no way to look at them or delete them.
 
+M6b.3, against a real gateway on this machine:
+
+- **The panel is served by the gateway it talks to.** Built to `frontend/dist`
+  and handed to `hermes serve --web-root`; in development Vite proxies `/api`,
+  `/v1` and the status paths to the same gateway. Both were exercised: every
+  endpoint the panel calls answers `200` on the panel's own origin, in both
+  modes. **No CORS layer exists anywhere in the workspace**, which was the point.
+- **The types were written from captured responses, not from the Rust.** Every
+  endpoint was called on a running gateway and its shape recorded before a line
+  of the client was written. That is why `model: null` and every `Probed`
+  section are in the types: they are the ordinary state at first start, and a
+  panel that assumed otherwise would break on the machine it was made for.
+- **A probe that could not read says so on screen.** `cpu_times`, `memory` and
+  `disk` each carry their own outcome, and the panel renders "not measured"
+  rather than a zero. The CPU tile shows nothing for its first second and says
+  `measuring…`, because a rate needs two readings — the client differences the
+  counters exactly as `/api/v1/system` was built to require.
+- **No web font is fetched.** The first draft linked Google Fonts. That is a
+  network dependency in a product built for machines that may have none, so it
+  was removed: the panel prefers Inter where it is installed and falls back to
+  the platform's own UI face. Nothing is downloaded to render the panel.
+- **The dev proxy was missing and the gate did not notice.** `vite.config.ts`
+  was lost to a failed `cd` in the scaffolding step. The production build still
+  worked — Vite compiles JSX without a config — so nothing was red, but
+  `npm run dev` could not have reached the gateway at all. Found by checking the
+  file list against what should exist rather than by trusting a green build.
+- **Blur is used on the rail and modals only.** Content cards take a translucent
+  tint with no `backdrop-filter`, because a dozen blurred panels drop frames on
+  exactly the hardware this product is for. The transparency toggle in Settings
+  makes every surface solid, which is the escape hatch when text over the
+  background is hard to read.
+- **Controls with nothing behind them are absent, not disabled.** The reference
+  design's Batch Size slider is not drawn: the gateway never passes a batch size
+  to the engine. The API Gateway screen's host, port and key are read-only and
+  say why, from the gateway's own `restart_required` list.
+- **`./scripts/check.sh` now type-checks and builds the panel**, and skips with
+  a reason when `frontend/node_modules` is absent, like every other optional
+  tier.
+
+**Not verified: how it looks.** Chromium and Firefox both fail to render on this
+box — the headless renderer is killed with 216 MB free — so the panel's
+appearance has been checked only by construction and against the reference
+design, never by looking at it. That is the one claim in this file with no run
+behind it.
+
 ## Next step
 
-M6b.3: the SPA itself — React, TypeScript and Vite, on the seams M6b.1 opened
-and the stores M6b.2 added, driven against a real gateway running a real model.
-Then M6b.4, the Electron shell. The full plan is `docs/M6B-PLAN.md`.
+M6b.4: the Electron shell — spawning and supervising `hermes serve`, attaching
+to one already running, the tray, key handling and packaging, which joins
+`packaging/systemd/`. The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 

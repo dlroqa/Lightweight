@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 /frontend/node_modules
+/frontend/dist
 /apps/desktop/node_modules
 /apps/desktop/dist
 /fixtures/generated
