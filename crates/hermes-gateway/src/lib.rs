@@ -25,6 +25,7 @@ pub mod routes;
 pub mod scheduler;
 pub mod state;
 pub mod stream;
+pub mod system;
 
 pub use auth::AuthPolicy;
 pub use catalog::{Catalog, ResidentModel};
@@ -67,5 +68,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/jobs", get(control::jobs))
         .route("/api/v1/jobs/{id}", get(control::job))
         .route("/api/v1/jobs/{id}/events", get(control::job_events))
+        .route("/api/v1/system", get(system::system))
+        .route("/api/v1/gateway", get(control::gateway))
         .with_state(state)
 }

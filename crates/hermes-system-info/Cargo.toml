@@ -11,6 +11,7 @@ hermes-core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 directories.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

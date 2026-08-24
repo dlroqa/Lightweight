@@ -335,6 +335,72 @@ pub async fn remove(
     }
 }
 
+/// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.
+///
+/// The API Gateway screen asks four questions no existing endpoint answers:
+/// where are we serving, is a key required, how many requests run at once, and
+/// what is the queue doing. `/health` and `/version` answer two adjacent ones
+/// and are deliberately left alone — they are probed by clients and scrapers
+/// that must keep seeing exactly what they see today.
+///
+/// **Read-only, and honest about why.** The address, the port and the key are
+/// settled before the first listener is bound, and changing any of them means
+/// restarting the listener — which nothing inside this process can do to
+/// itself. Rather than offering a control that would silently fail, each of
+/// those is reported with `restart_required`, so the panel can say so.
+///
+/// The key itself is never here. It is not logged, it is not in the engine's
+/// argv, and an endpoint that returned it would undo both.
+pub async fn gateway(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+
+    let config = &state.config;
+    let listeners: Vec<serde_json::Value> = config
+        .bound_addresses
+        .iter()
+        .map(|address| {
+            json!({
+                "address": address.to_string(),
+                "port": address.port(),
+                // Said plainly because it is what decides whether auth was
+                // required: a purely local bind is allowed to have no key.
+                "loopback": address.ip().is_loopback(),
+            })
+        })
+        .collect();
+
+    let resident = state.catalog.resident().await;
+    let queue = state.scheduler().snapshot();
+
+    axum::Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "backend": state.backend.id().to_string(),
+        "engine": state.backend.health().await,
+        "model": resident.as_ref().map(|model| model.id.to_string()),
+        "listeners": listeners,
+        // Empty when this gateway was built in-process, which is every unit
+        // test. Distinguished from "serving nothing" by `restart_required`
+        // being true either way: the panel never offers to change it.
+        "restart_required": ["listeners", "auth", "concurrency"],
+        "auth": {
+            "required": config.auth.is_enabled(),
+        },
+        "concurrency": {
+            "max_concurrent_requests": config.max_concurrent_requests,
+            "queue_timeout_seconds": config.queue_timeout.as_secs(),
+        },
+        "queue": queue,
+        "paths": config.paths.as_ref().map(|paths| json!({
+            "data": paths.data_dir(),
+            "models": paths.models_dir(),
+            "logs": paths.logs_dir(),
+        })),
+    }))
+    .into_response()
+}
+
 /// `GET /api/v1/jobs`.
 pub async fn jobs(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {

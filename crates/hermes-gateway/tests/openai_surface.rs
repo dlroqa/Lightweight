@@ -1757,3 +1757,70 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
         .expect("request");
     assert_eq!(authorized.status(), 200);
 }
+
+#[tokio::test]
+async fn describing_the_machine_and_the_service_needs_the_key() {
+    ensure_provider();
+    // `/api/v1/system` reports this machine's processor, its memory pressure
+    // and where its disks are; `/api/v1/gateway` reports where it is serving
+    // and whether a key is required. Both are inventory of the host, and on a
+    // bind reachable from elsewhere neither is public.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "secret-key".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(harness.get("/api/v1/system").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/gateway").await.status(), 401);
+
+    for path in ["/api/v1/system", "/api/v1/gateway"] {
+        let authorized = Harness::client()
+            .get(format!("{}{path}", harness.base))
+            .header("Authorization", "Bearer secret-key")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(authorized.status(), 200, "{path} with the key");
+    }
+}
+
+#[tokio::test]
+async fn the_gateway_description_never_carries_the_key() {
+    ensure_provider();
+    // The key is kept out of the log and out of the engine's argv. An endpoint
+    // that returned it would undo both, so this asserts the absence directly
+    // rather than trusting that nobody adds the field later.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "secret-key".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let body = Harness::client()
+        .get(format!("{}/api/v1/gateway", harness.base))
+        .header("Authorization", "Bearer secret-key")
+        .send()
+        .await
+        .expect("request")
+        .text()
+        .await
+        .expect("body");
+
+    assert!(
+        !body.contains("secret-key"),
+        "the gateway description leaked the API key: {body}"
+    );
+    // The fact that a key is required is reported; the key is not.
+    assert!(body.contains("\"required\":true"), "{body}");
+}

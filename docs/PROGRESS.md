@@ -21,7 +21,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
 | **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
-| M6b | next | Electron shell + SPA on the control API |
+| **M6b.1** Backend seams | **in progress** | `/api/v1/system` and `/api/v1/gateway`; disk space via `rustix` and processor time from `/proc/stat`, both as probes that say when they could not read |
+| M6b.2-4 | next | persistence, the SPA, the Electron shell |
 
 ## Verified by execution, not only by unit tests
 
@@ -406,7 +407,7 @@ assumptions, no workarounds — rather than by running it:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 565 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 588 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -542,12 +543,51 @@ Still open:
   client on *another* host completing a session, which needs either a command
   run there or a way in. SSH from here is refused by key.
 
+M6b.1, against a real gateway serving no model on this machine:
+
+- **The panel can describe the machine at last.** `/api/v1/system` reports this
+  box as it is — an Intel Pentium Silver J5005, four physical cores, `sse42` and
+  no AVX family, `expected_ggml_variant` `sse42`, which is exactly what the
+  engine was measured choosing in M0-M2. Nothing about it is hardcoded.
+- **Free space distinguishes the budget from the total.** On this machine the
+  models directory sits on a filesystem with 24.8 GB free but only 18.4 GB
+  *available* — the ext4 root reserve is 6.4 GB of it. A download sized against
+  the free count would be sized against 6 GB that an unprivileged process
+  cannot spend. `statvfs` reaches us through `rustix`, so no crate lost
+  `forbid(unsafe_code)` to get it, and `scripts/check-deps.sh` still passes:
+  rustix's build script only re-invokes `rustc` to probe cfgs and declares no
+  build-dependencies, and on Linux its `linux_raw` backend pulls in no libc.
+- **Processor load is published as counters, not a percentage.** `/proc/stat`
+  gives monotonic totals and a rate needs two readings of them, so the endpoint
+  hands over `total` and `idle` ticks and the caller differences consecutive
+  polls — the same discipline `/api/v1/metrics` already imposes on the charts.
+  No background sampler was added: it would have had to invent a sampling
+  interval, and its first reading would be either absent or a lie.
+- **Every probe says whether it was read.** `cpu_times`, `memory` and `disk`
+  each carry `state: read` or `state: unavailable` with the taxonomy's own
+  error code. A section that returned `0%` where the honest answer is "no probe
+  on this platform yet" would report a saturated machine as idle, which is the
+  one reading an operator must never be given wrongly.
+- **The service can describe itself.** `/api/v1/gateway` reports the addresses
+  actually bound — read from the sockets, so a `--port 0` request reports the
+  port the kernel chose — plus whether a key is required, the concurrency, the
+  live queue and the engine's health. The addresses are read **once** and shared
+  with the startup summary, rather than each asking the sockets separately.
+- **The key is absent by assertion, not by convention.** `/api/v1/gateway`
+  reports *that* a key is required and never the key; a test greps the whole
+  body for it, so a later field cannot quietly reintroduce what M3.5 kept out of
+  the log and out of the engine's argv.
+- **Both new endpoints are behind the key**, asserted directly: they are host
+  inventory, and on a bind reachable from elsewhere that is not public.
+
 ## Next step
 
-M6b. The Electron shell and the SPA, on top of the control API that M6a built:
-`/api/v1/models`, `/api/v1/catalog`, the import/download/load/unload verbs, and
-`/api/v1/jobs/{id}/events` for progress. `/api/v1/metrics` has been under this
-prefix since M5 for exactly this reason.
+The rest of M6b.1, then M6b.2-4. Still to build on this stage:
+`/api/v1/events` (one SSE stream serving both the live feed and the
+recent-requests list), `/api/v1/logs`, the RAM estimate on each catalog row,
+the GGUF detail fields the Models screen shows, a connection gauge in
+`metrics.rs`, and static asset serving so the SPA is same-origin and no CORS
+layer is ever needed. The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 

@@ -117,6 +117,19 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         listeners.push(bind(*address).await?);
     }
 
+    // Asked of the sockets rather than taken from `addresses`: a request for
+    // port 0 is answered by the kernel with a real port, and that is the port
+    // the operator has to type. Read once, here, and used both in the summary
+    // below and by the control API - two readings could disagree.
+    let mut bound = Vec::with_capacity(listeners.len());
+    for listener in &listeners {
+        bound.push(
+            listener
+                .local_addr()
+                .map_err(|err| format!("could not read the bound address: {err}"))?,
+        );
+    }
+
     // The engine is created whether or not a model is loaded now: it is what a
     // later `/api/v1/models/{id}/load` will load into.
     let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
@@ -172,6 +185,11 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
                     interactive: bands,
                     ..SchedulerConfig::default()
                 },
+                // The control API describes the machine and the service, so it
+                // needs both: where this process may write, and where it is
+                // answering. Neither is discoverable from inside a handler.
+                paths: Some(paths.clone()),
+                bound_addresses: bound.clone(),
                 ..GatewayConfig::default()
             },
         )
@@ -197,13 +215,10 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     }
 
     println!();
-    for listener in &listeners {
+    for address in &bound {
         // Printed for the operator, deliberately not logged: which addresses
         // this machine holds is not something the log file needs to remember.
-        let bound = listener
-            .local_addr()
-            .map_err(|err| format!("could not read the bound address: {err}"))?;
-        println!("serving  http://{bound}/v1");
+        println!("serving  http://{address}/v1");
     }
     match &loaded {
         Some(model) => {

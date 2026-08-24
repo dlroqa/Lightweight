@@ -40,6 +40,22 @@ pub struct GatewayConfig {
     pub queue_notice_interval: std::time::Duration,
     /// Who goes next when more than one request is waiting.
     pub scheduler: SchedulerConfig,
+    /// Where this gateway is allowed to read and write.
+    ///
+    /// Optional for the same reason the manager is: a gateway can be built
+    /// without one, and every existing test plus the contract suite's mock
+    /// gateway does exactly that. When it is absent, the endpoints that would
+    /// describe the filesystem say so rather than reporting a zero that would
+    /// read as a full disk.
+    pub paths: Option<hermes_system_info::DataPaths>,
+    /// The addresses this gateway is actually serving on.
+    ///
+    /// Recorded rather than re-derived. The listeners are bound before the
+    /// state is built — deliberately, so a bad address costs milliseconds
+    /// instead of a model load — and asking the sockets again later would mean
+    /// a second answer to "where are we serving?" that could disagree with the
+    /// first. Empty when nobody has said, which is every in-process test.
+    pub bound_addresses: Vec<std::net::SocketAddr>,
 }
 
 impl Default for GatewayConfig {
@@ -50,6 +66,8 @@ impl Default for GatewayConfig {
             queue_timeout: std::time::Duration::from_secs(600),
             queue_notice_interval: crate::stream::KEEP_ALIVE_INTERVAL,
             scheduler: SchedulerConfig::default(),
+            paths: None,
+            bound_addresses: Vec::new(),
         }
     }
 }

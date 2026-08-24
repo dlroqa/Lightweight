@@ -9,11 +9,15 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod cpu;
+pub mod disk;
+pub mod load;
 pub mod memory;
 pub mod network;
 pub mod paths;
 
 pub use cpu::{CpuInfo, IsaFeature};
+pub use disk::{DiskError, DiskSpace, space_for};
+pub use load::{CpuTimes, LoadError, cpu_times};
 pub use memory::{FixedMemoryProbe, MemoryError, MemoryProbe, MemorySnapshot, SystemMemoryProbe};
 pub use network::{NetworkError, reachable_addresses};
 pub use paths::{DataPaths, PathsError};
