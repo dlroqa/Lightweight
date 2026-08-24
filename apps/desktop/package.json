@@ -15,6 +15,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.7.2"
   },
   "build": {
@@ -38,7 +39,9 @@
       "target": [
         "AppImage"
       ],
-      "category": "Development"
+      "category": "Development",
+      "syncDesktopName": true,
+      "synopsis": "Local CPU inference gateway"
     },
     "mac": {
       "target": [
@@ -50,6 +53,11 @@
       "target": [
         "nsis"
       ]
+    },
+    "directories": {
+      "output": "release"
     }
-  }
+  },
+  "desktopName": "hermes.desktop",
+  "author": "Hermes"
 }

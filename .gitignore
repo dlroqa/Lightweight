@@ -4,6 +4,7 @@
 /frontend/dist
 /apps/desktop/node_modules
 /apps/desktop/dist
+/apps/desktop/release
 /fixtures/generated
 /runtime
 *.gguf

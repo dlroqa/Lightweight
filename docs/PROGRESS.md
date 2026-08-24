@@ -821,8 +821,50 @@ Electron is pinned at **43.4.1**. The version first reached for, 33, carried
 thirty‑four advisories; upgrading rather than accepting them leaves `npm audit`
 at zero.
 
-**Not verified: packaging.** `electron-builder` is configured but has never been
-run, and no installer has been produced or installed on any platform.
+Packaging, closed afterwards on 2026-08-24:
+
+- **`npm run package` called a tool that was not a dependency.** `electron-builder`
+  was named in the script and never installed, so the one command that claimed
+  to package the app could only ever fail. Added, and `npm audit` stays at zero.
+- **An AppImage now builds and carries what it should**: `bin/hermes` (the
+  release binary, current), `panel/` (the built SPA) and the app itself. 132 MB,
+  executable, verified by extracting it and running the packaged binary.
+- **The two build outputs were colliding.** `tsc` writes to `dist/` and
+  electron-builder was writing its installers there too, so a package run buried
+  the compiled main process under its own output — and `files: ["dist/**/*"]`
+  would then have swept the installer back into the next package. Installers now
+  go to `release/`.
+- **The window was not associated with its desktop entry.** `desktopName` at the
+  package root plus `linux.syncDesktopName` fixes it; the first attempt put
+  `desktopName` inside `build.linux`, which electron-builder rejects, and the
+  schema in `app-builder-lib` settled where each belongs.
+
+**Still not done: the application icon.** The AppImage ships with Electron's
+default. A brand asset has not been drawn, and inventing one was not the right
+call to make here.
+
+## Every tier, run
+
+On 2026-08-24 the three opt-in gates were all exercised rather than left
+skipped, so nothing in the suite is unproven:
+
+| Tier | Result |
+|---|---|
+| Default (`cargo test --workspace`) | 644 passed |
+| Real models (`HERMES_REQUIRE_REAL_MODELS`) | 3 passed |
+| **Real engine** (`HERMES_TEST_MODEL`, SmolLM2-135M) | **9 passed** |
+| **Model downloads** (`HERMES_TEST_NETWORK`) | **6 passed** |
+| **Gateway downloads** (`HERMES_TEST_NETWORK`) | **2 passed** |
+| openai contract suite | 30 passed |
+| Desktop shell | 25 passed |
+
+The smallest model was used for the real-engine tier deliberately: it proves the
+same path and costs a fraction of the memory on a machine that has little.
+
+A stale `target/release/hermes` from before M6b.1 was also rebuilt. It was a
+live trap — the desktop shell prefers a release build, and that one predated
+`--web-root`, so the shell failed on first run for a reason that had nothing to
+do with the shell.
 
 ## Next step
 
