@@ -17,8 +17,8 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 to 5 are complete. The gateway serves an OpenAI-compatible API
-over a supervised llama.cpp child process: streamed and non-streamed chat
+Milestones 0 through 6b are complete. The gateway serves an OpenAI-compatible
+API over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
 
@@ -29,20 +29,38 @@ the model called a declared tool, the tool ran, and the result came back as an
 answer — `finish_reason: "tool_calls"`, arguments that parse as JSON, and 166
 of 222 prompt tokens served from the prefix cache on the second turn.
 
-Requests are now **scheduled** rather than merely queued: a short request
-overtakes a long one that is waiting, a queued streamed request is told where it
-stands instead of sitting in silence, and what the gateway is doing is readable
-at `/metrics`.
+Requests are **scheduled** rather than merely queued: a short request overtakes
+a long one that is waiting, a queued streamed request is told where it stands
+instead of sitting in silence, and what the gateway is doing is readable at
+`/metrics`.
 
-The gateway now has a **model manager**. It keeps a catalog of what this machine
+The gateway has a **model manager**. It keeps a catalog of what this machine
 has, imports a `.gguf` you already own without copying it, downloads one of the
 pinned lightweight models against a digest recorded before the download, or
 takes any direct https link — recording per model how much can actually be
 promised about its bytes. A running gateway can be told to **load a different
 model**: it stops admitting, lets the request in flight finish, admits the new
 model against free memory, and re-derives the scheduler's ceilings for the
-context it ends up serving. The desktop shell is next. See
-[docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint.
+context it ends up serving.
+
+It also has a face. `/api/v1` reports the machine it runs on, the gateway's own
+configuration, a live event stream and the log file, and stores conversations
+and settings in the two directories M0 chose for them. On those seams sits a
+**control panel** — React and TypeScript, eight screens — served by the gateway
+itself, so the panel and the API are the same origin and no CORS layer exists
+anywhere. A browser on another machine reaches it over the exposed bind for
+free.
+
+Around both is a **desktop shell**. Electron: it attaches to a gateway already
+serving or starts one of its own, stops only what it started, keeps serving
+after its window is closed, and generates an API key only when the bind is
+reachable from another machine — passed in the environment, never in `argv`.
+`npm run package` builds an AppImage carrying the release binary and the built
+panel.
+
+What remains of the plan is M7 onward. See [docs/PROGRESS.md](docs/PROGRESS.md)
+for the current checkpoint, and [docs/M6B-PLAN.md](docs/M6B-PLAN.md) for what
+the last milestone deliberately left undone.
 
 ## Verified constraints
 
@@ -434,10 +452,20 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `hermes-inference` | The backend abstraction. Contains no engine, by design |
 | `hermes-backend-llamacpp` | Acquires and supervises `llama-server`, and translates its SSE into our events |
 | `hermes-backend-mock` | A deterministic backend, so the layers above are testable without an engine |
+| `hermes-download` | Resumable, digest-verified HTTP downloads. Shared by the engine installer and the model catalog, and knows about neither |
+| `hermes-catalog` | What models this machine has and how each one arrived. Atomic writes; integrity recorded per model, never rounded up |
+| `hermes-store` | What the user accumulates: conversations and settings. Owner-only, because a model can be downloaded again and a conversation cannot |
 | `hermes-api` | OpenAI request and response types, and the SSE chunk codec |
-| `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler and metrics |
+| `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
 | `hermes-observability` | Structured logging, rotation, privacy-mode wiring |
 | `hermes-cli` | Command-line access to the above |
+
+Two parts of the product are not crates:
+
+| Package | Responsibility |
+|---|---|
+| `frontend/` | The control panel: a React and TypeScript SPA, built by Vite and served by the gateway at `/` |
+| `apps/desktop/` | The desktop shell: an Electron window onto a gateway, and a supervisor for one |
 
 ## Designed for the machine it runs on
 

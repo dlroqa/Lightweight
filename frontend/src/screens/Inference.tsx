@@ -13,8 +13,9 @@ import { DEFAULT_PREFERENCES, usePreferences } from "../state/preferences";
  * `ui` half.
  *
  * The reference also shows a Batch Size control. It is deliberately absent: the
- * gateway never passes a batch size to the engine, and a slider that changes
- * nothing is worse than no slider.
+ * engine is always given the `RuntimeParams` defaults for `--batch-size` and
+ * `--ubatch-size`, and no request or load option can vary them, so a slider
+ * here would change nothing — which is worse than no slider.
  */
 export function Inference() {
   const { preferences, update } = usePreferences();
