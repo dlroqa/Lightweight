@@ -18,7 +18,13 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 echo "== fmt ==";     cargo fmt --all --check
 echo "== clippy ==";  cargo clippy --workspace --all-targets -- -D warnings
-echo "== test ==";    cargo test --workspace
+# The opt-in variables are deliberately unset for this run. With them set,
+# `--workspace` also picks up the real-engine and model-download tests, which
+# then run at default parallelism (nine engines at once on a four-core box) and
+# again in their own steps below. Unsetting them here is what makes the claim
+# "no network, no model downloads" true of this step even on a machine that has
+# both enabled.
+echo "== test ==";    env -u HERMES_TEST_MODEL -u HERMES_TEST_NETWORK cargo test --workspace
 
 # Real-model header tests skip when their (gitignored) fixtures are absent.
 # Fetch them if we can, and then demand them, so a green run cannot mean

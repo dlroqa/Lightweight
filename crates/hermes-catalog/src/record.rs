@@ -147,6 +147,19 @@ impl InstalledModel {
         }
     }
 
+    /// Whether this program may delete the model's file.
+    ///
+    /// True only for a file we downloaded into our own directory. An imported
+    /// one belongs to the user and was never copied, so removing it from the
+    /// catalog must leave it alone — forgetting a model and destroying
+    /// someone's file are very different acts.
+    ///
+    /// Lives on the record because three callers asked the same question and
+    /// three answers is two too many.
+    pub const fn is_ours_to_delete(&self) -> bool {
+        matches!(self.source, Source::Manifest { .. } | Source::Link { .. })
+    }
+
     /// Whether the file is still where the catalog left it.
     ///
     /// Checked rather than persisted. A record whose file is missing is kept —
@@ -251,6 +264,45 @@ mod tests {
     fn a_nameless_file_still_gets_an_id() {
         assert_eq!(slug_for(Path::new("/models/---.gguf")), "model");
         assert_eq!(slug_for(Path::new("")), "model");
+    }
+
+    #[test]
+    fn only_a_file_we_downloaded_is_ours_to_delete() {
+        // The distinction that keeps `--delete` from destroying a user's own
+        // file: we copied nothing on import, so we own nothing there.
+        let downloaded = Source::Manifest {
+            manifest_id: "m".into(),
+            url: "https://example.com/m.gguf".into(),
+        };
+        let linked = Source::Link {
+            url: "https://example.com/m.gguf".into(),
+        };
+        let imported = Source::Import {
+            original_path: PathBuf::from("/elsewhere/m.gguf"),
+        };
+
+        let record = |source| InstalledModel {
+            id: "m".into(),
+            name: "m".into(),
+            path: PathBuf::from("/models/m.gguf"),
+            bytes: 1,
+            sha256: "aa".into(),
+            integrity: Integrity::Recorded,
+            source,
+            architecture: "llama".into(),
+            supported: true,
+            param_count: None,
+            quantization: None,
+            context_length: None,
+            weight_bytes: None,
+            added_at: 0,
+            last_loaded_at: None,
+            last_n_ctx: None,
+        };
+
+        assert!(record(downloaded).is_ours_to_delete());
+        assert!(record(linked).is_ours_to_delete());
+        assert!(!record(imported).is_ours_to_delete());
     }
 
     #[test]

@@ -171,12 +171,14 @@ async fn an_interrupted_download_resumes_from_what_is_already_on_disk() {
 
     // Cancel part way through, which leaves the partial file in place on
     // purpose - that is what the next attempt resumes from.
+    //
+    // Cancelled after a fixed number of *bytes*, not after a fixed time. A
+    // timer races the connection: on a fast link the transfer finishes first
+    // and the test quietly stops testing resumption, which is the shape of a
+    // test that passes for the wrong reason.
     let cancel = CancellationToken::new();
+    let stop_after = entry.size / 4;
     let stopper = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        stopper.cancel();
-    });
 
     let client = hermes_download::client("hermes-test").expect("client");
     let first = hermes_download::fetch(
@@ -188,18 +190,19 @@ async fn an_interrupted_download_resumes_from_what_is_already_on_disk() {
             total_size: Some(entry.size),
             what: "the model",
         },
-        &|_, _| {},
+        &move |downloaded, _| {
+            if downloaded >= stop_after {
+                stopper.cancel();
+            }
+        },
         &cancel,
     )
     .await;
 
     let partial = hermes_download::partial_path(&destination);
-    let Err(err) = first else {
-        // Fast enough to finish inside three seconds. Nothing is wrong; there
-        // is simply no interrupted download left to resume from.
-        eprintln!("skipped the resume half: the download completed before it could be cancelled");
-        return;
-    };
+    let err = first.expect_err(
+        "the transfer was cancelled a quarter of the way through and must not have completed",
+    );
     assert_eq!(err.code(), "cancelled");
     let stopped_at = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
     assert!(stopped_at > 0, "nothing was written before cancelling");

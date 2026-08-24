@@ -145,12 +145,9 @@ pub fn remove(
     let _ = writeln!(out, "removed {} from the catalog", model.id);
 
     // An imported file belongs to the user and was never copied, so deleting it
-    // would be deleting something we do not own. Only a file we downloaded into
-    // our own directory is ours to remove, and even then only when asked.
-    let ours = matches!(
-        model.source,
-        hermes_catalog::Source::Manifest { .. } | hermes_catalog::Source::Link { .. }
-    );
+    // would be deleting something we do not own. The record answers this, so the
+    // CLI and the control API cannot disagree about it.
+    let ours = model.is_ours_to_delete();
     if delete_file {
         if ours {
             match std::fs::remove_file(&model.path) {

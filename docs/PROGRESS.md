@@ -384,12 +384,29 @@ assumptions, no workarounds — rather than by running it:
   route reports that.
 - **Two copies of "is this a GGUF?"** — the catalog's reader and a second one in
   the gateway's load path. There is one now.
+- **And a third copy of "is this file ours to delete?"**, found only by grepping
+  for it after claiming the duplication was fixed: the CLI had its own. The
+  predicate now lives on the record, where the data is, so the CLI and the
+  control API cannot disagree about whose file it is.
+- **A progress pump that panicked disappeared silently.** `let _ = pump.await`
+  discards a `JoinError`, which turns a panic in a background task into "the
+  progress bar stopped" with nothing anywhere to explain it. It is logged now,
+  and still never fails the operation it was reporting on.
+- **The gate's own "no network" step could reach the network.** With the opt-in
+  variables set, `cargo test --workspace` picked up the real-engine and
+  model-download tests too — running nine engines at default parallelism on a
+  four-core box, downloading the same 100 MB twice, and quietly contradicting
+  the step's own description. `check.sh` now unsets both for that step.
+- **The resume test could stop testing resumption.** It cancelled after three
+  seconds, which on a fast link is after the download has finished; it then
+  printed a skip and passed. It cancels after a quarter of the bytes now, so
+  there is always a partial file to resume from.
 
 ## Test counts
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 562 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 565 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -546,6 +563,12 @@ Deliberately left, and recorded so they are chosen rather than forgotten:
   every crate that would host it is `forbid(unsafe_code)`; weakening that to
   save a failed download is the wrong trade. A full disk is still reported
   actionably as `low_disk`, from `ENOSPC` as it happens rather than before it.
+- **A verified file can be orphaned in the downloads directory.** If the final
+  move into `models/` fails — a full disk, a permissions change between the
+  download and the move — the bytes are downloaded and checked but left where
+  they are. The error names the file so it can be moved by hand; a retry
+  re-downloads rather than adopting it, because recognising a staged file as
+  resumable is a second mechanism and this failure is rare.
 - **The catalog is not shared between processes.** Two `hermes` commands writing
   it at once would have one overwrite the other; each write is atomic, so the
   file is never corrupt, but there is no lock. A single gateway plus occasional

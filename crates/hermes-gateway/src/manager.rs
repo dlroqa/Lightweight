@@ -215,7 +215,7 @@ impl ModelManager {
         let outcome = self.install_phases(request, &progress, job).await;
 
         drop(progress);
-        let _ = pump.await;
+        report_pump(pump.await);
         outcome
     }
 
@@ -266,7 +266,7 @@ impl ModelManager {
         .await;
 
         drop(progress);
-        let _ = pump.await;
+        report_pump(pump.await);
         Ok(outcome?)
     }
 
@@ -294,13 +294,9 @@ impl ModelManager {
         let removed = catalog.remove(id)?;
         catalog.save()?;
 
-        // Only a file we downloaded into our own directory is ours to delete.
-        // An imported one belongs to the user and was never copied.
-        let ours = matches!(
-            removed.source,
-            hermes_catalog::Source::Manifest { .. } | hermes_catalog::Source::Link { .. }
-        );
-        let file_deleted = delete_file && ours && std::fs::remove_file(&removed.path).is_ok();
+        let file_deleted = delete_file
+            && removed.is_ours_to_delete()
+            && std::fs::remove_file(&removed.path).is_ok();
         tracing::info!(
             target: targets::MODEL,
             id = %removed.id,
@@ -327,7 +323,7 @@ impl ModelManager {
 
         let scanned = self.installer.scan_local(path, &progress).await;
         drop(progress);
-        let _ = drain.await;
+        report_pump(drain.await);
 
         let mut catalog = self.catalog.lock().await;
         Ok(Installer::commit(&mut catalog, scanned?)?)
@@ -342,6 +338,22 @@ impl ModelManager {
         // A failure to persist this is not worth failing a load over: it costs
         // a remembered default, nothing more.
         let _ = catalog.save();
+    }
+}
+
+/// Note a progress pump that did not finish cleanly.
+///
+/// Progress is advisory, so a pump that died must not fail the operation it was
+/// reporting on — but it must not vanish either. Silently discarding a
+/// `JoinError` is how a panic in a background task becomes "the progress bar
+/// stopped moving" with nothing anywhere to explain it.
+fn report_pump(outcome: Result<(), tokio::task::JoinError>) {
+    if let Err(err) = outcome {
+        tracing::warn!(
+            target: targets::MODEL,
+            error = %err,
+            "the progress reporter stopped early; the operation itself was unaffected"
+        );
     }
 }
 
@@ -513,7 +525,7 @@ pub async fn load_model(
         .backend
         .load(request, progress, job.cancel_token())
         .await;
-    let _ = pump.await;
+    report_pump(pump.await);
     let loaded = loaded?;
 
     // The ceilings follow the context that is actually running.
