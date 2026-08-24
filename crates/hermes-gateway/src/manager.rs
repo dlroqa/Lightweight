@@ -484,7 +484,14 @@ pub async fn load_model(
     let snapshot = SystemMemoryProbe
         .snapshot()
         .map_err(|err| BackendError::io("reading system memory", std::io::Error::other(err)))?;
-    let n_ctx = match options.n_ctx {
+    // The request first, then the user's stored default, then the largest this
+    // machine can safely give it. A stored default only ever *replaces the
+    // guess*: the estimate below still judges it, so setting one can make a
+    // load smaller than it might have been, never larger than it should be.
+    let requested = options
+        .n_ctx
+        .or_else(|| crate::store_api::gateway_settings(state).default_n_ctx);
+    let n_ctx = match requested {
         Some(requested) => requested,
         None => estimator
             .largest_safe_context(&metadata, base, snapshot, None)

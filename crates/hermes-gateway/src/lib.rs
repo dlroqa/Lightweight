@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod routes;
 pub mod scheduler;
 pub mod state;
+pub mod store_api;
 pub mod stream;
 pub mod system;
 pub mod web;
@@ -74,6 +75,20 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/gateway", get(control::gateway))
         .route("/api/v1/events", get(control::events))
         .route("/api/v1/logs", get(logs::logs))
+        .route(
+            "/api/v1/conversations",
+            get(store_api::list).post(store_api::create),
+        )
+        .route(
+            "/api/v1/conversations/{id}",
+            get(store_api::get)
+                .put(store_api::save)
+                .delete(store_api::delete),
+        )
+        .route(
+            "/api/v1/settings",
+            get(store_api::settings).put(store_api::save_settings),
+        )
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.
         .fallback(web::serve)

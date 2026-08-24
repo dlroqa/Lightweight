@@ -742,6 +742,7 @@ dependencies = [
  "hermes-inference",
  "hermes-memory",
  "hermes-observability",
+ "hermes-store",
  "hermes-system-info",
  "reqwest",
  "rustls",
@@ -801,6 +802,18 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hermes-store"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "hermes-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

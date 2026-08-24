@@ -155,6 +155,26 @@ impl GatewayState {
         self.manager.as_ref()
     }
 
+    /// Where this gateway keeps conversations, when it has a data directory.
+    ///
+    /// Built on demand rather than held: a store is a path and nothing else, so
+    /// there is no state to keep in sync and no second place for the directory
+    /// to be recorded.
+    pub fn conversations(&self) -> Option<hermes_store::ConversationStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| hermes_store::ConversationStore::new(paths.conversations_dir()))
+    }
+
+    /// Where this gateway keeps settings, when it has a data directory.
+    pub fn settings_store(&self) -> Option<hermes_store::SettingsStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| hermes_store::SettingsStore::new(paths.settings_file()))
+    }
+
     pub fn jobs(&self) -> &Arc<crate::jobs::Jobs> {
         &self.jobs
     }

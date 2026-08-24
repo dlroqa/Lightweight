@@ -22,7 +22,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
 | **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
 | **M6b.1** Backend seams | **done** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`, `GET /api/v1/models/{id}`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body; the panel served from the gateway, so no CORS layer exists |
-| M6b.2-4 | next | persistence, the SPA, the Electron shell |
+| **M6b.2** Persistence | **done** | `hermes-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
+| M6b.3-4 | next | the SPA, then the Electron shell |
 
 ## Verified by execution, not only by unit tests
 
@@ -407,7 +408,7 @@ assumptions, no workarounds — rather than by running it:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 616 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 644 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -671,11 +672,57 @@ M6b.1, third pass — the model detail and the panel's own files:
   names the assets, so a stale copy points a browser at scripts a redeploy has
   already removed.
 
+M6b.2, against a real gateway on this machine:
+
+- **The two M0 directories are finally written to.** `conversations_dir()` and
+  `settings_file()` were chosen in the first milestone and nothing had ever
+  called them. `hermes-store` is a crate of its own rather than part of
+  `hermes-catalog`: the two look alike — a directory, atomic writes, a JSON
+  document — and differ in the way that matters, which is that a model can be
+  downloaded again and a conversation cannot.
+- **What the user typed is owner-only.** Conversation files come out `0600` and
+  their directory `0700`, checked on a live gateway as well as in tests. The
+  log has redacted prompts by default since M0; writing the same words to a
+  world-readable file would have made that redaction decorative. The mode is set
+  when the temp file is *created*, not after it is written, because a file that
+  is briefly readable while megabytes go into it has been readable for as long
+  as it takes to read.
+- **Conversation ids are generated and never accepted.** An id becomes a file
+  name, so taking one from a request means taking a path from a request. They
+  are 128 random bits as hex, and the only shape the store will read back;
+  anything else is `malformed_conversation_id` rather than a 404, because "you
+  asked for something that cannot exist here" and "it is gone" are different
+  answers.
+- **Listing bounds its work, not just its output.** Directory entries carry a
+  modification time, so the newest are chosen before any file is opened — a
+  sidebar showing twenty conversations does not parse four hundred. The order
+  shown is then re-sorted on the *recorded* time, because a restore from backup
+  rewrites every mtime at once and the order the user remembers is in the file.
+- **One damaged conversation costs one conversation.** A file that will not
+  parse is skipped in a listing rather than failing it; the alternative turns a
+  problem with one chat into the appearance of having lost all of them.
+- **Settings have a typed half and an opaque half.** `gateway` is typed and
+  every field in it is acted on — `keep_history` gates writes, `default_n_ctx`
+  is consulted on the load path when a request names no context. A setting
+  stored but never read is the same mistake as a control on screen that changes
+  nothing. `ui` is passed through untouched, so the panel can remember a new
+  preference without a change here.
+- **An older build does not delete a newer one's settings.** Unknown top-level
+  keys are preserved across a write, so running an older gateway after a newer
+  panel does not silently discard configuration.
+- **A corrupt settings file is an error, not a silent reset** — except on the
+  load path, which falls back to defaults deliberately: a bad settings file must
+  not be able to stop a model from loading, and the endpoint that exists to show
+  settings reports the corruption plainly.
+- **Turning history off refuses writes and still allows reads.** Conversations
+  saved before the setting changed are still the user's; hiding them would leave
+  no way to look at them or delete them.
+
 ## Next step
 
-M6b.2: conversations under `conversations_dir()` and settings under
-`settings_file()`, both designed in M0 and never written to. Then M6b.3, the
-SPA, and M6b.4, the Electron shell. The full plan is `docs/M6B-PLAN.md`.
+M6b.3: the SPA itself — React, TypeScript and Vite, on the seams M6b.1 opened
+and the stores M6b.2 added, driven against a real gateway running a real model.
+Then M6b.4, the Electron shell. The full plan is `docs/M6B-PLAN.md`.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 
