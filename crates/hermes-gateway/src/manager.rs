@@ -98,6 +98,15 @@ pub enum ManagerError {
 
     #[error("{id} is in the catalog but its file is missing from {path}")]
     FileMissing { id: String, path: PathBuf },
+
+    /// The machine could not be measured, so no admission verdict exists.
+    ///
+    /// Delegated rather than flattened into an I/O error: the probe's own code
+    /// says whether the file would not parse or the platform has no probe at
+    /// all, and its remedy names `--force`, which is the only thing the caller
+    /// can actually do about it.
+    #[error(transparent)]
+    MemoryProbe(#[from] hermes_system_info::MemoryError),
 }
 
 impl Actionable for ManagerError {
@@ -109,6 +118,7 @@ impl Actionable for ManagerError {
             Self::NoCatalog => "no_model_catalog",
             Self::DrainTimedOut { .. } => "drain_timed_out",
             Self::FileMissing { .. } => "model_file_not_found",
+            Self::MemoryProbe(err) => err.code(),
         }
     }
 
@@ -124,6 +134,7 @@ impl Actionable for ManagerError {
             Self::NoCatalog => ErrorKind::Internal,
             Self::DrainTimedOut { .. } => ErrorKind::Unavailable,
             Self::FileMissing { .. } => ErrorKind::NotFound,
+            Self::MemoryProbe(err) => err.kind(),
         }
     }
 
@@ -146,6 +157,7 @@ impl Actionable for ManagerError {
                     section: SettingsSection::Models,
                 },
             )],
+            Self::MemoryProbe(err) => err.remedies(),
         }
     }
 }
@@ -481,9 +493,7 @@ pub async fn load_model(
     // Admission control, exactly as `hermes serve` does it: never promise a
     // model will run because its weights fit.
     let estimator = Estimator::headless();
-    let snapshot = SystemMemoryProbe
-        .snapshot()
-        .map_err(|err| BackendError::io("reading system memory", std::io::Error::other(err)))?;
+    let snapshot = SystemMemoryProbe.snapshot()?;
     // The request first, then the user's stored default, then the largest this
     // machine can safely give it. A stored default only ever *replaces the
     // guess*: the estimate below still judges it, so setting one can make a
@@ -499,6 +509,41 @@ pub async fn load_model(
     };
     let params = base.with_context(n_ctx);
     let estimate = estimator.estimate(&metadata, params, snapshot);
+
+    // Every admission decision is recorded, admitted or refused. An OOM kill
+    // twenty minutes from now is classified by the supervisor but has no
+    // antecedent unless the verdict that let the load through is in the same
+    // log. `Tight` is a warning for exactly that reason: it is the verdict that
+    // precedes the kill.
+    if estimate.verdict == Verdict::Tight {
+        tracing::warn!(
+            target: targets::MEMORY,
+            model = %model.id,
+            verdict = estimate.verdict.label(),
+            confidence = ?estimate.confidence,
+            n_ctx,
+            kv_type = %params.cache_type_k,
+            total = %estimate.total,
+            budget = %estimate.budget,
+            margin = %estimate.margin,
+            "admitting a load that leaves less headroom than the safety margin"
+        );
+    } else {
+        tracing::info!(
+            target: targets::MEMORY,
+            model = %model.id,
+            verdict = estimate.verdict.label(),
+            confidence = ?estimate.confidence,
+            n_ctx,
+            kv_type = %params.cache_type_k,
+            total = %estimate.total,
+            budget = %estimate.budget,
+            margin = %estimate.margin,
+            forced = options.force,
+            "admission verdict"
+        );
+    }
+
     if estimate.verdict == Verdict::Insufficient && !options.force {
         return Err(BackendError::InsufficientMemory {
             model: model.id.clone(),
@@ -731,6 +776,21 @@ mod tests {
 
         let err = ManagerError::from(BackendError::NoModelLoaded);
         assert_eq!(err.code(), "no_model_loaded");
+    }
+
+    #[test]
+    fn a_machine_that_could_not_be_measured_says_so_and_offers_a_way_through() {
+        // This used to be wrapped in a generic I/O error, which threw away both
+        // halves of what the caller needs: which probe failed, and that --force
+        // exists. A load refused for an unreadable /proc is not the same thing
+        // as a load refused because the model does not fit.
+        let err = ManagerError::from(hermes_system_info::MemoryError::UnsupportedPlatform {
+            platform: "macos",
+        });
+        assert_eq!(err.code(), "memory_probe_unsupported");
+        let remedies = err.remedies();
+        assert_eq!(remedies.len(), 1);
+        assert_eq!(remedies[0].action, hermes_core::RemedyAction::ForceLoad);
     }
 
     #[test]

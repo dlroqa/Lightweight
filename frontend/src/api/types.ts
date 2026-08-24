@@ -195,7 +195,11 @@ export interface Estimate {
 
 export type ModelDetail = CatalogRow & {
   header?: HeaderDetail;
-  estimate?: Estimate;
+  /**
+   * Absent only when there was no header to estimate against. An estimate the
+   * gateway could not *compute* arrives as `unavailable` with the reason.
+   */
+  estimate?: Probed<Estimate>;
 };
 
 /** A pinned model from `GET /api/v1/catalog`. */
@@ -315,12 +319,31 @@ export interface RequestEvent {
 }
 
 /** The error envelope every failing endpoint returns. */
+/**
+ * A remedy as the gateway sends it.
+ *
+ * `label` is the sentence to show; `action` is the tag the UI switches on to
+ * offer a button that applies the fix. Both are carried rather than just the
+ * sentence, because a remedy the user can only read is half of what the error
+ * taxonomy promises.
+ */
+export interface Remedy {
+  label: string;
+  /**
+   * Absent only on the one remedy the panel makes up itself, for the case where
+   * the gateway never answered at all and so cannot have sent one. Everything
+   * that crosses the wire carries an action.
+   */
+  action?: string;
+  [field: string]: unknown;
+}
+
 export interface ApiErrorBody {
   error: {
     message: string;
     type: string;
     code: string;
     param?: string | null;
-    hermes?: { remedies?: { message: string }[] } | null;
+    hermes?: { remedies?: Remedy[] } | null;
   };
 }

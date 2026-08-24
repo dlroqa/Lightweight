@@ -17,6 +17,7 @@ import type {
   ModelDetail,
   PinnedModel,
   CatalogRow,
+  Remedy,
   Settings,
   SystemReport,
 } from "./types";
@@ -32,9 +33,9 @@ import type {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
-  readonly remedies: string[];
+  readonly remedies: Remedy[];
 
-  constructor(status: number, code: string, message: string, remedies: string[]) {
+  constructor(status: number, code: string, message: string, remedies: Remedy[]) {
     super(message);
     this.name = "ApiError";
     this.status = status;
@@ -60,7 +61,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       0,
       "gateway_unreachable",
       "The gateway is not responding. Is it still running?",
-      ["Check that `hermes serve` is running, then try again."],
+      [{ label: "Check that `hermes serve` is running, then try again." }],
     );
   }
 
@@ -78,7 +79,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       response.status,
       error?.code ?? "http_error",
       error?.message ?? `${response.status} ${response.statusText}`,
-      error?.hermes?.remedies?.map((remedy) => remedy.message) ?? [],
+      error?.hermes?.remedies ?? [],
     );
   }
 

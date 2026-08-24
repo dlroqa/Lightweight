@@ -3,7 +3,8 @@ import { Download, HardDriveDownload, MoreVertical, RefreshCw } from "lucide-rea
 
 import { api, ApiError } from "../api/client";
 import { bytes, contextLength, parameters } from "../api/format";
-import type { CatalogRow, ModelDetail, PinnedModel } from "../api/types";
+import type { CatalogRow, Estimate, ModelDetail, PinnedModel } from "../api/types";
+import { wasRead } from "../api/types";
 import { Card } from "../components/Card";
 import { Empty, ErrorState, Loading, Pill, Row } from "../components/Bits";
 import { TopBar } from "../components/Shell";
@@ -278,12 +279,20 @@ function ModelDetailBody({ detail }: { detail: ModelDetail }) {
         </div>
       </div>
 
-      {detail.estimate && <EstimatePanel estimate={detail.estimate} />}
+      {wasRead(detail.estimate) ? (
+        <EstimatePanel estimate={detail.estimate} />
+      ) : (
+        detail.estimate && (
+          <div className="notice notice--warn">
+            No memory verdict: {detail.estimate.message}
+          </div>
+        )
+      )}
     </>
   );
 }
 
-function EstimatePanel({ estimate }: { estimate: NonNullable<ModelDetail["estimate"]> }) {
+function EstimatePanel({ estimate }: { estimate: Estimate }) {
   const tone =
     estimate.verdict === "safe"
       ? "ok"

@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use hermes_core::Bytes;
-use hermes_core::{Actionable, ErrorKind, Remedy, RemedyAction, SettingsSection};
+use hermes_core::{Actionable, ErrorKind, Remedy, RemedyAction};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -55,13 +55,42 @@ impl Actionable for MemoryError {
         ErrorKind::Internal
     }
 
+    /// What can actually be done, per failure.
+    ///
+    /// These once all pointed at "the available-memory override in settings",
+    /// a setting that has never existed. Naming a real escape hatch matters
+    /// more here than anywhere: without a reading there is no verdict at all,
+    /// so the user is not choosing to overrule a refusal - they are choosing
+    /// whether to proceed with the check unmade. `--force` says exactly that,
+    /// per load, and is recorded.
+    ///
+    /// An override was considered and rejected: it would let a user feed the
+    /// estimator a number nobody measured, which is the confident wrong verdict
+    /// the platform stub above refuses to produce.
     fn remedies(&self) -> Vec<Remedy> {
-        vec![Remedy::new(
-            "Set the available-memory override in settings so loads can still be admitted",
-            RemedyAction::OpenSettings {
-                section: SettingsSection::Inference,
-            },
-        )]
+        match self {
+            Self::Read { source_path, .. } => vec![Remedy::new(
+                format!(
+                    "{source_path} could not be read, so no memory verdict is possible; \
+                     load with --force to proceed without one"
+                ),
+                RemedyAction::ForceLoad,
+            )],
+            Self::MissingField { source_path, field } => vec![Remedy::new(
+                format!(
+                    "{source_path} did not report {field}, so no memory verdict is possible; \
+                     load with --force to proceed without one"
+                ),
+                RemedyAction::ForceLoad,
+            )],
+            Self::UnsupportedPlatform { platform } => vec![Remedy::new(
+                format!(
+                    "memory probing is not implemented on {platform}; \
+                     every load must be forced until it is"
+                ),
+                RemedyAction::ForceLoad,
+            )],
+        }
     }
 }
 
@@ -232,6 +261,46 @@ SwapCached:        84120 kB
 SwapTotal:       4194300 kB
 SwapFree:        2400508 kB
 ";
+
+    #[test]
+    fn every_variant_offers_a_remedy_that_names_something_real() {
+        // These all used to be one sentence pointing at an available-memory
+        // override in settings, which has never existed. A remedy naming a
+        // control the product does not have is worse than no remedy: it sends
+        // the user looking for a page that will not be there.
+        let failures = [
+            MemoryError::Read {
+                source_path: "/proc/meminfo",
+                source: std::io::Error::other("permission denied"),
+            },
+            MemoryError::MissingField {
+                source_path: "/proc/meminfo",
+                field: "MemTotal",
+            },
+            MemoryError::UnsupportedPlatform { platform: "macos" },
+        ];
+
+        let mut labels = Vec::new();
+        for failure in &failures {
+            let remedies = failure.remedies();
+            assert_eq!(remedies.len(), 1, "{failure} offered {remedies:?}");
+            let label = remedies[0].label.clone();
+            assert!(
+                !label.contains("settings"),
+                "{failure} still points at a settings page: {label}"
+            );
+            assert_eq!(remedies[0].action, RemedyAction::ForceLoad);
+            labels.push(label);
+        }
+
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            failures.len(),
+            "each failure must say what it could not read, not share one sentence"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

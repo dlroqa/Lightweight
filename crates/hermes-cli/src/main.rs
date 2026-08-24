@@ -359,9 +359,12 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             } else {
                 Estimator::default()
             };
+            // `describe`, not `to_string`: without a reading there is no
+            // verdict at all, and the remedy is the only thing that tells the
+            // user they can still load with --force.
             let estimate = estimator
                 .estimate_now(&metadata, params, &SystemMemoryProbe)
-                .map_err(|err| err.to_string())?;
+                .map_err(describe)?;
 
             if cli.json {
                 render_json(out, &estimate);

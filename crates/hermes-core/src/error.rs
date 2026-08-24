@@ -112,6 +112,13 @@ pub enum RemedyAction {
     SelectSupportedArchitecture { supported: Vec<String> },
     /// Wait and retry.
     RetryAfter { seconds: u32 },
+    /// Load anyway, without an admission verdict.
+    ///
+    /// Offered only when the verdict could not be *computed* - the memory probe
+    /// failed, or this platform has none. It is not an override of a refusal
+    /// the estimator arrived at with real numbers: that case has remedies that
+    /// name what would actually make the load fit.
+    ForceLoad,
     /// Nothing automatic; point the user at a settings page.
     OpenSettings { section: SettingsSection },
 }
@@ -268,6 +275,21 @@ mod tests {
         assert_eq!(json["action"], "reduce_context");
         assert_eq!(json["to_tokens"], 8192);
         assert_eq!(json["label"], "Reduce the context");
+    }
+
+    #[test]
+    fn a_fieldless_action_still_carries_its_tag() {
+        // `ForceLoad` has no fields, and an internally-tagged enum variant with
+        // no fields is exactly the shape serde is most likely to flatten into
+        // something the UI cannot switch on. Pin it.
+        let remedy = Remedy::new("Load without a memory verdict", RemedyAction::ForceLoad);
+        let json = serde_json::to_value(&remedy).expect("serialize");
+
+        assert_eq!(json["action"], "force_load");
+        assert_eq!(json["label"], "Load without a memory verdict");
+
+        let back: Remedy = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.action, RemedyAction::ForceLoad);
     }
 
     #[test]

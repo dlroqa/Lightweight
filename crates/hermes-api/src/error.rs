@@ -146,6 +146,14 @@ mod tests {
             .expect("remedies");
         assert!(!remedies.is_empty());
         assert_eq!(remedies[0]["to_tokens"], 8192);
+        // The panel renders this field. It read `message` for a while, which
+        // does not exist here, and drew a bullet list of `undefined` for every
+        // remedy the gateway has ever sent. Pin the name server-side so the
+        // next rename fails here rather than on screen.
+        assert!(
+            remedies[0]["label"].is_string(),
+            "a remedy must carry the sentence under `label`: {remedies:?}"
+        );
     }
 
     #[test]

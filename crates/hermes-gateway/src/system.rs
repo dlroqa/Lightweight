@@ -39,6 +39,10 @@ use crate::state::GatewayState;
 /// Tagged rather than nullable. A `null` section would leave a client to guess
 /// whether the number is zero, absent, or unsupported here, and the three call
 /// for three different things on screen.
+///
+/// Lives here because this is where the pattern started, and is used by
+/// [`crate::control`] too: a RAM estimate that could not be computed is the
+/// same shape of answer as a disk figure that could not be read.
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Probed<T> {
@@ -53,7 +57,7 @@ pub enum Probed<T> {
 }
 
 impl<T> Probed<T> {
-    fn from_probe<E: Actionable>(result: Result<T, E>) -> Self {
+    pub(crate) fn from_probe<E: Actionable>(result: Result<T, E>) -> Self {
         match result {
             Ok(reading) => Self::Read { reading },
             Err(err) => Self::Unavailable {

@@ -27,6 +27,7 @@ use crate::jobs::{Job, JobKind, JobState};
 use crate::manager::{self, LoadOptions};
 use crate::routes::authorize;
 use crate::state::GatewayState;
+use crate::system::Probed;
 
 /// One row of `GET /api/v1/models`.
 ///
@@ -552,8 +553,10 @@ pub struct ModelDetail {
     /// `None` when the file is not there to be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     header: Option<HeaderDetail>,
+    /// `None` only when there was no header to estimate against; an estimate
+    /// that could not be *computed* says why instead of going missing.
     #[serde(skip_serializing_if = "Option::is_none")]
-    estimate: Option<hermes_memory::Estimate>,
+    estimate: Option<Probed<hermes_memory::Estimate>>,
 }
 
 /// Read the header and estimate what loading it would cost.
@@ -565,7 +568,10 @@ fn describe_file(
     path: &std::path::Path,
     defaults: manager::RuntimeDefaults,
     last_n_ctx: Option<u32>,
-) -> (Option<HeaderDetail>, Option<hermes_memory::Estimate>) {
+) -> (
+    Option<HeaderDetail>,
+    Option<Probed<hermes_memory::Estimate>>,
+) {
     // The catalog's own reader, not a second copy: "is this a model?" must have
     // one answer.
     let Ok(metadata) = hermes_catalog::read_header(path) else {
@@ -577,9 +583,14 @@ fn describe_file(
     // top of the module: this is the only function in it that reads memory.
     use hermes_system_info::MemoryProbe as _;
 
-    let Ok(snapshot) = hermes_system_info::SystemMemoryProbe.snapshot() else {
-        // The header is still worth having; only the verdict needs the machine.
-        return (Some(detail), None);
+    let snapshot = match hermes_system_info::SystemMemoryProbe.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            // The header is still worth having; only the verdict needs the
+            // machine. But "no verdict" and "no verdict, and here is why" are
+            // different answers, and the panel can only act on the second.
+            return (Some(detail), Some(Probed::from_probe(Err(err))));
+        }
     };
 
     let cache_type = defaults.kv_type;
@@ -604,7 +615,7 @@ fn describe_file(
             .unwrap_or(base.n_ctx)
     });
     let estimate = estimator.estimate(&metadata, base.with_context(n_ctx), snapshot);
-    (Some(detail), Some(estimate))
+    (Some(detail), Some(Probed::Read { reading: estimate }))
 }
 
 /// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.

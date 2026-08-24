@@ -28,6 +28,7 @@ use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::{InferenceBackend, LoadProgress, LoadRequest};
 use hermes_memory::{Estimator, Verdict};
+use hermes_observability::targets;
 use hermes_system_info::{CpuInfo, DataPaths, MemoryProbe as _, SystemMemoryProbe};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -405,6 +406,36 @@ async fn load_at_startup(
     // Admission control. Section 19: never promise a model will run just
     // because its weights fit.
     let estimate = estimator.estimate(&metadata, params, snapshot);
+
+    // Printed below for the person watching, and logged here for the person
+    // reading the file afterwards - who is usually looking for why the engine
+    // was killed, and needs the verdict that admitted it.
+    if estimate.verdict == Verdict::Tight {
+        tracing::warn!(
+            target: targets::MEMORY,
+            verdict = estimate.verdict.label(),
+            confidence = ?estimate.confidence,
+            n_ctx = params.n_ctx,
+            kv_type = %params.cache_type_k,
+            total = %estimate.total,
+            budget = %estimate.budget,
+            margin = %estimate.margin,
+            "admitting a load that leaves less headroom than the safety margin"
+        );
+    } else {
+        tracing::info!(
+            target: targets::MEMORY,
+            verdict = estimate.verdict.label(),
+            confidence = ?estimate.confidence,
+            n_ctx = params.n_ctx,
+            kv_type = %params.cache_type_k,
+            total = %estimate.total,
+            budget = %estimate.budget,
+            margin = %estimate.margin,
+            forced = options.force,
+            "admission verdict"
+        );
+    }
 
     println!(
         "{}  {}  {}",

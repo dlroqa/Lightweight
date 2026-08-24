@@ -5,7 +5,7 @@ use hermes_gguf::ModelMetadata;
 use hermes_system_info::{MemoryProbe, MemorySnapshot};
 
 use crate::estimate::{ComputeModel, Confidence, Estimate, Verdict};
-use hermes_core::RuntimeParams;
+use hermes_core::{GgmlType, RuntimeParams};
 
 /// Minimum headroom above the estimate for a [`Verdict::Safe`].
 const MIN_MARGIN: Bytes = Bytes(512 * 1024 * 1024);
@@ -160,59 +160,64 @@ impl Estimator {
         let n_ctx = u64::from(params.n_ctx);
         let n_parallel = u64::from(params.n_parallel.max(1));
 
-        let mut bytes: u64 = 0;
-        let mut per_token: f64 = 0.0;
+        // The whole sum is fallible, so it is written as one fallible pass
+        // rather than as a loop with a fallback in it. The two halves of this
+        // arithmetic - the byte total and the marginal cost per token - have to
+        // agree about a type this build cannot size, and the only way to
+        // guarantee that is to leave no fallback for either of them to reach
+        // for. `?` on the same geometry both halves use is that guarantee.
+        let accumulate = || -> Result<KvCache, String> {
+            let bpe_k = bytes_per_element(params.cache_type_k)?;
+            let bpe_v = bytes_per_element(params.cache_type_v)?;
 
-        let bpe_k = params.cache_type_k.bits_per_element().unwrap_or(16.0) / 8.0;
-        let bpe_v = params.cache_type_v.bits_per_element().unwrap_or(16.0) / 8.0;
+            let mut bytes: u64 = 0;
+            let mut per_token: f64 = 0.0;
 
-        for layer in 0..layers {
-            // A layer past the end of a per-layer array is unknown. Falling
-            // back to layer zero's count would be a guess; billing nothing
-            // would understate. Record it and stop.
-            let Some(kv_heads) = metadata.kv_heads_for_layer(layer) else {
-                missing.push(format!("attention.head_count_kv for layer {layer}"));
-                return KvCache::UNKNOWN;
-            };
-            if kv_heads == 0 {
-                // Genuinely no attention in this layer, as in LFM2's
-                // short-convolution blocks. Not missing data - zero cost.
-                continue;
+            for layer in 0..layers {
+                // A layer past the end of a per-layer array is unknown. Falling
+                // back to layer zero's count would be a guess; billing nothing
+                // would understate. Record it and stop.
+                let kv_heads = metadata
+                    .kv_heads_for_layer(layer)
+                    .ok_or_else(|| format!("attention.head_count_kv for layer {layer}"))?;
+                if kv_heads == 0 {
+                    // Genuinely no attention in this layer, as in LFM2's
+                    // short-convolution blocks. Not missing data - zero cost.
+                    continue;
+                }
+
+                let k_elements = n_ctx
+                    .saturating_mul(kv_heads)
+                    .saturating_mul(head_dim_k)
+                    .saturating_mul(n_parallel);
+                let v_elements = n_ctx
+                    .saturating_mul(kv_heads)
+                    .saturating_mul(head_dim_v)
+                    .saturating_mul(n_parallel);
+
+                // Block-aware, using the same ggml geometry table as the weight
+                // arithmetic. A quantized cache is not a whole number of bytes
+                // per element: q8_0 is 34 bytes per 32.
+                bytes = bytes.saturating_add(sized(params.cache_type_k, k_elements)?);
+                bytes = bytes.saturating_add(sized(params.cache_type_v, v_elements)?);
+
+                let heads_times_parallel = (kv_heads.saturating_mul(n_parallel)) as f64;
+                per_token += heads_times_parallel
+                    * ((head_dim_k as f64) * bpe_k + (head_dim_v as f64) * bpe_v);
             }
 
-            let k_elements = n_ctx
-                .saturating_mul(kv_heads)
-                .saturating_mul(head_dim_k)
-                .saturating_mul(n_parallel);
-            let v_elements = n_ctx
-                .saturating_mul(kv_heads)
-                .saturating_mul(head_dim_v)
-                .saturating_mul(n_parallel);
+            Ok(KvCache {
+                bytes: Bytes(bytes),
+                bytes_per_token: per_token.ceil() as u64,
+            })
+        };
 
-            // Block-aware, using the same ggml geometry table as the weight
-            // arithmetic. A quantized cache is not a whole number of bytes per
-            // element: q8_0 is 34 bytes per 32.
-            bytes = bytes.saturating_add(
-                params
-                    .cache_type_k
-                    .bytes_for_elements(k_elements)
-                    .unwrap_or(0),
-            );
-            bytes = bytes.saturating_add(
-                params
-                    .cache_type_v
-                    .bytes_for_elements(v_elements)
-                    .unwrap_or(0),
-            );
-
-            let heads_times_parallel = (kv_heads.saturating_mul(n_parallel)) as f64;
-            per_token +=
-                heads_times_parallel * ((head_dim_k as f64) * bpe_k + (head_dim_v as f64) * bpe_v);
-        }
-
-        KvCache {
-            bytes: Bytes(bytes),
-            bytes_per_token: per_token.ceil() as u64,
+        match accumulate() {
+            Ok(kv_cache) => kv_cache,
+            Err(reason) => {
+                missing.push(reason);
+                KvCache::UNKNOWN
+            }
         }
     }
 
@@ -247,6 +252,31 @@ impl Estimator {
 
         Bytes((logits + activations + scratch).max(0.0) as u64)
     }
+}
+
+/// Average bytes per element of a KV cache side.
+///
+/// In bytes rather than bits because that is what the per-token arithmetic
+/// wants; dividing at each use is what let the two halves of the sum drift
+/// apart in the first place.
+fn bytes_per_element(kind: GgmlType) -> Result<f64, String> {
+    kind.bits_per_element()
+        .map(|bits| bits / 8.0)
+        .ok_or_else(|| unsizeable(kind))
+}
+
+/// Exact bytes for `elements` values, refusing a type this build cannot size.
+///
+/// The refusal is the point. A type with no geometry billed as zero would make
+/// the estimate *smaller* than the truth, which is the one direction section 7
+/// forbids being wrong in.
+fn sized(kind: GgmlType, elements: u64) -> Result<u64, String> {
+    kind.bytes_for_elements(elements)
+        .ok_or_else(|| unsizeable(kind))
+}
+
+fn unsizeable(kind: GgmlType) -> String {
+    format!("block geometry for KV cache type {kind}")
 }
 
 /// KV cache size plus its marginal cost per token of context.
@@ -477,6 +507,62 @@ mod tests {
             )
             .kv_cache;
         assert_eq!(q8.get() * 64, f16.get() * 34);
+    }
+
+    #[test]
+    fn an_unknown_kv_cache_type_is_partial_not_free() {
+        // A type this build cannot size must make the estimate *partial*, not
+        // make the cache free. Billing zero and reporting `Coarse` is a
+        // confident wrong answer, which is the failure the whole confidence
+        // axis exists to prevent.
+        let metadata = model(32, 32, vec![8], 128);
+        let params = RuntimeParams::default()
+            .with_context(8192)
+            .with_kv_cache_type(GgmlType::Unknown(9999));
+        let estimate = bare_estimator().estimate(&metadata, params, machine(64));
+
+        assert_eq!(estimate.confidence, Confidence::Partial);
+        assert_eq!(estimate.kv_cache, Bytes::ZERO);
+        // The half that used to disagree: a per-token cost assumed at 16 bits
+        // while the total assumed nothing at all.
+        assert_eq!(estimate.kv_bytes_per_token, 0);
+        assert_eq!(estimate.max_context_that_fits, None);
+        assert!(
+            estimate
+                .missing
+                .iter()
+                .any(|entry| entry.contains("block geometry")),
+            "the estimate must say which term it could not compute: {:?}",
+            estimate.missing
+        );
+    }
+
+    #[test]
+    fn the_per_token_figure_and_the_total_never_disagree() {
+        // Pins the two halves together for every type rather than for one. The
+        // total rounds each layer up to a whole block and the per-token figure
+        // cannot, so they agree to within one block per layer per side - and a
+        // half that had silently fallen back to a different type would miss
+        // that window by orders of magnitude.
+        let metadata = model(32, 32, vec![8], 128);
+        let n_ctx = 8192_u64;
+        for kind in GgmlType::ALL.iter().copied().filter(|kind| kind.is_known()) {
+            let estimate = bare_estimator().estimate(
+                &metadata,
+                RuntimeParams::default()
+                    .with_context(n_ctx as u32)
+                    .with_kv_cache_type(kind),
+                machine(64),
+            );
+            let projected = estimate.kv_bytes_per_token * n_ctx;
+            let slack = 32 * 2 * kind.type_size().expect("a known type has a size");
+            assert!(
+                projected <= estimate.kv_cache.get() + slack
+                    && estimate.kv_cache.get() <= projected + slack,
+                "{kind}: per-token projects {projected} against a total of {}",
+                estimate.kv_cache.get()
+            );
+        }
     }
 
     // ---- the budget ----

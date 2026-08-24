@@ -60,8 +60,8 @@ export function ErrorState({ error, onRetry }: { error: ApiError; onRetry?: () =
       {error.remedies.length > 0 && (
         <ul style={{ margin: 0, padding: 0, listStyle: "none", maxWidth: "52ch" }}>
           {error.remedies.map((remedy) => (
-            <li key={remedy} style={{ marginTop: 4 }}>
-              {remedy}
+            <li key={remedy.label} style={{ marginTop: 4 }}>
+              {remedy.label}
             </li>
           ))}
         </ul>
