@@ -440,3 +440,82 @@ and treats it as a model; the gateway serves it exactly as it serves anything
 else. Nothing here is allowed to require that a harness exists, and nothing
 here should ever be specialized to one — the moment it is, this stops being a
 provider and becomes part of somebody else's agent.
+
+## Why one downloader serves the engine and the models
+
+The engine installer had a resumable, digest-checked download since M2: re-hash
+whatever `.part` file is already on disk rather than trusting it, restart when
+the server ignores `Range`, hash as the bytes arrive, and never leave a file
+that failed verification where a later run could resume from it.
+
+A model download needs exactly those properties, and the tempting move —
+copying the loop — is how two copies of an integrity check end up differing in
+the half nobody looked at. So the loop moved to `hermes-download` and the
+installer now calls it. The extraction was done first and alone, and proven by
+deleting the installed engine and re-running the real-engine tier cold.
+
+## What a digest can and cannot promise
+
+The catalog records *how* each model's bytes were checked, and the four cases
+are genuinely different:
+
+- **Pinned** — checked against a digest recorded in `hermes-catalog::manifest`
+  before the download, by `scripts/record-model-digests.sh` reading
+  HuggingFace's tree API. The digest did not travel with the bytes.
+- **Published** — a pasted `huggingface.co/.../resolve/...` link, whose sha256
+  is the file's Git LFS object id, read over the same API. Strong, but it comes
+  from the party that served the bytes.
+- **Supplied** — checked against a digest the user gave.
+- **Recorded** — computed on arrival and checked against nothing. It makes a
+  later corruption detectable and is not evidence that the right file arrived.
+
+The UI and the CLI print these in words (`recorded, not verified`) rather than
+showing a single tick. Rounding the last case up to "verified" would be the one
+lie this whole mechanism exists to avoid.
+
+An unsupported architecture is recorded with a warning rather than refused: the
+load path already refuses it with the nearest supported alternatives, and a
+model a future engine build could run should not be impossible to keep.
+
+## Why a swap pauses and drains rather than preempting
+
+Nothing preempts a generation, because the engine cannot pause one. A model
+swap therefore stops admitting, waits for the running request to finish, and
+only then replaces the engine. Requests arriving meanwhile queue and keep their
+order, which is what they would do behind any long generation.
+
+Measured: a swap requested three seconds into a 160-token generation completed
+one second after that generation ended, and the generation kept every one of its
+tokens. The alternative — killing the engine under a live request — would turn a
+UI click into a truncated answer for someone else.
+
+The pause is a guard, so a load that fails anywhere (an engine that will not
+start, a model that does not fit) cannot leave the gateway permanently
+refusing to admit anything.
+
+Two things follow from the swap that are easy to miss:
+
+- **The band ceilings are re-derived** from the context actually loaded, and
+  exposed as `hermes_band_ceiling_tokens`. M5 established that ceilings computed
+  as fractions of a window are only right for the window they were computed for;
+  a swap that inherited them would repeat that with no way to see it.
+- **The engine is replaced, not doubled.** `ProcessBackend::load` shuts the
+  previous engine down before launching the next, so two models are never
+  resident at once — the memory spike admission control exists to prevent.
+
+## Why long operations are jobs
+
+A download is minutes and a load is tens of seconds on this hardware. A POST
+holding the socket open for that long is one a proxy or a client timeout kills,
+leaving the work running with nobody to tell. So these return a job id and the
+caller watches `/api/v1/jobs/{id}/events`.
+
+Two consequences are deliberate. A client that goes away does not cancel the
+work — a half-finished gigabyte that can resume is worth more than one abandoned
+because a tab closed — and a watcher that arrives late is given the job's
+current state before any new events, so a job that finished in the gap cannot
+leave it waiting forever.
+
+Progress is throttled to one update per whole percent. Unthrottled, a 16 MB
+engine download produced 1,010 SSE frames per watcher, and a gigabyte model
+would produce around 65,000 — measurable CPU on a box that has none to spare.

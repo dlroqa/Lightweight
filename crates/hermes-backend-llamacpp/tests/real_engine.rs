@@ -377,16 +377,7 @@ async fn dropping_the_stream_stops_the_engine_decoding() {
         .await
         .expect("generation");
 
-    // Read a little, then walk away exactly as a disconnecting client does.
-    let first = tokio::time::timeout(Duration::from_secs(120), events.next())
-        .await
-        .expect("the engine should produce something within two minutes");
-    assert!(first.is_some());
-    cancel.cancel();
-    drop(events);
-
-    // The engine must go idle. Measured from its own CPU time rather than by
-    // waiting a fixed period and hoping.
+    // The engine's own CPU time, rather than waiting a fixed period and hoping.
     let cpu_time = |pid: u32| -> Option<u64> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let fields: Vec<&str> = stat.rsplit(')').next()?.split_whitespace().collect();
@@ -394,36 +385,105 @@ async fn dropping_the_stream_stops_the_engine_decoding() {
         // after the comm field has been split off.
         Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
     };
+
+    // Read a little, so the engine is genuinely decoding.
+    let first = tokio::time::timeout(Duration::from_secs(120), events.next())
+        .await
+        .expect("the engine should produce something within two minutes");
+    assert!(first.is_some());
+
     let Some(engine_pid) = engine_pid(&backend).await else {
         backend.shutdown().await.expect("shutdown");
         return;
     };
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // What decoding costs on *this* machine, measured now rather than assumed.
+    // Without it the assertion below is a constant that means one thing on a
+    // fast box and another on a slow one.
+    let busy_start = cpu_time(engine_pid).unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let busy_ticks = cpu_time(engine_pid).unwrap_or(0).saturating_sub(busy_start);
+
+    // Now walk away exactly as a disconnecting client does.
+    cancel.cancel();
+    drop(events);
+
+    // The claim is that the engine **stops**, so that is what is measured: poll
+    // until it reports an idle half-second, with a deadline.
+    //
+    // Not a single fixed window, which is what this test used to do. Measured
+    // on this machine, a cancelled generation costs a short teardown tail —
+    // around 23 ticks over the first 500 ms — and then **exactly zero**, and
+    // the tail's length varies with how loaded the box is. A fixed wait
+    // followed by a fixed budget therefore fails when the tail happens to be
+    // long, while proving nothing more than this does.
+    let mut idle_after = None;
+    for window in 0..20 {
+        let before = cpu_time(engine_pid).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let ticks = cpu_time(engine_pid).unwrap_or(0).saturating_sub(before);
+        if ticks <= 1 {
+            idle_after = Some((window + 1) * 500);
+            break;
+        }
+    }
+    let idle_after = idle_after.unwrap_or_else(|| {
+        panic!(
+            "the engine never stopped after the client disconnected: still busy \
+             ten seconds later, where decoding costs about {busy_ticks} ticks a second"
+        )
+    });
+
+    // And it stays stopped: a generation that merely paused would resume.
     let before = cpu_time(engine_pid).unwrap_or(0);
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let after = cpu_time(engine_pid).unwrap_or(0);
+    let after_idle = cpu_time(engine_pid).unwrap_or(0).saturating_sub(before);
     assert!(
-        after.saturating_sub(before) <= 2,
-        "the engine kept burning CPU after the client disconnected: {} ticks",
-        after - before
+        after_idle <= 2,
+        "the engine went quiet and then started working again: {after_idle} ticks"
+    );
+    eprintln!(
+        "engine went idle {idle_after} ms after the disconnect \
+         (decoding costs about {busy_ticks} ticks a second on this box)"
     );
 
     backend.shutdown().await.expect("shutdown");
 }
 
 /// The engine's pid, read through the backend's own resource reporting.
+///
+/// **Scoped to the engine this backend started, by its own port.**
+///
+/// Matching any `llama-server` in `/proc` was wrong, and failed for real in two
+/// different ways: this machine can have another gateway serving in another
+/// terminal, and `cargo test --workspace` runs the tests in this file in
+/// parallel, so several engines of our own are alive at once. Either way the
+/// CPU-time assertion below measured a stranger's process and reported a busy
+/// engine as a cancellation that had not happened.
+///
+/// The port is the one thing unique to this engine: it is chosen per launch
+/// from an ephemeral port and passed as `--port`, so the backend's own endpoint
+/// identifies exactly one process.
 async fn engine_pid(backend: &ProcessBackend) -> Option<u32> {
-    // `resource_usage` proves an engine is running; the pid itself comes from
-    // the only place that has it.
+    // `resource_usage` proves an engine is running; the endpoint says which.
     backend.resource_usage().await.ok().flatten()?;
+    let (base_url, _key) = backend.engine_endpoint().await?;
+    let port = base_url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()?
+        .to_owned();
+
     std::fs::read_dir("/proc")
         .ok()?
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
         .find(|pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-                .is_ok_and(|cmdline| cmdline.contains("llama-server"))
+            // `/proc/<pid>/cmdline` is NUL-separated, so the port is its own
+            // whole argument rather than a substring of another number.
+            std::fs::read_to_string(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                cmdline.contains("llama-server") && cmdline.split('\0').any(|arg| arg == port)
+            })
         })
 }
 

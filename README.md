@@ -32,7 +32,16 @@ of 222 prompt tokens served from the prefix cache on the second turn.
 Requests are now **scheduled** rather than merely queued: a short request
 overtakes a long one that is waiting, a queued streamed request is told where it
 stands instead of sitting in silence, and what the gateway is doing is readable
-at `/metrics`. The model manager and the desktop shell are next. See
+at `/metrics`.
+
+The gateway now has a **model manager**. It keeps a catalog of what this machine
+has, imports a `.gguf` you already own without copying it, downloads one of the
+pinned lightweight models against a digest recorded before the download, or
+takes any direct https link — recording per model how much can actually be
+promised about its bytes. A running gateway can be told to **load a different
+model**: it stops admitting, lets the request in flight finish, admits the new
+model against free memory, and re-derives the scheduler's ceilings for the
+context it ends up serving. The desktop shell is next. See
 [docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint.
 
 ## Verified constraints
@@ -69,7 +78,7 @@ inscrutable build-script error rather than as "you broke the policy".
 ## Build and test
 
 ```sh
-cargo test --workspace       # 383 tests, no network, no model downloads
+cargo test --workspace       # 556 tests, no network, no model downloads
 ./scripts/check.sh           # fmt, clippy, tests, contract suite, dependency + secret gates
 ./scripts/contract-test.sh   # the real openai SDK against the gateway
 ```
@@ -85,6 +94,12 @@ parses back to the right number.
 `HERMES_TEST_MODEL=<path.gguf>` additionally enables the real-engine tests,
 which download the pinned engine, load a genuine model, stream a completion and
 prove that a dropped stream stops the engine decoding.
+
+`HERMES_TEST_NETWORK=1` enables the model-download tier, which fetches a real
+100 MB model from HuggingFace and checks what arrives: the digest matches the
+one recorded in the manifest, an interrupted transfer resumes and still
+verifies, a tampered digest is refused and the bytes discarded, and a link that
+is not a GGUF is deleted rather than catalogued.
 
 `scripts/fetch-real-headers.sh` captures the headers of six real models from
 HuggingFace with HTTP range requests — a few megabytes rather than the tens of
@@ -102,7 +117,43 @@ cargo run -p hermes-cli -- estimate model.gguf --ctx 8192 --kv-type q8_0
 # Acquire the engine, admit the model, load it, and serve the OpenAI API.
 # With no --ctx, the largest context that fits this machine is chosen.
 cargo run -p hermes-cli -- serve model.gguf --port 8737
+
+# Or start with nothing loaded and choose a model over the control API.
+cargo run -p hermes-cli -- serve --port 8737
 ```
+
+### Models
+
+```sh
+hermes models list                    # what this machine has
+hermes models available               # the pinned models, with sizes
+hermes models add qwen3-1.7b-q4_k_m   # download one, digest checked
+hermes models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
+hermes models import ~/models/mine.gguf   # referenced where it is, not copied
+hermes models remove <id> [--delete]
+```
+
+A HuggingFace link is verified against the sha256 the site publishes for the
+file. Any other link is **recorded, not verified** unless you pass `--sha256`,
+and the catalog says which of the two it was rather than showing one tick for
+both.
+
+### Control API
+
+Under `/api/v1`, deliberately never mixed in with the OpenAI routes:
+
+```sh
+curl 127.0.0.1:8737/api/v1/models          # the catalog, with load state
+curl 127.0.0.1:8737/api/v1/catalog         # what can be downloaded
+curl -X POST 127.0.0.1:8737/api/v1/models/<id>/load -d '{"ctx":8192}'
+curl -X POST 127.0.0.1:8737/api/v1/models/unload
+curl -N   127.0.0.1:8737/api/v1/jobs/<n>/events   # progress, as SSE
+```
+
+Loading and downloading return a job immediately rather than holding the socket
+open for minutes. Swapping a model waits for the request in flight to finish —
+nothing is preempted — and a request that arrives during the swap queues rather
+than being refused.
 
 Then point any OpenAI client at `http://127.0.0.1:8737/v1`:
 

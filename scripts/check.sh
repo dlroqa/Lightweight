@@ -38,6 +38,16 @@ else
   echo "== test (real engine) == skipped: set HERMES_TEST_MODEL to a .gguf to include"
 fi
 
+# The model-download tier talks to HuggingFace and fetches a real 100 MB model,
+# so it is opt-in like the real-engine tier. It says when it is skipped rather
+# than passing quietly.
+if [ -n "${HERMES_TEST_NETWORK:-}" ]; then
+  echo "== test (model downloads) =="
+  cargo test -p hermes-catalog --test real_download -- --test-threads=1
+else
+  echo "== test (model downloads) == skipped: set HERMES_TEST_NETWORK=1 to include"
+fi
+
 # The openai-SDK contract suite: the real client library against a real
 # gateway, asserting what the client ends up with rather than what we sent.
 # Needs python3 and one package from PyPI, so it is allowed to be absent - but

@@ -17,6 +17,7 @@ use std::io::Write as _;
 
 use clap::{Parser, Subcommand};
 
+mod models;
 mod serve;
 use hermes_core::{Actionable, GgmlType, units::Bytes};
 use hermes_gguf::{GgufFile, ModelMetadata};
@@ -56,7 +57,12 @@ enum Command {
     /// memory, loads it, and serves `/v1/chat/completions`, `/v1/models`,
     /// `/health` and `/props` until interrupted.
     Serve {
-        model: PathBuf,
+        /// The model to load at startup.
+        ///
+        /// Optional: with no model the gateway starts empty and waits to be
+        /// told what to load over the control API, which is what the desktop
+        /// shell drives.
+        model: Option<PathBuf>,
         /// Context length in tokens.
         ///
         /// Omitted, the largest size that still loads safely on this machine is
@@ -130,6 +136,100 @@ enum Command {
         #[arg(long)]
         header_only: bool,
     },
+    /// Manage the models this machine has.
+    ///
+    /// The catalog is a file, not a service, so every one of these works with
+    /// no gateway running.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsAction {
+    /// List installed models.
+    List,
+    /// List the models this build is known to run and can download.
+    Available,
+    /// Register a .gguf that is already on this machine.
+    ///
+    /// The file is referenced where it is, never copied, so importing a 4 GB
+    /// model costs no extra disk.
+    Import { path: PathBuf },
+    /// Download a model.
+    ///
+    /// Either one of the pinned ids from `hermes models available`, whose
+    /// digest is recorded in this build, or any direct https link with
+    /// `--url`. A HuggingFace link is verified against the digest the site
+    /// publishes; any other link is recorded rather than verified unless you
+    /// pass `--sha256`.
+    Add {
+        /// A pinned model id.
+        id: Option<String>,
+        /// A direct https link to a .gguf.
+        #[arg(long)]
+        url: Option<String>,
+        /// Expected sha256, for a link that is not on HuggingFace.
+        #[arg(long)]
+        sha256: Option<String>,
+    },
+    /// Remove a model from the catalog.
+    Remove {
+        id: String,
+        /// Also delete the file.
+        ///
+        /// Only ever applies to a model this program downloaded. An imported
+        /// file belongs to you and is left alone.
+        #[arg(long)]
+        delete: bool,
+    },
+}
+
+/// `hermes models ...`.
+///
+/// The read-only actions need no async runtime; import and add do, because they
+/// hash and download. Built here rather than around every command, the same way
+/// `serve` does it.
+fn models_command(cli: &Cli, out: &mut String, action: &ModelsAction) -> Result<ExitCode, String> {
+    let paths = hermes_system_info::DataPaths::discover().map_err(serve::describe)?;
+    let mut store = models::open(&paths)?;
+
+    match action {
+        ModelsAction::List => {
+            if cli.json {
+                render_json(out, &store.models().collect::<Vec<_>>());
+            } else {
+                models::list(out, &store);
+            }
+        }
+        ModelsAction::Available => {
+            if cli.json {
+                render_json(out, &hermes_catalog::manifest::MODELS);
+            } else {
+                models::available(out, &store);
+            }
+        }
+        ModelsAction::Import { path } => {
+            runtime()?.block_on(models::import(out, &paths, &mut store, path))?;
+        }
+        ModelsAction::Add { id, url, sha256 } => {
+            let request = models::add_request(id.as_deref(), url.as_deref(), sha256.as_deref())?;
+            runtime()?.block_on(models::add(out, &paths, &mut store, &request))?;
+        }
+        ModelsAction::Remove { id, delete } => {
+            models::remove(out, &mut store, id, *delete)?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A multi-threaded runtime for the commands that do I/O.
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("could not start the async runtime: {err}"))
 }
 
 /// Appends a formatted line to the output buffer.
@@ -211,6 +311,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             sysinfo(out, cli.json);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Models { action } => models_command(cli, out, action),
         Command::Inspect { model, header_only } => {
             let metadata = load_metadata(model, *header_only)?;
             if cli.json {

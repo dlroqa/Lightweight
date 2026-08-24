@@ -17,6 +17,9 @@
 pub mod auth;
 pub mod catalog;
 pub mod completions;
+pub mod control;
+pub mod jobs;
+pub mod manager;
 pub mod metrics;
 pub mod routes;
 pub mod scheduler;
@@ -49,5 +52,20 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))
+        // Our own control surface. Everything the desktop shell drives lives
+        // here, and nothing here is visible to a client walking `/v1`.
+        .route("/api/v1/models", get(control::models))
+        .route("/api/v1/models/import", post(control::import))
+        .route("/api/v1/models/download", post(control::download))
+        .route("/api/v1/models/unload", post(control::unload))
+        .route("/api/v1/models/{id}/load", post(control::load))
+        .route(
+            "/api/v1/models/{id}",
+            axum::routing::delete(control::remove),
+        )
+        .route("/api/v1/catalog", get(control::pinned))
+        .route("/api/v1/jobs", get(control::jobs))
+        .route("/api/v1/jobs/{id}", get(control::job))
+        .route("/api/v1/jobs/{id}/events", get(control::job_events))
         .with_state(state)
 }

@@ -264,7 +264,12 @@ impl Metrics {
     }
 
     /// Read every counter at once.
-    pub fn snapshot(&self, queue: QueueSnapshot, model: Option<ModelSnapshot>) -> MetricsSnapshot {
+    pub fn snapshot(
+        &self,
+        queue: QueueSnapshot,
+        model: Option<ModelSnapshot>,
+        bands: BandSnapshot,
+    ) -> MetricsSnapshot {
         let mut requests = Vec::with_capacity(Endpoint::ALL.len() * Outcome::ALL.len());
         for endpoint in Endpoint::ALL {
             for outcome in Outcome::ALL {
@@ -299,6 +304,7 @@ impl Metrics {
             decode: self.decode.read(),
             queue,
             model,
+            bands,
         }
     }
 }
@@ -355,6 +361,20 @@ pub struct MetricsSnapshot {
     pub decode: TallySnapshot,
     pub queue: QueueSnapshot,
     pub model: Option<ModelSnapshot>,
+    /// The interactive band's ceilings as they stand right now.
+    ///
+    /// Derived from the context of the model that is loaded, so they change
+    /// when a model is swapped. Exposed because they are the scheduler's whole
+    /// policy: without them, "why did that request queue behind this one?" is
+    /// unanswerable from outside.
+    pub bands: BandSnapshot,
+}
+
+/// The ceilings that decide which band a request lands in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BandSnapshot {
+    pub interactive_prompt_tokens: u32,
+    pub interactive_output_tokens: u32,
 }
 
 impl MetricsSnapshot {
@@ -569,6 +589,23 @@ impl MetricsSnapshot {
                 model.n_ctx
             );
         }
+
+        header(
+            &mut out,
+            "hermes_band_ceiling_tokens",
+            "Largest prompt and stated output budget still counted as interactive.",
+            "gauge",
+        );
+        let _ = writeln!(
+            out,
+            "hermes_band_ceiling_tokens{{kind=\"prompt\"}} {}",
+            self.bands.interactive_prompt_tokens
+        );
+        let _ = writeln!(
+            out,
+            "hermes_band_ceiling_tokens{{kind=\"output\"}} {}",
+            self.bands.interactive_output_tokens
+        );
 
         out
     }

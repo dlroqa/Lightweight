@@ -13,13 +13,16 @@
 //! not exist.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hermes_backend_llamacpp::backend::ProcessBackend;
-use hermes_core::{Actionable, ModelId, RuntimeParams, units::Bytes};
-use hermes_gateway::catalog::{Catalog, ResidentModel};
+use hermes_catalog::CatalogStore;
+use hermes_catalog::install::Installer;
+use hermes_core::{Actionable, GgmlType, ModelId, RuntimeParams, units::Bytes};
+use hermes_gateway::catalog::ResidentModel;
+use hermes_gateway::manager::{ModelManager, RuntimeDefaults};
 use hermes_gateway::scheduler::{BandLimits, SchedulerConfig};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_gguf::{GgufFile, ModelMetadata};
@@ -31,7 +34,12 @@ use tokio_util::sync::CancellationToken;
 
 /// Everything `serve` needs.
 pub struct ServeOptions {
-    pub model: PathBuf,
+    /// The model to load at startup.
+    ///
+    /// Optional since M6: a gateway can start with nothing loaded and be told
+    /// what to load over the control API. `serve <model.gguf>` behaves exactly
+    /// as it always has.
+    pub model: Option<PathBuf>,
     /// `None` selects the largest context that loads safely here.
     pub n_ctx: Option<u32>,
     pub threads: Option<u32>,
@@ -109,192 +117,87 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         listeners.push(bind(*address).await?);
     }
 
-    let file = GgufFile::open(&options.model).map_err(describe)?;
-    let metadata = ModelMetadata::from_file(&file).map_err(describe)?;
-
-    let cache_type = options
+    // The engine is created whether or not a model is loaded now: it is what a
+    // later `/api/v1/models/{id}/load` will load into.
+    let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
+    let cpu = CpuInfo::detect();
+    let concurrency = options.concurrency.max(1);
+    let cache_type: GgmlType = options
         .kv_type
         .parse()
         .map_err(|_| format!("unknown KV cache type {:?}", options.kv_type))?;
-    let cpu = CpuInfo::detect();
-    let concurrency = options.concurrency.max(1);
-    let base = RuntimeParams {
-        cache_type_k: cache_type,
-        cache_type_v: cache_type,
-        threads: Some(options.threads.unwrap_or_else(|| cpu.default_threads())),
-        // The engine is told the same number the gateway will hand out, so the
-        // estimate, the KV cache and the queue all describe one machine.
-        n_parallel: concurrency,
-        ..RuntimeParams::default()
-    };
 
-    let estimator = Estimator::headless();
-    let snapshot = SystemMemoryProbe.snapshot().map_err(describe)?;
-
-    // Sizing the context to the machine rather than to a constant is what lets
-    // one build serve a small laptop and a large workstation well. A fixed
-    // default would either waste a big machine or refuse to load on a small one.
-    let (n_ctx, chosen_automatically) = match options.n_ctx {
-        Some(requested) => (requested, false),
-        None => (
-            estimator
-                .largest_safe_context(&metadata, base, snapshot, None)
-                .unwrap_or(base.n_ctx),
-            true,
+    let loaded = match &options.model {
+        Some(model) => Some(
+            load_at_startup(
+                &options,
+                model,
+                &backend,
+                LoadShape {
+                    cache_type,
+                    concurrency,
+                    cpu,
+                },
+            )
+            .await?,
         ),
+        None => {
+            println!("no model loaded — use `hermes models list` and the control API to load one");
+            None
+        }
     };
-    let params = base.with_context(n_ctx);
-
-    // Admission control. Section 19: never promise a model will run just
-    // because its weights fit.
-    let estimate = estimator.estimate(&metadata, params, snapshot);
-
-    println!(
-        "{}  {}  {}",
-        metadata.name.as_deref().unwrap_or(&metadata.architecture),
-        metadata.quantization_label(),
-        metadata.parameters_label().unwrap_or_default()
-    );
-    println!(
-        "  estimated {} (weights {} + KV {} + compute {} + overhead {})",
-        estimate.total, estimate.weights, estimate.kv_cache, estimate.compute, estimate.overhead
-    );
-    println!(
-        "  available {}   status {}",
-        estimate.budget,
-        estimate.verdict.label()
-    );
-    if chosen_automatically {
-        println!(
-            "  context {} tokens, chosen to fit this machine (model supports up to {})",
-            params.n_ctx,
-            metadata
-                .context_length
-                .map_or_else(|| "unknown".to_owned(), |max| max.to_string())
-        );
-    }
-
-    if estimate.verdict == Verdict::Insufficient {
-        for remedy in estimate.remedies() {
-            println!("  - {}", remedy.label);
-        }
-        if !options.force {
-            return Err(format!(
-                "refusing to load: short by {}. Pass --force to try anyway.",
-                estimate.shortfall()
-            ));
-        }
-        println!("  --force given: loading anyway, which may end in an OOM kill");
-    }
-
-    let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
-    let cancel = CancellationToken::new();
-    let (progress_tx, mut progress_rx) = mpsc::channel(32);
-
-    // Reported as it happens: acquiring the engine on a first run is a 16 MB
-    // download, and a large model load is tens of seconds. Silence for that
-    // long reads as a hang.
-    let reporter = tokio::spawn(async move {
-        // Only redraw when the whole percent changes. A 16 MB download arrives
-        // in thousands of chunks, and a line per chunk buries everything else.
-        let mut last_percent = u64::MAX;
-        while let Some(update) = progress_rx.recv().await {
-            match update {
-                LoadProgress::AcquiringRuntime { downloaded, total } => {
-                    // `checked_div` rather than a preceding `> 0` test: the
-                    // precondition stays part of the expression.
-                    if let Some(percent) = downloaded
-                        .saturating_mul(100)
-                        .checked_div(total.unwrap_or(0))
-                        && percent != last_percent
-                    {
-                        last_percent = percent;
-                        print!("\r  downloading engine {percent:>3}%");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                    }
-                }
-                LoadProgress::VerifyingRuntime => println!("\r  verifying engine       "),
-                LoadProgress::StartingEngine => println!("  starting engine"),
-                LoadProgress::LoadingWeights => println!("  loading weights"),
-                LoadProgress::Ready => println!("  ready"),
-            }
-        }
-    });
-
-    // Captured before the metadata is moved into the load request: the catalog
-    // reports what the model *is*, and the gateway answers `/v1/models` from
-    // that rather than by asking the engine, which only knows a file path.
-    let architecture = metadata.architecture.clone();
-    let param_count = metadata.param_count;
-    let quantization = Some(metadata.quantization_label());
-    let model_max_context_length = metadata.context_length;
-
-    let request = LoadRequest {
-        model: ModelId::with_context(
-            options
-                .model
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("model"),
-            params.n_ctx,
-        ),
-        gguf_path: options.model.clone(),
-        metadata: Arc::new(metadata),
-        runtime: params,
-    };
-
-    let started = std::time::Instant::now();
-    let loaded = backend
-        .load(request, progress_tx, cancel.clone())
-        .await
-        .map_err(describe)?;
-    let _ = reporter.await;
-
-    println!(
-        "\nloaded {} in {:.1}s  (engine variant {}, {} threads)",
-        loaded.model,
-        started.elapsed().as_secs_f64(),
-        cpu.expected_ggml_variant(),
-        loaded.effective.threads.unwrap_or(0)
-    );
-
-    if let Ok(Some(usage)) = backend.resource_usage().await {
-        println!("  engine resident {}  peak {}", usage.rss, usage.peak_rss);
-        report_estimate_accuracy(estimate.total, usage.peak_rss);
-    }
 
     let backend = Arc::new(backend);
-    let catalog = Arc::new(Catalog::with_resident(ResidentModel {
-        id: loaded.model.clone(),
-        instance: loaded.instance,
-        // The *effective* context, which is what every endpoint advertises. A
-        // client sizes its prompts to this number.
-        n_ctx: loaded.effective.n_ctx,
-        architecture,
-        param_count,
-        quantization,
-        model_max_context_length,
-        ram_verdict: Some(estimate.verdict.label().to_owned()),
-        backend: Some(backend.id().to_string()),
-        model_path: options.model.display().to_string(),
-    }));
+    let n_ctx = loaded.as_ref().map_or(0, |model| model.n_ctx);
+    let catalog = hermes_gateway::catalog::shared(loaded.clone());
 
-    let state = Arc::new(GatewayState::new(
-        Arc::clone(&backend) as Arc<dyn InferenceBackend>,
-        catalog,
-        GatewayConfig {
-            auth,
-            max_concurrent_requests: concurrency,
-            // Band ceilings from the context this model was actually loaded
-            // with, which was itself chosen from this machine's free memory. A
-            // constant here would describe whichever machine it was written on.
-            scheduler: SchedulerConfig {
-                interactive: BandLimits::for_context(loaded.effective.n_ctx),
-                ..SchedulerConfig::default()
+    // The catalog is opened whether or not a model was named, so
+    // `/api/v1/models` can answer and a model can be loaded later.
+    let manager = build_manager(&paths, cache_type, options.threads, concurrency)?;
+
+    let state = Arc::new(
+        GatewayState::new(
+            Arc::clone(&backend) as Arc<dyn InferenceBackend>,
+            catalog,
+            GatewayConfig {
+                auth,
+                max_concurrent_requests: concurrency,
+                // Band ceilings from the context this model was actually loaded
+                // with, which was itself chosen from this machine's free
+                // memory. A constant here would describe whichever machine it
+                // was written on. With nothing loaded the defaults stand until
+                // the first load re-derives them.
+                scheduler: SchedulerConfig {
+                    interactive: if n_ctx > 0 {
+                        BandLimits::for_context(n_ctx)
+                    } else {
+                        BandLimits::default()
+                    },
+                    ..SchedulerConfig::default()
+                },
+                ..GatewayConfig::default()
             },
-            ..GatewayConfig::default()
-        },
-    ));
+        )
+        .with_manager(Arc::clone(&manager)),
+    );
+
+    // Registering the model that was named on the command line happens after
+    // the gateway is built, not before it serves: hashing a multi-gigabyte file
+    // takes seconds, and none of them should be seconds where the gateway is
+    // not yet answering. A failure here costs a catalog entry, never the
+    // service.
+    if let Some(model) = options.model.clone() {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            if let Err(err) = manager.register_at_startup(model).await {
+                tracing::warn!(
+                    target: hermes_observability::targets::MODEL,
+                    error = %err,
+                    "the model served from the command line could not be added to the catalog"
+                );
+            }
+        });
+    }
 
     println!();
     for listener in &listeners {
@@ -305,8 +208,16 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             .map_err(|err| format!("could not read the bound address: {err}"))?;
         println!("serving  http://{bound}/v1");
     }
-    println!("  model    {}", loaded.model);
-    println!("  context  {} tokens", loaded.effective.n_ctx);
+    match &loaded {
+        Some(model) => {
+            println!("  model    {}", model.id);
+            println!("  context  {} tokens", model.n_ctx);
+        }
+        None => {
+            println!("  model    none loaded");
+            println!("  load one POST /api/v1/models/<id>/load");
+        }
+    }
     println!(
         "  requests {concurrency} at a time{}",
         if concurrency == 1 {
@@ -417,7 +328,217 @@ async fn watch_for_death(backend: &ProcessBackend) {
     }
 }
 
-fn describe<E: Actionable>(err: E) -> String {
+/// The machine-shaped parameters a startup load needs.
+#[derive(Clone, Debug)]
+struct LoadShape {
+    cache_type: GgmlType,
+    concurrency: u32,
+    cpu: CpuInfo,
+}
+
+/// Load the model named on the command line.
+///
+/// This is the M0-M5 startup path, unchanged in what it does: read the header,
+/// size the context to the machine, admit against free memory, load, and report
+/// what it cost. It is a function now only so that `serve` can skip it when no
+/// model was named.
+async fn load_at_startup(
+    options: &ServeOptions,
+    model_path: &Path,
+    backend: &ProcessBackend,
+    shape: LoadShape,
+) -> Result<ResidentModel, String> {
+    let file = GgufFile::open(model_path).map_err(describe)?;
+    let metadata = ModelMetadata::from_file(&file).map_err(describe)?;
+
+    let base = RuntimeParams {
+        cache_type_k: shape.cache_type,
+        cache_type_v: shape.cache_type,
+        threads: Some(
+            options
+                .threads
+                .unwrap_or_else(|| shape.cpu.default_threads()),
+        ),
+        // The engine is told the same number the gateway will hand out, so the
+        // estimate, the KV cache and the queue all describe one machine.
+        n_parallel: shape.concurrency,
+        ..RuntimeParams::default()
+    };
+
+    let estimator = Estimator::headless();
+    let snapshot = SystemMemoryProbe.snapshot().map_err(describe)?;
+
+    // Sizing the context to the machine rather than to a constant is what lets
+    // one build serve a small laptop and a large workstation well. A fixed
+    // default would either waste a big machine or refuse to load on a small one.
+    let (n_ctx, chosen_automatically) = match options.n_ctx {
+        Some(requested) => (requested, false),
+        None => (
+            estimator
+                .largest_safe_context(&metadata, base, snapshot, None)
+                .unwrap_or(base.n_ctx),
+            true,
+        ),
+    };
+    let params = base.with_context(n_ctx);
+
+    // Admission control. Section 19: never promise a model will run just
+    // because its weights fit.
+    let estimate = estimator.estimate(&metadata, params, snapshot);
+
+    println!(
+        "{}  {}  {}",
+        metadata.name.as_deref().unwrap_or(&metadata.architecture),
+        metadata.quantization_label(),
+        metadata.parameters_label().unwrap_or_default()
+    );
+    println!(
+        "  estimated {} (weights {} + KV {} + compute {} + overhead {})",
+        estimate.total, estimate.weights, estimate.kv_cache, estimate.compute, estimate.overhead
+    );
+    println!(
+        "  available {}   status {}",
+        estimate.budget,
+        estimate.verdict.label()
+    );
+    if chosen_automatically {
+        println!(
+            "  context {} tokens, chosen to fit this machine (model supports up to {})",
+            params.n_ctx,
+            metadata
+                .context_length
+                .map_or_else(|| "unknown".to_owned(), |max| max.to_string())
+        );
+    }
+
+    if estimate.verdict == Verdict::Insufficient {
+        for remedy in estimate.remedies() {
+            println!("  - {}", remedy.label);
+        }
+        if !options.force {
+            return Err(format!(
+                "refusing to load: short by {}. Pass --force to try anyway.",
+                estimate.shortfall()
+            ));
+        }
+        println!("  --force given: loading anyway, which may end in an OOM kill");
+    }
+
+    let cancel = CancellationToken::new();
+    let (progress_tx, mut progress_rx) = mpsc::channel(32);
+
+    // Reported as it happens: acquiring the engine on a first run is a 16 MB
+    // download, and a large model load is tens of seconds. Silence for that
+    // long reads as a hang.
+    let reporter = tokio::spawn(async move {
+        // Only redraw when the whole percent changes. A 16 MB download arrives
+        // in thousands of chunks, and a line per chunk buries everything else.
+        let mut last_percent = u64::MAX;
+        while let Some(update) = progress_rx.recv().await {
+            match update {
+                LoadProgress::AcquiringRuntime { downloaded, total } => {
+                    // `checked_div` rather than a preceding `> 0` test: the
+                    // precondition stays part of the expression.
+                    if let Some(percent) = downloaded
+                        .saturating_mul(100)
+                        .checked_div(total.unwrap_or(0))
+                        && percent != last_percent
+                    {
+                        last_percent = percent;
+                        print!("\r  downloading engine {percent:>3}%");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                }
+                LoadProgress::VerifyingRuntime => println!("\r  verifying engine       "),
+                LoadProgress::StartingEngine => println!("  starting engine"),
+                LoadProgress::LoadingWeights => println!("  loading weights"),
+                LoadProgress::Ready => println!("  ready"),
+            }
+        }
+    });
+
+    // Captured before the metadata is moved into the load request: the catalog
+    // reports what the model *is*, and the gateway answers `/v1/models` from
+    // that rather than by asking the engine, which only knows a file path.
+    let architecture = metadata.architecture.clone();
+    let param_count = metadata.param_count;
+    let quantization = Some(metadata.quantization_label());
+    let model_max_context_length = metadata.context_length;
+
+    let request = LoadRequest {
+        model: ModelId::with_context(
+            model_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model"),
+            params.n_ctx,
+        ),
+        gguf_path: model_path.to_path_buf(),
+        metadata: Arc::new(metadata),
+        runtime: params,
+    };
+
+    let started = std::time::Instant::now();
+    let loaded = backend
+        .load(request, progress_tx, cancel.clone())
+        .await
+        .map_err(describe)?;
+    let _ = reporter.await;
+
+    println!(
+        "\nloaded {} in {:.1}s  (engine variant {}, {} threads)",
+        loaded.model,
+        started.elapsed().as_secs_f64(),
+        shape.cpu.expected_ggml_variant(),
+        loaded.effective.threads.unwrap_or(0)
+    );
+
+    if let Ok(Some(usage)) = backend.resource_usage().await {
+        println!("  engine resident {}  peak {}", usage.rss, usage.peak_rss);
+        report_estimate_accuracy(estimate.total, usage.peak_rss);
+    }
+
+    Ok(ResidentModel {
+        id: loaded.model.clone(),
+        instance: loaded.instance,
+        // The *effective* context, which is what every endpoint advertises. A
+        // client sizes its prompts to this number.
+        n_ctx: loaded.effective.n_ctx,
+        architecture,
+        param_count,
+        quantization,
+        model_max_context_length,
+        ram_verdict: Some(estimate.verdict.label().to_owned()),
+        backend: Some(hermes_backend_llamacpp::backend::BACKEND_ID.to_string()),
+        model_path: model_path.display().to_string(),
+    })
+}
+
+/// Open the catalog and the installer for this profile.
+fn build_manager(
+    paths: &DataPaths,
+    kv_type: GgmlType,
+    threads: Option<u32>,
+    concurrency: u32,
+) -> Result<Arc<ModelManager>, String> {
+    let store = CatalogStore::open(paths.catalog_file()).map_err(describe)?;
+    let installer = Installer::new(paths.models_dir(), paths.downloads_dir()).map_err(describe)?;
+    Ok(Arc::new(ModelManager::new(
+        store,
+        installer,
+        RuntimeDefaults {
+            kv_type,
+            threads,
+            concurrency,
+        },
+    )))
+}
+
+/// Render an error with its remedies, the way every command reports one.
+///
+/// `pub(crate)` so `hermes models` reports catalog errors identically; the
+/// body is unchanged.
+pub(crate) fn describe<E: Actionable>(err: E) -> String {
     let mut out = err.to_string();
     let remedies = err.remedies();
     if !remedies.is_empty() {

@@ -626,6 +626,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hermes-core",
+ "hermes-download",
  "hermes-gguf",
  "hermes-inference",
  "hermes-memory",
@@ -661,6 +662,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-catalog"
+version = "0.1.0"
+dependencies = [
+ "hermes-core",
+ "hermes-download",
+ "hermes-gguf",
+ "hermes-observability",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hermes-cli"
 version = "0.1.0"
 dependencies = [
@@ -668,6 +688,7 @@ dependencies = [
  "clap",
  "hermes-api",
  "hermes-backend-llamacpp",
+ "hermes-catalog",
  "hermes-core",
  "hermes-gateway",
  "hermes-gguf",
@@ -692,6 +713,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-download"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hermes-core",
+ "hex",
+ "reqwest",
+ "rustls",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "hermes-gateway"
 version = "0.1.0"
 dependencies = [
@@ -700,9 +736,13 @@ dependencies = [
  "getrandom 0.4.3",
  "hermes-api",
  "hermes-backend-mock",
+ "hermes-catalog",
  "hermes-core",
+ "hermes-gguf",
  "hermes-inference",
+ "hermes-memory",
  "hermes-observability",
+ "hermes-system-info",
  "reqwest",
  "rustls",
  "serde",

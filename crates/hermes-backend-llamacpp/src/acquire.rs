@@ -6,18 +6,21 @@
 //! anything is extracted**, not after it has already run.
 //!
 //! Downloads resume. For a 16 MB engine that is a convenience; the same code
-//! path serves multi-gigabyte model downloads later, where it is not. Resuming
+//! path serves multi-gigabyte model downloads, where it is not. Resuming
 //! re-hashes the bytes already on disk rather than trusting them, because a
 //! partial file left behind by a previous run has no provenance at all.
+//!
+//! That transfer now lives in [`hermes_download`], because the model catalog
+//! needs exactly the same guarantees and two copies of an integrity check
+//! diverge. What stays here is what is specific to an *engine*: which artifact
+//! this platform needs, unpacking an archive whose entries are
+//! attacker-controlled, and marking the result executable.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use futures_util::StreamExt;
+use hermes_download::{DownloadError, Fetch};
 use hermes_inference::{BackendError, LoadProgress};
 use hermes_observability::targets;
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -42,13 +45,8 @@ impl RuntimeInstaller {
     /// directory: a verified, re-downloadable artifact, so losing it costs a
     /// download and nothing else.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        crate::tls::ensure_provider();
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("hermes-gateway/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|err| BackendError::RuntimeDownloadFailed {
-                reason: format!("could not create an HTTP client: {err}"),
-            })?;
+        let client = hermes_download::client(concat!("hermes-gateway/", env!("CARGO_PKG_VERSION")))
+            .map_err(as_backend_error)?;
         Ok(Self {
             root: root.into(),
             client,
@@ -136,6 +134,10 @@ impl RuntimeInstaller {
     }
 
     /// Download the artifact, resuming a previous attempt when one is present.
+    ///
+    /// The transfer itself is [`hermes_download::fetch`]; what is added here is
+    /// the engine's vocabulary — its digest, its size, and errors a caller of
+    /// this crate can act on.
     async fn download(
         &self,
         artifact: &RuntimeArtifact,
@@ -143,131 +145,53 @@ impl RuntimeInstaller {
         progress: &mpsc::Sender<LoadProgress>,
         cancel: &CancellationToken,
     ) -> Result<(), BackendError> {
-        if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|err| map_io("creating the engine directory", err))?;
-        }
+        // Never `send().await`. Progress is advisory: if nobody is draining it,
+        // or the channel is momentarily full, dropping an update is correct and
+        // blocking the download is not.
+        let sink = move |downloaded: u64, total: Option<u64>| {
+            let _ = progress.try_send(LoadProgress::AcquiringRuntime { downloaded, total });
+        };
 
-        let partial = destination.with_extension("part");
-        // Re-hash whatever is already on disk rather than trusting it: a
-        // partial file from an earlier run carries no guarantee at all. Also
-        // blocking work, so it leaves the executor too.
-        let rehash_path = partial.clone();
-        let (mut hasher, resume_from) =
-            tokio::task::spawn_blocking(move || rehash_partial(&rehash_path))
-                .await
-                .map_err(|err| BackendError::RuntimeDownloadFailed {
-                    reason: format!("the hashing task failed: {err}"),
-                })??;
-
-        let mut request = self.client.get(artifact.url());
-        if resume_from > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|err| BackendError::RuntimeDownloadFailed {
-                reason: err.to_string(),
-            })?;
-
-        // A server that ignores the range header answers 200 with the whole
-        // file. Appending that to our prefix would corrupt it, so start over.
-        let restart = resume_from > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT;
-        if restart {
-            hasher = Sha256::new();
-        }
-        let mut written = if restart { 0 } else { resume_from };
-
-        if !response.status().is_success() {
-            return Err(BackendError::RuntimeDownloadFailed {
-                reason: format!("{} returned HTTP {}", artifact.url(), response.status()),
-            });
-        }
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(!restart && resume_from > 0)
-            .truncate(restart || resume_from == 0)
-            .open(&partial)
-            .await
-            .map_err(|err| map_io("opening the download file", err))?;
-
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            if cancel.is_cancelled() {
-                // The partial file is left in place on purpose: the next
-                // attempt resumes from it.
-                return Err(BackendError::Cancelled);
-            }
-            let chunk = chunk.map_err(|err| BackendError::RuntimeDownloadFailed {
-                reason: err.to_string(),
-            })?;
-            file.write_all(&chunk)
-                .await
-                .map_err(|err| map_io("writing the download", err))?;
-            // Hashed as it arrives, so verification costs no second pass over
-            // the file.
-            hasher.update(&chunk);
-            written = written.saturating_add(chunk.len() as u64);
-
-            // Never `send().await` here. Progress is advisory: if nobody is
-            // draining it, or the channel is momentarily full, dropping an
-            // update is correct and blocking the download is not.
-            let _ = progress.try_send(LoadProgress::AcquiringRuntime {
-                downloaded: written,
-                total: Some(artifact.size),
-            });
-        }
-        file.flush()
-            .await
-            .map_err(|err| map_io("flushing the download", err))?;
-        drop(file);
-
-        let actual = hex::encode(hasher.finalize());
-        if actual != artifact.sha256 {
-            // Never leave a file that failed verification where a later run
-            // could resume from it and inherit the corruption.
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(BackendError::RuntimeCorrupt {
-                expected: artifact.sha256.to_owned(),
-                actual,
-            });
-        }
-
-        tokio::fs::rename(&partial, destination)
-            .await
-            .map_err(|err| map_io("finalising the download", err))?;
+        hermes_download::fetch(
+            &self.client,
+            Fetch {
+                url: &artifact.url(),
+                destination,
+                expected_sha256: Some(artifact.sha256),
+                total_size: Some(artifact.size),
+                what: "the inference engine",
+            },
+            &sink,
+            cancel,
+        )
+        .await
+        .map_err(as_backend_error)?;
         Ok(())
     }
 }
 
-/// Hash an existing partial download and report how many bytes it holds.
-fn rehash_partial(partial: &Path) -> Result<(Sha256, u64), BackendError> {
-    let mut hasher = Sha256::new();
-    let Ok(mut file) = std::fs::File::open(partial) else {
-        return Ok((hasher, 0));
-    };
-
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| map_io("reading the partial download", err))?;
-        if read == 0 {
-            break;
+/// Report a download failure in this crate's own vocabulary.
+///
+/// The engine is not "a file": a caller recovering from `RuntimeCorrupt` has to
+/// know it was the *engine* that failed verification, and section 27's taxonomy
+/// names it that way.
+fn as_backend_error(err: DownloadError) -> BackendError {
+    match err {
+        DownloadError::Corrupt { expected, actual } => {
+            BackendError::RuntimeCorrupt { expected, actual }
         }
-        match buffer.get(..read) {
-            Some(slice) => hasher.update(slice),
-            None => break,
+        DownloadError::LowDisk { needed, .. } => BackendError::LowDisk {
+            needed,
+            available: 0,
+        },
+        DownloadError::Io { context, source } => BackendError::io(context, source),
+        DownloadError::Cancelled => BackendError::Cancelled,
+        other @ (DownloadError::Failed { .. } | DownloadError::InsecureUrl { .. }) => {
+            BackendError::RuntimeDownloadFailed {
+                reason: other.to_string(),
+            }
         }
-        total = total.saturating_add(read as u64);
     }
-    Ok((hasher, total))
 }
 
 /// Unpack an archive into `install_dir`.
@@ -588,47 +512,8 @@ mod tests {
         assert_eq!(safe_join(Path::new("/install"), Path::new(".")), None);
     }
 
-    // ---- resuming a partial download ----
-
-    #[test]
-    fn a_missing_partial_file_starts_from_zero() {
-        let temp = TempDir::new("nopart");
-        let (_, resume) = rehash_partial(&temp.0.join("absent.part")).expect("no error");
-        assert_eq!(resume, 0);
-    }
-
-    #[test]
-    fn an_existing_partial_is_rehashed_rather_than_trusted() {
-        // A partial file left by an earlier run has no provenance. Re-hashing
-        // it is what lets the final digest check still mean something.
-        let temp = TempDir::new("part");
-        let path = temp.0.join("archive.part");
-        std::fs::write(&path, b"hello world").expect("write");
-
-        let (hasher, resume) = rehash_partial(&path).expect("hash");
-        assert_eq!(resume, 11);
-
-        // The digest must match hashing the same bytes in one go.
-        let expected = hex::encode(Sha256::digest(b"hello world"));
-        assert_eq!(hex::encode(hasher.finalize()), expected);
-    }
-
-    #[test]
-    fn rehashing_spans_more_than_one_buffer() {
-        // The read loop is chunked; a file larger than the buffer would expose
-        // an off-by-one in how chunks are fed to the hasher.
-        let temp = TempDir::new("bigpart");
-        let path = temp.0.join("archive.part");
-        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        std::fs::write(&path, &payload).expect("write");
-
-        let (hasher, resume) = rehash_partial(&path).expect("hash");
-        assert_eq!(resume, payload.len() as u64);
-        assert_eq!(
-            hex::encode(hasher.finalize()),
-            hex::encode(Sha256::digest(&payload))
-        );
-    }
+    // Resuming a partial download is exercised in `hermes-download`, which
+    // owns that code now.
 
     // ---- extraction ----
 

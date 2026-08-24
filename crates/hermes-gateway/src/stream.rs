@@ -671,7 +671,7 @@ mod tests {
         }
         drop(body);
 
-        let snapshot = metrics.snapshot(Default::default(), None);
+        let snapshot = metrics.snapshot(Default::default(), None, Default::default());
         assert_eq!(
             snapshot.tokens.decoded, 20,
             "the last timing is the one that counts"

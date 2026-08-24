@@ -67,6 +67,15 @@ pub struct GatewayState {
     /// Shared rather than owned: a request's guard keeps a handle so that it
     /// can report from its own `Drop`, which outlives the handler.
     metrics: Arc<Metrics>,
+    /// The catalog and the operations that change it.
+    ///
+    /// Optional because a gateway can be built without one — the contract
+    /// suite and every existing test do exactly that, and a mock backend has
+    /// no models to manage. When it is absent the control API reports that
+    /// rather than pretending to have an empty catalog.
+    manager: Option<Arc<crate::manager::ModelManager>>,
+    /// Long operations, watched rather than waited for.
+    jobs: Arc<crate::jobs::Jobs>,
     /// Cancelled when the gateway shuts down.
     ///
     /// The root of the cancellation tree: shutdown cancels every job, and each
@@ -100,8 +109,29 @@ impl GatewayState {
             config,
             scheduler,
             metrics: Arc::new(Metrics::new()),
+            manager: None,
+            jobs: Arc::new(crate::jobs::Jobs::new()),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Attach a model manager, enabling the control API.
+    ///
+    /// Additive rather than a new constructor: every existing caller builds a
+    /// state without one and keeps working unchanged.
+    #[must_use]
+    pub fn with_manager(mut self, manager: Arc<crate::manager::ModelManager>) -> Self {
+        self.manager = Some(manager);
+        self
+    }
+
+    /// The model manager, when this gateway has one.
+    pub fn manager(&self) -> Option<&Arc<crate::manager::ModelManager>> {
+        self.manager.as_ref()
+    }
+
+    pub fn jobs(&self) -> &Arc<crate::jobs::Jobs> {
+        &self.jobs
     }
 
     /// The counters, for the handlers that record into them.
@@ -119,7 +149,15 @@ impl GatewayState {
             id: model.id.to_string(),
             n_ctx: model.n_ctx,
         });
-        self.metrics.snapshot(self.scheduler.snapshot(), model)
+        let limits = self.scheduler.band_limits();
+        self.metrics.snapshot(
+            self.scheduler.snapshot(),
+            model,
+            crate::metrics::BandSnapshot {
+                interactive_prompt_tokens: limits.prompt_tokens,
+                interactive_output_tokens: limits.output_tokens,
+            },
+        )
     }
 
     /// A permit to run one request, waited for up to the queue timeout.

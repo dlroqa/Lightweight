@@ -18,6 +18,7 @@ path = "src/bin/hermes-fake-engine.rs"
 hermes-core.workspace = true
 hermes-gguf.workspace = true
 hermes-inference.workspace = true
+hermes-download.workspace = true
 hermes-system-info.workspace = true
 hermes-observability.workspace = true
 thiserror.workspace = true

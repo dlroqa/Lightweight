@@ -15,6 +15,10 @@ mock = ["dep:hermes-backend-mock"]
 hermes-core.workspace = true
 hermes-api.workspace = true
 hermes-inference.workspace = true
+hermes-catalog.workspace = true
+hermes-memory.workspace = true
+hermes-system-info.workspace = true
+hermes-gguf.workspace = true
 hermes-observability.workspace = true
 hermes-backend-mock = { workspace = true, optional = true }
 axum.workspace = true

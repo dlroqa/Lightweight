@@ -349,7 +349,9 @@ async fn serve_completions(
     let band = Band::classify(
         largest_prompt,
         request.max_tokens,
-        state.config.scheduler.interactive,
+        // Live rather than configured: a model swap re-derives these from the
+        // context the new model is actually loaded with.
+        state.scheduler().band_limits(),
     );
     let cancel = state.job_token();
     let waiting_since = std::time::Instant::now();
@@ -486,7 +488,9 @@ async fn serve_chat(
     let band = Band::classify(
         prompt_tokens,
         request.requested_max_tokens(),
-        state.config.scheduler.interactive,
+        // Live rather than configured: a model swap re-derives these from the
+        // context the new model is actually loaded with.
+        state.scheduler().band_limits(),
     );
     let cancel = state.job_token();
     let builder = ChunkBuilder::new(completion_id(), model.id.to_string());
@@ -762,7 +766,7 @@ fn is_authorized(state: &GatewayState, headers: &HeaderMap) -> bool {
 /// Check the request's credentials, if any are required.
 ///
 /// Returns the refusal to send, or `None` when the request may proceed.
-fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());

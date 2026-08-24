@@ -28,11 +28,11 @@
 //! is wait for every turn queued ahead of it.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
 
 /// How much work a request is allowed to be and still count as interactive.
@@ -228,6 +228,12 @@ struct Inner {
     running: usize,
     waiting: VecDeque<Waiter>,
     next_id: u64,
+    /// While paused, no new request starts.
+    ///
+    /// Requests still *queue* — a client that arrives during a model swap is
+    /// told it is waiting, exactly as it would be behind a long generation,
+    /// rather than being refused for something that will be over in seconds.
+    paused: bool,
 }
 
 /// Admission control for the engine's slots.
@@ -235,8 +241,20 @@ struct Inner {
 pub struct Scheduler {
     capacity: usize,
     config: SchedulerConfig,
+    /// The interactive ceilings, live.
+    ///
+    /// Separate from `config` because they change when a different model is
+    /// loaded: the ceilings are derived from the context the engine is actually
+    /// running, and a swapped-in model with a different window must not be
+    /// judged by the previous one's numbers. Atomics rather than a lock so that
+    /// reading them on the request path costs nothing and cannot deadlock
+    /// against the queue lock.
+    interactive_prompt_tokens: AtomicU32,
+    interactive_output_tokens: AtomicU32,
     inner: Mutex<Inner>,
     counters: Counters,
+    /// Signalled when the last running request finishes.
+    drained: Notify,
 }
 
 impl Scheduler {
@@ -244,13 +262,78 @@ impl Scheduler {
         Arc::new(Self {
             capacity: (capacity.max(1)) as usize,
             config,
+            interactive_prompt_tokens: AtomicU32::new(config.interactive.prompt_tokens),
+            interactive_output_tokens: AtomicU32::new(config.interactive.output_tokens),
             inner: Mutex::new(Inner::default()),
             counters: Counters::default(),
+            drained: Notify::new(),
         })
     }
 
     pub fn config(&self) -> SchedulerConfig {
         self.config
+    }
+
+    /// The ceilings a request is classified against right now.
+    pub fn band_limits(&self) -> BandLimits {
+        BandLimits {
+            prompt_tokens: self.interactive_prompt_tokens.load(Ordering::Relaxed),
+            output_tokens: self.interactive_output_tokens.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Re-derive the ceilings for a newly loaded model.
+    ///
+    /// Called on every successful load. Skipping it would serve a new model
+    /// under the previous model's ceilings — which is the failure M5 paid to
+    /// find, in a new place: limits that are correct by construction and wrong
+    /// for the context actually being served.
+    pub fn set_band_limits(&self, limits: BandLimits) {
+        self.interactive_prompt_tokens
+            .store(limits.prompt_tokens, Ordering::Relaxed);
+        self.interactive_output_tokens
+            .store(limits.output_tokens, Ordering::Relaxed);
+    }
+
+    /// Stop admitting requests until the returned guard is dropped.
+    ///
+    /// What a model swap needs: nothing new starts, what is already running is
+    /// left to finish, and the queue keeps its order so that whoever was next
+    /// is still next afterwards. Nothing is preempted — that remains true, and
+    /// cannot change until the engine can pause a generation.
+    pub fn pause(self: &Arc<Self>) -> PauseGuard {
+        self.lock().paused = true;
+        PauseGuard {
+            scheduler: Arc::clone(self),
+        }
+    }
+
+    /// Wait until nothing is running, for at most `timeout`.
+    ///
+    /// Returns whether the engine actually went idle. A caller that gets
+    /// `false` has a generation still in flight and must decide what to do
+    /// about it rather than swapping the model out from under it.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.lock().running == 0 {
+                return true;
+            }
+            // Armed before the second check so a release that lands between the
+            // two is not a lost wakeup.
+            let waiting = self.drained.notified();
+            if self.lock().running == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, waiting).await.is_err() {
+                return self.lock().running == 0;
+            }
+        }
+    }
+
+    /// Whether new requests are currently being held.
+    pub fn is_paused(&self) -> bool {
+        self.lock().paused
     }
 
     /// Lock the queue, tolerating a poisoned mutex.
@@ -271,7 +354,7 @@ impl Scheduler {
     /// of this module.
     pub fn try_admit(self: &Arc<Self>) -> Option<SlotPermit> {
         let mut inner = self.lock();
-        if inner.running < self.capacity && inner.waiting.is_empty() {
+        if !inner.paused && inner.running < self.capacity && inner.waiting.is_empty() {
             inner.running += 1;
             self.counters
                 .admitted_immediately
@@ -367,6 +450,17 @@ impl Scheduler {
     fn release(&self) {
         let mut inner = self.lock();
         inner.running = inner.running.saturating_sub(1);
+        if inner.running == 0 {
+            // Tell a swap that the engine is now idle. Notifying under the lock
+            // is deliberate: the waiter re-checks `running` after being woken,
+            // so it cannot observe a stale zero.
+            self.drained.notify_waiters();
+        }
+        if inner.paused {
+            // The freed slot stays free. Whoever is queued keeps their place
+            // and is granted it when the pause lifts.
+            return;
+        }
         let now = Instant::now();
         // A grant whose receiver has already gone (a client that disconnected
         // in the microseconds between being picked and being told) must not
@@ -413,6 +507,27 @@ impl Scheduler {
         inner.waiting.remove(index)
     }
 
+    /// Start admitting again, and hand out every slot that is now free.
+    ///
+    /// Up to `capacity` grants rather than one, because a pause can end with
+    /// several slots idle and several requests queued; `release` only ever
+    /// frees one.
+    fn resume(&self) {
+        let mut inner = self.lock();
+        inner.paused = false;
+        let now = Instant::now();
+        while inner.running < self.capacity {
+            let Some(waiter) = self.take_next(&mut inner, now) else {
+                break;
+            };
+            if waiter.grant.send(()).is_ok() {
+                inner.running += 1;
+            } else {
+                self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Drop a waiter that gave up, and say whether it had already been granted.
     fn withdraw(&self, id: u64) -> bool {
         let mut inner = self.lock();
@@ -422,6 +537,23 @@ impl Scheduler {
             return true;
         }
         false
+    }
+}
+
+/// Holds the scheduler paused for as long as it lives.
+///
+/// A guard rather than a pair of calls so that a swap which fails half way —
+/// an engine that will not start, a load that is refused for memory — cannot
+/// leave the gateway permanently refusing to admit anything. The `?` that
+/// returns early drops this, and admission comes back.
+#[derive(Debug)]
+pub struct PauseGuard {
+    scheduler: Arc<Scheduler>,
+}
+
+impl Drop for PauseGuard {
+    fn drop(&mut self) {
+        self.scheduler.resume();
     }
 }
 
@@ -822,5 +954,131 @@ mod tests {
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.wait_ms_max, 3000);
         assert_eq!(snapshot.wait_ms_total, 3000);
+    }
+
+    // ---- pausing for a model swap ----
+
+    #[tokio::test]
+    async fn a_paused_scheduler_admits_nothing_new() {
+        let scheduler = Scheduler::new(1, SchedulerConfig::default());
+        let guard = scheduler.pause();
+
+        assert!(scheduler.is_paused());
+        assert!(
+            scheduler.try_admit().is_none(),
+            "a request started during a swap"
+        );
+
+        drop(guard);
+        assert!(!scheduler.is_paused());
+        assert!(scheduler.try_admit().is_some(), "admission never came back");
+    }
+
+    #[tokio::test]
+    async fn a_pause_waits_for_what_is_already_running_rather_than_stopping_it() {
+        // Nothing is preempted. The generation in flight when a swap is asked
+        // for runs to its end, and the swap waits.
+        let scheduler = Scheduler::new(1, SchedulerConfig::default());
+        let permit = scheduler.try_admit().expect("permit");
+        let _guard = scheduler.pause();
+
+        assert!(
+            !scheduler.drain(Duration::from_millis(50)).await,
+            "drain claimed the engine was idle while a request was running"
+        );
+
+        drop(permit);
+        assert!(
+            scheduler.drain(Duration::from_millis(500)).await,
+            "drain did not notice the request finishing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_arrives_during_a_swap_queues_and_then_runs() {
+        // The behaviour a client sees: not a refusal, a wait. And its place in
+        // the queue survives the swap.
+        let scheduler = Scheduler::new(1, SchedulerConfig::default());
+        let guard = scheduler.pause();
+
+        let mut first = scheduler.enqueue(Band::Bulk);
+        let mut second = scheduler.enqueue(Band::Bulk);
+        assert_eq!(scheduler.snapshot().waiting, 2);
+        assert_eq!(scheduler.snapshot().running, 0);
+
+        drop(guard);
+
+        let granted = first.granted().await.expect("the first waiter runs");
+        assert_eq!(scheduler.snapshot().running, 1);
+        // One slot, so the second is still waiting - in the order it arrived.
+        assert_eq!(scheduler.snapshot().waiting, 1);
+        drop(granted);
+        assert!(second.granted().await.is_some(), "the second never ran");
+    }
+
+    #[tokio::test]
+    async fn lifting_a_pause_fills_every_free_slot_not_just_one() {
+        // `release` frees one slot and grants one. A pause can end with the
+        // whole engine idle and several requests queued, so resuming has to
+        // hand out up to capacity.
+        let scheduler = Scheduler::new(3, SchedulerConfig::default());
+        let guard = scheduler.pause();
+        let mut waiters: Vec<_> = (0..3).map(|_| scheduler.enqueue(Band::Bulk)).collect();
+        drop(guard);
+
+        // The permits are held, not dropped: dropping one releases its slot
+        // immediately and the count would read zero for the wrong reason.
+        let mut permits = Vec::new();
+        for waiter in &mut waiters {
+            permits.push(
+                waiter
+                    .granted()
+                    .await
+                    .expect("a queued request was left waiting on an idle engine"),
+            );
+        }
+        assert_eq!(scheduler.snapshot().running, 3);
+        assert_eq!(permits.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_swap_cannot_leave_the_gateway_paused_forever() {
+        // The guard exists for exactly this: an early return anywhere in a load
+        // must not strand admission.
+        let scheduler = Scheduler::new(1, SchedulerConfig::default());
+
+        fn swap_that_fails(scheduler: &Arc<Scheduler>) -> Result<(), &'static str> {
+            let _guard = scheduler.pause();
+            Err("the engine would not start")
+        }
+
+        assert!(swap_that_fails(&scheduler).is_err());
+        assert!(!scheduler.is_paused());
+        assert!(scheduler.try_admit().is_some());
+    }
+
+    #[test]
+    fn band_ceilings_follow_the_model_that_is_actually_loaded() {
+        // A swap to a model with a different context must re-derive these. The
+        // scheduler starts from its configured limits and takes new ones.
+        let scheduler = Scheduler::new(1, SchedulerConfig::default());
+        assert_eq!(scheduler.band_limits(), BandLimits::default());
+
+        scheduler.set_band_limits(BandLimits::for_context(2048));
+        assert_eq!(scheduler.band_limits(), BandLimits::for_context(2048));
+        // And the seeded value is genuinely different, so this test can fail.
+        assert_ne!(BandLimits::for_context(2048), BandLimits::default());
+    }
+
+    #[test]
+    fn a_scheduler_starts_from_the_limits_it_was_configured_with() {
+        let scheduler = Scheduler::new(
+            1,
+            SchedulerConfig {
+                interactive: BandLimits::for_context(32768),
+                ..SchedulerConfig::default()
+            },
+        );
+        assert_eq!(scheduler.band_limits(), BandLimits::for_context(32768));
     }
 }

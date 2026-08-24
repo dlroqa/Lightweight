@@ -20,7 +20,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
-| M6 | next | model manager, Electron shell + SPA |
+| **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
+| M6b | next | Electron shell + SPA on the control API |
 
 ## Verified by execution, not only by unit tests
 
@@ -274,14 +275,87 @@ M5, verified against a real engine (`b10590`) running SmolLM2-135M at a
   prompt, no completion, no `/mock/model.gguf`, no model path. The model *id*
   appears, because `/v1/models` already advertises it.
 
+M6a, the model manager, verified against a real engine and the real network on
+2026-08-23:
+
+- **A model downloads and verifies against a digest recorded beforehand.**
+  SmolLM2-135M Q4_K_M, 100.6 MiB in 5.1 s (19.8 MiB/s), sha256 matching the
+  manifest entry that `scripts/record-model-digests.sh` read from HuggingFace's
+  tree API. Cancelled at **62,251,949 bytes** and re-run, the transfer resumed
+  and the completed file still verified — the resume path the engine installer
+  has had since M2, now proven on something large enough for it to matter.
+- **A digest that does not match is refused and the bytes are discarded**, with
+  nothing left where a later resume could inherit it. A link that returns a
+  valid file which is not a GGUF (`huggingface.co/robots.txt`) is deleted and
+  reported rather than registered as a model.
+- **How much was promised about a file is recorded per model, and never rounded
+  up.** A pinned entry is `verified (pinned digest)`; the *same file* fetched by
+  pasting its HuggingFace link is `verified (published digest)`, read from the
+  LFS metadata; a link elsewhere with no digest is `recorded, not verified` in
+  those words. An import is `imported from this machine` and checks nothing,
+  because there is nothing to check it against.
+- **An import references the file where it is.** A 1.19 GiB Qwen3 was hashed in
+  place in about 4 s and registered; nothing was copied, and removing it from
+  the catalog left the user's file alone. Importing the same file twice returns
+  the model already installed rather than a second entry, matched by digest.
+- **The gateway starts with no model and is told what to load.**
+  `/v1/chat/completions` answers 503 `no_model_loaded`,
+  `POST /api/v1/models/{id}/load` returns a job, and the job's SSE stream
+  reports `starting_engine → loading_weights → ready → succeeded → [DONE]`.
+- **A hot swap works and re-derives the band ceilings.** smollm2@2k → qwen3@8k
+  on a serving gateway took **25 s**, `/v1/models` and `/props` both moved to
+  the new context, and `hermes_band_ceiling_tokens` went 512/128 → 1024/256.
+  Inherited ceilings would have been the M5 bug in a new place, so they are now
+  exposed in `/metrics` rather than being invisible policy.
+- **Nothing is preempted, and the swap waits.** A 160-token generation was
+  running when a load was requested three seconds in. It finished with **all
+  160 completion tokens** and `finish_reason: length` — not truncated, not
+  aborted — and the swap completed **one second after it**, having waited about
+  116 s. A request arriving during a swap queues and is served afterwards
+  rather than being refused.
+- **Deleting the loaded model is refused** with `model_in_use` and a remedy;
+  after unloading it is allowed, and the *imported* file is left on disk because
+  it was never ours. Unloading twice is not an error.
+- **A record outlives its file.** With the weights moved away the model reads
+  `missing` rather than disappearing, and asking to load it names the id and the
+  path it expected rather than failing inside the engine.
+
+Found by running M6a, and fixed:
+
+- **A job's progress stream was 1,010 SSE frames for a 16 MB download.** The
+  transfer reports per 16 KB chunk, and every update became a broadcast send and
+  a frame per watcher — around 65,000 of them for a 1 GB model, on a box whose
+  CPU is the scarce resource. Throttled to one update per whole percent plus
+  every stage change: the same load now emits **4 frames**.
+- **A URL with no path made the host the model's file name.** Caught by its own
+  test before it ever ran: `https://example.com` produced a model file called
+  `example.com`.
+- **The cancellation test could measure a stranger's process.** `engine_pid`
+  matched the *first* `llama-server` in `/proc`, so with another gateway serving
+  on this machine — or with `cargo test --workspace` running this file's tests
+  in parallel — it read an unrelated engine's CPU time. It now matches on the
+  engine's own ephemeral port, which is unique per launch. This is a test that
+  could pass for the wrong reason, which is worse than one that fails.
+- **And that test's real bar was wrong.** With the right process measured, a
+  cancelled generation costs a short teardown tail and then exactly nothing: on
+  this box it goes idle **1000-2000 ms** after the disconnect, against a decode
+  cost of 210-254 ticks per second. The old assertion allowed 2 ticks in a fixed
+  window starting 500 ms after the disconnect, which fails whenever the tail
+  runs long and proves no more than the new one. The test now polls until the
+  engine reports an idle half-second, asserts it stays idle, and prints both
+  numbers. The M3 claim stands in substance — a disconnected client stops
+  costing CPU — with the honest shape: it stops within a second or two, rather
+  than instantly.
+
 ## Test counts
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 483 | no network, no model downloads |
+| Default (`cargo test --workspace`) | 556 | no network, no model downloads |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
+| Model downloads | 6 | needs `HERMES_TEST_NETWORK=1`; fetches a real 100 MB model from HuggingFace |
 
 Measured on this machine, and recorded as a property of *this* box rather than
 of the build: Qwen3-1.7B Q4_K_M decodes at roughly 0.7 tokens per second on
@@ -415,14 +489,12 @@ Still open:
 
 ## Next step
 
-M6. The model manager and the desktop shell: a catalog that can hold more than
-one model, import and download with the digest verification M2 already has,
-load and unload against the RAM estimator's verdicts, and the Electron shell and
-SPA on top of the control API — which is why `/api/v1/metrics` exists under its
-own prefix rather than beside the OpenAI routes.
+M6b. The Electron shell and the SPA, on top of the control API that M6a built:
+`/api/v1/models`, `/api/v1/catalog`, the import/download/load/unload verbs, and
+`/api/v1/jobs/{id}/events` for progress. `/api/v1/metrics` has been under this
+prefix since M5 for exactly this reason.
 
-Two things M5 deliberately left, both recorded so they are chosen rather than
-forgotten:
+Deliberately left, and recorded so they are chosen rather than forgotten:
 
 - **`/v1/completions` waits at the door.** A queued request there is refused
   with a 503 rather than answered and told its position, because one such
@@ -430,5 +502,13 @@ forgotten:
   machine for that is a second one. The band and the metrics apply to it
   already.
 - **Nothing is preempted, and nothing can be** until the engine can pause a
-  generation. A short request still waits for the current turn; what it no
-  longer does is wait for every turn queued ahead of it.
+  generation. A swap now waits for the running turn — measured at 116 s above —
+  which is the honest behaviour rather than a fast one.
+- **No pre-flight disk check before a download.** `statvfs` needs `unsafe`, and
+  every crate that would host it is `forbid(unsafe_code)`; weakening that to
+  save a failed download is the wrong trade. A full disk is still reported
+  actionably as `low_disk`, from `ENOSPC` as it happens rather than before it.
+- **The catalog is not shared between processes.** Two `hermes` commands writing
+  it at once would have one overwrite the other; each write is atomic, so the
+  file is never corrupt, but there is no lock. A single gateway plus occasional
+  CLI use is the shape this is built for.
