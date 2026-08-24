@@ -19,8 +19,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M3.55** The remote leg | **done** | `hermes sysinfo` reports every bindable address; a `--host` name that resolves only to loopback is diagnosed instead of served silently |
 | **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
-| M5 | next | scheduler, metrics, queue fairness, per-token timings |
-| M6 | pending | model manager, Electron shell + SPA |
+| **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
+| M6 | next | model manager, Electron shell + SPA |
 
 ## Verified by execution, not only by unit tests
 
@@ -234,11 +234,51 @@ M4 profiled on the running gateway, for M5 planning (2026-08-23):
   `/v1/chat/completions` with the timings the gateway already returns; nothing
   was restarted, and no source, test or configuration file was changed.
 
+M5, verified against a real engine (`b10590`) running SmolLM2-135M at a
+2048-token context, driven with the real client's own numbers:
+
+- **The acceptance run's failure no longer happens.** Three requests, one slot:
+  an agent turn (`max_tokens` 65536, as `agent/run_agent.py:1673` sends), a
+  second turn arriving one second later, and a title generation (`max_tokens`
+  64, as `agent/title_generator.py:408` sends) arriving one second after
+  *that*. Finish order was **A → C → B**: the title request overtook the turn
+  that had queued ahead of it and finished at 30.6 s instead of after B at
+  52.4 s. `overtakes` in `/metrics` counted exactly 1.
+- **A queued request is answered immediately.** Both queued requests had their
+  response headers in **10 and 20 milliseconds**, and received
+  `: queued position=1 waited=15s` / `: queued position=0 waited=15s` while
+  they waited. Before this, a queued client received nothing at all — no
+  headers, no bytes — until the request ahead of it finished.
+- **The band is decided from measurements, and the ceilings were wrong.** The
+  first live run put both the "long" and the "short" request in the interactive
+  band and served them first-come-first-served, correctly by the rules and
+  uselessly in practice: at a 2048-token context the output ceiling computed to
+  exactly 64 tokens, and the real client's title generation asks for exactly
+  64. The one request the band exists for classified correctly by a single
+  token, and would have classified wrongly on any smaller window. The floors
+  are now twice the observed value and there is a test named after the two real
+  requests, at the smallest context this project has served.
+- **An abandoned generation reports what it cost.** A client that walked away
+  after 20 seconds contributed **116 completion tokens over 18.8 s** to the
+  counters, where the old behaviour was to report nothing at all — the chunk
+  carrying the cost is the one such a request never receives. It is counted as
+  `cancelled`, not as an error: closing a laptop lid is a normal act.
+- **The numbers agree with each other.** After the three-request run:
+  3 requests ok, 3 generations, 3 `stop`, 112 prompt tokens of which 48 cached
+  and 64 actually prefilled, `queued` 2, `admitted_immediately` 1, queue wait
+  max 29.5 s, time to first token max 31.6 s, prefill 8.30 tok/s and decode
+  4.56 tok/s. A warm cached request measured 13.08 tok/s decode on the same box
+  minutes later — the spread this machine is known for, now visible rather than
+  inferred.
+- **A scrape carries no text.** Asserted in the suite and checked live: no
+  prompt, no completion, no `/mock/model.gguf`, no model path. The model *id*
+  appears, because `/v1/models` already advertises it.
+
 ## Test counts
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 454 | no network, no model downloads |
+| Default (`cargo test --workspace`) | 483 | no network, no model downloads |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -301,7 +341,7 @@ was never touched, the harness initialized against `/v1/models`, sent a
 it prefill on this CPU. No `EmptyStreamError`, no truncated stream, and the
 gateway served five requests across the session.
 
-Found by that same run, and left for M5:
+Found by that same run, and **fixed in M5**:
 
 - **A harness issues auxiliary requests alongside the main turn.** While a
   5,596-token agent prompt was prefilling, the harness sent a small
@@ -310,7 +350,9 @@ Found by that same run, and left for M5:
   harness's own timeout fired: `Auxiliary title generation failed: Request
   timed out.` Nothing was lost and the session continued, but it is precisely
   the case section 22's priority bands exist for — a short request must not sit
-  behind a multi-minute one. Queue position events and fairness are M5.
+  behind a multi-minute one. It now does not: reproduced with the same numbers
+  above, the short request overtakes and the queued one is told where it
+  stands.
 - **A harness may impose a minimum context.** This one refuses any model
   advertising under 64,000 tokens and says so at startup rather than failing
   later. The gateway advertises what it is really serving, which is the right
@@ -319,6 +361,21 @@ Found by that same run, and left for M5:
   anything is loaded. On this box it cannot — Qwen3-1.7B at 32768 is already
   2.47 GiB short, with ranked remedies — which is a property of the hardware,
   not of the design.
+
+Found by running M5 against a real engine, and fixed:
+
+- **The per-token token count latched on its first reading.** With
+  `timings_per_token` each timing supersedes the last, and the gateway kept the
+  first one it saw — `if completion_tokens == 0` looked like a sensible guard
+  and was not. An eight-second abandoned generation reported **1** token
+  instead of the twenty it had produced, which is a worse answer than reporting
+  none, because it looks like data. Caught by comparing the counter against the
+  wall clock on a live cancel, then pinned by a unit test that drops the stream
+  half way.
+- **The band ceilings were derived without checking them against the client.**
+  See the M5 evidence above: correct by construction, useless at the context
+  this box serves. Fractions of a window are a good shape for a limit and a bad
+  source of a floor.
 
 ## Verify-before-coding checklist
 
@@ -332,8 +389,11 @@ Items 1, 2, 4-9 are resolved. What M3 settled, each against the pinned build:
 - **`cache_prompt` defaults to `true`** (item 4): `tools/server/server-task.h:53`
   at `b10590`, and confirmed live by non-zero `cached_tokens` across turns.
 - **Timings** (item 3): the engine attaches a `timings` object to the final
-  chunk, and the gateway forwards it on the usage chunk. Per-token timings
-  (`timings_per_token`) remain an M5 concern, with metrics.
+  chunk, and the gateway forwards it on the usage chunk. **Per-token timings
+  are now on**: `timings_per_token` is sent with every generation (the symbol
+  is present in `libllama-server-impl.so` at the pinned build), so the timing
+  object arrives on every chunk and a generation that never reaches its final
+  chunk still reports what it cost.
 
 Still open:
 
@@ -355,9 +415,20 @@ Still open:
 
 ## Next step
 
-M4. Tool calls end to end in a real agent loop (the gateway's delta re-emission
-and accumulation are already in place and tested; what M4 adds is `tools` in the
-request, the engine's `--jinja` parsers exercised against a tool-capable model,
-and `reasoning_content` from a model that produces it), the full section 27
-error taxonomy as OpenAI-shaped bodies, and `/v1/completions` with its own
-integration test.
+M6. The model manager and the desktop shell: a catalog that can hold more than
+one model, import and download with the digest verification M2 already has,
+load and unload against the RAM estimator's verdicts, and the Electron shell and
+SPA on top of the control API — which is why `/api/v1/metrics` exists under its
+own prefix rather than beside the OpenAI routes.
+
+Two things M5 deliberately left, both recorded so they are chosen rather than
+forgotten:
+
+- **`/v1/completions` waits at the door.** A queued request there is refused
+  with a 503 rather than answered and told its position, because one such
+  request can carry many prompts under a single permit and the streaming state
+  machine for that is a second one. The band and the metrics apply to it
+  already.
+- **Nothing is preempted, and nothing can be** until the engine can pause a
+  generation. A short request still waits for the current turn; what it no
+  longer does is wait for every turn queued ahead of it.

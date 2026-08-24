@@ -193,6 +193,120 @@ is reported as `hermes.model_max_context_length`. The `model_` prefix is
 load-bearing: `max_context_length` is in the scanner's key set, and naming it
 that would have undone the whole point.
 
+## Why priority is measured and never claimed
+
+The scheduler classifies a request into a band from two numbers it already has:
+the prompt the engine counted, with the chat template and tool declarations
+applied, and the output budget the client asked for. Nothing a client says about
+its own importance is read, and there is no field to say it in.
+
+That is not distrust of any particular client. A priority that can be requested
+is a priority every caller requests — the first client to set it wins, the rest
+copy it, and within a release the field means nothing. Cost is the one thing a
+caller cannot exaggerate, because the gateway measures it before admitting
+anything.
+
+The output budget is read as **requested**, not as clamped. `max_tokens` is
+clamped upward to the remaining window when a client omits it — Hermes defaults
+it to 65536 — so classifying on the clamped value would place every client that
+simply leaves the field out into the slow band, and the fast band would go
+unused. An unstated budget is missing evidence, not evidence of a long request.
+
+The ceilings are fractions of the loaded context rather than constants, for the
+same reason the context itself is derived from the machine: on a 2048-token
+window a 1024-token prompt is half the context and nothing like interactive,
+while on a 32K window it is a rounding error.
+
+## Why the band decides who starts, and never who stops
+
+There is no preemption, and there cannot be. The engine has no way to pause a
+generation and resume it later, and killing one to run something shorter would
+discard the prefill that dominates the cost on a CPU — the work already spent is
+exactly the work that would have to be repeated.
+
+So a short request still waits for the current turn to finish. What it no longer
+does is wait for every turn queued ahead of it, which is the case that produced
+the failure: not one long generation, but a queue of them.
+
+Starvation is bounded by time rather than by a count of overtakes. Once a
+request has waited past the ceiling it sorts ahead of every band, and among
+aged-out requests the longest wait wins. One rule, one comparison, and the
+position reported to a client is computed with the same key the scheduler picks
+by — so a reported position cannot contradict the order actually served.
+
+## Why a queued streamed request is answered before it runs
+
+The gateway used to take a slot and *then* answer. For an uncontended request
+that is still what happens, and it is the better order: nothing has been written
+to the client, so a failure to start generating can be an HTTP status.
+
+For a queued request it is the wrong order. A client that has to wait minutes
+for the response headers cannot tell a busy gateway from a hung one, and its
+read timeout eventually decides for it. So a streamed request that finds the
+slot taken is answered immediately and waits inside its own response body,
+emitting a comment frame with its position.
+
+The cost is stated rather than hidden: once the response has started, a failure
+to *begin* generating can no longer be a status code and arrives as the terminal
+error chunk instead. That trade is made only for a request that was genuinely
+queued. Its refusal carries the same `server_busy` code the non-streamed path
+returns with a 503, because which side of the headers a client happened to be on
+is our implementation detail, not a difference in what went wrong.
+
+The position is a comment (`: queued position=0 waited=30s`), not a chunk. A
+queued request has produced no tokens, so any `data:` frame would be a
+completion object that is not one, and every strict client would have to be
+taught to ignore it. Comment frames are already discarded by the SSE decoders
+this gateway is checked against — including the real `openai` package — and they
+are plainly readable in `curl`, which is where "is it stuck, or is it waiting?"
+actually gets asked.
+
+## Why the scheduler hands out a grant rather than a permit
+
+A waiting request holds a channel that the release path signals when its turn
+comes. What travels through that channel is a bare grant, and the permit is
+constructed by the receiver.
+
+Sending the permit itself would be the obvious design and it deadlocks. The
+release path holds the queue lock while it picks the next waiter; if that
+waiter's receiver has already gone — a client that disconnected in the
+microseconds between being picked and being told — the send fails and returns
+the permit to a caller holding the lock, where dropping it re-enters the release
+path against a lock it already owns.
+
+The remaining race is the mirror of it: a grant delivered to a ticket that goes
+away before claiming it. Nothing else knows that slot exists, so the ticket's
+`Drop` looks in its own channel for an unclaimed grant and gives the slot back.
+Without that, one unlucky disconnect would cost the gateway a slot for the life
+of the process. It is asserted directly, because it is the kind of thing that
+never shows up in a test that only exercises the happy path.
+
+## Why metrics are counted here and timed by the engine
+
+Prefill and decode times come from the engine, which measures them from inside
+the loop. The queue wait and the time to first token are measured by the
+gateway, because the engine cannot see them — it does not know a request existed
+until the request is handed to it.
+
+They are reported separately rather than summed. A slow first token and a busy
+queue are different problems with different fixes, and a single latency number
+that mixes them tells an operator to buy a faster CPU when the answer was to
+raise the concurrency, or the reverse.
+
+Everything is an atomic counter written on the request path. A metric that costs
+a lock is a metric that changes the thing it measures, and on a gateway where
+one request holds a slot for minutes, a lock on that path would be held for
+minutes too.
+
+Nothing here may carry text. Not prompts, not completions, not tool arguments,
+not the model's filesystem path. Metrics are the easiest accidental route out
+for exactly the content section 26 protects — they are aggregate, they look
+harmless, and they are exposed at an endpoint whose whole purpose is to be
+scraped by something else — so the types have nowhere to put text: every field
+is a number, and the only strings are fixed label values known at compile time.
+The model *id* appears, because it is the name the gateway already advertises at
+`/v1/models`.
+
 ## Why cancellation is a `Drop` guard rather than a callback
 
 The SSE response body owns a `RequestGuard` holding the job's cancellation

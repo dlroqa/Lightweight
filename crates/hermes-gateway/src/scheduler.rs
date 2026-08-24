@@ -61,10 +61,22 @@ impl BandLimits {
     /// interactive, while on a workstation serving 32K it is a rounding error.
     /// The caps stop a very large context from calling a genuinely expensive
     /// prompt small.
+    ///
+    /// **The floors come from a real client rather than from roundness.** The
+    /// auxiliary request this scheduler exists for asks for exactly 64 output
+    /// tokens (`agent/title_generator.py:408`), while the agent turn it must
+    /// not queue behind asks for 65536 (`agent/run_agent.py:1673`). A ceiling
+    /// derived purely as a fraction of the window lands on exactly 64 at a
+    /// 2048-token context — so the one request the band exists for would
+    /// classify correctly by a single token there, and wrongly on any smaller
+    /// window. The floors are twice the observed value, which is the side to be
+    /// wrong on: a ceiling that is too high costs some medium request its place
+    /// in the fast band and is bounded by the starvation ceiling anyway, while
+    /// one that is too low means the feature never fires at all.
     pub fn for_context(n_ctx: u32) -> Self {
         Self {
-            prompt_tokens: (n_ctx / 8).clamp(128, 1024),
-            output_tokens: (n_ctx / 32).clamp(32, 256),
+            prompt_tokens: (n_ctx / 8).clamp(512, 1024),
+            output_tokens: (n_ctx / 32).clamp(128, 256),
         }
     }
 }
@@ -588,18 +600,38 @@ mod tests {
 
     #[test]
     fn band_limits_come_from_the_context_the_model_was_loaded_with() {
-        // On a 2048-token window a 1024-token prompt is half the context and
-        // nothing like interactive; on a 32K window it is a rounding error.
+        // Proportional to the window, and capped so that a very large context
+        // does not start calling genuinely expensive prompts small.
         let small = BandLimits::for_context(2048);
-        assert_eq!(small.prompt_tokens, 256);
-        assert_eq!(Band::classify(300, None, small), Band::Bulk);
-
         let large = BandLimits::for_context(131_072);
         assert_eq!(
             large.prompt_tokens, 1024,
             "capped, not proportional forever"
         );
-        assert_eq!(Band::classify(300, None, large), Band::Interactive);
+        assert!(large.prompt_tokens > small.prompt_tokens);
+        assert_eq!(Band::classify(4000, None, large), Band::Bulk);
+    }
+
+    #[test]
+    fn the_two_requests_this_scheduler_exists_for_land_in_different_bands() {
+        // Measured from the real client rather than imagined: its title
+        // generation asks for 64 output tokens
+        // (`agent/title_generator.py:408`) and its agent turn asks for 65536
+        // (`agent/run_agent.py:1673`). If those two ever land in the same band
+        // the scheduler does nothing for the case it was built for — so it is
+        // checked at the smallest context this project has served, where the
+        // ceilings are tightest.
+        let limits = BandLimits::for_context(2048);
+        assert_eq!(
+            Band::classify(32, Some(64), limits),
+            Band::Interactive,
+            "the auxiliary request must be interactive at every context size"
+        );
+        assert_eq!(
+            Band::classify(5596, Some(65536), limits),
+            Band::Bulk,
+            "the agent turn must not be"
+        );
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 to 4 are complete. The gateway serves an OpenAI-compatible API
+Milestones 0 to 5 are complete. The gateway serves an OpenAI-compatible API
 over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
@@ -27,8 +27,12 @@ against a real model works end to end, and disconnecting mid-stream stops the
 engine within milliseconds. A **full agent loop** does too: against Qwen3-1.7B,
 the model called a declared tool, the tool ran, and the result came back as an
 answer — `finish_reason: "tool_calls"`, arguments that parse as JSON, and 166
-of 222 prompt tokens served from the prefix cache on the second turn. The
-scheduler and per-token metrics are next. See
+of 222 prompt tokens served from the prefix cache on the second turn.
+
+Requests are now **scheduled** rather than merely queued: a short request
+overtakes a long one that is waiting, a queued streamed request is told where it
+stands instead of sitting in silence, and what the gateway is doing is readable
+at `/metrics`. The model manager and the desktop shell are next. See
 [docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint.
 
 ## Verified constraints
@@ -113,6 +117,81 @@ curl -N -H 'Authorization: Bearer no-key-required' \
 Authentication is off for a loopback bind — a client that sends
 `Bearer no-key-required`, or no header at all, is accepted — and is **forced on**
 the moment any bind is reachable from another machine.
+
+`--concurrency N` raises how many requests run at once. It is one number on
+purpose: it sizes the engine's slots, the gateway's queue and the RAM estimate
+together, because the KV cache is per sequence and four concurrent sequences
+cost four caches. The default is 1, which is right for a small CPU — a second
+concurrent generation on four slow cores makes both slower than running them in
+turn.
+
+## Waiting, and being told about it
+
+The engine generates for one request at a time, and on a slow CPU one turn can
+take minutes. Which request goes next is therefore the whole scheduling problem,
+and first-come-first-served answers it badly: an agent that sends a 20-token
+title generation alongside a 5,596-token turn watches the small request sit
+behind the large one until its own timeout fires. That happened here, and it is
+what the scheduler is for.
+
+- **A request is classified from what has been measured**, never from what it
+  claims. The two numbers are the prompt the engine counted — tool declarations
+  included — and the output budget the client asked for. A priority that can be
+  requested is a priority every caller requests, so there is no way to ask for
+  one.
+- **A short request overtakes a long one that is waiting.** The ceilings come
+  from the context the model was loaded with, which was itself chosen from this
+  machine's free memory.
+- **Nobody waits forever.** Once a request has waited past the starvation
+  ceiling it can no longer be overtaken. Being long costs a bounded delay, never
+  a denial.
+- **Nothing is preempted.** A band decides who *starts* next; a generation
+  already running is never paused, because the engine cannot pause one and
+  restarting it would throw away the prefill that dominates the cost.
+
+A streamed request that arrives to a busy gateway is answered immediately and
+waits inside its own response, so `curl -N` shows it moving up the queue:
+
+```
+: queued position=1 waited=15s
+: queued position=0 waited=30s
+data: {"choices":[{"delta":{"role":"assistant"},...
+```
+
+Those are SSE comments, which every client's decoder discards — a queued request
+has produced no tokens, and a `data:` frame would be a completion that is not
+one. A request that cannot stream still waits at the door and is refused with a
+503 and `server_busy` if the queue timeout runs out; a streamed one that waits
+too long gets the same code in the terminal error chunk, because which side of
+the response headers a client happened to be on is our detail, not theirs.
+
+## Metrics
+
+```sh
+curl 127.0.0.1:8737/metrics          # Prometheus text
+curl 127.0.0.1:8737/api/v1/metrics   # the same snapshot as JSON
+```
+
+Requests by endpoint and outcome, generations by finish reason, tokens by kind —
+prompt, completion, cached, actually prefilled, decoded — queue depth by band,
+scheduler events including how many times a waiting request was overtaken, and
+four timings: queue wait, time to first token, prefill and decode. Prefill and
+decode are the engine's own measurements; the queue wait and the time to first
+token are measured here, because only the gateway can see them. They are
+reported separately rather than added, since a slow first token and a busy queue
+are different problems with different fixes.
+
+Every field is a number. No prompt text, no completion text, no filesystem path
+— metrics are the easiest accidental route out for exactly the content Privacy
+Mode protects, so the types have nowhere to put it. Both endpoints sit behind
+the API key when one is configured.
+
+A generation the client abandoned is counted as **cancelled**, not as an error:
+closing a laptop lid is a normal act, and counting it beside a crashed engine is
+how an operator ends up chasing a failure that never happened. Per-token timings
+are enabled upstream, so an abandoned generation still reports what it had cost
+— the chunk that used to carry that number is the one such a request never
+receives.
 
 ## The two generation endpoints
 
@@ -305,7 +384,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `hermes-backend-llamacpp` | Acquires and supervises `llama-server`, and translates its SSE into our events |
 | `hermes-backend-mock` | A deterministic backend, so the layers above are testable without an engine |
 | `hermes-api` | OpenAI request and response types, and the SSE chunk codec |
-| `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation |
+| `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler and metrics |
 | `hermes-observability` | Structured logging, rotation, privacy-mode wiring |
 | `hermes-cli` | Command-line access to the above |
 

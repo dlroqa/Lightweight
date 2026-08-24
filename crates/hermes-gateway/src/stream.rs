@@ -416,11 +416,14 @@ fn absorb(encoder: &mut Encoder, event: GenerationEvent) {
             record.prefill = Some(Duration::from_secs_f64(timings.prompt_ms / 1000.0));
             record.decode = Some(Duration::from_secs_f64(timings.predicted_ms / 1000.0));
             record.cached_tokens = timings.cached_n;
-            if record.completion_tokens == 0 {
-                // Only until the usage chunk says otherwise: this is what makes
-                // an abandoned generation count the tokens it did produce.
-                record.completion_tokens = timings.predicted_n;
-            }
+            // Overwritten by every timing, and finally by the usage chunk when
+            // one arrives. Taking only the first — which an `is_empty` guard
+            // here quietly did — makes an abandoned generation report the one
+            // token it had produced when the first timing came, rather than the
+            // twenty it had produced when the client walked away. Measured
+            // against a real engine: 1 token reported for an eight-second
+            // generation, before this line was a plain assignment.
+            record.completion_tokens = timings.predicted_n;
             encoder.timings = serde_json::to_value(timings).ok();
         }
         GenerationEvent::Finished {
@@ -625,6 +628,61 @@ mod tests {
         let usage_chunk = json(&events[events.len() - 2]);
         assert_eq!(usage_chunk["timings"]["prompt_n"], 36);
         assert_eq!(usage_chunk["timings"]["predicted_n"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_generation_reports_what_it_had_cost_so_far() {
+        // With per-token timings each one supersedes the last. Keeping only the
+        // first — which is what a "set it if unset" guard here did — made an
+        // eight-second generation report the single token it had produced when
+        // the first timing arrived. Found by running it against a real engine,
+        // not by a type error.
+        fn timings(predicted_n: u32, predicted_ms: f64) -> GenerationEvent {
+            GenerationEvent::Timings(hermes_inference::generation::Timings {
+                prompt_n: 10,
+                prompt_ms: 1000.0,
+                predicted_n,
+                predicted_ms,
+                cached_n: 4,
+            })
+        }
+
+        let metrics = Arc::new(Metrics::new());
+        let guard =
+            RequestGuard::new(CancellationToken::new(), None).reporting_to(Arc::clone(&metrics));
+        let builder = ChunkBuilder::new("chatcmpl-test", "m@4k");
+        let events = events(vec![
+            Ok(GenerationEvent::ContentDelta { text: "a".into() }),
+            Ok(timings(1, 500.0)),
+            Ok(GenerationEvent::ContentDelta { text: "b".into() }),
+            Ok(timings(20, 8000.0)),
+            Ok(GenerationEvent::ContentDelta { text: "c".into() }),
+            Ok(GenerationEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::new(10, 21),
+            }),
+        ]);
+
+        // Read the role chunk and three content chunks, then walk away: no
+        // finish chunk is ever read, which is what a disconnect looks like.
+        let mut body = Box::pin(encode(events, builder, guard, true));
+        for _ in 0..4 {
+            assert!(body.next().await.is_some());
+        }
+        drop(body);
+
+        let snapshot = metrics.snapshot(Default::default(), None);
+        assert_eq!(
+            snapshot.tokens.decoded, 20,
+            "the last timing is the one that counts"
+        );
+        assert_eq!(snapshot.decode.total_ms, 8000);
+        assert_eq!(snapshot.tokens.cached, 4);
+        assert_eq!(
+            snapshot.finish_reasons.cancelled, 1,
+            "a client that walked away is not an error"
+        );
+        assert_eq!(snapshot.finish_reasons.error, 0);
     }
 
     #[tokio::test]
