@@ -407,7 +407,7 @@ assumptions, no workarounds — rather than by running it:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 588 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 589 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -550,13 +550,21 @@ M6b.1, against a real gateway serving no model on this machine:
   no AVX family, `expected_ggml_variant` `sse42`, which is exactly what the
   engine was measured choosing in M0-M2. Nothing about it is hardcoded.
 - **Free space distinguishes the budget from the total.** On this machine the
-  models directory sits on a filesystem with 24.8 GB free but only 18.4 GB
-  *available* — the ext4 root reserve is 6.4 GB of it. A download sized against
-  the free count would be sized against 6 GB that an unprivileged process
-  cannot spend. `statvfs` reaches us through `rustix`, so no crate lost
-  `forbid(unsafe_code)` to get it, and `scripts/check-deps.sh` still passes:
-  rustix's build script only re-invokes `rustc` to probe cfgs and declares no
-  build-dependencies, and on Linux its `linux_raw` backend pulls in no libc.
+  models filesystem has 23.2 GB free but only 16.8 GB *available* — the ext4
+  root reserve is the difference. A download sized against the free count would
+  be sized against gigabytes an unprivileged process cannot spend. `statvfs`
+  reaches us through `rustix`, so no crate lost `forbid(unsafe_code)` to get it,
+  and `scripts/check-deps.sh` still passes: rustix's build script only
+  re-invokes `rustc` to probe cfgs and declares no build-dependencies, and on
+  Linux its `linux_raw` backend pulls in no libc.
+- **Both filesystems a download touches are reported.** The first pass measured
+  the models directory alone and its doc comment called that "where a download
+  lands", which is wrong: bytes accumulate in `downloads_dir()` under the
+  **cache** root and are moved into `models_dir()` under the **data** root.
+  `hermes_catalog::install` has fallen back to a copy on `EXDEV` since M6a, so
+  the code already knew those can be different filesystems. Both are now
+  reported, with `same_filesystem` derived from the device id rather than from
+  `statvfs`'s `f_fsid`, which is documented upstream as meaningless.
 - **Processor load is published as counters, not a percentage.** `/proc/stat`
   gives monotonic totals and a rate needs two readings of them, so the endpoint
   hands over `total` and `idle` ticks and the caller differences consecutive
@@ -579,6 +587,17 @@ M6b.1, against a real gateway serving no model on this machine:
   the log and out of the engine's argv.
 - **Both new endpoints are behind the key**, asserted directly: they are host
   inventory, and on a bind reachable from elsewhere that is not public.
+- **The probes cannot wedge the gateway.** `statvfs` on a network mount that has
+  gone away blocks for the mount's timeout, and a panel polling once a second
+  would hold every worker on a four-core box. They run under `spawn_blocking`,
+  as every other blocking read in this workspace does.
+- **No response body is built with `json!` over a path any more.** That macro
+  resolves to `to_value(..).unwrap()`, `PathBuf` fails to serialize when a path
+  is not valid UTF-8 — legal on Linux — and the release profile sets
+  `panic = "abort"`, so one request could have taken the process down. Both the
+  new gateway description and `GET /api/v1/models`, which has carried a
+  `PathBuf` this way since M6a, are now typed and serialized through
+  `axum::Json`, where the same failure is a 500.
 
 ## Next step
 

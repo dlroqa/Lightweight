@@ -323,16 +323,21 @@ btime 1755900000
     fn an_inconsistent_pair_is_clamped_rather_than_reported_above_one() {
         // `busy` and `total` are separate counters; a read straddling a kernel
         // update can leave them momentarily disagreeing.
+        // 10 ticks pass, but `idle` also falls by 5, so the busy delta is 15 -
+        // more than the whole interval. Without the clamp this reports 150%.
         let earlier = CpuTimes {
             total: 1_000,
             idle: 900,
         };
         let later = CpuTimes {
             total: 1_010,
-            idle: 900,
+            idle: 895,
         };
         let utilization = later.utilization_since(&earlier).expect("an interval");
-        assert!((0.0..=1.0).contains(&utilization));
+        assert_eq!(
+            utilization, 1.0,
+            "an inconsistent pair must saturate at fully busy, not exceed it"
+        );
     }
 
     #[cfg(target_os = "linux")]

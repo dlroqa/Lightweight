@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use hermes_core::{Actionable, Bytes};
 use hermes_system_info::{
@@ -121,10 +121,7 @@ impl From<MemorySnapshot> for MemoryReport {
 
 /// Space on one filesystem, and which directory it was measured through.
 #[derive(Debug, Serialize)]
-pub struct DiskReport {
-    /// The directory probed — the models directory, because that is where a
-    /// download lands and therefore the only filesystem whose free space
-    /// decides anything.
+pub struct FilesystemReport {
     path: PathBuf,
     #[serde(flatten)]
     space: DiskSpace,
@@ -132,7 +129,7 @@ pub struct DiskReport {
     pressure: f64,
 }
 
-impl DiskReport {
+impl FilesystemReport {
     fn new(path: PathBuf, space: DiskSpace) -> Self {
         Self {
             path,
@@ -141,6 +138,30 @@ impl DiskReport {
             space,
         }
     }
+}
+
+/// Both filesystems a download touches.
+///
+/// A download does not land in one place. It accumulates in the downloads
+/// directory under the **cache** root, is verified there, and is then moved
+/// into the models directory under the **data** root. On this platform those
+/// are `~/.cache/...` and `~/.local/share/...`, which are usually one
+/// filesystem and are not required to be — `hermes_catalog::install` already
+/// falls back to a copy when the final rename returns `EXDEV`, so the code has
+/// known they can differ since M6a.
+///
+/// Reporting one number would therefore be reporting the wrong one roughly
+/// whenever it matters. Both are given, and `same_filesystem` says whether the
+/// distinction is live on this machine so a caller can collapse them when it
+/// is not.
+#[derive(Debug, Serialize)]
+pub struct DiskReport {
+    /// Where the bytes accumulate first, and where a long transfer runs out.
+    downloads: Probed<FilesystemReport>,
+    /// Where verified weights end up, and what the final move needs free.
+    models: Probed<FilesystemReport>,
+    /// `None` when either side could not be identified.
+    same_filesystem: Option<bool>,
 }
 
 /// Which platform this is, as the binary was built for it.
@@ -176,11 +197,37 @@ pub struct SystemReport {
 }
 
 /// `GET /api/v1/system`.
+///
+/// The probes are moved off the runtime with `spawn_blocking`, as every other
+/// blocking read in this workspace is. `/proc` answers instantly, but `statvfs`
+/// is a filesystem call: if a model directory is on a network mount that has
+/// gone away, it blocks for as long as the mount's timeout. A panel polling
+/// this once a second would then hold every worker on a four-core box and take
+/// the gateway down with it — the endpoint that exists to report trouble must
+/// not be able to cause it.
 pub async fn system(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
         return refusal;
     }
-    axum::Json(report(&state)).into_response()
+
+    let probed = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || report(&probed)).await {
+        Ok(report) => axum::Json(report).into_response(),
+        // The task itself cannot panic - every probe returns a `Result` - so
+        // this is a runtime that is shutting down. Said plainly rather than
+        // reported as a broken probe.
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": format!("the system probe could not be run: {err}"),
+                    "type": "server_error",
+                    "code": "probe_unavailable",
+                }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Read every probe once.
@@ -213,10 +260,46 @@ fn disk_report(state: &GatewayState) -> Probed<DiskReport> {
                 .to_owned(),
         };
     };
+
+    let downloads = paths.downloads_dir();
     let models = paths.models_dir();
+    Probed::Read {
+        reading: DiskReport {
+            same_filesystem: same_filesystem(&downloads, &models),
+            downloads: filesystem_report(downloads),
+            models: filesystem_report(models),
+        },
+    }
+}
+
+fn filesystem_report(path: PathBuf) -> Probed<FilesystemReport> {
     Probed::from_probe(
-        hermes_system_info::space_for(&models).map(|space| DiskReport::new(models.clone(), space)),
+        hermes_system_info::space_for(&path)
+            .map(|space| FilesystemReport::new(path.clone(), space)),
     )
+}
+
+/// Whether two directories sit on the same filesystem.
+///
+/// From the device id in each one's metadata, which is what `EXDEV` is decided
+/// by. `statvfs` publishes an `f_fsid` that would look like the right field to
+/// use and is documented upstream as having no clear meaning anywhere, so it is
+/// not used.
+///
+/// `None` when either path cannot be stat'd — usually because it does not
+/// exist yet. Unknown is reported as unknown rather than guessed either way.
+#[cfg(unix)]
+fn same_filesystem(left: &std::path::Path, right: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = std::fs::metadata(left).ok()?;
+    let right = std::fs::metadata(right).ok()?;
+    Some(left.dev() == right.dev())
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(_left: &std::path::Path, _right: &std::path::Path) -> Option<bool> {
+    None
 }
 
 #[cfg(test)]
@@ -272,7 +355,8 @@ mod tests {
         let body = json(&state(GatewayConfig::default()));
         assert_eq!(body["disk"]["state"], "unavailable");
         assert_eq!(body["disk"]["code"], "no_data_directory");
-        assert!(body["disk"]["total"].is_null());
+        assert!(body["disk"]["models"].is_null());
+        assert!(body["disk"]["downloads"].is_null());
     }
 
     #[cfg(target_os = "linux")]
@@ -309,12 +393,26 @@ mod tests {
         assert!(body["memory"]["pressure"].as_f64().is_some());
     }
 
+    /// A directory nothing else will touch, in the workspace's usual shape:
+    /// a tag plus a unique suffix. A fixed name would be shared by two
+    /// concurrent runs and by a second user on the same machine, and this test
+    /// deletes what it creates.
+    fn scratch_root(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("hermes-system-{tag}-{unique}"))
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn disk_is_measured_through_the_models_directory() {
-        // The filesystem a download lands on is the only one whose free space
-        // decides anything, so that is the one reported.
-        let root = std::env::temp_dir().join("hermes-system-report-test");
+    fn both_filesystems_a_download_touches_are_reported() {
+        // A download accumulates under the cache root and is then moved under
+        // the data root. Reporting only one of them would report the wrong one
+        // on any machine where they differ - which `install` already handles by
+        // falling back to a copy on `EXDEV`.
+        let root = scratch_root("both-filesystems");
         let paths = DataPaths::rooted_at(&root);
         paths.create_all().expect("create the test directories");
 
@@ -324,10 +422,41 @@ mod tests {
         }));
 
         assert_eq!(body["disk"]["state"], "read");
-        assert_eq!(body["disk"]["path"], paths.models_dir().to_str().unwrap());
-        assert!(body["disk"]["total"].as_u64().unwrap() > 0);
-        assert!(body["disk"]["available"].as_u64().is_some());
+        for (section, expected) in [
+            ("models", paths.models_dir()),
+            ("downloads", paths.downloads_dir()),
+        ] {
+            let reading = &body["disk"][section];
+            assert_eq!(reading["state"], "read", "{section}");
+            assert_eq!(reading["path"], expected.to_str().unwrap(), "{section}");
+            assert!(reading["total"].as_u64().unwrap() > 0, "{section}");
+            assert!(reading["available"].as_u64().is_some(), "{section}");
+        }
+
+        // Both are under one root here, so the answer is knowable and true.
+        assert_eq!(body["disk"]["same_filesystem"], true);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_filesystem_that_cannot_be_read_does_not_sink_the_other_one() {
+        // The directories are deliberately not created. Each side reports its
+        // own failure, and the report as a whole still arrives - a partial
+        // answer beats no answer, as the address probe already has it.
+        let paths = DataPaths::rooted_at(scratch_root("absent"));
+
+        let body = json(&state(GatewayConfig {
+            paths: Some(paths),
+            ..GatewayConfig::default()
+        }));
+
+        assert_eq!(body["disk"]["state"], "read");
+        assert_eq!(body["disk"]["models"]["state"], "unavailable");
+        assert_eq!(body["disk"]["models"]["code"], "disk_probe_failed");
+        // Neither path could be stat'd, so sameness is unknown rather than
+        // guessed in either direction.
+        assert!(body["disk"]["same_filesystem"].is_null());
     }
 }

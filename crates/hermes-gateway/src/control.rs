@@ -77,7 +77,30 @@ pub async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
         })
         .collect();
 
-    axum::Json(json!({ "object": "list", "data": rows })).into_response()
+    axum::Json(ListBody::of(rows)).into_response()
+}
+
+/// An OpenAI-shaped list body.
+///
+/// Typed rather than `json!({"object": "list", "data": rows})`, because that
+/// macro resolves to `to_value(..).unwrap()` and a `CatalogRow` carries a
+/// `PathBuf`. A model stored under a path that is not valid UTF-8 - legal on
+/// Linux, where a path is bytes - would fail to serialize, and under the
+/// release profile's `panic = "abort"` that unwrap takes the gateway down on a
+/// request that should have been a 500.
+#[derive(Debug, Serialize)]
+pub struct ListBody<T> {
+    object: &'static str,
+    data: Vec<T>,
+}
+
+impl<T> ListBody<T> {
+    fn of(data: Vec<T>) -> Self {
+        Self {
+            object: "list",
+            data,
+        }
+    }
 }
 
 /// `GET /api/v1/catalog` — the pinned models, and what is already installed.
@@ -335,6 +358,59 @@ pub async fn remove(
     }
 }
 
+/// One address this gateway is answering on.
+#[derive(Debug, Serialize)]
+pub struct ListenerReport {
+    address: String,
+    port: u16,
+    /// Said plainly because it is what decided whether auth was required: a
+    /// purely local bind is allowed to have no key.
+    loopback: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthReport {
+    required: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConcurrencyReport {
+    max_concurrent_requests: u32,
+    queue_timeout_seconds: u64,
+}
+
+/// Where this gateway reads and writes.
+///
+/// Typed, and serialized through `axum::Json` rather than built with `json!`.
+/// That macro resolves to `to_value(..).unwrap()`, and `PathBuf` fails to
+/// serialize when a path is not valid UTF-8 — which on Linux is a legal path.
+/// Under the release profile's `panic = "abort"` that unwrap would take the
+/// whole gateway down on one request. Serializing the response as a value lets
+/// the same failure become a 500.
+#[derive(Debug, Serialize)]
+pub struct PathsReport {
+    data: PathBuf,
+    models: PathBuf,
+    logs: PathBuf,
+}
+
+/// The reply to `GET /api/v1/gateway`.
+#[derive(Debug, Serialize)]
+pub struct GatewayReport {
+    version: &'static str,
+    backend: String,
+    engine: hermes_inference::BackendHealth,
+    model: Option<String>,
+    listeners: Vec<ListenerReport>,
+    /// What cannot be changed without restarting the listener, named so the
+    /// panel can render those fields as read-only and say why.
+    restart_required: Vec<&'static str>,
+    auth: AuthReport,
+    concurrency: ConcurrencyReport,
+    queue: crate::scheduler::QueueSnapshot,
+    paths: Option<PathsReport>,
+}
+
 /// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.
 ///
 /// The API Gateway screen asks four questions no existing endpoint answers:
@@ -347,7 +423,7 @@ pub async fn remove(
 /// settled before the first listener is bound, and changing any of them means
 /// restarting the listener — which nothing inside this process can do to
 /// itself. Rather than offering a control that would silently fail, each of
-/// those is reported with `restart_required`, so the panel can say so.
+/// those is named in `restart_required`.
 ///
 /// The key itself is never here. It is not logged, it is not in the engine's
 /// argv, and an endpoint that returned it would undo both.
@@ -355,50 +431,46 @@ pub async fn gateway(State(state): State<Arc<GatewayState>>, headers: HeaderMap)
     if let Some(refusal) = authorize(&state, &headers) {
         return refusal;
     }
+    axum::Json(describe_gateway(&state).await).into_response()
+}
 
+/// Read the gateway's own description.
+///
+/// Split from the handler so it can be asserted on without a server or a key,
+/// as `system::report` is.
+pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
     let config = &state.config;
-    let listeners: Vec<serde_json::Value> = config
-        .bound_addresses
-        .iter()
-        .map(|address| {
-            json!({
-                "address": address.to_string(),
-                "port": address.port(),
-                // Said plainly because it is what decides whether auth was
-                // required: a purely local bind is allowed to have no key.
-                "loopback": address.ip().is_loopback(),
-            })
-        })
-        .collect();
-
     let resident = state.catalog.resident().await;
-    let queue = state.scheduler().snapshot();
 
-    axum::Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "backend": state.backend.id().to_string(),
-        "engine": state.backend.health().await,
-        "model": resident.as_ref().map(|model| model.id.to_string()),
-        "listeners": listeners,
-        // Empty when this gateway was built in-process, which is every unit
-        // test. Distinguished from "serving nothing" by `restart_required`
-        // being true either way: the panel never offers to change it.
-        "restart_required": ["listeners", "auth", "concurrency"],
-        "auth": {
-            "required": config.auth.is_enabled(),
+    GatewayReport {
+        version: env!("CARGO_PKG_VERSION"),
+        backend: state.backend.id().to_string(),
+        engine: state.backend.health().await,
+        model: resident.as_ref().map(|model| model.id.to_string()),
+        listeners: config
+            .bound_addresses
+            .iter()
+            .map(|address| ListenerReport {
+                address: address.to_string(),
+                port: address.port(),
+                loopback: address.ip().is_loopback(),
+            })
+            .collect(),
+        restart_required: vec!["listeners", "auth", "concurrency"],
+        auth: AuthReport {
+            required: config.auth.is_enabled(),
         },
-        "concurrency": {
-            "max_concurrent_requests": config.max_concurrent_requests,
-            "queue_timeout_seconds": config.queue_timeout.as_secs(),
+        concurrency: ConcurrencyReport {
+            max_concurrent_requests: config.max_concurrent_requests,
+            queue_timeout_seconds: config.queue_timeout.as_secs(),
         },
-        "queue": queue,
-        "paths": config.paths.as_ref().map(|paths| json!({
-            "data": paths.data_dir(),
-            "models": paths.models_dir(),
-            "logs": paths.logs_dir(),
-        })),
-    }))
-    .into_response()
+        queue: state.scheduler().snapshot(),
+        paths: config.paths.as_ref().map(|paths| PathsReport {
+            data: paths.data_dir().to_path_buf(),
+            models: paths.models_dir(),
+            logs: paths.logs_dir(),
+        }),
+    }
 }
 
 /// `GET /api/v1/jobs`.
