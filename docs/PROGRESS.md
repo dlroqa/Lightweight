@@ -405,6 +405,52 @@ assumptions, no workarounds — rather than by running it:
   printed a skip and passed. It cancels after a quarter of the bytes now, so
   there is always a partial file to resume from.
 
+## The icon
+
+One artwork, `icon/source.png`, and one script that cuts everything from it:
+`scripts/build-icons.py`. The script measures where the mark actually sits -
+the render frames it small and high in a large field of plate - and re-cuts the
+canvas so the mark fills 78% of it, because an icon framed for a poster is a
+coloured square with a smudge in it at 32px.
+
+What it writes is committed, so no build step and nothing at run time depends
+on Pillow. Replacing `icon/source.png` and re-running the script is the whole
+of "change the icon":
+
+| Output | Size | Read by |
+|---|---:|---|
+| `apps/desktop/build/icons/<n>x<n>.png` | 16-1024 | electron-builder, as an icon *set*: the AppImage installs each size where the desktop looks for it, and macOS and Windows convert the largest |
+| `apps/desktop/build/window.png` | 256 | the shell's `BrowserWindow`, via `dist/` |
+| `apps/desktop/build/tray.png` | 48 | the shell's tray, via `dist/` |
+| `frontend/public/icon.png` | 256 | the browser tab, and the panel's rail |
+| `frontend/public/apple-touch-icon.png` | 180 | a home screen |
+| `frontend/public/favicon.ico` | 16/32/48 | the reflex request for `/favicon.ico`, so it is not a 404 on every load |
+
+Three decisions worth keeping:
+
+- **The runtime icons travel in `dist/`, not `build/`.** `build/` is
+  electron-builder's own resources directory: it reads `icons/` from there to
+  make the package's icon, and excludes that directory from the app itself -
+  `getMainFileMatchers` adds `!<buildResources>{,/**/*}` to every file pattern.
+  An icon loaded from `build/` at run time would be present in a checkout and
+  missing from the AppImage - the worst kind of difference, because only the
+  shipped copy is wrong. `scripts-build.mjs` copies them into `dist/` and fails
+  the build if they are not there.
+- **The rail chip's ring is an `outline`, not an inset `box-shadow`.** The
+  first version used the shadow, which is what the rest of the panel uses, and
+  it drew nothing: an inset shadow is painted below the element's content, and
+  the content of an `img` is an opaque image covering the whole box. Checked in
+  a browser against a deliberately garish test ring rather than reasoned about
+  - `outline` with a negative `outline-offset` draws above the image and still
+  follows `border-radius`.
+- **There is no transparent version of the mark.** It was tried, with alpha
+  taken from each pixel's distance to the plate colour. The feather's vane is a
+  dark teal about as far from the plate as the film grain is, so keying it out
+  deletes half the mark and leaves a quill and a bolt. The artwork is drawn *on*
+  its plate and keeps it everywhere, which is why the panel's rail chip is the
+  application icon itself rather than a recolourable glyph - and why that chip
+  is the one surface in the panel that looks identical in light and dark.
+
 ## Test counts
 
 | Suite | Count | Notes |

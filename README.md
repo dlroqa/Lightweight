@@ -467,6 +467,14 @@ Two parts of the product are not crates:
 | `frontend/` | The control panel: a React and TypeScript SPA, built by Vite and served by the gateway at `/` |
 | `apps/desktop/` | The desktop shell: an Electron window onto a gateway, and a supervisor for one |
 
+And one is not code. `icon/source.png` is the application's artwork; every icon
+the product ships — the window, the tray, the packaged application, the browser
+tab and the panel's own rail — is cut from it by `scripts/build-icons.py`,
+which re-frames the mark for the size it will be seen at rather than trusting a
+crop guessed once. The outputs are committed, so nothing at build or run time
+needs the script or Pillow; re-running it is only needed when the artwork
+changes.
+
 ## Designed for the machine it runs on
 
 Limits are derived at runtime, never frozen as constants measured during

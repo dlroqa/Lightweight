@@ -21,6 +21,7 @@
   "build": {
     "appId": "ai.hermes.cpu-inference-gateway",
     "productName": "Hermes",
+    "icon": "build/icons",
     "files": [
       "dist/**/*",
       "package.json"

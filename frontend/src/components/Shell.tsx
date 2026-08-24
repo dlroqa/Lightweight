@@ -4,7 +4,6 @@ import {
   Cpu,
   FileText,
   Gauge,
-  Hexagon,
   LayoutDashboard,
   MessageSquare,
   Moon,
@@ -60,9 +59,15 @@ export function Shell() {
 
       <nav className="rail" aria-label="Sections">
         <div className="rail__brand">
-          <span className="rail__mark">
-            <Hexagon size={19} strokeWidth={2.2} fill="currentColor" />
-          </span>
+          {/*
+            The application's own icon, from `public/`, rather than a glyph
+            standing in for one - the same file the browser puts in the tab, so
+            it is fetched once and the rail and the tab cannot drift apart. It
+            is served by the gateway beside the panel, so it needs no network,
+            and `alt` is empty because the name it stands for is spelled out
+            immediately to its right.
+          */}
+          <img className="rail__mark" src="/icon.png" alt="" width={38} height={38} />
           {!collapsed && (
             <span className="rail__name">
               <strong>Hermes</strong>

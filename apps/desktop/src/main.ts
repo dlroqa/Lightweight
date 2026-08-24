@@ -22,6 +22,7 @@ import {
   ipcMain,
   nativeImage,
   shell,
+  type NativeImage,
 } from "electron";
 
 import {
@@ -61,6 +62,23 @@ function panelRoot(): string | undefined {
   return undefined;
 }
 
+/**
+ * An icon that ships beside the compiled main process.
+ *
+ * `scripts-build.mjs` copies these into `dist/`, so the same path resolves in a
+ * checkout and inside the packaged asar - `join(here, ...)` is the same
+ * directory `preload.cjs` is loaded from above.
+ *
+ * `createFromPath` is documented to return an empty image, rather than throw,
+ * when the file is missing, unreadable or not an image, and both callers accept
+ * an empty one. That is the behaviour wanted here: a shell that refused to
+ * start because a decoration was absent would be a worse failure than one that
+ * starts without it.
+ */
+function icon(name: string): NativeImage {
+  return nativeImage.createFromPath(join(here, name));
+}
+
 function repoRoot(): string {
   return join(here, "..", "..", "..");
 }
@@ -73,6 +91,9 @@ async function createWindow(): Promise<void> {
     minHeight: 640,
     show: false,
     title: "Hermes",
+    // Linux and Windows read the window's icon from the process; macOS uses the
+    // bundle's and ignores this.
+    icon: icon("window.png"),
     backgroundColor: "#eef2fb",
     webPreferences: {
       // CommonJS, and named `.cjs` so Node reads it as such inside a
@@ -184,10 +205,9 @@ function updateTray(state: GatewayState): void {
 }
 
 function createTray(): void {
-  // An empty image rather than a missing file: a packaged icon is added at
-  // packaging time, and a shell that refuses to start because an icon is absent
-  // would be failing over decoration.
-  tray = new Tray(nativeImage.createEmpty());
+  // Given at 48px for a tray that draws it at 16-24: the platform scales it
+  // down, and a HiDPI display has real pixels to use.
+  tray = new Tray(icon("tray.png"));
   updateTray(supervisor.current());
 }
 

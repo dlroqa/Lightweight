@@ -122,16 +122,30 @@ textarea {
   min-width: 0;
 }
 
+/*
+ * The brand chip: the application's icon, at rail size.
+ *
+ * The artwork is drawn on its own dark plate and keeps it here, so this is the
+ * one surface in the panel that looks identical in light and dark - a mark
+ * that changed colour with the theme would not be the same mark. The ring and
+ * the shadow are the panel's, and are all that ties it to the surface it sits
+ * on.
+ *
+ * The ring is an `outline` and not an inset `box-shadow`: an inset shadow is
+ * painted below the element's content, and the content of an `img` is an
+ * opaque image that covers the whole box, so the ring would be drawn and then
+ * hidden. A negative `outline-offset` puts it back inside the box, and an
+ * outline follows `border-radius`.
+ */
 .rail__mark {
-  display: grid;
-  place-items: center;
+  display: block;
   flex: none;
   width: 38px;
   height: 38px;
   border-radius: 11px;
-  color: #ffffff;
-  background: linear-gradient(150deg, #4f7ef7 0%, #2f5fe0 55%, #6d5ef0 100%);
-  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28);
+  box-shadow: 0 4px 12px rgba(8, 15, 20, 0.3);
+  outline: 1px solid rgba(148, 163, 184, 0.22);
+  outline-offset: -1px;
 }
 
 .rail__name {

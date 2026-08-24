@@ -4,6 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hermes — CPU Inference Gateway</title>
+
+    <!--
+      Icons, from `public/`, which Vite copies to the web root verbatim.
+
+      Fixed paths on purpose: the bundler content-hashes everything it emits,
+      but a browser asks for `/favicon.ico` by reflex and a home screen asks for
+      `/apple-touch-icon.png`, and neither reads this document first. All three
+      are cut from `icon/source.png` by `scripts/build-icons.py`.
+    -->
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#131c23" />
     <!--
       No web font is fetched.
 
