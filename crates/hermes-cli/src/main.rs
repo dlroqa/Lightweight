@@ -88,6 +88,16 @@ enum Command {
         /// Port to bind. `0` picks a free one and prints it.
         #[arg(long, default_value_t = 8737)]
         port: u16,
+        /// Requests to run at once.
+        ///
+        /// One by default, because the engine serves one sequence at a time and
+        /// a second concurrent generation on a small CPU makes both slower than
+        /// running them in turn. Raise it on a machine with cores and memory to
+        /// spare: the engine is given the same number of slots and the RAM
+        /// estimate is computed for it, so the answer to "does this fit?" stays
+        /// honest.
+        #[arg(long, default_value_t = 1)]
+        concurrency: u32,
         /// Require this key on every request.
         ///
         /// Optional on loopback and mandatory as soon as any bind is reachable
@@ -176,6 +186,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             host,
             port,
             api_key,
+            concurrency,
         } => {
             // Only this command needs an async runtime, so it is built here
             // rather than wrapping every command in one.
@@ -192,6 +203,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 hosts: host.clone(),
                 port: *port,
                 api_key: api_key.clone(),
+                concurrency: *concurrency,
             }))?;
             Ok(ExitCode::SUCCESS)
         }

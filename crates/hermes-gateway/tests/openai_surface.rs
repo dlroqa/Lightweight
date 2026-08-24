@@ -12,6 +12,7 @@ use std::time::Duration;
 use hermes_backend_mock::{MockBackend, MockConfig, Script};
 use hermes_core::{ModelId, SseDecoder, SseEvent};
 use hermes_gateway::catalog::{Catalog, ResidentModel};
+use hermes_gateway::scheduler::Band;
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_inference::InferenceBackend;
 use hermes_inference::generation::{Prompt, ToolChoice};
@@ -547,7 +548,7 @@ async fn a_client_that_disconnects_mid_stream_frees_the_slot() {
     // so a slow machine does not turn this into a flake.
     let freed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(permit) = harness.state.acquire_slot().await {
+            if let Some(permit) = harness.state.acquire_slot(Band::Bulk).await {
                 return permit;
             }
         }
@@ -1448,4 +1449,311 @@ async fn a_completion_that_fails_midway_ends_the_stream_cleanly() {
         error_chunk["error"]["code"].is_string(),
         "the error chunk must carry a code: {error_chunk}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The scheduler, the queue and the metrics, as a client sees them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_queued_streamed_request_is_told_where_it_stands() {
+    ensure_provider();
+    // The failure this replaces: a client whose request is behind a
+    // multi-minute generation receives *nothing at all* — no headers, no
+    // bytes — until the request ahead of it finishes, which every client's read
+    // timeout eventually reads as a hung server.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            queue_notice_interval: Duration::from_millis(50),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    // Hold the only slot, exactly as a long generation would.
+    let permit = harness.state.try_acquire_slot().expect("the free slot");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(permit);
+    });
+
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .await;
+    // Answered immediately, while still queued: this is the whole point.
+    assert_eq!(response.status(), 200);
+
+    let body = response.text().await.expect("body");
+    assert!(
+        body.contains(": queued position=0"),
+        "the client was never told it was queued: {body}"
+    );
+    assert!(
+        body.contains("Hello"),
+        "the request never ran after being queued: {body}"
+    );
+    assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+    release.await.expect("release");
+}
+
+#[tokio::test]
+async fn a_queued_streamed_request_that_waits_too_long_is_told_so() {
+    ensure_provider();
+    // Once headers are out a refusal cannot be a status code, so it has to be
+    // the terminal error chunk — carrying the same `server_busy` code the
+    // non-streamed path returns with its 503, because which side of the headers
+    // the client happened to be on is our detail, not theirs.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            queue_timeout: Duration::from_millis(100),
+            queue_notice_interval: Duration::from_millis(20),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let _permit = harness.state.try_acquire_slot().expect("the free slot");
+
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    let events = read_stream(response).await;
+    let error = events
+        .iter()
+        .filter(|event| !event.is_done())
+        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+        .find(|chunk| chunk.get("error").is_some())
+        .expect("an error chunk");
+    assert_eq!(error["error"]["code"], "server_busy");
+    assert_eq!(error["choices"][0]["finish_reason"], "error");
+    assert!(events.last().expect("frames").is_done());
+}
+
+#[tokio::test]
+async fn a_queued_request_that_cannot_stream_is_refused_with_a_status() {
+    ensure_provider();
+    // Unchanged from before the scheduler existed, and deliberately so: nothing
+    // has been written to this client, so it can still be told in the one way
+    // every client already handles.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            queue_timeout: Duration::from_millis(50),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let _permit = harness.state.try_acquire_slot().expect("the free slot");
+
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    assert_eq!(response.status(), 503);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "server_busy");
+}
+
+#[tokio::test]
+async fn a_short_request_is_served_before_a_long_one_that_was_already_waiting() {
+    ensure_provider();
+    // The acceptance run's failure, end to end: a small auxiliary request
+    // arriving while a long turn is queued must not go to the back.
+    let harness = Harness::default().await;
+    let permit = harness.state.try_acquire_slot().expect("the free slot");
+
+    // A long request queues first — a big stated output budget is what makes it
+    // long, and the gateway knows that number before it admits anything.
+    let long = harness.state.enqueue(Band::classify(
+        11,
+        Some(4000),
+        harness.state.config.scheduler.interactive,
+    ));
+    let short = harness.state.enqueue(Band::classify(
+        11,
+        Some(16),
+        harness.state.config.scheduler.interactive,
+    ));
+    assert_eq!(long.band(), Band::Bulk);
+    assert_eq!(short.band(), Band::Interactive);
+    assert_eq!(short.position(), 0, "the later, shorter request is next");
+    assert_eq!(long.position(), 1);
+
+    drop(permit);
+    drop(long);
+    drop(short);
+}
+
+#[tokio::test]
+async fn metrics_report_what_the_gateway_actually_did() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let scrape = harness.get("/metrics").await;
+    assert_eq!(scrape.status(), 200);
+    assert!(
+        scrape
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain")),
+        "a Prometheus scrape must be text"
+    );
+    let text = scrape.text().await.expect("body");
+    assert!(
+        text.contains("hermes_requests_total{endpoint=\"chat_completions\",outcome=\"ok\"} 1"),
+        "{text}"
+    );
+    assert!(text.contains("hermes_generations_total 1"), "{text}");
+    assert!(
+        text.contains("hermes_finish_reason_total{reason=\"stop\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hermes_queue_slots{state=\"capacity\"} 1"),
+        "{text}"
+    );
+    // Every metric a scraper reads must have been declared first.
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let name = line.split(['{', ' ']).next().unwrap_or_default();
+        assert!(
+            text.contains(&format!("# TYPE {name} ")),
+            "{name} was emitted without a TYPE line"
+        );
+    }
+    assert!(
+        !text.contains("/mock/model.gguf"),
+        "a scrape must not carry the model's path: {text}"
+    );
+}
+
+#[tokio::test]
+async fn the_json_metrics_carry_the_same_numbers_for_our_own_ui() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .await
+        .text()
+        .await
+        .expect("body");
+
+    let body: Value = harness
+        .get("/api/v1/metrics")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["generations"], 1);
+    assert_eq!(body["finish_reasons"]["stop"], 1);
+    assert_eq!(body["queue"]["capacity"], 1);
+    assert_eq!(body["queue"]["running"], 0, "the slot came back");
+    assert_eq!(body["tokens"]["prompt"], 11);
+    assert!(
+        body["model"]["id"]
+            .as_str()
+            .is_some_and(|id| id.contains("mock-model")),
+        "{body}"
+    );
+    assert!(
+        body.to_string().find("/mock/model.gguf").is_none(),
+        "the model's path must not appear in metrics"
+    );
+}
+
+#[tokio::test]
+async fn a_generation_the_client_abandons_is_counted_as_cancelled_not_as_an_error() {
+    ensure_provider();
+    // Closing a laptop lid is a normal act. Counting it in the same column as a
+    // crashed engine is how an operator ends up chasing a failure that never
+    // happened.
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Endless {
+                fragment: "tick".into(),
+                interval: Duration::from_millis(10),
+            },
+            ..MockConfig::default()
+        },
+        GatewayConfig::default(),
+    )
+    .await;
+
+    let response = harness
+        .post_chat(json!({
+            "model": "mock-model@4k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(response.status(), 200);
+    drop(response);
+
+    // The counter is written from the guard's `Drop`, which happens when the
+    // body is dropped; poll briefly rather than sleeping a fixed time.
+    let counted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = harness.state.metrics_snapshot().await;
+            if snapshot.finish_reasons.cancelled == 1 {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let snapshot = counted.expect("the abandoned generation was never counted");
+    assert_eq!(snapshot.finish_reasons.error, 0, "and not as an error");
+    assert_eq!(snapshot.queue.running, 0, "the slot came back");
+}
+
+#[tokio::test]
+async fn metrics_are_behind_the_key_when_one_is_configured() {
+    ensure_provider();
+    // Request rates, token counts and queue depth describe what this machine is
+    // doing. On a bind that is reachable from elsewhere, that is not public.
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "secret-key".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(harness.get("/metrics").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/metrics").await.status(), 401);
+
+    let authorized = Harness::client()
+        .get(format!("{}/metrics", harness.base))
+        .header("Authorization", "Bearer secret-key")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(authorized.status(), 200);
 }

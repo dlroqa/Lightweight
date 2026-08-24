@@ -22,8 +22,10 @@
 //! chunk carries `finish_reason: "error"` and an error body, then `[DONE]`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
 use hermes_api::chat::UsageBody;
 use hermes_api::error::ErrorEnvelope;
@@ -32,34 +34,87 @@ use hermes_core::Actionable;
 use hermes_inference::generation::{FinishReason, GenerationEvent};
 use hermes_inference::{BackendError, GenerationStream};
 use hermes_observability::targets;
-use tokio::sync::OwnedSemaphorePermit;
+// tokio's clock rather than the standard one, so that every duration this
+// module reports — a queue wait, a time to first token — is measurable under
+// `tokio::time::pause()`. A test that has to sleep in real time to check a
+// 15-second interval is a test nobody runs.
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use crate::metrics::{GenerationRecord, Metrics};
+use crate::scheduler::{SlotPermit, Ticket};
 
 /// How often a keep-alive goes out while the engine is still reading the
 /// prompt.
 ///
 /// Fifteen seconds is well inside the shortest idle timeout worth worrying
 /// about, and costs six bytes.
-pub(crate) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Holds a request's slot and cancels its work when dropped.
+/// Holds a request's slot, records what it cost, and cancels its work when
+/// dropped.
 ///
 /// The entire cancellation design rests on this type being owned by the
 /// response body. Nothing needs to detect a disconnect: hyper drops the body,
 /// the body drops this, and the token cancels — which drops the upstream
 /// response, closes the connection to the engine, and stops it decoding.
+///
+/// Metrics are written from the same `Drop`, and for the same reason: a
+/// generation that ended because the client walked away is exactly the one a
+/// counter placed at the end of a happy path would miss, and it is the one
+/// worth knowing about.
 #[derive(Debug)]
 pub struct RequestGuard {
     cancel: CancellationToken,
     /// Held, never read. Dropping it is the point.
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<SlotPermit>,
+    metrics: Option<Arc<Metrics>>,
+    record: GenerationRecord,
+    started: Instant,
 }
 
 impl RequestGuard {
-    pub fn new(cancel: CancellationToken, permit: Option<OwnedSemaphorePermit>) -> Self {
+    pub fn new(cancel: CancellationToken, permit: Option<SlotPermit>) -> Self {
         Self {
             cancel,
-            _permit: permit,
+            permit,
+            metrics: None,
+            record: GenerationRecord::default(),
+            started: Instant::now(),
+        }
+    }
+
+    /// The same guard, reporting what it measured when it is dropped.
+    #[must_use]
+    pub fn reporting_to(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Record how long this request waited for its slot.
+    pub fn waited(&mut self, queue_wait: Duration) {
+        self.record.queue_wait = queue_wait;
+    }
+
+    /// Take the slot, for a request that was still queued when its response
+    /// started.
+    pub fn admitted(&mut self, permit: SlotPermit) {
+        self.permit = Some(permit);
+    }
+
+    /// The measurements this request is accumulating.
+    pub fn record_mut(&mut self) -> &mut GenerationRecord {
+        &mut self.record
+    }
+
+    /// Note the moment the client could first have seen a token.
+    ///
+    /// Only the first call counts. Time to first token is a latency, and a
+    /// latency that is overwritten by every subsequent token is a measure of
+    /// nothing.
+    pub fn first_token(&mut self) {
+        if self.record.time_to_first_token.is_none() {
+            self.record.time_to_first_token = Some(self.started.elapsed());
         }
     }
 
@@ -76,6 +131,13 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.cancel.cancel();
+        if let Some(metrics) = &self.metrics {
+            self.record.total = self.started.elapsed();
+            metrics.record_generation(&self.record);
+        }
+        // Explicit, and last: the slot must not be handed to the next request
+        // until this one has finished accounting for itself.
+        drop(self.permit.take());
     }
 }
 
@@ -86,9 +148,34 @@ struct Outcome {
     tool_call_chunks: u64,
 }
 
+/// How a streamed response starts a generation it does not have yet.
+///
+/// Boxed because the work has to be deferred until a slot is free: the engine
+/// serves one request at a time, so calling it before admission would be
+/// exactly the queue-jumping the scheduler exists to prevent.
+pub type StartGeneration =
+    Box<dyn FnOnce() -> BoxFuture<'static, Result<GenerationStream, BackendError>> + Send>;
+
+/// Where a streamed response's events come from.
+enum Source {
+    /// A generation the engine has already accepted.
+    Running(GenerationStream),
+    /// A place in the queue, and what to do when it comes up.
+    Queued {
+        ticket: Ticket,
+        start: StartGeneration,
+        /// When to stop waiting and say so.
+        deadline: Instant,
+        /// How often to say where this request stands.
+        notice_interval: Duration,
+    },
+    /// Being transitioned between the two above.
+    InTransit,
+}
+
 /// State carried while encoding one streamed completion.
 struct Encoder {
-    events: GenerationStream,
+    source: Source,
     builder: ChunkBuilder,
     guard: RequestGuard,
     pending: VecDeque<String>,
@@ -101,7 +188,7 @@ struct Encoder {
     outcome: Outcome,
 }
 
-/// Encode a generation into SSE frames.
+/// Encode a running generation into SSE frames.
 ///
 /// The returned stream yields whole frames, in the order spec section 12
 /// requires, and ends with `data: [DONE]`.
@@ -111,8 +198,53 @@ pub fn encode(
     guard: RequestGuard,
     include_usage: bool,
 ) -> impl futures_util::Stream<Item = Result<String, std::convert::Infallible>> + Send {
+    encode_source(Source::Running(events), builder, guard, include_usage)
+}
+
+/// Encode a response for a request that is still waiting for a slot.
+///
+/// The difference this makes is the whole of the streamed half of M5. Waiting
+/// for admission *before* answering means a queued client sees nothing at all —
+/// no headers, no bytes — for however long the request ahead of it takes, which
+/// on this hardware is minutes and which every client's read timeout eventually
+/// reads as a hung server. Answering first and waiting inside the response
+/// turns that silence into a position that visibly counts down.
+///
+/// The cost is stated rather than hidden: once the response has started, a
+/// failure to *begin* generating can no longer be an HTTP status and arrives as
+/// this module's terminal error chunk instead. That trade is only made for a
+/// request that was genuinely queued — an uncontended one still takes its slot
+/// first and keeps the status codes — so the common path is unchanged.
+pub fn encode_queued(
+    ticket: Ticket,
+    start: StartGeneration,
+    deadline: Instant,
+    notice_interval: Duration,
+    builder: ChunkBuilder,
+    guard: RequestGuard,
+    include_usage: bool,
+) -> impl futures_util::Stream<Item = Result<String, std::convert::Infallible>> + Send {
+    encode_source(
+        Source::Queued {
+            ticket,
+            start,
+            deadline,
+            notice_interval,
+        },
+        builder,
+        guard,
+        include_usage,
+    )
+}
+
+fn encode_source(
+    source: Source,
+    builder: ChunkBuilder,
+    guard: RequestGuard,
+    include_usage: bool,
+) -> impl futures_util::Stream<Item = Result<String, std::convert::Infallible>> + Send {
     let mut encoder = Encoder {
-        events,
+        source,
         builder,
         guard,
         pending: VecDeque::new(),
@@ -138,13 +270,25 @@ pub fn encode(
                 return None;
             }
 
+            if matches!(encoder.source, Source::Queued { .. }) {
+                wait_for_a_slot(&mut encoder).await;
+                continue;
+            }
+
+            let Source::Running(events) = &mut encoder.source else {
+                // Not queued and not running: admission failed and said so in
+                // a frame already queued above.
+                close(&mut encoder, FinishReason::Error);
+                continue;
+            };
+
             // A keep-alive is only sent while the engine is still reading the
             // prompt. Once tokens flow, the stream speaks for itself.
             let next = if encoder.started {
-                encoder.events.next().await
+                events.next().await
             } else {
                 tokio::select! {
-                    event = encoder.events.next() => event,
+                    event = events.next() => event,
                     () = tokio::time::sleep(KEEP_ALIVE_INTERVAL) => {
                         let ping = encoder.builder.keep_alive();
                         encoder.pending.push_back(ping);
@@ -173,15 +317,78 @@ pub fn encode(
     })
 }
 
+/// Wait for admission, telling the client where it stands while it waits.
+///
+/// Leaves `encoder.source` as [`Source::Running`] when the generation has
+/// started, or queues the frames that end the stream when it cannot.
+async fn wait_for_a_slot(encoder: &mut Encoder) {
+    let Source::Queued {
+        mut ticket,
+        start,
+        deadline,
+        notice_interval,
+    } = std::mem::replace(&mut encoder.source, Source::InTransit)
+    else {
+        return;
+    };
+
+    tokio::select! {
+        granted = ticket.granted() => {
+            let waited = ticket.waited();
+            match granted {
+                Some(permit) => {
+                    drop(ticket);
+                    tracing::info!(
+                        target: targets::SCHEDULER,
+                        id = encoder.builder.id(),
+                        waited_ms = waited.as_millis() as u64,
+                        "admitted after waiting"
+                    );
+                    encoder.guard.admitted(permit);
+                    encoder.guard.waited(waited);
+                    match start().await {
+                        Ok(events) => encoder.source = Source::Running(events),
+                        Err(err) => fail(encoder, &err),
+                    }
+                }
+                // The scheduler is gone, which happens only at shutdown.
+                None => fail(encoder, &BackendError::Cancelled),
+            }
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            tracing::warn!(
+                target: targets::SCHEDULER,
+                id = encoder.builder.id(),
+                waited_ms = ticket.waited().as_millis() as u64,
+                position = ticket.position(),
+                "gave up waiting for a slot"
+            );
+            drop(ticket);
+            fail_with(encoder, "server_busy", queue_timeout_envelope());
+        }
+        () = tokio::time::sleep(notice_interval) => {
+            let notice = encoder.builder.queued(ticket.position(), ticket.waited());
+            encoder.pending.push_back(notice);
+            encoder.source = Source::Queued { ticket, start, deadline, notice_interval };
+        }
+    }
+}
+
 fn absorb(encoder: &mut Encoder, event: GenerationEvent) {
     match event {
         GenerationEvent::Started { .. } => {}
         GenerationEvent::ContentDelta { text } => {
             encoder.outcome.content_chunks += 1;
+            encoder.guard.first_token();
             let frame = encoder.builder.content(text).to_sse_frame();
             encoder.pending.push_back(frame);
         }
         GenerationEvent::ReasoningDelta { text } => {
+            // Reasoning counts as a first token. It is output, it reaches the
+            // client, and a thinking model can spend a whole budget in it — a
+            // latency measured only to the first *visible* token would report
+            // minutes of silence that the client was not experiencing.
+            encoder.guard.first_token();
             let frame = encoder.builder.reasoning(text).to_sse_frame();
             encoder.pending.push_back(frame);
         }
@@ -192,6 +399,7 @@ fn absorb(encoder: &mut Encoder, event: GenerationEvent) {
             arguments,
         } => {
             encoder.outcome.tool_call_chunks += 1;
+            encoder.guard.first_token();
             let frame = encoder
                 .builder
                 .tool_call(index, id, name, arguments)
@@ -199,12 +407,32 @@ fn absorb(encoder: &mut Encoder, event: GenerationEvent) {
             encoder.pending.push_back(frame);
         }
         GenerationEvent::Timings(timings) => {
+            // With per-token timings enabled upstream this arrives once per
+            // token rather than once per generation, and each one supersedes
+            // the last. That is the point: a generation the client abandons
+            // half way still leaves behind what it had cost so far, where
+            // before there was nothing until the final chunk that never came.
+            let record = encoder.guard.record_mut();
+            record.prefill = Some(Duration::from_secs_f64(timings.prompt_ms / 1000.0));
+            record.decode = Some(Duration::from_secs_f64(timings.predicted_ms / 1000.0));
+            record.cached_tokens = timings.cached_n;
+            if record.completion_tokens == 0 {
+                // Only until the usage chunk says otherwise: this is what makes
+                // an abandoned generation count the tokens it did produce.
+                record.completion_tokens = timings.predicted_n;
+            }
             encoder.timings = serde_json::to_value(timings).ok();
         }
         GenerationEvent::Finished {
             finish_reason,
             usage,
         } => {
+            let record = encoder.guard.record_mut();
+            record.prompt_tokens = usage.prompt_tokens;
+            record.completion_tokens = usage.completion_tokens;
+            if usage.cached_tokens > 0 {
+                record.cached_tokens = usage.cached_tokens;
+            }
             encoder.usage = Some(UsageBody::from(usage));
             close(encoder, finish_reason);
         }
@@ -213,16 +441,34 @@ fn absorb(encoder: &mut Encoder, event: GenerationEvent) {
 
 /// End the stream after a failure that arrived once bytes were already sent.
 fn fail(encoder: &mut Encoder, err: &BackendError) {
+    fail_with(encoder, err.code(), ErrorEnvelope::from_error(err));
+}
+
+/// The same, for a refusal that is the gateway's own rather than a backend's.
+fn fail_with(encoder: &mut Encoder, code: &str, envelope: ErrorEnvelope) {
     tracing::warn!(
         target: targets::INFERENCE,
-        code = err.code(),
+        code,
         "generation failed after the response had started"
     );
-    let body = ErrorEnvelope::from_error(err).to_value();
-    let frame = encoder.builder.error(body).to_sse_frame();
+    encoder.guard.record_mut().finish_reason = Some(FinishReason::Error);
+    let frame = encoder.builder.error(envelope.to_value()).to_sse_frame();
     encoder.pending.push_back(frame);
     encoder.pending.push_back(encoder.builder.done());
     encoder.finished = true;
+}
+
+/// The refusal a queued request gets when its wait runs out.
+///
+/// Word for word the body the non-streamed path returns with a 503, and the
+/// same `server_busy` code: whether a client was queued before or after the
+/// headers went out is our implementation detail, and it must not change what
+/// the client is told went wrong.
+fn queue_timeout_envelope() -> ErrorEnvelope {
+    ErrorEnvelope::invalid_request(
+        "the gateway is busy with another request; try again shortly",
+        "server_busy",
+    )
 }
 
 /// Emit the finish chunk, the usage chunk and `[DONE]`.
@@ -230,6 +476,7 @@ fn close(encoder: &mut Encoder, finish_reason: FinishReason) {
     if encoder.finished {
         return;
     }
+    encoder.guard.record_mut().finish_reason = Some(finish_reason);
     let frame = encoder.builder.finish(finish_reason).to_sse_frame();
     encoder.pending.push_back(frame);
 
@@ -261,7 +508,7 @@ fn close(encoder: &mut Encoder, finish_reason: FinishReason) {
     // Cancellation is idempotent and the permit is released either way; this
     // just does it as soon as the work is done rather than when the client
     // finishes reading.
-    encoder.guard.cancel.cancel();
+    encoder.guard.cancel();
 }
 
 #[cfg(test)]
@@ -270,8 +517,6 @@ mod tests {
     use futures_util::stream as futures_stream;
     use hermes_core::{SseDecoder, SseEvent};
     use hermes_inference::generation::Usage;
-    use std::sync::Arc;
-    use tokio::sync::Semaphore;
 
     fn events(items: Vec<Result<GenerationEvent, BackendError>>) -> GenerationStream {
         futures_stream::iter(items).boxed()
@@ -528,8 +773,8 @@ mod tests {
     async fn dropping_the_stream_releases_the_slot_and_cancels_the_work() {
         // The property the whole cancellation design rests on: a client that
         // disappears must not leave a permit held or an engine decoding.
-        let slots = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&slots).acquire_owned().await.expect("permit");
+        let slots = crate::scheduler::Scheduler::new(1, Default::default());
+        let permit = slots.try_admit().expect("permit");
         let cancel = CancellationToken::new();
         let guard = RequestGuard::new(cancel.clone(), Some(permit));
         let builder = ChunkBuilder::new("chatcmpl-test", "m@4k");
@@ -543,10 +788,10 @@ mod tests {
 
         let mut body = Box::pin(encode(endless, builder, guard, false));
         assert!(body.next().await.is_some());
-        assert_eq!(slots.available_permits(), 0);
+        assert_eq!(slots.snapshot().running, 1);
 
         drop(body);
         assert!(cancel.is_cancelled(), "the work was not cancelled");
-        assert_eq!(slots.available_permits(), 1, "the slot leaked");
+        assert_eq!(slots.snapshot().running, 0, "the slot leaked");
     }
 }

@@ -27,6 +27,8 @@
 
 use hermes_core::sse;
 use hermes_inference::generation::FinishReason;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -288,6 +290,22 @@ impl ChunkBuilder {
     /// comment lines, so this is invisible to the caller.
     pub fn keep_alive(&self) -> String {
         sse::encode_comment("ping")
+    }
+
+    /// A comment frame saying where in the queue this request is.
+    ///
+    /// A comment rather than a chunk, deliberately. A queued request has
+    /// produced no tokens, so any `data:` frame would be a chunk shaped like a
+    /// completion that is not one, and every strict client would have to be
+    /// taught to ignore it. Comments are already discarded by the SSE decoder
+    /// in every client this gateway is checked against, and they are plainly
+    /// readable in `curl` — which is where the question "is it stuck, or is it
+    /// waiting?" actually gets asked.
+    pub fn queued(&self, position: u32, waited: Duration) -> String {
+        sse::encode_comment(&format!(
+            "queued position={position} waited={}s",
+            waited.as_secs()
+        ))
     }
 }
 

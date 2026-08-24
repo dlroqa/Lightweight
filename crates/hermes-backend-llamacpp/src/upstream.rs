@@ -21,6 +21,9 @@
 //!   *without* `[DONE]` (`server-context.cpp:4348`).
 //! * The engine sends `:\n\n` comment pings on a slow prefill, which the
 //!   decoder discards.
+//! * `timings_per_token` attaches the `timings` object to every chunk rather
+//!   than only the final one (symbol present in `libllama-server-impl.so` at
+//!   the pinned build).
 //! * `POST /v1/chat/completions/input_tokens` returns `{"input_tokens":N}`
 //!   with the model's own chat template applied — the only honest way to count
 //!   a prompt before generating it.
@@ -237,6 +240,19 @@ impl UpstreamClient {
         // counts from exactly that chunk, and the metrics layer needs the
         // same numbers.
         body.insert("stream_options".into(), json!({ "include_usage": true }));
+        // Timings on *every* chunk rather than only the last one. Two things
+        // depend on it. A generation the client abandons half way — the
+        // ordinary outcome of closing a laptop lid — otherwise reports nothing
+        // at all, because the chunk that would have carried its cost is the one
+        // that never arrives. And decode rate becomes observable while a
+        // generation is still running, which on a CPU where a turn takes
+        // minutes is the difference between "it is slow" and "it is stuck".
+        //
+        // Read out of the pinned build rather than from documentation: the
+        // symbol `timings_per_token` is present in `libllama-server-impl.so` at
+        // `b10590`. The cost is a small JSON object per token, against a decode
+        // measured here in single-digit tokens per second.
+        body.insert("timings_per_token".into(), Value::Bool(true));
 
         if let Some(max_tokens) = request.max_tokens {
             body.insert("max_tokens".into(), json!(max_tokens));
@@ -964,6 +980,45 @@ mod tests {
         ] {
             assert!(body.get(absent).is_none(), "{absent} should not be sent");
         }
+    }
+
+    #[test]
+    fn every_chunk_is_asked_to_carry_its_timings() {
+        // Without this the only timings a generation ever reports arrive on the
+        // final chunk — which is precisely the chunk a cancelled or failed
+        // generation never sends, leaving the most interesting requests as the
+        // ones we know nothing about.
+        let client = UpstreamClient::new("http://127.0.0.1:1", "key").expect("client");
+        let body =
+            client.build_request_body(&GenerationRequest::new(vec![ChatMessage::user("hi")]));
+        assert_eq!(body["timings_per_token"], json!(true));
+    }
+
+    #[test]
+    fn timings_arriving_mid_stream_are_reported_as_they_come() {
+        // With per-token timings the engine attaches `timings` to content
+        // chunks too, and each one supersedes the last. The translator must
+        // pass every one of them through rather than waiting for an end that a
+        // cancelled generation never reaches.
+        let events = absorb_all(&[
+            r#"data: {"choices":[{"index":0,"delta":{"content":"a"}}],"timings":{"cache_n":12,"prompt_n":36,"prompt_ms":2040.0,"predicted_n":1,"predicted_ms":600.0}}
+
+"#,
+            r#"data: {"choices":[{"index":0,"delta":{"content":"b"}}],"timings":{"cache_n":12,"prompt_n":36,"prompt_ms":2040.0,"predicted_n":2,"predicted_ms":1200.0}}
+
+"#,
+        ]);
+        let timings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(GenerationEvent::Timings(timings)) => Some(*timings),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(timings.len(), 2, "one per chunk that carried them");
+        assert_eq!(timings[0].predicted_n, 1);
+        assert_eq!(timings[1].predicted_n, 2);
+        assert_eq!(timings[1].cached_n, 12, "and the cache hit is carried too");
     }
 
     #[test]

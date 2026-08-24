@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use hermes_inference::InferenceBackend;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthPolicy;
 use crate::catalog::Catalog;
+use crate::metrics::{Metrics, MetricsSnapshot, ModelSnapshot};
+use crate::scheduler::{Band, Scheduler, SchedulerConfig, SlotPermit, Ticket};
 
 /// How the gateway behaves.
 #[derive(Clone, Debug)]
@@ -29,6 +30,16 @@ pub struct GatewayConfig {
     /// request can wait minutes; the alternative to waiting is a 503 that
     /// makes the client retry into the same queue.
     pub queue_timeout: std::time::Duration,
+    /// How often a queued streamed request is told where it stands.
+    ///
+    /// The same fifteen seconds as the prefill keep-alive, and for the same
+    /// reason: it is well inside the shortest idle timeout worth worrying
+    /// about, and it costs a comment frame. A parameter rather than a constant
+    /// because a test that has to wait fifteen seconds to observe one notice is
+    /// a test that gets deleted.
+    pub queue_notice_interval: std::time::Duration,
+    /// Who goes next when more than one request is waiting.
+    pub scheduler: SchedulerConfig,
 }
 
 impl Default for GatewayConfig {
@@ -37,6 +48,8 @@ impl Default for GatewayConfig {
             auth: AuthPolicy::Disabled,
             max_concurrent_requests: 1,
             queue_timeout: std::time::Duration::from_secs(600),
+            queue_notice_interval: crate::stream::KEEP_ALIVE_INTERVAL,
+            scheduler: SchedulerConfig::default(),
         }
     }
 }
@@ -46,8 +59,14 @@ pub struct GatewayState {
     pub backend: Arc<dyn InferenceBackend>,
     pub catalog: Arc<Catalog>,
     pub config: GatewayConfig,
-    /// One permit per concurrent request.
-    slots: Arc<Semaphore>,
+    /// Admission control: one permit per concurrent request, and the order in
+    /// which waiting requests get one.
+    scheduler: Arc<Scheduler>,
+    /// What has happened so far, in numbers.
+    ///
+    /// Shared rather than owned: a request's guard keeps a handle so that it
+    /// can report from its own `Drop`, which outlives the handler.
+    metrics: Arc<Metrics>,
     /// Cancelled when the gateway shuts down.
     ///
     /// The root of the cancellation tree: shutdown cancels every job, and each
@@ -58,10 +77,12 @@ pub struct GatewayState {
 
 impl std::fmt::Debug for GatewayState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let queue = self.scheduler.snapshot();
         f.debug_struct("GatewayState")
             .field("backend", &self.backend.id())
             .field("config", &self.config)
-            .field("available_slots", &self.slots.available_permits())
+            .field("running", &queue.running)
+            .field("waiting", &queue.waiting)
             .finish()
     }
 }
@@ -72,30 +93,58 @@ impl GatewayState {
         catalog: Arc<Catalog>,
         config: GatewayConfig,
     ) -> Self {
-        let slots = Arc::new(Semaphore::new(
-            config.max_concurrent_requests.max(1) as usize
-        ));
+        let scheduler = Scheduler::new(config.max_concurrent_requests, config.scheduler);
         Self {
             backend,
             catalog,
             config,
-            slots,
+            scheduler,
+            metrics: Arc::new(Metrics::new()),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// The counters, for the handlers that record into them.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    pub fn scheduler(&self) -> &Arc<Scheduler> {
+        &self.scheduler
+    }
+
+    /// Everything measured so far, read at one instant.
+    pub async fn metrics_snapshot(&self) -> MetricsSnapshot {
+        let model = self.catalog.resident().await.map(|model| ModelSnapshot {
+            id: model.id.to_string(),
+            n_ctx: model.n_ctx,
+        });
+        self.metrics.snapshot(self.scheduler.snapshot(), model)
     }
 
     /// A permit to run one request, waited for up to the queue timeout.
     ///
     /// Returns `None` when the wait ran out, which the caller turns into a 503
     /// with a `Retry-After` rather than a request that hangs forever.
-    pub async fn acquire_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        tokio::time::timeout(
-            self.config.queue_timeout,
-            Arc::clone(&self.slots).acquire_owned(),
-        )
-        .await
-        .ok()?
-        .ok()
+    pub async fn acquire_slot(&self, band: Band) -> Option<SlotPermit> {
+        self.scheduler
+            .admit(band, self.config.queue_timeout)
+            .await
+            .ok()
+    }
+
+    /// A slot if one is free this instant, and nothing if not.
+    ///
+    /// The uncontended path. A caller that gets `None` here has learned
+    /// something worth telling the client — that it is queued — which is why
+    /// this is separate from waiting.
+    pub fn try_acquire_slot(&self) -> Option<SlotPermit> {
+        self.scheduler.try_admit()
+    }
+
+    /// Join the queue, keeping the place so it can be reported and released.
+    pub fn enqueue(&self, band: Band) -> Ticket {
+        self.scheduler.enqueue(band)
     }
 
     /// A cancellation token for one job, rooted in the gateway's own.
@@ -133,10 +182,10 @@ mod tests {
     #[tokio::test]
     async fn one_request_runs_at_a_time_by_default() {
         let state = state(GatewayConfig::default());
-        let first = state.acquire_slot().await.expect("first permit");
-        assert_eq!(state.slots.available_permits(), 0);
+        let first = state.acquire_slot(Band::Bulk).await.expect("first permit");
+        assert_eq!(state.scheduler().snapshot().running, 1);
         drop(first);
-        assert_eq!(state.slots.available_permits(), 1);
+        assert_eq!(state.scheduler().snapshot().running, 0);
     }
 
     #[tokio::test]
@@ -145,9 +194,9 @@ mod tests {
             queue_timeout: std::time::Duration::from_millis(20),
             ..GatewayConfig::default()
         });
-        let _held = state.acquire_slot().await.expect("first permit");
+        let _held = state.acquire_slot(Band::Bulk).await.expect("first permit");
         assert!(
-            state.acquire_slot().await.is_none(),
+            state.acquire_slot(Band::Bulk).await.is_none(),
             "the second request must time out rather than wait forever"
         );
     }
@@ -172,8 +221,20 @@ mod tests {
         });
         let mut permits = Vec::new();
         for _ in 0..4 {
-            permits.push(state.acquire_slot().await.expect("permit"));
+            permits.push(state.acquire_slot(Band::Bulk).await.expect("permit"));
         }
-        assert_eq!(state.slots.available_permits(), 0);
+        assert_eq!(state.scheduler().snapshot().running, 4);
+    }
+
+    #[tokio::test]
+    async fn the_metrics_snapshot_describes_a_gateway_that_has_done_nothing() {
+        // A fresh gateway must read as empty rather than as fast: a mean over
+        // no samples is not zero.
+        let state = state(GatewayConfig::default());
+        let snapshot = state.metrics_snapshot().await;
+        assert_eq!(snapshot.generations, 0);
+        assert_eq!(snapshot.queue.capacity, 1);
+        assert!(snapshot.decode_tokens_per_second().is_none());
+        assert!(snapshot.time_to_first_token.mean_ms().is_none());
     }
 }

@@ -17,7 +17,9 @@
 pub mod auth;
 pub mod catalog;
 pub mod completions;
+pub mod metrics;
 pub mod routes;
+pub mod scheduler;
 pub mod state;
 pub mod stream;
 
@@ -32,13 +34,16 @@ use axum::routing::{get, post};
 
 /// Build the router.
 ///
-/// The OpenAI surface lives under `/v1`; `/health`, `/props` and `/version`
-/// are unprefixed because that is where clients probe for them. Our own UI
-/// control API will live under `/api/v1` and is deliberately never mixed in
-/// with the OpenAI routes.
+/// The OpenAI surface lives under `/v1`; `/health`, `/props`, `/version` and
+/// `/metrics` are unprefixed because that is where clients and scrapers probe
+/// for them. Our own UI control API lives under `/api/v1` and is deliberately
+/// never mixed in with the OpenAI routes — a client enumerating `/v1` must find
+/// only what OpenAI defines there.
 pub fn app(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/health", get(routes::health))
+        .route("/metrics", get(routes::metrics))
+        .route("/api/v1/metrics", get(routes::metrics_json))
         .route("/props", get(routes::props))
         .route("/version", get(routes::version))
         .route("/v1/models", get(routes::models))

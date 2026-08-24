@@ -20,6 +20,7 @@ use std::time::Duration;
 use hermes_backend_llamacpp::backend::ProcessBackend;
 use hermes_core::{Actionable, ModelId, RuntimeParams, units::Bytes};
 use hermes_gateway::catalog::{Catalog, ResidentModel};
+use hermes_gateway::scheduler::{BandLimits, SchedulerConfig};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::{InferenceBackend, LoadProgress, LoadRequest};
@@ -54,6 +55,14 @@ pub struct ServeOptions {
     /// Key required on every request. Mandatory as soon as any bind is
     /// reachable from another machine.
     pub api_key: Option<String>,
+    /// Requests the gateway may run at once.
+    ///
+    /// One number, not two: it sizes the engine's slots *and* the gateway's
+    /// queue, and the RAM estimate is computed for the same value — the KV
+    /// cache is per sequence, so four concurrent sequences cost four caches.
+    /// Splitting it into separate settings would let a machine be configured to
+    /// promise more concurrency than it budgeted for.
+    pub concurrency: u32,
 }
 
 /// The environment variable holding the API key.
@@ -108,10 +117,14 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         .parse()
         .map_err(|_| format!("unknown KV cache type {:?}", options.kv_type))?;
     let cpu = CpuInfo::detect();
+    let concurrency = options.concurrency.max(1);
     let base = RuntimeParams {
         cache_type_k: cache_type,
         cache_type_v: cache_type,
         threads: Some(options.threads.unwrap_or_else(|| cpu.default_threads())),
+        // The engine is told the same number the gateway will hand out, so the
+        // estimate, the KV cache and the queue all describe one machine.
+        n_parallel: concurrency,
         ..RuntimeParams::default()
     };
 
@@ -271,6 +284,14 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         catalog,
         GatewayConfig {
             auth,
+            max_concurrent_requests: concurrency,
+            // Band ceilings from the context this model was actually loaded
+            // with, which was itself chosen from this machine's free memory. A
+            // constant here would describe whichever machine it was written on.
+            scheduler: SchedulerConfig {
+                interactive: BandLimits::for_context(loaded.effective.n_ctx),
+                ..SchedulerConfig::default()
+            },
             ..GatewayConfig::default()
         },
     ));
@@ -286,6 +307,14 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     }
     println!("  model    {}", loaded.model);
     println!("  context  {} tokens", loaded.effective.n_ctx);
+    println!(
+        "  requests {concurrency} at a time{}",
+        if concurrency == 1 {
+            " (others queue; short requests go first)"
+        } else {
+            ""
+        }
+    );
     println!(
         "  auth     {}",
         if state.config.auth.is_enabled() {

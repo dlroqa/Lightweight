@@ -40,8 +40,10 @@ use serde_json::json;
 use crate::auth::AuthFailure;
 use crate::catalog::ResidentModel;
 use crate::completions::{self as completions_run, PendingCompletion};
+use crate::metrics::{Endpoint, Outcome};
+use crate::scheduler::Band;
 use crate::state::GatewayState;
-use crate::stream::{self as sse_stream, RequestGuard};
+use crate::stream::{self as sse_stream, RequestGuard, StartGeneration};
 
 /// An error on its way to the client.
 ///
@@ -155,6 +157,44 @@ pub async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
     axum::Json(ModelList::new(state.catalog.rows().await)).into_response()
 }
 
+/// `GET /metrics`.
+///
+/// Prometheus text exposition, because that is what a scrape expects to find
+/// at that path and inventing a private format would mean every operator
+/// writing an exporter.
+///
+/// Behind the same key as `/v1/models` when one is configured: request rates,
+/// token counts and queue depth describe what this machine is doing, and on an
+/// exposed bind that is not public information. It carries no prompt text, no
+/// completion text and no filesystem path — see [`crate::metrics`].
+pub async fn metrics(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let body = state.metrics_snapshot().await.to_prometheus();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/metrics`.
+///
+/// The same snapshot as JSON, for our own UI. Under `/api/v1` rather than
+/// `/v1`, because `/v1` is the OpenAI surface and a client walking it must
+/// never find one of our own endpoints there.
+pub async fn metrics_json(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    axum::Json(state.metrics_snapshot().await).into_response()
+}
+
 /// `POST /v1/chat/completions`.
 pub async fn chat_completions(
     State(state): State<Arc<GatewayState>>,
@@ -182,10 +222,15 @@ pub async fn chat_completions(
         );
     }
 
-    match serve_chat(state, request).await {
+    let metrics = Arc::clone(&state);
+    let response = match serve_chat(state, request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
-    }
+    };
+    metrics
+        .metrics()
+        .record_request(Endpoint::ChatCompletions, outcome_of(response.status()));
+    response
 }
 
 /// `POST /v1/completions`.
@@ -216,9 +261,29 @@ pub async fn completions(
         );
     }
 
-    match serve_completions(state, request).await {
+    let metrics = Arc::clone(&state);
+    let response = match serve_completions(state, request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
+    };
+    metrics
+        .metrics()
+        .record_request(Endpoint::Completions, outcome_of(response.status()));
+    response
+}
+
+/// How a status code counts.
+///
+/// `Busy` is pulled out of the 5xx range on purpose: it is the only one that
+/// says the gateway could not keep up rather than that something broke, and
+/// folding it in with genuine failures hides the single number that says the
+/// queue needs attention.
+fn outcome_of(status: StatusCode) -> Outcome {
+    match status {
+        StatusCode::SERVICE_UNAVAILABLE => Outcome::Busy,
+        status if status.is_success() => Outcome::Ok,
+        status if status.is_client_error() => Outcome::ClientError,
+        _ => Outcome::ServerError,
     }
 }
 
@@ -245,6 +310,7 @@ async fn serve_completions(
     // request whose third prompt overflows the window must fail as a 400, not
     // after two completions have already been streamed to the client.
     let mut queue = VecDeque::with_capacity(prompts.len());
+    let mut largest_prompt = 0;
     for (index, prompt) in prompts.iter().enumerate() {
         let mut generation = request.to_generation_request(prompt);
         let prompt_tokens = state
@@ -259,6 +325,7 @@ async fn serve_completions(
             })
             .with_param("prompt"));
         }
+        largest_prompt = largest_prompt.max(prompt_tokens);
         generation.max_tokens = Some(clamp_max_tokens(
             request.max_tokens,
             model.n_ctx,
@@ -273,8 +340,20 @@ async fn serve_completions(
 
     // One permit for the whole request, held across every generation in it, so
     // a multi-prompt request cannot be interleaved with another client's.
+    //
+    // The band is taken from the *largest* prompt in the request, and one
+    // request here can carry many: a request is as long as its longest part,
+    // and classifying by the first prompt alone would let a short opener carry
+    // a dozen long continuations into the fast band. The output budget is
+    // shared, so it counts once.
+    let band = Band::classify(
+        largest_prompt,
+        request.max_tokens,
+        state.config.scheduler.interactive,
+    );
     let cancel = state.job_token();
-    let permit = state.acquire_slot().await.ok_or_else(|| {
+    let waiting_since = std::time::Instant::now();
+    let permit = state.acquire_slot(band).await.ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorEnvelope::invalid_request(
@@ -283,7 +362,9 @@ async fn serve_completions(
             ),
         )
     })?;
-    let guard = RequestGuard::new(cancel, Some(permit));
+    let mut guard =
+        RequestGuard::new(cancel, Some(permit)).reporting_to(Arc::clone(state.metrics()));
+    guard.waited(waiting_since.elapsed());
 
     let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
     tracing::info!(
@@ -400,8 +481,82 @@ async fn serve_chat(
         prompt_tokens,
     ));
 
+    // Which queue this request joins, decided from what has just been
+    // measured rather than from anything the client claimed about itself.
+    let band = Band::classify(
+        prompt_tokens,
+        request.requested_max_tokens(),
+        state.config.scheduler.interactive,
+    );
     let cancel = state.job_token();
-    let permit = state.acquire_slot().await.ok_or_else(|| {
+    let builder = ChunkBuilder::new(completion_id(), model.id.to_string());
+    tracing::info!(
+        target: targets::INFERENCE,
+        id = builder.id(),
+        model = %model.id,
+        prompt_tokens,
+        band = band.as_str(),
+        stream = request.stream,
+        "generating"
+    );
+
+    // The uncontended path, unchanged: take the slot, start the generation, and
+    // report any failure to start as an HTTP status, because nothing has been
+    // written to the client yet.
+    if let Some(permit) = state.try_acquire_slot() {
+        let guard = RequestGuard::new(cancel.clone(), Some(permit))
+            .reporting_to(Arc::clone(state.metrics()));
+        let events = state
+            .backend
+            .generate(model.instance, generation, cancel)
+            .await
+            .map_err(|err| ApiError::from_backend(&err))?;
+        return Ok(if request.stream {
+            streamed_response(sse_stream::encode(
+                events,
+                builder,
+                guard,
+                request.wants_usage(),
+            ))
+        } else {
+            aggregate(events, builder, guard, &model).await
+        });
+    }
+
+    // Contended. A streamed request is answered *now* and waits inside its own
+    // response, so the client can see that it is queued and where; anything
+    // else waits here and is told 503 if the wait runs out.
+    tracing::info!(
+        target: targets::SCHEDULER,
+        id = builder.id(),
+        band = band.as_str(),
+        waiting = state.scheduler().snapshot().waiting,
+        "queued behind another request"
+    );
+
+    if request.stream {
+        let ticket = state.enqueue(band);
+        let deadline = tokio::time::Instant::now() + state.config.queue_timeout;
+        let guard =
+            RequestGuard::new(cancel.clone(), None).reporting_to(Arc::clone(state.metrics()));
+        let backend = Arc::clone(&state.backend);
+        let instance = model.instance;
+        let start: StartGeneration = Box::new(move || {
+            Box::pin(async move { backend.generate(instance, generation, cancel).await })
+        });
+        return Ok(streamed_response(sse_stream::encode_queued(
+            ticket,
+            start,
+            deadline,
+            state.config.queue_notice_interval,
+            builder,
+            guard,
+            request.wants_usage(),
+        )));
+    }
+
+    let waiting_since = std::time::Instant::now();
+    let permit = state.acquire_slot(band).await.ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorEnvelope::invalid_request(
@@ -410,7 +565,9 @@ async fn serve_chat(
             ),
         )
     })?;
-    let guard = RequestGuard::new(cancel.clone(), Some(permit));
+    let mut guard =
+        RequestGuard::new(cancel.clone(), Some(permit)).reporting_to(Arc::clone(state.metrics()));
+    guard.waited(waiting_since.elapsed());
 
     let events = state
         .backend
@@ -418,26 +575,7 @@ async fn serve_chat(
         .await
         .map_err(|err| ApiError::from_backend(&err))?;
 
-    let builder = ChunkBuilder::new(completion_id(), model.id.to_string());
-    tracing::info!(
-        target: targets::INFERENCE,
-        id = builder.id(),
-        model = %model.id,
-        prompt_tokens,
-        stream = request.stream,
-        "generating"
-    );
-
-    if request.stream {
-        Ok(streamed_response(sse_stream::encode(
-            events,
-            builder,
-            guard,
-            request.wants_usage(),
-        )))
-    } else {
-        Ok(aggregate(events, builder, guard, &model).await)
-    }
+    Ok(aggregate(events, builder, guard, &model).await)
 }
 
 /// Turn a request-level refusal into the 400 that names the field at fault.
@@ -488,9 +626,9 @@ async fn aggregate(
     guard: RequestGuard,
     model: &ResidentModel,
 ) -> Response {
-    // Held for the whole aggregation: the slot is released, and the work
-    // cancelled, when this returns by any path.
-    let _guard = guard;
+    // Held for the whole aggregation: the slot is released, the work
+    // cancelled, and what it cost recorded, when this returns by any path.
+    let mut guard = guard;
 
     let mut content = String::new();
     let mut reasoning = String::new();
@@ -501,14 +639,21 @@ async fn aggregate(
 
     while let Some(event) = events.next().await {
         match event {
-            Ok(GenerationEvent::ContentDelta { text }) => content.push_str(&text),
-            Ok(GenerationEvent::ReasoningDelta { text }) => reasoning.push_str(&text),
+            Ok(GenerationEvent::ContentDelta { text }) => {
+                guard.first_token();
+                content.push_str(&text);
+            }
+            Ok(GenerationEvent::ReasoningDelta { text }) => {
+                guard.first_token();
+                reasoning.push_str(&text);
+            }
             Ok(GenerationEvent::ToolCallDelta {
                 index,
                 id,
                 name,
                 arguments,
             }) => {
+                guard.first_token();
                 let call = tool_calls.entry(index).or_default();
                 // Assigned, not appended - the same discipline the streamed
                 // form follows, so both produce the same call.
@@ -523,6 +668,14 @@ async fn aggregate(
                 }
             }
             Ok(GenerationEvent::Timings(measured)) => {
+                let record = guard.record_mut();
+                record.prefill = Some(std::time::Duration::from_secs_f64(
+                    measured.prompt_ms / 1000.0,
+                ));
+                record.decode = Some(std::time::Duration::from_secs_f64(
+                    measured.predicted_ms / 1000.0,
+                ));
+                record.cached_tokens = measured.cached_n;
                 timings = serde_json::to_value(measured).ok();
             }
             Ok(GenerationEvent::Finished {
@@ -530,12 +683,20 @@ async fn aggregate(
                 usage: measured,
             }) => {
                 finish_reason = reason;
+                let record = guard.record_mut();
+                record.finish_reason = Some(reason);
+                record.prompt_tokens = measured.prompt_tokens;
+                record.completion_tokens = measured.completion_tokens;
+                if measured.cached_tokens > 0 {
+                    record.cached_tokens = measured.cached_tokens;
+                }
                 usage = UsageBody::from(measured);
             }
             Ok(GenerationEvent::Started { .. }) => {}
             Err(err) => {
                 // Nothing has been sent yet, so this can still be an honest
                 // HTTP status rather than a half-written body.
+                guard.record_mut().finish_reason = Some(FinishReason::Error);
                 return ApiError::from_backend(&err).into_response();
             }
         }
