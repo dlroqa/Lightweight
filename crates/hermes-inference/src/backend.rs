@@ -81,6 +81,14 @@ pub struct BackendCapabilities {
     /// lets a bad choice be refused with a list of alternatives instead of
     /// failing as an opaque engine exit.
     pub kv_cache_types: Vec<GgmlType>,
+    /// The engine build these capabilities describe.
+    ///
+    /// `None` for a backend with no version to state, such as the mock. It is
+    /// here because a measurement is a fact about one build: a benchmark taken
+    /// against one engine and a coefficient fitted from it must not be applied
+    /// to another, and without this the only surface that knows the build is
+    /// the crate that pins it.
+    pub build: Option<String>,
 }
 
 /// A request to make a model resident.
@@ -351,6 +359,7 @@ mod tests {
             reasoning_content: true,
             max_concurrent_requests: 1,
             kv_cache_types: vec![GgmlType::F16],
+            build: None,
         };
         assert_eq!(caps.device, DeviceKind::Cpu);
     }

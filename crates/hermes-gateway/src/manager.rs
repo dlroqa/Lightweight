@@ -75,6 +75,13 @@ pub struct LoadOptions {
     pub n_ctx: Option<u32>,
     pub kv_type: Option<GgmlType>,
     pub threads: Option<u32>,
+    /// Physical batch size. The one runtime knob that changes both throughput
+    /// and the memory estimate, which is why it can be priced before a load.
+    pub ubatch: Option<u32>,
+    /// Threads for prompt processing. Absent means the same as `threads`.
+    pub threads_batch: Option<u32>,
+    /// How the weights are brought into memory.
+    pub load_mode: Option<hermes_core::LoadMode>,
     /// Load even though the estimate says it will not fit.
     pub force: bool,
 }
@@ -576,7 +583,15 @@ pub async fn load_model(
                 .unwrap_or_else(|| cpu.default_threads()),
         ),
         n_parallel: defaults.concurrency.max(1),
+        threads_batch: options.threads_batch,
+        load_mode: options.load_mode,
         ..RuntimeParams::default()
+    };
+    // Applied through the builder so `n_batch` is raised with it: the engine
+    // refuses a physical batch larger than the logical one.
+    let base = match options.ubatch {
+        Some(ubatch) => base.with_ubatch(ubatch),
+        None => base,
     };
 
     // Admission control, exactly as `hermes serve` does it: never promise a
@@ -597,15 +612,31 @@ pub async fn load_model(
     // `MemAvailable`; crediting the whole of it would count the weights twice
     // and the error would be the optimistic one that ends in an OOM kill. A
     // probe that could not read reports `None`, and `None` credits nothing.
+    //
+    // A locked engine is the exception, and it is why `locked` is credited
+    // beside `anon_rss`: `mlock` pins the weights, so they are no longer
+    // file-backed cache the kernel counts as available — they are genuinely
+    // occupied and genuinely returned when the engine exits. Crediting only
+    // the anonymous set there would under-credit by the size of the model and
+    // refuse a swap that fits.
     let reclaimable = if state.catalog.resident().await.is_some() {
-        state
-            .backend
-            .resource_usage()
-            .await
-            .ok()
-            .flatten()
+        let usage = state.backend.resource_usage().await.ok().flatten();
+        let anonymous = usage
             .and_then(|usage| usage.anon_rss)
-            .unwrap_or(hermes_core::units::Bytes::ZERO)
+            .unwrap_or(hermes_core::units::Bytes::ZERO);
+        let locked = state
+            .catalog
+            .resident()
+            .await
+            .filter(|resident| {
+                resident
+                    .effective
+                    .load_mode
+                    .is_some_and(hermes_core::LoadMode::locks_weights)
+            })
+            .and_then(|_| usage.map(|usage| usage.rss.get().saturating_sub(anonymous.get())))
+            .unwrap_or(0);
+        hermes_core::units::Bytes(anonymous.get().saturating_add(locked))
     } else {
         hermes_core::units::Bytes::ZERO
     };
@@ -658,6 +689,26 @@ pub async fn load_model(
             forced = options.force,
             "admission verdict"
         );
+    }
+
+    // A locking load may not proceed on `Tight`.
+    //
+    // Locked pages cannot be reclaimed, so overshooting them is an OOM kill
+    // rather than the paging that `Tight` otherwise means. The verdict that is
+    // merely a warning for a memory-mapped load is a refusal for this one,
+    // and `--force` remains the way to say it anyway.
+    if params
+        .load_mode
+        .is_some_and(hermes_core::LoadMode::locks_weights)
+        && estimate.verdict == Verdict::Tight
+        && !options.force
+    {
+        return Err(ManagerError::Insufficient {
+            model: model.id.clone(),
+            required: estimate.total.to_string(),
+            available: estimate.budget.to_string(),
+            estimate: Box::new(estimate),
+        });
     }
 
     if estimate.verdict == Verdict::Insufficient && !options.force {

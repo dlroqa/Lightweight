@@ -36,6 +36,104 @@ pub struct RuntimeParams {
     /// which is the section 9 default; hyperthread siblings share execution
     /// units that matrix multiplication already saturates.
     pub threads: Option<u32>,
+    /// Threads for prompt processing. `None` means "the same as `threads`",
+    /// which is the engine's own default, so leaving it unset changes nothing.
+    ///
+    /// Worth having as a separate knob because the two phases are not the same
+    /// kind of work: prefill is compute-bound matrix multiplication that can use
+    /// every hardware thread, while decode is memory-bound and usually stops
+    /// scaling at the physical core count. Which way that cuts depends on the
+    /// machine, which is why there is no default here derived from any one of
+    /// them.
+    pub threads_batch: Option<u32>,
+    /// How hard idle engine threads spin waiting for work, 0 to 100.
+    ///
+    /// `None` leaves the engine's default of 50. Polling trades processor time
+    /// for latency, which is a good trade on an idle machine and a bad one on a
+    /// machine already fully committed — so it is exposed and left alone.
+    pub poll: Option<u8>,
+    /// Smallest chunk the engine will try to reuse from the KV cache by
+    /// shifting, rather than only matching an exact prefix.
+    ///
+    /// `None` leaves the engine's default of 0, which is off. Turning it on
+    /// helps exactly the shape an agent loop produces — a stable system prompt
+    /// with a changed message in the middle — but it reuses cache entries by
+    /// moving them, which trades a little output fidelity. No estimate judges
+    /// output fidelity, so this is a choice and not a default.
+    pub cache_reuse: Option<u32>,
+    /// The processors the engine's threads may run on, as an inclusive range.
+    ///
+    /// `None` lets the scheduler place them, which is right on nearly every
+    /// machine. It earns its place on the ones where it is not: hybrid cores of
+    /// unequal speed, or a box where the engine should be kept off the cores
+    /// something else needs.
+    pub cpu_range: Option<(u32, u32)>,
+    /// Whether the placement above is strict.
+    pub cpu_strict: bool,
+    /// How the weights are brought into memory.
+    ///
+    /// `None` leaves the engine's `auto`, which memory-maps them. Anything that
+    /// *locks* them changes what the memory budget may credit, which is why
+    /// this is a typed choice rather than a passthrough string — see the
+    /// admission path in `hermes-gateway`.
+    pub load_mode: Option<LoadMode>,
+}
+
+/// How the engine brings a model's weights into memory.
+///
+/// The names are the engine's own, read from `--help` at the pinned build
+/// rather than transcribed from documentation. `--mmap`, `--no-mmap` and
+/// `--mlock` are all deprecated in favour of this one flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMode {
+    /// Memory-map, unless a device cannot.
+    Auto,
+    /// No special handling.
+    None,
+    /// Memory-map.
+    Mmap,
+    /// Keep the weights in RAM rather than letting them be swapped or
+    /// compressed.
+    Mlock,
+    /// Both.
+    MmapMlock,
+}
+
+impl LoadMode {
+    /// Every mode the pinned engine accepts, in its own spelling.
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::None,
+        Self::Mmap,
+        Self::Mlock,
+        Self::MmapMlock,
+    ];
+
+    /// The value the engine's `--load-mode` expects.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Mmap => "mmap",
+            Self::Mlock => "mlock",
+            Self::MmapMlock => "mmap+mlock",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == name)
+    }
+
+    /// Whether this mode pins the weights in memory.
+    ///
+    /// The distinction the memory budget turns on: locked weights are not
+    /// reclaimable page cache, so they neither come out of `MemAvailable` for
+    /// free nor return to it quietly, and an overshoot is an OOM kill rather
+    /// than paging.
+    pub const fn locks_weights(self) -> bool {
+        matches!(self, Self::Mlock | Self::MmapMlock)
+    }
 }
 
 impl Default for RuntimeParams {
@@ -51,6 +149,15 @@ impl Default for RuntimeParams {
             cache_type_k: GgmlType::F16,
             cache_type_v: GgmlType::F16,
             threads: None,
+            // Every one of these is `None`, and that is the whole point: absent
+            // means "whatever the engine does by default", so adding them
+            // changed no existing deployment's behaviour by a single flag.
+            threads_batch: None,
+            poll: None,
+            cache_reuse: None,
+            cpu_range: None,
+            cpu_strict: false,
+            load_mode: None,
         }
     }
 }
@@ -69,6 +176,18 @@ impl RuntimeParams {
     pub fn with_kv_cache_type(mut self, cache_type: GgmlType) -> Self {
         self.cache_type_k = cache_type;
         self.cache_type_v = cache_type;
+        self
+    }
+
+    /// The physical batch, and the logical batch raised to hold it.
+    ///
+    /// The engine refuses `n_ubatch > n_batch`, and finding that out from a
+    /// failed launch several minutes into a benchmark is a poor way to learn
+    /// it. Raising rather than refusing, because a caller asking for a larger
+    /// physical batch means it.
+    pub fn with_ubatch(mut self, n_ubatch: u32) -> Self {
+        self.n_ubatch = n_ubatch.max(1);
+        self.n_batch = self.n_batch.max(self.n_ubatch);
         self
     }
 

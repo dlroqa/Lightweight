@@ -29,13 +29,16 @@ export function Models() {
   // What the user is weighing. Both are per-load: a context is judged by the
   // estimate beside it, and a KV type trades output quality, which no estimate
   // judges — so neither is stored as a gateway-wide default here.
-  const [wanted, setWanted] = useState<{ ctx?: number; kv_type?: string }>({});
+  const [wanted, setWanted] = useState<LoadChoice>({});
 
   // What this engine accepts, and what a load would use if asked nothing. Both
   // come from the gateway rather than from a list kept here: the engine's real
   // set is read from its own `--help` at the pinned build, and a copy in the
   // panel would be a second answer waiting to go stale.
   const gateway = usePoll(api.gateway, 0);
+  // `thread_choices` has been served by /api/v1/system since M6b.1 and read by
+  // nothing. This is what reads it.
+  const system = usePoll(api.system, 0);
   const kvTypes = gateway.data?.engine_capabilities.kv_cache_types ?? [];
   const refused =
     wasRead(detail?.estimate) && detail.estimate.verdict === "insufficient";
@@ -227,6 +230,13 @@ export function Models() {
                 onWant={setWanted}
                 kvTypes={kvTypes}
                 defaultKvType={gateway.data?.defaults.kv_type}
+                threadChoices={system.data?.cpu.thread_choices ?? []}
+                defaultThreads={
+                  gateway.data?.defaults.threads ??
+                  system.data?.cpu.default_threads
+                }
+                loadModes={gateway.data?.defaults.load_modes ?? []}
+                defaultUbatch={gateway.data?.defaults.ubatch}
               />
             )}
           </Card>
@@ -281,18 +291,40 @@ function ModelRow({
   );
 }
 
+/**
+ * What the user has chosen for the next load.
+ *
+ * Every field optional and absent by default: an unset control means "whatever
+ * the gateway would do", which is exactly what the request body means too.
+ */
+export interface LoadChoice {
+  ctx?: number;
+  kv_type?: string;
+  threads?: number;
+  ubatch?: number;
+  load_mode?: string;
+}
+
 function ModelDetailBody({
   detail,
   wanted,
   onWant,
   kvTypes,
   defaultKvType,
+  threadChoices,
+  defaultThreads,
+  loadModes,
+  defaultUbatch,
 }: {
   detail: ModelDetail;
-  wanted: { ctx?: number; kv_type?: string };
-  onWant: (wanted: { ctx?: number; kv_type?: string }) => void;
+  wanted: LoadChoice;
+  onWant: (wanted: LoadChoice) => void;
   kvTypes: string[];
   defaultKvType?: string;
+  threadChoices: number[];
+  defaultThreads?: number;
+  loadModes: string[];
+  defaultUbatch?: number;
 }) {
   const presets = detail.header?.context_presets ?? [];
   const chosenCtx = wasRead(detail.estimate)
@@ -364,15 +396,14 @@ function ModelDetailBody({
         </div>
       </div>
 
-      {(presets.length > 0 || kvTypes.length > 0) && (
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-            gap: 12,
-            marginTop: 16,
-          }}
-        >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: 12,
+          marginTop: 16,
+        }}
+      >
           {presets.length > 0 && (
             <div className="field">
               <label className="field__label" htmlFor="load-ctx">
@@ -422,6 +453,100 @@ function ModelDetailBody({
               </select>
             </div>
           )}
+          {threadChoices.length > 0 && (
+            <div className="field">
+              <label className="field__label" htmlFor="load-threads">
+                Threads
+              </label>
+              <select
+                id="load-threads"
+                className="select tnum"
+                value={wanted.threads ?? ""}
+                onChange={(event) =>
+                  onWant({
+                    ...wanted,
+                    threads: event.target.value
+                      ? Number(event.target.value)
+                      : undefined,
+                  })
+                }
+              >
+                <option value="">
+                  {defaultThreads ?? "physical cores"} (default)
+                </option>
+                {threadChoices.map((count) => (
+                  <option key={count} value={count}>
+                    {count}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div className="field">
+            <label className="field__label" htmlFor="load-ubatch">
+              Physical batch
+            </label>
+            <select
+              id="load-ubatch"
+              className="select tnum"
+              value={wanted.ubatch ?? ""}
+              onChange={(event) =>
+                onWant({
+                  ...wanted,
+                  ubatch: event.target.value
+                    ? Number(event.target.value)
+                    : undefined,
+                })
+              }
+            >
+              <option value="">{defaultUbatch ?? 512} (default)</option>
+              {UBATCH_CHOICES.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </select>
+          </div>
+          {loadModes.length > 0 && (
+            <div className="field">
+              <label className="field__label" htmlFor="load-mode">
+                Weight loading
+              </label>
+              <select
+                id="load-mode"
+                className="select"
+                value={wanted.load_mode ?? ""}
+                onChange={(event) =>
+                  onWant({
+                    ...wanted,
+                    load_mode: event.target.value || undefined,
+                  })
+                }
+              >
+                <option value="">auto (default)</option>
+                {loadModes
+                  .filter((mode) => mode !== "auto")
+                  .map((mode) => (
+                    <option key={mode} value={mode}>
+                      {mode}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          )}
+      </div>
+      {wanted.load_mode?.includes("mlock") && (
+        <div className="notice notice--warn" style={{ marginTop: 10 }}>
+          Locking keeps the weights out of swap, and locked pages cannot be
+          reclaimed — so this load is refused unless the estimate is
+          comfortable, and it is checked against this user&rsquo;s
+          locked-memory allowance before the engine starts.
+        </div>
+      )}
+      {wanted.ubatch !== undefined && (
+        <div className="card__note" style={{ marginTop: 8 }}>
+          A larger physical batch raises prompt-processing throughput and the
+          compute buffers with it. The estimate below is for the size chosen.
         </div>
       )}
 
@@ -718,3 +843,13 @@ function AddModel({ onDone }: { onDone: () => void }) {
     </Card>
   );
 }
+
+/**
+ * Physical batch sizes worth offering.
+ *
+ * Powers of two around the engine's default of 512. Not derived from the
+ * machine, because this one is not a machine limit: it is a throughput and
+ * memory trade whose right answer is measured, which is what `hermes bench`
+ * is for.
+ */
+const UBATCH_CHOICES = [64, 128, 256, 512, 1024, 2048];

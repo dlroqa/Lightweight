@@ -51,6 +51,9 @@ pub struct ServeOptions {
     /// declared sliding window, and its compute term is uncalibrated until a
     /// benchmark has run. A user who knows their model better than we do
     /// should be able to say so — and be told plainly what they are overriding.
+    pub ubatch: Option<u32>,
+    pub threads_batch: Option<u32>,
+    pub load_mode: Option<String>,
     pub force: bool,
     /// Addresses or hostnames to bind the gateway to.
     ///
@@ -372,6 +375,26 @@ async fn load_at_startup(
     let file = GgufFile::open(model_path).map_err(describe)?;
     let metadata = ModelMetadata::from_file(&file).map_err(describe)?;
 
+    let load_mode = match options
+        .load_mode
+        .as_deref()
+        .map(hermes_core::LoadMode::from_name)
+    {
+        None => None,
+        Some(Some(parsed)) => Some(parsed),
+        Some(None) => {
+            return Err(format!(
+                "`{}` is not a load mode this engine accepts. It takes: {}",
+                options.load_mode.clone().unwrap_or_default(),
+                hermes_core::LoadMode::ALL
+                    .iter()
+                    .map(|mode| mode.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+
     let base = RuntimeParams {
         cache_type_k: shape.cache_type,
         cache_type_v: shape.cache_type,
@@ -383,7 +406,15 @@ async fn load_at_startup(
         // The engine is told the same number the gateway will hand out, so the
         // estimate, the KV cache and the queue all describe one machine.
         n_parallel: shape.concurrency,
+        threads_batch: options.threads_batch,
+        load_mode,
         ..RuntimeParams::default()
+    };
+    // Through the builder, so `n_batch` is raised with it rather than the
+    // engine refusing the pair after a load has already been admitted.
+    let base = match options.ubatch {
+        Some(ubatch) => base.with_ubatch(ubatch),
+        None => base,
     };
 
     let estimator = Estimator::headless();

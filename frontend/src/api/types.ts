@@ -210,7 +210,15 @@ export interface GatewayReport {
     kv_cache_types: string[];
   };
   /** What a load uses when a request names nothing. */
-  defaults: { kv_type: string; threads?: number; concurrency: number };
+  defaults: {
+    kv_type: string;
+    threads?: number;
+    concurrency: number;
+    /** The physical batch a load uses when a request names none. */
+    ubatch: number;
+    /** The load modes this engine accepts, in its own spelling. */
+    load_modes: string[];
+  };
 }
 
 /** A row of `GET /api/v1/models`. */

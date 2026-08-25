@@ -448,3 +448,84 @@ async fn a_rejected_kv_type_names_the_endpoint_that_lists_them() {
     );
     assert!(report["defaults"]["kv_type"].is_string());
 }
+
+#[tokio::test]
+async fn a_larger_physical_batch_is_priced_before_it_is_chosen() {
+    ensure_provider();
+
+    // `n_ubatch` is the one runtime knob that changes both throughput and the
+    // memory estimate — compute buffers scale with it and with nothing else in
+    // `RuntimeParams`. That is why it joins `ctx` and `kv_type` as a query
+    // parameter, and why `threads` does not.
+    let (_dir, state, id) = gateway("ubatch-price", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let compute_at = |body: &Value| body["estimate"]["compute"].as_u64().expect("compute");
+
+    let (_, small) = server
+        .get(&format!("/api/v1/models/{id}?ctx=2048&ubatch=128"))
+        .await;
+    let (_, large) = server
+        .get(&format!("/api/v1/models/{id}?ctx=2048&ubatch=512"))
+        .await;
+
+    assert_eq!(
+        compute_at(&large),
+        compute_at(&small) * 4,
+        "compute buffers are linear in the physical batch"
+    );
+    // And the KV cache is not: it is a property of the context, and a caller
+    // weighing a batch size must not be shown a KV cache that moved.
+    assert_eq!(
+        large["estimate"]["kv_cache"], small["estimate"]["kv_cache"],
+        "the batch size does not change the KV cache"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_ubatch_leaves_the_response_exactly_as_it_was() {
+    ensure_provider();
+
+    // The additive rule, at the surface a client sees: adding a query parameter
+    // must not change the answer given to a caller that does not use it.
+    let (_dir, state, id) = gateway("ubatch-absent", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let (_, plain) = server.get(&format!("/api/v1/models/{id}?ctx=2048")).await;
+    let (_, explicit) = server
+        .get(&format!("/api/v1/models/{id}?ctx=2048&ubatch=512"))
+        .await;
+    assert_eq!(
+        plain["estimate"], explicit["estimate"],
+        "512 is the default, so naming it changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_load_mode_the_engine_does_not_accept_is_refused_by_name() {
+    ensure_provider();
+
+    let (_dir, state, id) = gateway("load-mode", 32_768, MockBackend::default()).await;
+    let server = Server::start(state).await;
+
+    let (status, refused) = server
+        .post(
+            &format!("/api/v1/models/{id}/load"),
+            serde_json::json!({ "load_mode": "mmap+lock" }),
+        )
+        .await;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(refused["error"]["param"], "load_mode");
+
+    // The endpoint the message names must actually list them.
+    let (status, gateway_report) = server.get("/api/v1/gateway").await;
+    assert_eq!(status, 200);
+    let modes = gateway_report["defaults"]["load_modes"]
+        .as_array()
+        .expect("the load modes are listed");
+    assert!(
+        modes.iter().any(|mode| mode == "mmap+mlock"),
+        "{gateway_report}"
+    );
+    assert!(modes.iter().any(|mode| mode == "auto"));
+}

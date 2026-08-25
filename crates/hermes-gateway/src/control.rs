@@ -255,6 +255,15 @@ pub struct LoadBody {
     pub kv_type: Option<String>,
     #[serde(default)]
     pub threads: Option<u32>,
+    /// Physical batch size. Priced by `GET /api/v1/models/{id}?ubatch=`.
+    #[serde(default)]
+    pub ubatch: Option<u32>,
+    /// Threads for prompt processing. Absent means the same as `threads`.
+    #[serde(default)]
+    pub threads_batch: Option<u32>,
+    /// `auto`, `none`, `mmap`, `mlock` or `mmap+mlock`.
+    #[serde(default)]
+    pub load_mode: Option<String>,
     #[serde(default)]
     pub force: bool,
 }
@@ -293,10 +302,33 @@ pub async fn load(
         }
     };
 
+    let load_mode = match body
+        .load_mode
+        .as_deref()
+        .map(hermes_core::LoadMode::from_name)
+    {
+        None => None,
+        Some(Some(parsed)) => Some(parsed),
+        Some(None) => {
+            return bad_request(
+                "load_mode",
+                "unknown load mode; GET /api/v1/gateway lists what this engine accepts",
+            );
+        }
+    };
+    if let Some(ubatch) = body.ubatch
+        && ubatch == 0
+    {
+        return bad_request("ubatch", "a physical batch size of zero processes nothing");
+    }
+
     let options = LoadOptions {
         n_ctx: body.ctx,
         kv_type,
         threads: body.threads,
+        ubatch: body.ubatch,
+        threads_batch: body.threads_batch,
+        load_mode,
         force: body.force,
     };
 
@@ -445,6 +477,14 @@ pub struct DefaultsReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     threads: Option<u32>,
     concurrency: u32,
+    /// The physical batch a load uses when a request names none.
+    ubatch: u32,
+    /// The load modes this engine accepts, in its own spelling.
+    ///
+    /// Served here rather than on `/health` for the same reason the KV cache
+    /// types are: `/health` is probed by health checks and by the desktop
+    /// shell, and is left exactly as it is.
+    load_modes: Vec<&'static str>,
 }
 
 /// What the GGUF header says, beyond what the catalog keeps.
@@ -566,6 +606,7 @@ pub async fn model_detail(
     let asked = DetailOptions {
         n_ctx: query.ctx,
         kv_type,
+        ubatch: query.ubatch,
         stored_default,
     };
 
@@ -631,6 +672,13 @@ pub struct DetailQuery {
     pub ctx: Option<u32>,
     /// Estimate for this KV cache type rather than the gateway's default.
     pub kv_type: Option<String>,
+    /// Estimate for this physical batch size rather than the default.
+    ///
+    /// Here, where `threads` is deliberately not, because compute buffers
+    /// scale with `n_ubatch` and with nothing else on this list. A knob that
+    /// changed no number in the estimate would be reporting a memory effect it
+    /// does not have.
+    pub ubatch: Option<u32>,
 }
 
 /// The inputs the estimate is computed from, resolved.
@@ -638,6 +686,7 @@ pub struct DetailQuery {
 struct DetailOptions {
     n_ctx: Option<u32>,
     kv_type: Option<GgmlType>,
+    ubatch: Option<u32>,
     stored_default: Option<u32>,
 }
 
@@ -684,6 +733,10 @@ fn describe_file(
         ),
         n_parallel: defaults.concurrency.max(1),
         ..hermes_core::RuntimeParams::default()
+    };
+    let base = match asked.ubatch {
+        Some(ubatch) if ubatch > 0 => base.with_ubatch(ubatch),
+        _ => base,
     };
 
     // Exactly how `load` chooses, through the same function it calls, so the
@@ -772,6 +825,11 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
                 kv_type: defaults.kv_type,
                 threads: defaults.threads,
                 concurrency: defaults.concurrency,
+                ubatch: hermes_core::RuntimeParams::default().n_ubatch,
+                load_modes: hermes_core::LoadMode::ALL
+                    .iter()
+                    .map(|mode| mode.as_str())
+                    .collect(),
             }
         },
         queue: state.scheduler().snapshot(),

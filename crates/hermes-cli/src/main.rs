@@ -77,6 +77,27 @@ enum Command {
         threads: Option<u32>,
         #[arg(long, default_value = "f16")]
         kv_type: String,
+        /// Physical batch size.
+        ///
+        /// Larger raises prompt-processing throughput and the compute buffers
+        /// with it; the estimate prices both. Absent leaves the engine's
+        /// default, which is what every deployment has been running.
+        #[arg(long)]
+        ubatch: Option<u32>,
+        /// Threads for prompt processing. Defaults to `--threads`.
+        ///
+        /// Separate because the two phases are different work: prefill is
+        /// compute-bound and decode is memory-bound. Which way that cuts is a
+        /// property of the machine, so there is no default derived here.
+        #[arg(long)]
+        threads_batch: Option<u32>,
+        /// How the weights are brought into memory: auto, none, mmap, mlock or
+        /// mmap+mlock.
+        ///
+        /// A locking mode pins the weights against swap, and is checked against
+        /// this user's locked-memory allowance before the engine is launched.
+        #[arg(long)]
+        load_mode: Option<String>,
         /// Load even if the RAM estimate says it will not fit.
         #[arg(long)]
         force: bool,
@@ -329,6 +350,9 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             ctx,
             threads,
             kv_type,
+            ubatch,
+            threads_batch,
+            load_mode,
             force,
             host,
             port,
@@ -347,6 +371,9 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 n_ctx: *ctx,
                 threads: *threads,
                 kv_type: kv_type.clone(),
+                ubatch: *ubatch,
+                threads_batch: *threads_batch,
+                load_mode: load_mode.clone(),
                 force: *force,
                 hosts: host.clone(),
                 port: *port,

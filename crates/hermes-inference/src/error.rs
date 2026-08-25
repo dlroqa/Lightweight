@@ -73,6 +73,21 @@ pub enum BackendError {
         available: String,
     },
 
+    /// A locking load mode was asked for and the kernel would not allow it.
+    ///
+    /// Its own variant rather than folded into `InsufficientMemory`, because
+    /// the remedy is different in kind: no amount of freeing memory changes
+    /// `RLIMIT_MEMLOCK`, and no amount of raising `RLIMIT_MEMLOCK` helps a
+    /// model that does not fit.
+    #[error(
+        "locking this model's {required} of weights needs a locked-memory \
+         allowance of at least that much; this user's is {limit}"
+    )]
+    LockedMemoryTooSmall {
+        required: hermes_core::units::Bytes,
+        limit: hermes_core::units::Bytes,
+    },
+
     // ---- process lifecycle ----
     #[error("the engine did not become ready within {seconds} seconds")]
     StartTimeout { seconds: u64 },
@@ -136,6 +151,7 @@ impl Actionable for BackendError {
             // The code OpenAI clients already recognize for this condition.
             Self::ContextOverflow { .. } => "context_length_exceeded",
             Self::InsufficientMemory { .. } => "insufficient_memory",
+            Self::LockedMemoryTooSmall { .. } => "locked_memory_too_small",
             Self::StartTimeout { .. } => "engine_start_timeout",
             Self::EngineCrashed { .. } => "engine_crashed",
             Self::EngineOom { .. } => "engine_out_of_memory",
@@ -154,7 +170,12 @@ impl Actionable for BackendError {
             Self::UnsupportedArchitecture { .. }
             | Self::InvalidContextLength { .. }
             | Self::ContextOverflow { .. }
-            | Self::UnsupportedKvCacheType { .. } => ErrorKind::InvalidRequest,
+            | Self::UnsupportedKvCacheType { .. }
+            // A configuration the caller chose, which the caller can unchoose.
+            // Not `ResourceExhausted`: no amount of freeing memory raises
+            // `RLIMIT_MEMLOCK`, so a retry-when-there-is-room reading would be
+            // wrong in both directions.
+            | Self::LockedMemoryTooSmall { .. } => ErrorKind::InvalidRequest,
             Self::LowDisk { .. } | Self::InsufficientMemory { .. } | Self::EngineOom { .. } => {
                 ErrorKind::ResourceExhausted
             }
@@ -169,6 +190,28 @@ impl Actionable for BackendError {
 
     fn remedies(&self) -> Vec<Remedy> {
         match self {
+            Self::LockedMemoryTooSmall { required, limit } => vec![
+                Remedy::new(
+                    format!(
+                        "Load without a locking mode; the weights are then \
+                         memory-mapped, which is the default and needs no \
+                         allowance (this one is {limit})"
+                    ),
+                    RemedyAction::OpenSettings {
+                        section: SettingsSection::Models,
+                    },
+                ),
+                Remedy::new(
+                    format!(
+                        "Or raise this user's locked-memory allowance to at \
+                         least {required} — `ulimit -l` in the shell that \
+                         starts the gateway, or a limits.conf entry"
+                    ),
+                    RemedyAction::OpenSettings {
+                        section: SettingsSection::Storage,
+                    },
+                ),
+            ],
             Self::UnsupportedArchitecture { supported, .. } => vec![Remedy::new(
                 "Choose a model with a supported architecture",
                 RemedyAction::SelectSupportedArchitecture {

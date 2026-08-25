@@ -72,11 +72,10 @@ pub async fn run(
         machine: MachineFingerprint::detect(),
         engine: EngineFingerprint {
             backend: state.backend.id().to_string(),
-            // The gateway does not know the engine's build number: the backend
-            // trait does not carry one, and inventing it here would put a wrong
-            // fingerprint on a saved result. Absent is the honest answer, and a
-            // fit keyed on it simply will not match one from the CLI.
-            build: None,
+            // Stated by the backend rather than guessed here. Without it a run
+            // taken through the gateway could never be compared with one taken
+            // by `hermes bench` against the very same engine.
+            build: state.backend.capabilities().build,
             ggml_variant: Some(
                 hermes_system_info::CpuInfo::detect()
                     .expected_ggml_variant()

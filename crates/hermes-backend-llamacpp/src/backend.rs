@@ -137,6 +137,27 @@ impl ProcessBackend {
                 path: request.gguf_path.clone(),
             });
         }
+
+        // Locking weights means locking all of them, and the kernel enforces a
+        // per-process allowance that is commonly far smaller than a model. The
+        // engine's own response to exceeding it is a warning on stderr and a
+        // model that pages anyway — which looks like success and performs like
+        // failure. Checked here instead, where it can be a refusal that names
+        // the number.
+        if request
+            .runtime
+            .load_mode
+            .is_some_and(hermes_core::LoadMode::locks_weights)
+            && let Some(limit) = crate::supervisor::locked_memory_limit()
+            && let Some(weights) = request.metadata.weight_bytes
+            && weights > limit
+        {
+            return Err(BackendError::LockedMemoryTooSmall {
+                required: Bytes(weights),
+                limit: Bytes(limit),
+            });
+        }
+
         Ok(())
     }
 }
@@ -156,6 +177,7 @@ impl InferenceBackend for ProcessBackend {
             // One at a time for now. Section 22: serialize first, and design so
             // continuous batching is an internal change later.
             max_concurrent_requests: 1,
+            build: Some(crate::manifest::PINNED_BUILD.to_owned()),
             kv_cache_types: ALLOWED_KV_CACHE_TYPES
                 .iter()
                 .filter_map(|name| hermes_core::GgmlType::from_name(name))

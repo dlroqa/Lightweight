@@ -230,6 +230,7 @@ impl InferenceBackend for MockBackend {
             tool_calls: true,
             reasoning_content: true,
             max_concurrent_requests: 1,
+            build: None,
             kv_cache_types: vec![GgmlType::F16, GgmlType::Q8_0],
         }
     }

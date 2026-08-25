@@ -451,7 +451,7 @@ async fn await_ready(
 /// because a command line is readable by every user on the machine.
 pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
     let params = &config.params;
-    vec![
+    let mut args = vec![
         "--model".into(),
         config.model_path.display().to_string(),
         // Loopback only. Section 23: the engine is never network-reachable, and
@@ -479,10 +479,79 @@ pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
         params.cache_type_v.name().to_owned(),
         // Chat templates come from the model's own metadata.
         "--jinja".into(),
-        // Prometheus metrics on the engine's private port, for the metrics
-        // provider to scrape.
+        // Prometheus metrics on the engine's private port, scraped once per
+        // pull by `InferenceBackend::engine_counters`.
         "--metrics".into(),
-    ]
+    ];
+
+    // Everything below is optional and absent by default, so a gateway that
+    // sets none of it produces the argv this function has always produced. That
+    // is checked by a test, because "additive" is easy to claim and easy to
+    // break.
+    if let Some(threads_batch) = params.threads_batch {
+        args.push("--threads-batch".into());
+        args.push(threads_batch.max(1).to_string());
+    }
+    if let Some(poll) = params.poll {
+        args.push("--poll".into());
+        args.push(poll.min(100).to_string());
+    }
+    if let Some(reuse) = params.cache_reuse {
+        args.push("--cache-reuse".into());
+        args.push(reuse.to_string());
+    }
+    if let Some((low, high)) = params.cpu_range {
+        args.push("--cpu-range".into());
+        args.push(format!("{low}-{high}"));
+        if params.cpu_strict {
+            args.push("--cpu-strict".into());
+            args.push("1".into());
+        }
+    }
+    if let Some(mode) = params.load_mode {
+        args.push("--load-mode".into());
+        args.push(mode.as_str().to_owned());
+    }
+
+    args
+}
+
+/// The memory this user is allowed to lock, from `/proc/self/limits`.
+///
+/// Read rather than assumed, and read from the *parent*: a child inherits the
+/// parent's limits, so this is the limit the engine will have. Text parsing
+/// rather than `getrlimit`, because that would be `unsafe` in a crate that
+/// forbids it, and the file is world-readable and stable.
+///
+/// `None` where the file is absent or unreadable — off Linux, most obviously.
+/// A caller must treat that as "cannot check", never as "no limit".
+#[cfg(target_os = "linux")]
+pub fn locked_memory_limit() -> Option<u64> {
+    parse_locked_memory_limit(&std::fs::read_to_string("/proc/self/limits").ok()?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn locked_memory_limit() -> Option<u64> {
+    None
+}
+
+/// Pull the soft limit out of a `/proc/self/limits` body.
+///
+/// The columns are fixed-width prose — "Max locked memory", then soft, hard and
+/// units — so the name is matched by prefix and the next field taken. A soft
+/// limit of `unlimited` is exactly that, and is reported as no limit rather
+/// than as zero.
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_locked_memory_limit(limits: &str) -> Option<u64> {
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max locked memory"))?;
+    let rest = line.trim_start_matches("Max locked memory").trim();
+    let soft = rest.split_whitespace().next()?;
+    if soft.eq_ignore_ascii_case("unlimited") {
+        return Some(u64::MAX);
+    }
+    soft.parse().ok()
 }
 
 /// Reserve a free loopback port.
@@ -593,7 +662,7 @@ mod tests {
     use hermes_core::Actionable;
     use hermes_core::GgmlType;
 
-    fn config() -> EngineConfig {
+    pub(super) fn config() -> EngineConfig {
         EngineConfig {
             server_path: PathBuf::from("/engine/llama-server"),
             install_dir: PathBuf::from("/engine"),
@@ -606,6 +675,7 @@ mod tests {
                 cache_type_k: GgmlType::F16,
                 cache_type_v: GgmlType::F16,
                 threads: Some(4),
+                ..RuntimeParams::default()
             },
             threads: 4,
             start_timeout: Duration::from_secs(60),
@@ -617,7 +687,7 @@ mod tests {
     }
 
     /// The value following `flag`, if present.
-    fn value_of(args: &[String], flag: &str) -> Option<String> {
+    pub(super) fn value_of(args: &[String], flag: &str) -> Option<String> {
         let index = args.iter().position(|arg| arg == flag)?;
         args.get(index.saturating_add(1)).cloned()
     }
@@ -806,5 +876,121 @@ mod tests {
             .await
             .expect_err("should refuse");
         assert_eq!(err.code(), "model_not_found");
+    }
+}
+
+#[cfg(test)]
+mod optional_flag_tests {
+    use super::tests::{config as base_config, value_of};
+    use super::*;
+    use hermes_core::LoadMode;
+
+    fn config_with(mutate: impl FnOnce(&mut RuntimeParams)) -> EngineConfig {
+        let mut config = base_config();
+        mutate(&mut config.params);
+        config
+    }
+
+    #[test]
+    fn a_gateway_that_sets_none_of_them_produces_the_argv_it_always_did() {
+        // The additive claim, checked rather than asserted in a commit message.
+        // Every knob M8 added is absent by default, so an existing deployment's
+        // engine is launched with exactly the flags it was launched with before.
+        let args = build_args(&base_config(), 45_871);
+        for flag in [
+            "--threads-batch",
+            "--poll",
+            "--cache-reuse",
+            "--cpu-range",
+            "--cpu-strict",
+            "--load-mode",
+        ] {
+            assert!(!args.contains(&flag.to_owned()), "{flag} appeared unbidden");
+        }
+    }
+
+    #[test]
+    fn each_knob_reaches_the_engine_in_its_own_spelling() {
+        let config = config_with(|params| {
+            params.threads_batch = Some(8);
+            params.poll = Some(0);
+            params.cache_reuse = Some(256);
+            params.load_mode = Some(LoadMode::MmapMlock);
+        });
+        let args = build_args(&config, 45_871);
+        assert_eq!(value_of(&args, "--threads-batch").as_deref(), Some("8"));
+        assert_eq!(value_of(&args, "--poll").as_deref(), Some("0"));
+        assert_eq!(value_of(&args, "--cache-reuse").as_deref(), Some("256"));
+        // The engine's own spelling, from `--help` at the pinned build. A
+        // plus sign in the middle of a value is exactly the kind of thing a
+        // transcription from memory gets wrong.
+        assert_eq!(
+            value_of(&args, "--load-mode").as_deref(),
+            Some("mmap+mlock")
+        );
+    }
+
+    #[test]
+    fn an_affinity_range_is_only_strict_when_it_was_asked_to_be() {
+        let loose = build_args(
+            &config_with(|params| {
+                params.cpu_range = Some((0, 1));
+            }),
+            45_871,
+        );
+        assert_eq!(value_of(&loose, "--cpu-range").as_deref(), Some("0-1"));
+        assert!(!loose.contains(&"--cpu-strict".to_owned()));
+
+        let strict = build_args(
+            &config_with(|params| {
+                params.cpu_range = Some((2, 3));
+                params.cpu_strict = true;
+            }),
+            45_871,
+        );
+        assert_eq!(value_of(&strict, "--cpu-range").as_deref(), Some("2-3"));
+        assert_eq!(value_of(&strict, "--cpu-strict").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_polling_level_past_the_engines_range_is_clamped_rather_than_passed_on() {
+        let args = build_args(
+            &config_with(|params| {
+                params.poll = Some(200);
+            }),
+            45_871,
+        );
+        assert_eq!(value_of(&args, "--poll").as_deref(), Some("100"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_locked_memory_limit_is_read_rather_than_assumed() {
+        // Captured from `/proc/self/limits`. The columns are fixed-width prose,
+        // so the parser matches the name and takes the next field.
+        const SAMPLE: &str = "\
+Limit                     Soft Limit           Hard Limit           Units
+Max cpu time              unlimited            unlimited            seconds
+Max locked memory         1016844288           1016844288           bytes
+Max processes             30563                30563                processes
+";
+        assert_eq!(parse_locked_memory_limit(SAMPLE), Some(1_016_844_288));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unlimited_lock_allowance_is_not_a_limit_of_zero() {
+        // The failure this prevents: reading "unlimited" as unparseable, then
+        // as zero, and refusing every locking load on a machine that has no
+        // restriction at all.
+        const SAMPLE: &str = "\
+Limit                     Soft Limit           Hard Limit           Units
+Max locked memory         unlimited            unlimited            bytes
+";
+        assert_eq!(parse_locked_memory_limit(SAMPLE), Some(u64::MAX));
+        assert_eq!(
+            parse_locked_memory_limit("Max open files 1024 1024\n"),
+            None
+        );
     }
 }

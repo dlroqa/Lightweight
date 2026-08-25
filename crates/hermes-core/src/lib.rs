@@ -38,6 +38,6 @@ pub use error::{Actionable, ErrorKind, ErrorReport, Remedy, RemedyAction, Settin
 pub use ggml::GgmlType;
 pub use ids::{ClientKey, InstanceId, JobId, ModelId};
 pub use privacy::Private;
-pub use runtime::RuntimeParams;
+pub use runtime::{LoadMode, RuntimeParams};
 pub use sse::{SseDecodeError, SseDecoder, SseEvent};
 pub use units::Bytes;

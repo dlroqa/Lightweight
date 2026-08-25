@@ -137,10 +137,17 @@ export const api = {
    * token, and doing that here would mean a second implementation of ggml block
    * geometry waiting to disagree with what the engine allocates.
    */
-  model: (id: string, options: { ctx?: number; kv_type?: string } = {}) => {
+  model: (
+    id: string,
+    options: { ctx?: number; kv_type?: string; ubatch?: number } = {},
+  ) => {
     const query = new URLSearchParams();
     if (options.ctx !== undefined) query.set("ctx", String(options.ctx));
     if (options.kv_type !== undefined) query.set("kv_type", options.kv_type);
+    // Only the parameters the estimate actually depends on. `threads` is not
+    // among them and is deliberately not sent: it would ask the gateway to
+    // price a knob that changes no number in the answer.
+    if (options.ubatch !== undefined) query.set("ubatch", String(options.ubatch));
     const suffix = query.size > 0 ? `?${query}` : "";
     return request<ModelDetail>(
       `/api/v1/models/${encodeURIComponent(id)}${suffix}`,
@@ -151,7 +158,14 @@ export const api = {
 
   loadModel: (
     id: string,
-    options: { ctx?: number; kv_type?: string; force?: boolean } = {},
+    options: {
+      ctx?: number;
+      kv_type?: string;
+      threads?: number;
+      ubatch?: number;
+      load_mode?: string;
+      force?: boolean;
+    } = {},
   ) =>
     request<{ job: number; events: string }>(
       `/api/v1/models/${encodeURIComponent(id)}/load`,
