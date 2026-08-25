@@ -32,8 +32,15 @@ Two more, of the same family: `BackendCapabilities.kv_cache_types` is populated
 `resource_usage()` — the engine's own RSS, the one number that makes a `Coarse`
 estimate checkable — has exactly one caller in the tree, in the CLI.
 
-Five of these nine are the product telling the user something untrue. That
-settles the shape of the milestone.
+A tenth, found while verifying the milestone against a real engine rather than
+while planning it: **`BackendError::InsufficientMemory` has no remedy arm at
+all**, and `load_model` discarded the `Estimate` one line before building the
+error — so the single most important refusal in the product arrived with nothing
+actionable attached. The estimator had computed "reduce the context to N",
+"quantize the KV cache, saving X" and "free Y" and thrown all three away.
+
+Six of these ten are the product telling the user something untrue. That settles
+the shape of the milestone.
 
 ## 2. Three stages
 

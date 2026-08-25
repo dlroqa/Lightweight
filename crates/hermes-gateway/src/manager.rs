@@ -99,6 +99,22 @@ pub enum ManagerError {
     #[error("{id} is in the catalog but its file is missing from {path}")]
     FileMissing { id: String, path: PathBuf },
 
+    /// The load does not fit, and the estimate that says so came with the
+    /// remedies for making it fit.
+    ///
+    /// A distinct variant rather than `BackendError::InsufficientMemory`
+    /// because that type lives in `hermes-inference`, which cannot see an
+    /// `Estimate` — so building one here threw away exactly the part of the
+    /// refusal a user can act on. The message and the code are unchanged, so
+    /// nothing that reads either can tell the difference.
+    #[error("{model} needs {required} but only {available} is free")]
+    Insufficient {
+        model: String,
+        required: String,
+        available: String,
+        estimate: Box<hermes_memory::Estimate>,
+    },
+
     /// The machine could not be measured, so no admission verdict exists.
     ///
     /// Delegated rather than flattened into an I/O error: the probe's own code
@@ -119,6 +135,9 @@ impl Actionable for ManagerError {
             Self::DrainTimedOut { .. } => "drain_timed_out",
             Self::FileMissing { .. } => "model_file_not_found",
             Self::MemoryProbe(err) => err.code(),
+            // The same code `BackendError::InsufficientMemory` reports, because
+            // this is the same condition and clients route on it.
+            Self::Insufficient { .. } => "insufficient_memory",
         }
     }
 
@@ -135,6 +154,7 @@ impl Actionable for ManagerError {
             Self::DrainTimedOut { .. } => ErrorKind::Unavailable,
             Self::FileMissing { .. } => ErrorKind::NotFound,
             Self::MemoryProbe(err) => err.kind(),
+            Self::Insufficient { .. } => ErrorKind::ResourceExhausted,
         }
     }
 
@@ -158,6 +178,11 @@ impl Actionable for ManagerError {
                 },
             )],
             Self::MemoryProbe(err) => err.remedies(),
+            // The whole point of the variant: "Reduce the context to 4096
+            // tokens", "Quantize the KV cache to q8_0, saving about 84 MiB",
+            // "Free about 2.9 GiB" - computed by the estimator, and previously
+            // discarded one line before the error was built.
+            Self::Insufficient { estimate, .. } => estimate.remedies(),
         }
     }
 }
@@ -636,14 +661,14 @@ pub async fn load_model(
     }
 
     if estimate.verdict == Verdict::Insufficient && !options.force {
-        return Err(BackendError::InsufficientMemory {
+        return Err(ManagerError::Insufficient {
             model: model.id.clone(),
             // Rendered rather than raw: this string reaches the user, and
             // "2.47 GiB" is the number they can act on.
             required: estimate.total.to_string(),
             available: estimate.budget.to_string(),
-        }
-        .into());
+            estimate: Box::new(estimate),
+        });
     }
 
     // Nothing new starts, and what is running is left to finish.

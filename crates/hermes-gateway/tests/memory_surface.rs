@@ -221,6 +221,17 @@ async fn a_swap_is_not_refused_for_memory_the_outgoing_model_is_about_to_release
         "64 MiB free must not admit a load on its own: {refused}"
     );
     assert_eq!(refused["error"]["code"], "insufficient_memory");
+    // A refusal that says only "it does not fit" is the one the error taxonomy
+    // exists to prevent. The estimator computes what would make it fit, and
+    // this is where those reach the user.
+    let remedies = refused["error"]["remedies"]
+        .as_array()
+        .expect("a refusal must say what to do about it");
+    assert!(!remedies.is_empty());
+    assert!(
+        remedies.iter().all(|remedy| remedy["label"].is_string()),
+        "{remedies:?}"
+    );
 
     // Force it resident, so there is something to reclaim. The same 64 MiB
     // plus 2 GiB about to be released is a different question, and gets a

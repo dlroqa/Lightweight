@@ -17,7 +17,7 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 through 6b are complete. The gateway serves an OpenAI-compatible
+Milestones 0 through 7 are complete. The gateway serves an OpenAI-compatible
 API over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
@@ -58,9 +58,20 @@ reachable from another machine — passed in the environment, never in `argv`.
 `npm run package` builds an AppImage carrying the release binary and the built
 panel.
 
-What remains of the plan is M7 onward. See [docs/PROGRESS.md](docs/PROGRESS.md)
-for the current checkpoint, and [docs/M6B-PLAN.md](docs/M6B-PLAN.md) for what
-the last milestone deliberately left undone.
+The three quantities that decide whether a model runs at all — the KV cache, the
+memory budget and the context window — are now **honest about what they cannot
+compute, and reachable by the person they constrain**. An estimate says which
+term it could not measure rather than billing it at zero. A refused load arrives
+with the numbers to fix it: reduce the context to N tokens, quantize the KV cache
+and save this much, free that much. A model swap is judged against the memory the
+outgoing engine is about to release — its anonymous set, not its whole resident
+set, because the weights are mmapped and the kernel already counts them. And the
+panel offers a context and a KV cache type per load, priced by the gateway before
+the button is pressed.
+
+What remains of the plan is M8 onward. See [docs/PROGRESS.md](docs/PROGRESS.md)
+for the current checkpoint, and [docs/M7-PLAN.md](docs/M7-PLAN.md) for what the
+last milestone deliberately left undone.
 
 ## Verified constraints
 

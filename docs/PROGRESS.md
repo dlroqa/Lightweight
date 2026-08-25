@@ -1,7 +1,7 @@
 # Progress
 
 Checkpoint of where the build stands, so work resumes without re-deriving it.
-Milestones follow the approved plan (M0-M10); this pass covers M0-M6.
+Milestones follow the approved plan (M0-M10); this pass covers M0-M7.
 
 Updated after each milestone, and only ever on green: `./scripts/check.sh` must
 pass — fmt, clippy `-D warnings`, the full test suite, the openai-SDK contract
@@ -25,6 +25,9 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M6b.2** Persistence | **done** | `hermes-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
 | **M6b.3** The panel | **done** | React + TypeScript + Vite in `frontend/`, eight screens on the seams M6b.1 and M6b.2 opened, served same-origin by the gateway; no CORS layer exists anywhere |
 | **M6b.4** The desktop shell | **done** | `apps/desktop`: attaches to a gateway already serving or starts one, stops only what it started, tray, key handling, packaging config |
+| **M7.1** Say the true number | **done** | the KV arithmetic as one fallible pass, so its two halves cannot disagree about a type this build cannot size; per-variant memory remedies naming `--force` instead of a setting that never existed; `Probed<Estimate>` and `ManagerError::MemoryProbe` so a probe failure says why; `targets::MEMORY` given its call sites; the panel reading `label` rather than a field that does not exist |
+| **M7.2** Spend the right budget | **done** | an injectable `MemoryProbe` on `GatewayState`; `Budget` crediting a swap with the `RssAnon` the outgoing engine is about to release; engine RSS and peak in `/api/v1/metrics` and two new Prometheus gauges, read per pull with no sampler; `Verdict::Tight` warned in the log and said on screen, gating nothing |
+| **M7.3** Controls that change something | **done** | one `choose_context` for the load path and the detail that disagreed; `last_n_ctx` demoted to history; engine capabilities and load defaults on `/api/v1/gateway`; `?ctx=`/`?kv_type=` pricing on the model detail; context and KV type pickers in the panel, which now follows the load job and shows the refusal it had been hiding |
 
 ## Verified by execution, not only by unit tests
 
@@ -912,12 +915,66 @@ live trap — the desktop shell prefers a release build, and that one predated
 `--web-root`, so the shell failed on first run for a reason that had nothing to
 do with the shell.
 
+## M7, against a real engine
+
+On 2026-08-24 every claim M7 makes was checked against `llama-server` running
+SmolLM2-135M and Qwen3-1.7B, not only against the mock.
+
+- **The block geometry is real, not rounded.** The same model at 8192 context
+  estimates a 180.0 MiB KV cache with `f16` and 95.6 MiB with `q8_0` — exactly
+  34/64. Rounding q8_0 to "one byte per element" would have said 90 MiB.
+- **`RssAnon` is the right credit, and the margin is not small.** A resident
+  SmolLM2 engine reported `rss` 181 MiB against `anon_rss` 67 MiB: the ~99 MiB
+  of weights are mmapped and file-backed, already inside `MemAvailable`.
+  Crediting the whole resident set on a swap would have double-counted them.
+- **The credit reaches the verdict.** Swapping Qwen3 in over SmolLM2 logged
+  `reclaimable = 67.2 MiB` on `hermes::memory` and admitted the load as
+  `TIGHT`, with the warning that verdict now carries.
+- **A refusal says what to do about it.** `qwen3-1.7b-q4_k_m` at 32768 is
+  refused with four remedies carrying the numbers to apply them: reduce the
+  context to 1084 tokens, quantize the KV cache to q8_0 saving 1.64 GiB, choose
+  a model under 1.67 GiB, or free 3.38 GiB. **That list was empty before M7.**
+  `BackendError::InsufficientMemory` has no remedy arm and the load path threw
+  the estimate away one line before building the error, so the single most
+  important refusal in the product arrived with nothing actionable attached —
+  and the panel never displayed it at all, because it stopped at the 202.
+- **The gauges appear only once measured.** `hermes_engine_resident_bytes` and
+  `hermes_engine_peak_resident_bytes` are absent from `/metrics` with no engine
+  and present with one.
+- **The detail prices what the caller is weighing.** `?ctx=1024` against
+  `?ctx=2048` doubles the KV cache exactly; `?kv_type=q8_0` reproduces the
+  34/64 identity through HTTP.
+
+Tiers run for this milestone: default (`cargo test --workspace`), the openai
+contract suite, the frontend typecheck and build, the desktop shell's 25 tests,
+the dependency gate and the secrets gate — all via `./scripts/check.sh` — plus
+the real-engine tier (`HERMES_TEST_MODEL`, 9 passed, 115 s).
+
 ## Next step
 
-M6b is complete. What remains of the approved plan is M7 onward. The deferrals
-recorded through M6b — batch size, Run Benchmark, live host/port editing, and
-the browser build never seeing the API key — are still deferred deliberately.
-The full plan is `docs/M6B-PLAN.md`.
+M7 is complete. What remains of the approved plan is M8 onward; M9 is
+calibration — fitting the estimator's compute and overhead terms from observed
+peak RSS, which M7 made visible without consuming — and M10 is cross-platform.
+The full plan is `docs/M7-PLAN.md`.
+
+The deferrals recorded through M6b — batch size, Run Benchmark, live host/port
+editing, and the browser build never seeing the API key — are still deferred
+deliberately, and `docs/M6B-PLAN.md` records why. Live host/port editing is now
+the one of those that is genuinely unblocked: M6b.4 put the shell in charge of
+the process, so something can restart the listener.
+
+M7 adds two of its own:
+
+- **No global default KV cache type.** `default_n_ctx` earns its place in
+  settings because context is bounded by memory and the estimate still judges
+  it. A KV type trades output quality, which no estimate judges, and a stored
+  default would shadow the CLI's `--kv-type` with a precedence rule nobody asked
+  for. It is a per-load choice, made while looking at the estimate that prices
+  it.
+- **`ResourceSnapshot.cpu_percent` is still not serialized.** Nothing produces
+  it — the only implementation sets `None` — and a percentage derived from one
+  sample is exactly the invention `hermes-system-info::load` exists to refuse.
+  It awaits either deletion or the counter treatment `CpuTimes` gets.
 
 Deliberately left, and recorded so they are chosen rather than forgotten:
 
