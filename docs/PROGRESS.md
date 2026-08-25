@@ -1,7 +1,7 @@
 # Progress
 
 Checkpoint of where the build stands, so work resumes without re-deriving it.
-Milestones follow the approved plan (M0-M10); this pass covers M0-M9.
+Milestones follow the approved plan (M0-M10); this pass covers M0-M10.
 
 Updated after each milestone, and only ever on green: `./scripts/check.sh` must
 pass — fmt, clippy `-D warnings`, the full test suite, the openai-SDK contract
@@ -34,6 +34,8 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M9.1** Engine truth | **done** | `--ctx-size` multiplied by the slot count at the one boundary that knows the engine's convention, so each client gets the window every surface advertises; `--no-kv-unified` and `--cont-batching` stated; the engine's own `/props` read back once it is ready and the recorded parameters reconciled with it; three hardcoded `max_concurrent_requests: 1` capabilities retired |
 | **M9.2** Clients, not only requests | **done** | `PeerKey` from the connection — observed, never claimed, never logged or labelled; a fair-queuing round in the sort key that degenerates to today's order for one caller; `Ticket::position` an `Option`; `timed_out` and `abandoned` made to mean what they say; admission one locked decision; the benchmark's discarded permit |
 | **M9.3** The number, and the clients | **done** | `--concurrency auto` derived from cores and memory, with the divisor set by a sweep rather than chosen; the scheduler's capacity re-derived per load; `/api/v1/requests` and a Running Now card, because a running request was a bare `usize`; `hermes bench --parallel` with a concurrent scenario; two genuinely concurrent clients in the contract suite |
+| **M10a** Cross-platform | **done** | `hermes-sys`, the workspace's only platform FFI, with one `SAFETY:` note per call and nothing contributed to a Linux build, so `hermes-system-info` keeps its `forbid(unsafe_code)`; `check.yml` running `scripts/check.sh` itself on four runners; the Linux artifact no longer disabling its own Chromium sandbox; one artifact per platform and a Flatpak that builds; per-process memory on the two platforms without `/proc`, and `PeakKind` so a macOS footprint is not mistaken for a resident-set peak |
+| **M10b** Calibration | **done** | `HermesPaths::calibration_file()`; the six estimator sites taking a calibrated model when a trustworthy fit describes the load and the shipped defaults when not; `Confidence::Measured` reachable, said by `hermes estimate` and shown in the panel; `/api/v1/gateway` reporting the calibration outcome; trust rules informed by measurement — three distinct batch sizes, and a line accounting for 95% of the spread — and the finding that on this machine no fit earns them, because the shipped compute shape is wrong for this engine rather than merely mis-set |
 
 ## Verified by execution, not only by unit tests
 
@@ -1080,20 +1082,171 @@ Found while building M9, and fixed:
   was on its way into it — at capacity one, a client waiting out the whole queue
   timeout in front of a gateway doing nothing.
 
+M10a, verified by the matrix rather than by this machine:
+
+- **Four runners run `scripts/check.sh` itself**, not a reimplementation of it,
+  so a tier that is skipped locally is skipped visibly there too. All six jobs
+  — `linux-x64`, `macos-arm64`, `macos-x64`, `windows-x64`, `linux artifacts`
+  and `flatpak` — pass on the branch head.
+- **Two platform breaks were found by the matrix and not by review**, which is
+  why `check.sh` now cross-checks `hermes-sys` for the three non-host targets on
+  any machine that has them installed: the crate holds every `unsafe` block in
+  the workspace and has no C dependencies, so a typo in a Windows arm need not
+  wait for CI.
+- **macOS needed a different number, not a bigger probe.** It publishes no
+  per-process maximum resident set, and the lifetime maximum it does publish is
+  a *footprint*, which excludes the clean file-backed pages a mapped model's
+  weights live in. Subtracting weights from a footprint underflows, the sample
+  is discarded, and `--fit` reported a run with no fits and no reason. `PeakKind`
+  now travels with every sample, defaulted on read so runs already on disk parse
+  as the resident-set peaks they were, and `Prediction::exact_within` subtracts
+  only what that kind of peak contains.
+
+M10b's three measurement questions, answered on 2026-08-25 against
+SmolLM2-135M Q4_K_M on llama.cpp `b10590`, at `--prompt-tokens 256 --repeat 2`
+(runs `18cf2bfb07298264`, `18cf2c104b6c6db3`, `18cf2c1c92bd4be4`):
+
+- **Peak RSS is a ratchet, and it had been fitted as if it were noise.** Within
+  one bucket every sample is read from one engine process, and `peak_rss` is a
+  high-water mark, so the readings only climb: 39.95 → 57.43 MiB across a
+  bucket's six samples. The spread was **17.5 MiB in all eight buckets swept**,
+  within 0.1 MiB of the same value at four batch sizes and three contexts, and
+  it resets on each reload. `bench.rs` already knew this at bucket granularity —
+  it reloads between buckets for exactly this reason — and the fit did not know
+  it at sample granularity. Regressing the raw samples therefore fitted the
+  order they were taken in: R² **0.10**, on data whose slope is stable to 1.4%.
+- **1. Is the residual affine in `n_ubatch`? No.** Comparing like with like, the
+  segment slopes across 64 → 128 → 256 → 512 are **32,600, then 26,378, then
+  2,949 bytes per ubatch** — an elevenfold disagreement, most of the growth at
+  the small end and almost none at the large. A straight line through the four
+  peaks scores **0.79**. Per M10-PLAN section 4.1, that makes the trust rules
+  the place that has to say so, and they now do.
+- **2. How wrong are the shipped defaults? Conservative, increasingly so with
+  batch size.** Predicted engine-side memory against the measured peak residual:
+  **1.37×** at ubatch 64, 1.57× at 128, 1.95× at 256, **2.85×** at 512. The
+  cause is structural rather than a mis-set coefficient: `compute_bytes` scales
+  the logits term by `n_ubatch`, which is 196,608 bytes per ubatch for this
+  vocabulary and **fifteen times the entire measured slope** of ~13,100. The
+  engine appears to size that buffer by the number of tokens it is asked for,
+  which during prefill is one.
+- **3. Does the residual move with `n_ctx`? No.** At a fixed ubatch of 512, the
+  residual across contexts of 1024, 2048 and 4096 was **45.40, 45.88 and 45.52
+  MiB** at matched positions — 0.48 MiB, under 1%, across a fourfold range —
+  while the KV cache it excludes went 22.5 → 45 → 90 MiB. The context's cost is
+  the exact half, which is where the estimator already puts it. `n_parallel` is
+  nearly as flat: 45.60, 45.66, 46.80 MiB at 1, 2 and 4 slots (M9's run
+  `18ceefe0aa03aba1`). **The bucket key is not widened on this evidence** — the
+  plan reserves that for a measurement that sets out to test it, and this one
+  did not — but the finding is recorded for the pass that does.
+
+What those numbers decided, and what they refused:
+
+- **The trust rules are two.** A fit must rest on at least three *distinct*
+  batch sizes, and its line must account for at least 95% of the spread across
+  them. The count is checked first because two batch sizes always score a
+  perfect 1.0 — a line through two points passes through both — so the order is
+  what makes the second rule a rule. The two rules stand on different footing
+  and are labelled as such: the count follows from what a line through two
+  points can mean, while **95% is measurement-informed conservative policy
+  rather than a derived number**. What the sweep establishes is that 0.79 must
+  fail; any bar above it would have done that, and the margin above is chosen
+  for the asymmetry of the risk, not calculated.
+- **The counting defect was real and had shipped.** The old rule counted
+  observations, and this machine's stored fit rested on **twelve observations at
+  two batch sizes**. Twelve is comfortably more than three. It is refused now,
+  by a test written against the fit that fooled it.
+- **The fit is taken at each bucket's peak rather than through its climb**,
+  which is the ratchet finding applied: the peak a configuration reached is both
+  the independent observation and the quantity an estimator has to cover. Every
+  observation is still recorded, so a later pass can fit them differently
+  without re-running anything.
+- **On this machine, calibration correctly refuses, and the shipped guesses
+  stand.** Proven end to end rather than argued, on run `18cf2ce44809bc3a`:
+  `hermes bench --ubatch 64,128,256,512 --fit` recorded `12965 bytes per ubatch
+  token, 57.7 MiB fixed, R² 0.77` and said of it, in the same output, `not used:
+  the fitted line accounts for 77% of the spread across batch sizes, below the
+  95% a measurement must reach`. `hermes estimate` against that same
+  `calibration.json` then reported `SAFE (uncalibrated; compute and overhead are
+  estimates)` — the two surfaces agreeing, where before one of them insisted
+  nothing read the file at all. A second sweep reproducing the first to within
+  2% on the slope is also the answer to how repeatable any of this is.
+  This is the contingency M10-PLAN section 4.1 named: it said that if the points
+  do not lie near a line, the fit format is describing something it cannot
+  describe and the trust rules are the place that has to say so. They said so.
+  Section 4.2 is *not* the clause that covers this — it allowed for "the
+  defaults are already close", and at 1.37× to 2.85× these defaults plainly are
+  not. What makes the refusal the right outcome rather than a near miss is the
+  direction of the error: an over-estimate refuses a load the user can force, an
+  under-estimate invites the OOM killer. **On this machine M10b's value is
+  precisely that it prevents a false `Confidence::Measured`.**
+- **`SlopeBelowLogits` was written to catch a run that measured the wrong
+  thing, and here it fires on runs that measured correctly.** It stays, because
+  its effect is right even where its stated reason was not, and the reason is
+  corrected where the guard is. Fixing the *shape* of the compute term on one
+  machine's evidence would be the confident wrong number this design exists to
+  refuse; it is recorded as a deferral below.
+- **A fit is now matched on the engine variant it was actually taken against.**
+  Found by audit rather than by a failure: `EngineFingerprint::matches` compared
+  the backend and the build and skipped `ggml_variant`, which it had been
+  recording all along. The machine fingerprint pins the ISA features the variant
+  is derived from, so it was *usually* implied — and "usually implied" is not
+  what a type whose whole purpose is refusing a mismatch should rest on. The
+  mapping from ISA features to a dispatched variant belongs to the build that
+  does the mapping, so a later build shipping a different set of variant
+  libraries would have reused a fit taken against code that is not the code
+  running. Both sides are read from `CpuInfo::detect()` at runtime, never from
+  whatever compiled the binary. Checked against the defect it exists for:
+  restore the two-field comparison and the test fails.
+- **Three user-facing claims that nothing reads a calibration are gone.** They
+  were true when written and had been false since M10b.2: the `--fit` argument's
+  own help, the sentence `hermes bench --fit` printed after every fit, and
+  `fit.rs`'s module doc. In their place `hermes bench` now reports, per fit,
+  whether the next load will use it — which is the question a person actually
+  has, and the one whose wrong answer hid all of this.
+
 ## Next step
 
-M9 is complete. What remains of the approved plan is M10.
+M10 is complete, and with it the approved plan M0-M10. Stated exactly:
+**calibration is measured, wired, observable, and safely refused when its model
+is invalid. On `b10590` the shipped compute shape prevents any honest fit from
+being applied; correcting that shape is successor work.**
 
-**M10 is calibration and cross-platform.** M8 built everything calibration
-needs except the decision: `hermes bench --fit` already writes a versioned,
-machine-scoped `calibration.json` carrying a slope, an intercept and the raw
-residual points. What remains is the policy — how many buckets make a fit
-trustworthy, how close a fingerprint must match, and when
-`Confidence::Measured` is earned — plus the wiring into the three load paths.
-`Estimator::new(ComputeModel)` is the seam, and it has been there since M1. It
-sits with cross-platform deliberately: a fit from one machine and one engine
-build is a fact about that machine, and the value of fitting appears when there
-is a second machine to fit against.
+**What M10 leaves behind is a design problem, not a pending measurement.** The
+calibration path is built, wired into all six estimator sites, and enforcing
+rules that numbers rather than arguments put there. What it uncovered is that
+`Estimator::compute_bytes` has the wrong *shape* for this engine, not merely
+mis-set coefficients: it scales the logits term by `n_ubatch`, and the entire
+measured slope is a fifteenth of that one term. A milestone that only ran
+another sweep would not touch this. Closing it takes three things, in order:
+
+- **A model correction.** Logits are the largest term in the shipped compute
+  model and the one the measurement contradicts. Whatever replaces it is a
+  change to the estimator's structure, and it needs its own argument about what
+  the engine actually allocates — not a coefficient fitted to make the number
+  come out.
+- **Validation against a second engine build**, to tell an llama.cpp convention
+  from a general one. Every number in this milestone comes from `b10590`.
+- **Validation on a second machine**, which is what the whole file format exists
+  for. A fit is machine-scoped by design and `Calibration::find` refuses a
+  mismatch, so nothing about the shape can be separated from this Pentium Silver
+  until something else has measured it.
+
+Until all three are done the shipped guesses stand and over-estimate by 1.37× to
+2.85×, which is the direction `ComputeModel`'s own doc comment says to err.
+Correcting the shape on this machine's evidence alone would be calibrating
+against one machine, one engine and one model — the confident wrong number this
+design was built to refuse.
+
+**What the product is today, said plainly.** Flexible across machines by safe
+fallback and local self-calibration: it estimates conservatively everywhere, it
+can measure the machine it is actually running on, and it refuses its own
+measurement when the model behind it does not hold. It is *not* universally
+adaptive optimization, and no part of this milestone should be read as claiming
+that. The successor work has to stay engine-shape-aware — the defect it exists
+to fix is a structural one in the compute term, not a coefficient — and it has
+to be validated on several **runtime** machines. Every fingerprint in this
+design is read where the engine runs, never from whichever machine compiled the
+build, and the successor's evidence must come from the same place.
 
 The deferrals recorded through M7 stand, with two closed by this milestone:
 `ResourceSnapshot.cpu_percent` is resolved — it became a counter — and Run
@@ -1121,3 +1274,24 @@ M8 adds its own, each chosen rather than forgotten:
 - **The fit separates a slope from an intercept and nothing finer.** Two of the
   estimator's coefficients are collinear in peak RSS. A later pass that wants
   them apart needs a second observable, not more samples.
+
+M10 adds three, each with the measurement that would close it:
+
+- **The compute term's shape is not corrected.** Logits are scaled by
+  `n_ubatch` and the engine does not appear to allocate them that way — the
+  whole measured slope is a fifteenth of that one term. Correcting it needs a
+  second engine build to tell a convention from a coincidence. Until then
+  `SlopeBelowLogits` refuses every fit on llama.cpp `b10590`, which is a refusal
+  in the safe direction rather than a wrong number.
+- **The bucket key is not widened, though the residual is flat in `n_ctx`.**
+  0.48 MiB across a fourfold context range is a strong hint that a fit could
+  travel between contexts, and M10-PLAN section 4.3 says only a measurement that
+  sets out to test that may widen the key. This one did not: it varied context
+  at one batch size on one model. The narrow key stands.
+- **95% is policy informed by one machine, not a number that machine derived.**
+  The sweep proves 0.79 must fail; it does not single out 0.95 from any other
+  bar above 0.79. The margin is chosen for the asymmetry — passing buys
+  permission to budget *less* memory than the shipped guess — and its doc
+  comment says exactly this rather than implying a derivation. A second machine
+  scoring between 0.79 and 0.95 lands in the range nothing has evidence about,
+  and is the reason to revisit it with that machine's data.

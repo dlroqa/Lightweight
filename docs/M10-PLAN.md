@@ -182,6 +182,35 @@ The numbers, the run ids and the conclusion belong in `PROGRESS.md` when they
 exist, next to M8's and M9's, and in the doc comment of any constant they set —
 the rule `CORES_PER_SLOT` follows.
 
+### 4a. What they answered
+
+Run on 2026-08-25 against SmolLM2-135M Q4_K_M on llama.cpp `b10590`. The full
+numbers are in `PROGRESS.md`; the conclusions are these.
+
+1. **No, the residual is not affine in `n_ubatch`.** Segment slopes across
+   64 → 128 → 256 → 512 were 32,600, 26,378 and 2,949 bytes per ubatch, and a
+   line through the four peaks scores 0.79. This is the contingency section 4.1
+   named, and the trust rules are where it is said: `MIN_UBATCH_VALUES` and
+   `MIN_R_SQUARED` in `apply.rs`. The first follows from what a line through two
+   points can mean; the second is conservative policy informed by this sweep —
+   0.79 must fail, and no measurement here singles out 0.95 from any other bar
+   above it.
+2. **The shipped defaults over-estimate by 1.37× to 2.85×**, growing with batch
+   size because the logits term is scaled by `n_ubatch` and the engine does not
+   appear to allocate it that way. Structural rather than a mis-set
+   coefficient, and left alone until a second engine build can tell a
+   convention from a coincidence.
+3. **The residual is flat in `n_ctx`** — 0.48 MiB across 1024/2048/4096 — and
+   nearly flat in `n_parallel`. **The key is not widened**, because this run
+   varied context at one batch size on one model, which is not the measurement
+   that clause reserves the right to.
+
+A fourth thing, which none of the three questions asked and which had to be
+answered before any of them could be: **peak RSS ratchets within one engine
+process**, 17.5 MiB per bucket, identically in all eight buckets swept. The old
+fit regressed those raw samples and so fitted the order they were taken in
+(R² 0.10). Each batch size now contributes one point, its largest residual.
+
 ## 4b. The gap the matrix found, and how much of it is closed
 
 `ResourceSnapshot` for the *engine process* - its resident set, its high-water

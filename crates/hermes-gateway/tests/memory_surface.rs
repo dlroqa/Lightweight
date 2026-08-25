@@ -650,6 +650,9 @@ async fn a_measurement_of_this_machine_reaches_the_estimate_on_screen() {
         bucket,
         compute_bytes_per_ubatch: Some(slope),
         overhead_bytes: Some(intercept),
+        // The three points are on the line by construction, so the line
+        // accounts for all of their spread.
+        r_squared: Some(1.0),
         max_residual_bytes: points
             .iter()
             .map(|point| point.residual_bytes)

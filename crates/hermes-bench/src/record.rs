@@ -112,8 +112,26 @@ pub struct EngineFingerprint {
 }
 
 impl EngineFingerprint {
+    /// Exact on all three fields, the variant included.
+    ///
+    /// The variant used to be recorded and not compared, on the reasoning that
+    /// the machine fingerprint pins the ISA features it is derived from and so
+    /// implies it. "Implies" is the problem: the variant is what the engine
+    /// *dispatches to*, and the mapping from ISA features to a variant is this
+    /// build's own — a later build that ships a different set of variant
+    /// libraries, or maps the same features differently, would reuse a fit
+    /// taken against code that is not the code now running. That is a fit
+    /// crossing an engine boundary while every fingerprint says it did not,
+    /// which is what this whole type exists to prevent.
+    ///
+    /// It is also a *runtime* property on both sides: recorded from
+    /// `CpuInfo::detect()` where the run happened and compared against
+    /// `CpuInfo::detect()` where the load is happening, never against whichever
+    /// machine compiled the binary.
     pub fn matches(&self, other: &Self) -> bool {
-        self.backend == other.backend && self.build == other.build
+        self.backend == other.backend
+            && self.build == other.build
+            && self.ggml_variant == other.ggml_variant
     }
 }
 

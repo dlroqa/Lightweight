@@ -21,6 +21,26 @@
 //! process, and calibrating a term nothing measured is exactly the confident
 //! wrong number this design refuses. The exact half is never touched at all.
 //!
+//! **What the measurements decided.** Two of the rules below carry a number,
+//! and neither was argued into place. A four-value batch-size sweep and a
+//! three-value context sweep on this machine (2026-08-25, SmolLM2-135M on
+//! llama.cpp b10590) found that the residual is *flat* in `n_ctx` — 0.48 MiB
+//! across a fourfold range, because the context's cost is the KV cache, which
+//! is the exact half — and that it moves with `n_ubatch` by only 6 MiB across
+//! an eightfold range, in a curve rather than a line. [`MIN_UBATCH_VALUES`] and
+//! [`MIN_R_SQUARED`] are where those findings live, each with its numbers in
+//! its own doc comment — and each says how far its number actually follows from
+//! them, which is further for the first than for the second.
+//!
+//! The outcome on this machine is that no fit is trustworthy and the shipped
+//! guesses stand. That is the contingency M10-PLAN section 4.1 named rather
+//! than a failure, and it is not the "defaults are already close" of section
+//! 4.2: they over-estimate by 1.4× to 2.9×, in the direction [`ComputeModel`]'s
+//! own doc comment says to err. What the refusal is worth here is that it stops
+//! a false [`hermes_memory::Confidence::Measured`] — the compute term's shape is
+//! wrong for this engine, and a fit spent against it would be a measured-looking
+//! number built on it.
+//!
 //! **Why the two compute coefficients move together.** The estimator's compute
 //! term is `vocab*ub*4 + activation*ub*embd*4 + scratch*ub*max(embd,ffn)*4`.
 //! A fit provides one slope, and `fit.rs` explains why peak RSS cannot separate
@@ -36,32 +56,78 @@ use hermes_memory::ComputeModel;
 use crate::fit::{BucketKey, Calibration, Fit};
 use crate::record::{EngineFingerprint, MachineFingerprint};
 
-/// Fewest observations a fit may rest on.
+/// Fewest *distinct* batch sizes a fit may rest on.
 ///
 /// Two points define a line exactly, with no evidence that the line is the
 /// right shape; the third is the first one that can disagree with it.
-pub const MIN_POINTS: usize = 3;
+///
+/// It counts batch sizes rather than observations, and the difference is not
+/// pedantic: the fit this machine had on disk before this rule existed rested
+/// on twelve observations at **two** batch sizes, and twelve is comfortably
+/// more than three. Repetitions and scenarios multiply the observations without
+/// adding a single point the line can be wrong about.
+pub const MIN_UBATCH_VALUES: usize = 3;
+
+/// How much of the spread a fitted line must account for.
+///
+/// **Measurement-informed conservative policy, not a derived constant, and the
+/// difference is worth being exact about.** What the measurement establishes is
+/// a lower bound: a four-value sweep on this machine (run `18cf2bfb07298264`,
+/// SmolLM2-135M on llama.cpp b10590) scored **0.79** with its ratchet
+/// controlled for, and that shortfall is not noise — the slope between
+/// consecutive batch sizes was 32,600 then 26,378 then 2,949 bytes per ubatch
+/// across 64 → 128 → 256 → 512. An elevenfold disagreement between segments is
+/// a curve, and a straight line through it describes something the fit format
+/// cannot describe. So 0.79 must fail. **Nothing here derives 0.95**; any bar
+/// above 0.79 would have refused this sweep.
+///
+/// It is set high within that freedom because of the asymmetry in what passing
+/// buys: permission to lower a memory budget below the shipped guess, where
+/// being wrong invites the OOM killer rather than a refusal the user can
+/// override. A machine whose residual really is affine will score far nearer
+/// 1.0 than 0.95 and pass without argument. A second machine scoring between
+/// 0.79 and 0.95 is the case this number was chosen without evidence about, and
+/// is a reason to revisit it with that machine's data.
+pub const MIN_R_SQUARED: f64 = 0.95;
 
 /// Why a fit was not used.
 ///
 /// Returned rather than logged and swallowed, because every one of these is
 /// something a person running `hermes bench` would want to be told.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Untrusted {
     /// No fit for this machine, this engine build and this bucket.
     NoFit,
-    /// Fewer than [`MIN_POINTS`] observations.
-    TooFewPoints { have: usize },
+    /// Fewer than [`MIN_UBATCH_VALUES`] distinct batch sizes.
+    TooFewUbatchValues { have: usize },
     /// One ubatch value, so the regression declined to report a slope.
     NoSlope,
+    /// The line accounts for less than [`MIN_R_SQUARED`] of the spread, so the
+    /// residual is not the affine function of `n_ubatch` the format assumes.
+    NotAffine { r_squared: f64 },
+    /// The fit predates this field and cannot be judged against
+    /// [`MIN_R_SQUARED`]. Refitting the run it came from produces one.
+    NoGoodnessOfFit,
     /// A negative slope or intercept: a measurement artefact, not a
     /// coefficient. It happens when the weights were not all resident.
     NegativeTerm,
     /// The model's own geometry is missing, so the slope cannot be spent.
     ShapeUnknown,
-    /// The measured slope is below the logits term alone, which is computed
-    /// from the vocabulary rather than fitted. The run did not measure what it
-    /// thought it did.
+    /// The measured slope is below the logits term alone, which the shipped
+    /// model computes from the vocabulary rather than fitting.
+    ///
+    /// This was written expecting to catch a run that measured the wrong thing.
+    /// On this machine it fires on runs that measured correctly, and the reason
+    /// is worth recording where the guard is: against llama.cpp b10590 the
+    /// *whole* measured slope is about 13,100 bytes per ubatch, while the
+    /// shipped logits term alone claims 196,608 — fifteen times more — because
+    /// `Estimator::compute_bytes` scales logits by `n_ubatch` and the engine
+    /// appears to size that buffer by the number of tokens it is actually asked
+    /// for, which during prefill is one. Until the compute term's *shape* is
+    /// revisited against a second engine, this guard refuses every honest fit
+    /// on this one. That is the conservative direction — the shipped guess
+    /// stands and it over-estimates — so it stays, and the shape is recorded as
+    /// a deferral rather than fixed here on one machine's evidence.
     SlopeBelowLogits,
 }
 
@@ -70,11 +136,23 @@ impl Untrusted {
     pub fn reason(self) -> String {
         match self {
             Self::NoFit => "no measurement for this machine, engine and settings".to_owned(),
-            Self::TooFewPoints { have } => format!(
-                "only {have} observation(s); {MIN_POINTS} are needed before a fit is believed"
+            Self::TooFewUbatchValues { have } => format!(
+                "the run swept {have} batch size(s); {MIN_UBATCH_VALUES} are needed before a line \
+                 through them is believed"
             ),
             Self::NoSlope => {
                 "the run held the batch size fixed, so it has no slope to spend".to_owned()
+            }
+            Self::NotAffine { r_squared } => format!(
+                "the fitted line accounts for {:.0}% of the spread across batch sizes, below the \
+                 {:.0}% a measurement must reach before it replaces the shipped guess",
+                r_squared * 100.0,
+                MIN_R_SQUARED * 100.0
+            ),
+            Self::NoGoodnessOfFit => {
+                "the fit was recorded before goodness of fit was, so it cannot be judged; \
+                 re-run `hermes bench --fit`"
+                    .to_owned()
             }
             Self::NegativeTerm => {
                 "the fit is negative, which means the weights were not all resident".to_owned()
@@ -148,14 +226,26 @@ pub fn apply(
     metadata: &ModelMetadata,
     base: ComputeModel,
 ) -> Result<Calibrated, Untrusted> {
-    if fit.points.len() < MIN_POINTS {
-        return Err(Untrusted::TooFewPoints {
-            have: fit.points.len(),
+    // Counted first, and before the goodness of fit is read, because two batch
+    // sizes always score a perfect 1.0 — a line through two points passes
+    // through both — and a rule that cannot fail is not a rule.
+    let ubatch_values: std::collections::BTreeSet<u32> =
+        fit.points.iter().map(|point| point.n_ubatch).collect();
+    if ubatch_values.len() < MIN_UBATCH_VALUES {
+        return Err(Untrusted::TooFewUbatchValues {
+            have: ubatch_values.len(),
         });
     }
     let (Some(slope), Some(intercept)) = (fit.compute_bytes_per_ubatch, fit.overhead_bytes) else {
         return Err(Untrusted::NoSlope);
     };
+    match fit.r_squared {
+        None => return Err(Untrusted::NoGoodnessOfFit),
+        Some(r_squared) if r_squared < MIN_R_SQUARED => {
+            return Err(Untrusted::NotAffine { r_squared });
+        }
+        Some(_) => {}
+    }
     if slope < 0.0 || intercept < 0.0 {
         return Err(Untrusted::NegativeTerm);
     }
@@ -378,6 +468,10 @@ mod tests {
             bucket: bucket_for(&metadata(), params()),
             compute_bytes_per_ubatch: Some(slope),
             overhead_bytes: Some(intercept),
+            // Every point is on the line by construction, so the line accounts
+            // for all of the spread. A test that wants the linearity rule to
+            // fire lowers this itself.
+            r_squared: Some(1.0),
             max_residual_bytes: points
                 .iter()
                 .map(|point| point.residual_bytes)
@@ -489,6 +583,22 @@ mod tests {
         // What `regress` reports for a single distinct ubatch.
         fit.compute_bytes_per_ubatch = None;
         fit.overhead_bytes = None;
+        // Refused for the batch-size count rather than for the missing slope:
+        // both are true, and the count is the one that names what to do about
+        // it. Three repetitions of one batch size is one point.
+        assert_eq!(
+            apply(&fit, &metadata(), ComputeModel::headless()),
+            Err(Untrusted::TooFewUbatchValues { have: 1 })
+        );
+    }
+
+    #[test]
+    fn a_fit_with_enough_batch_sizes_and_no_slope_is_still_refused() {
+        // `regress` cannot produce this, so it is a file that was edited or
+        // damaged. The guard stays because "believe a slope that is not there"
+        // is the one outcome that must not be reachable from a bad file.
+        let mut fit = fit_on_the_line(40_000.0, 60_000_000.0, &[128, 256, 512]);
+        fit.compute_bytes_per_ubatch = None;
         assert_eq!(
             apply(&fit, &metadata(), ComputeModel::headless()),
             Err(Untrusted::NoSlope)
@@ -500,7 +610,44 @@ mod tests {
         let fit = fit_on_the_line(40_000.0, 60_000_000.0, &[256, 512]);
         assert_eq!(
             apply(&fit, &metadata(), ComputeModel::headless()),
-            Err(Untrusted::TooFewPoints { have: 2 })
+            Err(Untrusted::TooFewUbatchValues { have: 2 })
+        );
+    }
+
+    #[test]
+    fn repetitions_do_not_turn_two_batch_sizes_into_three_points() {
+        // The defect this exists for, and it shipped: the rule counted
+        // observations, so the twelve-point two-value fit this machine had on
+        // disk sailed through a check that exists to stop exactly that. Six
+        // repetitions of each of two batch sizes is still two points.
+        let fit = fit_on_the_line(40_000.0, 60_000_000.0, &[128, 128, 128, 512, 512, 512]);
+        assert_eq!(fit.points.len(), 6);
+        assert_eq!(
+            apply(&fit, &metadata(), ComputeModel::headless()),
+            Err(Untrusted::TooFewUbatchValues { have: 2 })
+        );
+    }
+
+    #[test]
+    fn a_curve_through_three_batch_sizes_is_not_spent_as_a_line() {
+        // Modelled on what this machine actually measured: the segment slopes
+        // across 64 -> 128 -> 256 -> 512 were 32,600 then 26,378 then 2,949
+        // bytes per ubatch, which is a curve. A line through it scored 0.79.
+        let mut fit = fit_on_the_line(40_000.0, 60_000_000.0, &[64, 128, 256, 512]);
+        fit.r_squared = Some(0.79);
+        assert_eq!(
+            apply(&fit, &metadata(), ComputeModel::headless()),
+            Err(Untrusted::NotAffine { r_squared: 0.79 })
+        );
+    }
+
+    #[test]
+    fn a_fit_recorded_before_goodness_of_fit_was_is_refused_rather_than_assumed_good() {
+        let mut fit = fit_on_the_line(40_000.0, 60_000_000.0, &[128, 256, 512]);
+        fit.r_squared = None;
+        assert_eq!(
+            apply(&fit, &metadata(), ComputeModel::headless()),
+            Err(Untrusted::NoGoodnessOfFit)
         );
     }
 

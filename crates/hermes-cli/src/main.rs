@@ -212,8 +212,10 @@ enum Command {
         parallel: Vec<u32>,
         /// Fit the measured residuals into `calibration.json`.
         ///
-        /// Nothing reads that file yet: the estimator keeps its shipped
-        /// defaults until a later milestone decides when a fit is trustworthy.
+        /// Every load path reads that file and spends a fit that passes the
+        /// trust rules; one that does not is ignored and the shipped defaults
+        /// stand. Sweep at least three `--ubatch` values, or the fit will not
+        /// have enough points to be believed.
         #[arg(long)]
         fit: bool,
     },
