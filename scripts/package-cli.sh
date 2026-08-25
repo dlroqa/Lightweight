@@ -59,8 +59,10 @@ A local CPU inference gateway. Run \`./hermes serve --help\` to start.
   directory. Nothing is compiled on your machine.
 - **Nothing here is code-signed.** Verify the download against \`SHA256SUMS\`
   from the same release.
-- Service wrapper examples for systemd, launchd and Task Scheduler are in
-  \`packaging/\` in the repository.
+- To run it as a service on Linux, there is a systemd unit example in
+  \`packaging/systemd/\` in the repository. On macOS and Windows, run
+  \`./hermes serve\` from a terminal — no launchd or Task Scheduler example is
+  shipped, because none has been tested.
 EOF
 
 mkdir -p "$OUT"
