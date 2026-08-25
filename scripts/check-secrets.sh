@@ -51,7 +51,14 @@ ipv4_hits=$(scan '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)' -- . \
       # allowed address on a line does not excuse another beside it.
       echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' | while IFS= read -r addr; do
         # A CIDR range names a standard rather than a machine.
-        case "$addr" in */*) continue ;; esac
+        #
+        # Written as a suffix test rather than a `case`: bash 3.2 - which is
+        # what macOS ships, and what the macOS runners use - scans for the
+        # closing paren of a `$( ... )` naively, and a `case` pattern's own `)`
+        # inside one is a syntax error there. This whole block is inside a
+        # command substitution. Found by the check matrix's first macOS run,
+        # where every test passed and then the gate died in its last step.
+        if [ "${addr%%/*}" != "$addr" ]; then continue; fi
         if ! echo "$addr" | grep -qE "$allowed_v4"; then
           echo "$line"
           break

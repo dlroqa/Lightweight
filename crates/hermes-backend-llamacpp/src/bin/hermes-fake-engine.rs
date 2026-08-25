@@ -148,7 +148,22 @@ fn raise(signal: i32) {
 }
 
 #[cfg(not(unix))]
-fn raise(_signal: i32) {
-    // Windows has no equivalent; abort is close enough for what the tests need.
-    std::process::abort();
+fn raise(signal: i32) {
+    // Windows has no signals, and `abort()` here would only prove that the
+    // supervisor can see a non-zero exit. What a *real* engine does on this
+    // platform is die with an NTSTATUS in its exit code, so that is what this
+    // reproduces: the same two causes the Unix arm raises, in the spelling
+    // Windows uses for them.
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+    let status = match signal {
+        11 => STATUS_ACCESS_VIOLATION,
+        4 => STATUS_ILLEGAL_INSTRUCTION,
+        // Nothing else has a Windows equivalent worth pretending to.
+        _ => {
+            std::process::abort();
+        }
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    std::process::exit(status as i32);
 }
