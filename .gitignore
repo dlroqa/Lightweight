@@ -14,3 +14,7 @@
 # Python bytecode from the contract suite
 __pycache__/
 .pytest_cache/
+
+# Staged for packaging, and produced by it
+/apps/desktop/staging
+/dist-cli

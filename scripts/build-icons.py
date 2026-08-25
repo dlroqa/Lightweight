@@ -150,6 +150,23 @@ def main() -> None:
     # show. 256 is the largest either asks for.
     save(icon, ROOT / "apps/desktop/build/window.png", 256)
 
+    # macOS and Windows want a single multi-resolution file rather than the
+    # directory of PNGs the Linux target reads. They are generated here and
+    # committed like every other icon, so no build step needs Pillow - the
+    # dependency policy keeps tool-time requirements out of the build.
+    desktop_build = ROOT / "apps/desktop/build"
+    icon.save(
+        desktop_build / "icon.icns",
+        sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)],
+    )
+    print("apps/desktop/build/icon.icns  16-1024")
+    # `.ico` tops out at 256; Windows scales that for anything larger.
+    icon.resize((256, 256), Image.LANCZOS).save(
+        desktop_build / "icon.ico",
+        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+    )
+    print("apps/desktop/build/icon.ico   16-256")
+
     # The panel. `public/` is copied to the web root verbatim, so these keep
     # stable names - unlike the bundler's hashed assets, a favicon is asked for
     # by a fixed path. `icon.png` is both the tab icon and the mark the rail

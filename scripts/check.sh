@@ -91,6 +91,8 @@ else
   echo "== desktop shell == skipped: npm unavailable"
 fi
 
+echo "== versions =="; ./scripts/check-versions.sh
+printf ""
 echo "== deps ==";    ./scripts/check-deps.sh
 echo "== secrets =="; ./scripts/check-secrets.sh
 echo "All checks passed."
