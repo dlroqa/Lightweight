@@ -98,11 +98,24 @@ describe("finding the binary", () => {
 
   it("names every place it looked when it finds nothing", () => {
     // "The gateway could not be started" is not an actionable sentence.
+    //
+    // The expected paths are built the way `candidatePaths` builds them rather
+    // than written out with forward slashes: Windows joins with `\\` and calls
+    // the binary `hermes.exe`, so a literal `/repo/target/release/hermes` here
+    // failed on that platform against an error message that was perfectly
+    // correct. What is being asserted is that every path it looked in appears
+    // in the message, which is exactly this loop.
+    const looked = candidatePaths({ repoRoot: "/repo" });
+    assert.ok(looked.length >= 2, "a repo checkout has release and debug");
     assert.throws(
       () => resolveBinary({ repoRoot: "/repo" }, () => false),
       (error: Error) => {
-        assert.match(error.message, /\/repo\/target\/release\/hermes/);
-        assert.match(error.message, /\/repo\/target\/debug\/hermes/);
+        for (const path of looked) {
+          assert.ok(
+            error.message.includes(path),
+            `the message does not name ${path}: ${error.message}`,
+          );
+        }
         assert.match(error.message, /cargo build --release/);
         return true;
       },
