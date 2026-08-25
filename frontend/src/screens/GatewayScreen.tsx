@@ -8,6 +8,7 @@ import { ErrorState, Loading, Pill, Row } from "../components/Bits";
 import { TopBar } from "../components/Shell";
 import { useRequestEvents } from "../hooks/useEventStream";
 import { usePoll } from "../hooks/usePoll";
+import type { GatewayReport } from "../api/types";
 
 const ENDPOINTS = [
   { method: "POST", path: "/v1/chat/completions" },
@@ -16,6 +17,26 @@ const ENDPOINTS = [
   { method: "GET", path: "/health" },
   { method: "GET", path: "/metrics" },
 ];
+
+/**
+ * The sentence beside "Memory estimates".
+ *
+ * Says which of the three states the file is in *and* what it means for the
+ * numbers, because "unreadable" on its own tells somebody nothing about
+ * whether their model will load.
+ */
+function calibrationNote(calibration: GatewayReport["calibration"]): string {
+  if (calibration.state === "unreadable") {
+    return "the calibration file could not be read";
+  }
+  if (calibration.state === "absent") {
+    return "run `hermes bench --fit` to measure this machine";
+  }
+  if (calibration.fits_for_this_machine === 0) {
+    return `${calibration.fits} fit(s) on file, none for this machine and engine`;
+  }
+  return `${calibration.fits_for_this_machine} of ${calibration.fits} fit(s) describe this machine`;
+}
 
 /**
  * What this gateway is, where it answers, and what it is doing.
@@ -122,6 +143,23 @@ export function GatewayScreen() {
                 <Row label="Queue timeout">
                   {gateway.data.concurrency.queue_timeout_seconds}s
                 </Row>
+                <Row label="Memory estimates">
+                  {gateway.data.calibration.state === "present" &&
+                  gateway.data.calibration.fits_for_this_machine > 0
+                    ? "measured on this machine"
+                    : "shipped coefficients"}
+                  <span className="card__note" style={{ marginLeft: 8 }}>
+                    {calibrationNote(gateway.data.calibration)}
+                  </span>
+                </Row>
+
+                {gateway.data.calibration.state === "unreadable" && (
+                  <div className="notice notice--warn" style={{ marginTop: 14 }}>
+                    The calibration file exists and could not be read, so every
+                    estimate uses the shipped coefficients. Loading still works;
+                    re-run <code>hermes bench --fit</code> to replace it.
+                  </div>
+                )}
 
                 <div className="notice notice--info" style={{ marginTop: 14 }}>
                   {gateway.data.restart_required.join(", ")} are fixed when the

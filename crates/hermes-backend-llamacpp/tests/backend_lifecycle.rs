@@ -301,7 +301,20 @@ async fn a_dead_engine_is_reported_as_failed_and_cleared() {
 
     let (_, _, _, _) = backend.resident().await.expect("resident");
     let usage = backend.resource_usage().await.expect("usage");
+    // The engine's *own* resident set is read from `/proc/<pid>/status`, which
+    // exists on Linux and nowhere else. M10a.1 gave the workspace macOS and
+    // Windows probes for the machine; this is the per-process reading, and it
+    // has no equivalent there yet. Asserted per platform rather than skipped,
+    // so that implementing it elsewhere makes this test fail until it is
+    // updated - and so that the gap is stated where somebody will meet it.
+    #[cfg(target_os = "linux")]
     assert!(usage.is_some(), "a running engine should report memory use");
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        usage.is_none(),
+        "per-process memory is a `/proc` reading; off Linux it must report \
+         nothing rather than a made-up number"
+    );
 
     backend.shutdown().await.expect("shutdown");
     assert_eq!(backend.health().await, BackendHealth::Stopped);

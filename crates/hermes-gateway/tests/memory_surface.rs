@@ -688,6 +688,18 @@ async fn a_measurement_of_this_machine_reaches_the_estimate_on_screen() {
         before["estimate"]["kv_cache"],
         after["estimate"]["kv_cache"]
     );
+
+    // And it is visible from outside, which is the rule every number that
+    // changes an admission decision is held to.
+    let (status, report) = server.get("/api/v1/gateway").await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["calibration"]["state"], "present");
+    assert_eq!(report["calibration"]["fits"], 1);
+    assert_eq!(
+        report["calibration"]["fits_for_this_machine"], 1,
+        "a fit taken on this machine and this engine must be counted as one: {}",
+        report["calibration"]
+    );
 }
 
 #[tokio::test]
@@ -708,4 +720,10 @@ async fn a_damaged_calibration_file_costs_nobody_their_estimate() {
     assert_eq!(body["estimate"]["state"], "read");
     assert_eq!(body["estimate"]["confidence"], "coarse");
     assert!(body["estimate"]["total"].as_u64().is_some());
+
+    // Damaged is not absent, and the difference is the whole reason this is
+    // three words rather than a boolean: one of them is worth acting on.
+    let (status, report) = server.get("/api/v1/gateway").await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["calibration"]["state"], "unreadable");
 }

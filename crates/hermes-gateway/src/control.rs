@@ -473,8 +473,34 @@ pub struct GatewayReport {
     /// actually do, and would have to show a control whose starting position
     /// is a guess.
     defaults: DefaultsReport,
+    /// What this machine has measured about its own memory use.
+    ///
+    /// A number that changes an admission decision and cannot be seen from
+    /// outside is the thing `/api/v1/system` was built to stop. Until M10 the
+    /// estimator's coefficients were the same on every machine, so there was
+    /// nothing to report; now they are sometimes a measurement, and which one
+    /// it is has to be visible without reading the log.
+    calibration: CalibrationReport,
     queue: crate::scheduler::QueueSnapshot,
     paths: Option<PathsReport>,
+}
+
+/// The state of this machine's fitted coefficients.
+#[derive(Debug, Serialize)]
+pub struct CalibrationReport {
+    /// `absent`, `present` or `unreadable`. Three words rather than a boolean,
+    /// because a damaged file is not the same as no file and only one of them
+    /// is worth acting on.
+    state: &'static str,
+    /// How many fits it holds, across every machine, engine and bucket it has
+    /// accumulated. Zero when there is no file.
+    fits: usize,
+    /// How many of those describe *this* machine and *this* engine build.
+    ///
+    /// The difference between the two numbers is a data directory that has
+    /// travelled, which is a thing the file is designed to allow: a fit from
+    /// another machine is kept and never used.
+    fits_for_this_machine: usize,
 }
 
 /// The load defaults this gateway was started with.
@@ -893,12 +919,58 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
                     .collect(),
             }
         },
+        calibration: describe_calibration(state),
         queue: state.scheduler().snapshot(),
         paths: config.paths.as_ref().map(|paths| PathsReport {
             data: paths.data_dir().to_path_buf(),
             models: paths.models_dir(),
             logs: paths.logs_dir(),
         }),
+    }
+}
+
+/// Read the calibration file, for reporting only.
+///
+/// Reading it here rather than caching it: it is written by a benchmark that
+/// may finish at any time, and a cached count would tell somebody who just ran
+/// `hermes bench --fit` that nothing had happened. It is a small file read on
+/// an endpoint a panel polls slowly, which is the trade M6b.1 already made for
+/// the disk probe.
+fn describe_calibration(state: &GatewayState) -> CalibrationReport {
+    let Some(paths) = state.config.paths.as_ref() else {
+        return CalibrationReport {
+            state: "absent",
+            fits: 0,
+            fits_for_this_machine: 0,
+        };
+    };
+    let path = paths.calibration_file();
+    if !path.exists() {
+        return CalibrationReport {
+            state: "absent",
+            fits: 0,
+            fits_for_this_machine: 0,
+        };
+    }
+    match hermes_bench::fit::Calibration::load(&path) {
+        Ok(calibration) => {
+            let machine = hermes_bench::MachineFingerprint::detect();
+            let engine = state.engine_fingerprint();
+            CalibrationReport {
+                state: "present",
+                fits: calibration.fits.len(),
+                fits_for_this_machine: calibration
+                    .fits
+                    .iter()
+                    .filter(|fit| fit.machine.matches(&machine) && fit.engine.matches(&engine))
+                    .count(),
+            }
+        }
+        Err(_) => CalibrationReport {
+            state: "unreadable",
+            fits: 0,
+            fits_for_this_machine: 0,
+        },
     }
 }
 

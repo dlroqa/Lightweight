@@ -797,7 +797,10 @@ fn render_estimate(out: &mut String, metadata: &ModelMetadata, estimate: &hermes
     }
 
     let confidence = match estimate.confidence {
-        hermes_memory::Confidence::Measured => "measured for this model",
+        // Reachable for the first time in M10: a fit is keyed by the machine,
+        // the engine build *and* the settings, so saying "for this model" alone
+        // would claim less precision than the number actually has.
+        hermes_memory::Confidence::Measured => "measured on this machine, at these settings",
         hermes_memory::Confidence::Coarse => "uncalibrated; compute and overhead are estimates",
         hermes_memory::Confidence::Partial => "PARTIAL; some metadata was missing",
     };

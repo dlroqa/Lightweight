@@ -182,6 +182,38 @@ The numbers, the run ids and the conclusion belong in `PROGRESS.md` when they
 exist, next to M8's and M9's, and in the doc comment of any constant they set —
 the rule `CORES_PER_SLOT` follows.
 
+## 4b. The gap the matrix found, and what it costs calibration
+
+`ResourceSnapshot` for the *engine process* - its resident set, its high-water
+mark and its processor ticks - is read from `/proc/<pid>/status` and
+`/proc/<pid>/stat`. M10a.1 gave the workspace macOS and Windows probes for the
+**machine**; there is no equivalent yet for a **process**, and the first macOS
+run of the matrix said so by failing
+`a_dead_engine_is_reported_as_failed_and_cleared`.
+
+The test states the per-platform truth now rather than skipping, so
+implementing the reading elsewhere makes it fail until it is updated. What the
+gap costs, in order of how much it matters:
+
+1. **`hermes bench --fit` can fit nothing off Linux.** `fit_run` skips any
+   sample without a `peak_rss`, so a run on macOS or Windows records timings
+   and no residuals, and `calibration.json` stays empty. Everything in M10b
+   still behaves correctly there - it reports `NoFit` and the shipped
+   coefficients stand - but the milestone's whole point is unavailable on two
+   of the three platforms it now ships to.
+2. **Engine RSS and peak are absent from `/api/v1/metrics`**, and the two
+   Prometheus gauges M7.2 added report nothing.
+3. **A swap credits nothing**, because `anon_rss` is the credit and there is
+   none to read. The safe direction: a swap is judged against memory the
+   outgoing engine still holds, so it is refused more often rather than less.
+
+Closing it is `proc_pid_rusage` on macOS - `ri_resident_size` and
+`ri_lifetime_max_phys_footprint`, which is the peak - and
+`GetProcessMemoryInfo` plus `GetProcessTimes` on Windows, both in
+`crates/hermes-sys` beside the machine probes and behind the same single
+`#[allow(unsafe_code)]`. Neither can be executed on the development machine,
+so the matrix is what would prove it.
+
 ## 5. Deliberately left
 
 - **Fitting `host_overhead`.** Nothing measures the shell. See M10b.1.

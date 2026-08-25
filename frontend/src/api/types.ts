@@ -214,6 +214,19 @@ export interface GatewayReport {
     max_concurrent_requests: number;
     kv_cache_types: string[];
   };
+  /**
+   * What this machine has measured about its own memory use.
+   *
+   * `state` is `absent`, `present` or `unreadable` — three words rather than a
+   * flag, because a damaged file is not the same as no file and only one of
+   * them is worth doing anything about. `fits` counts every fit in the file,
+   * including ones taken on other machines, which are kept and never used.
+   */
+  calibration: {
+    state: "absent" | "present" | "unreadable";
+    fits: number;
+    fits_for_this_machine: number;
+  };
   /** What a load uses when a request names nothing. */
   defaults: {
     kv_type: string;
