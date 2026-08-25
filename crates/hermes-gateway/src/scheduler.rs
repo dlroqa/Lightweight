@@ -28,12 +28,81 @@
 //! is wait for every turn queued ahead of it.
 
 use std::collections::VecDeque;
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use axum::extract::ConnectInfo;
+
 use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
+
+/// Which caller a request came from, for scheduling and for nothing else.
+///
+/// **Observed, never claimed.** The address comes off the connection, where the
+/// kernel put it; there is no header to set and no field to send. That is the
+/// same standard the bands are held to — a priority that can be requested is a
+/// priority every caller requests — applied to identity instead of to cost.
+///
+/// The IP alone, never the port. A port is unique per connection, so keying on
+/// one would give a client that opens four connections four identities and one
+/// that reuses a connection a single identity for a hundred requests, which is
+/// the opposite of what fairness needs. Canonicalised, so a caller arriving on
+/// a dual-stack listener as `::ffff:127.0.0.1` is not a second client.
+///
+/// `None` is a request that arrived with no connection information at all,
+/// which is every in-process test and every future transport that is not a
+/// socket. They share one key — the degenerate single-client case, whose order
+/// is exactly the order this scheduler served before there were clients in it.
+///
+/// **It is never logged, never a metric label, never serialized and never
+/// stored.** It lives in the queue for as long as a request is waiting and goes
+/// away with it. The `Debug` here is what keeps that true when somebody prints
+/// the queue while debugging something else.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PeerKey(Option<IpAddr>);
+
+impl std::fmt::Debug for PeerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            Some(_) => "PeerKey(<peer>)",
+            None => "PeerKey(local)",
+        })
+    }
+}
+
+impl PeerKey {
+    /// The key for a request that arrived over a socket.
+    pub fn from_socket(address: SocketAddr) -> Self {
+        Self(Some(address.ip().to_canonical()))
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerKey {
+    /// Extraction cannot fail, deliberately.
+    ///
+    /// `ConnectInfo` itself rejects with a 500 when the server was built
+    /// without `into_make_service_with_connect_info`, which would make adding
+    /// this extractor to a handler a new way for a request to fail. A router
+    /// assembled without connection information — a `tower::oneshot` in a test,
+    /// or a transport that has no peer — degrades to the shared local key
+    /// instead, and serves requests in the order it always did.
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map_or_else(Self::default, |ConnectInfo(address)| {
+                Self::from_socket(*address)
+            }))
+    }
+}
 
 /// How much work a request is allowed to be and still count as interactive.
 ///
@@ -225,6 +294,17 @@ pub struct QueueSnapshot {
 struct Waiter {
     id: u64,
     band: Band,
+    /// Which caller this request came from. Never leaves this module.
+    peer: PeerKey,
+    /// This request's turn in its own caller's rotation.
+    ///
+    /// The number of requests that caller already had waiting when this one
+    /// arrived: its first queued request is round 0, its second is round 1.
+    /// Fixed at enqueue and never renumbered — renumbering as requests depart
+    /// would make every grant linear in the queue *and* would let a caller's
+    /// place improve as its own earlier requests are served, which is exactly
+    /// the advantage this exists to remove.
+    round: u32,
     enqueued: Instant,
     /// Signals that a slot is now this waiter's.
     ///
@@ -366,6 +446,48 @@ impl Scheduler {
     /// of this module.
     pub fn try_admit(self: &Arc<Self>) -> Option<SlotPermit> {
         let mut inner = self.lock();
+        self.take_free_slot(&mut inner)
+    }
+
+    /// Take a slot, or join the queue — deciding under one lock.
+    ///
+    /// The two used to be separate calls with a gap between them, and a slot
+    /// released inside that gap found an empty queue, went idle, and left the
+    /// request that was on its way in to wait for the *next* release. At
+    /// capacity one that is a client waiting out the whole queue timeout in
+    /// front of a gateway doing nothing. Deciding under one lock closes it:
+    /// either the slot was free when we looked, or we were in the queue before
+    /// it could be released.
+    pub fn admit_or_enqueue(
+        self: &Arc<Self>,
+        band: Band,
+        peer: PeerKey,
+    ) -> Result<SlotPermit, Ticket> {
+        let mut inner = self.lock();
+        if let Some(permit) = self.take_free_slot(&mut inner) {
+            return Ok(permit);
+        }
+        Err(self.push_waiter(&mut inner, band, peer))
+    }
+
+    /// Join the queue.
+    ///
+    /// Returns a [`Ticket`], which can report its position while it waits and
+    /// which releases its place when dropped — including when it is dropped by
+    /// a client disconnecting, which is the only reason this is a ticket rather
+    /// than a plain future.
+    pub fn enqueue(self: &Arc<Self>, band: Band, peer: PeerKey) -> Ticket {
+        let mut inner = self.lock();
+        self.push_waiter(&mut inner, band, peer)
+    }
+
+    /// Take a slot if the queue's state allows it, under a lock already held.
+    ///
+    /// The `waiting.is_empty()` clause is the anti-barging rule, and it is what
+    /// gives the round in [`rank`] its meaning: without it a fresh arrival
+    /// would take a free slot ahead of a queue it never joined, and no ordering
+    /// among the waiters could matter.
+    fn take_free_slot(self: &Arc<Self>, inner: &mut Inner) -> Option<SlotPermit> {
         if !inner.paused && inner.running < self.capacity && inner.waiting.is_empty() {
             inner.running += 1;
             self.counters
@@ -376,26 +498,30 @@ impl Scheduler {
         None
     }
 
-    /// Join the queue.
-    ///
-    /// Returns a [`Ticket`], which can report its position while it waits and
-    /// which releases its place when dropped — including when it is dropped by
-    /// a client disconnecting, which is the only reason this is a ticket rather
-    /// than a plain future.
-    pub fn enqueue(self: &Arc<Self>, band: Band) -> Ticket {
+    /// Add a waiter, under a lock already held.
+    fn push_waiter(self: &Arc<Self>, inner: &mut Inner, band: Band, peer: PeerKey) -> Ticket {
         let (grant, granted) = oneshot::channel();
-        let mut inner = self.lock();
         inner.next_id += 1;
         let id = inner.next_id;
         let enqueued = Instant::now();
+        // This caller's turn in the rotation, counted rather than tracked. A
+        // map of per-peer counters would be O(1) instead of this scan, and
+        // would have to be evicted — an un-evicted map keyed by address is
+        // exactly the identity-at-rest this design promises not to keep.
+        let round = inner
+            .waiting
+            .iter()
+            .filter(|waiter| waiter.peer == peer)
+            .count() as u32;
         inner.waiting.push_back(Waiter {
             id,
             band,
+            peer,
+            round,
             enqueued,
             grant,
         });
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
-        drop(inner);
         Ticket {
             id,
             band,
@@ -403,6 +529,7 @@ impl Scheduler {
             scheduler: Arc::clone(self),
             granted,
             taken: false,
+            withdrawal: Withdrawal::Abandoned,
         }
     }
 
@@ -414,17 +541,21 @@ impl Scheduler {
     pub async fn admit(
         self: &Arc<Self>,
         band: Band,
+        peer: PeerKey,
         timeout: Duration,
     ) -> Result<SlotPermit, Queued> {
-        if let Some(permit) = self.try_admit() {
-            return Ok(permit);
-        }
-        let mut ticket = self.enqueue(band);
+        let mut ticket = match self.admit_or_enqueue(band, peer) {
+            Ok(permit) => return Ok(permit),
+            Err(ticket) => ticket,
+        };
         match tokio::time::timeout(timeout, ticket.granted()).await {
             Ok(Some(permit)) => Ok(permit),
             Ok(None) => Err(Queued::Closed),
             Err(_) => {
-                self.counters.timed_out.fetch_add(1, Ordering::Relaxed);
+                // Counted by the ticket's own departure rather than here.
+                // Counting it in both places is how `timed_out` and
+                // `abandoned` came to describe overlapping sets of requests.
+                ticket.timed_out();
                 Err(Queued::TimedOut)
             }
         }
@@ -541,11 +672,19 @@ impl Scheduler {
     }
 
     /// Drop a waiter that gave up, and say whether it had already been granted.
-    fn withdraw(&self, id: u64) -> bool {
+    ///
+    /// Exactly one counter moves, and which one is the caller's to say: a
+    /// request whose wait ran out and a client that closed its laptop are
+    /// different facts with different remedies, and they used to be counted as
+    /// both or as the wrong one depending on which code path arrived here.
+    fn withdraw(&self, id: u64, reason: Withdrawal) -> bool {
         let mut inner = self.lock();
         if let Some(index) = inner.waiting.iter().position(|waiter| waiter.id == id) {
             inner.waiting.remove(index);
-            self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
+            match reason {
+                Withdrawal::TimedOut => self.counters.timed_out.fetch_add(1, Ordering::Relaxed),
+                Withdrawal::Abandoned => self.counters.abandoned.fetch_add(1, Ordering::Relaxed),
+            };
             return true;
         }
         false
@@ -571,13 +710,31 @@ impl Drop for PauseGuard {
 
 /// The sort key that decides who runs next. Smaller wins.
 ///
+/// Four parts, in order: the starvation guarantee, the band, the caller's turn
+/// in the rotation, and arrival order.
+///
 /// Tier 0 is the starvation guarantee: once a request has waited past the
 /// ceiling it sorts ahead of every band, and among aged-out requests the
-/// longest wait wins. Below that it is band, then arrival order.
-fn rank(waiter: &Waiter, now: Instant, ceiling: Duration) -> (u8, Instant) {
+/// longest wait wins. **The round is zeroed there too**, or an aged-out request
+/// could still be overtaken by a fresher aged-out one from a quieter caller,
+/// and the guarantee would hold only within a caller.
+///
+/// The round is what makes the queue fair between callers rather than only
+/// between requests. Each caller's first waiting request competes with every
+/// other caller's first; its second waits behind every other caller's first. A
+/// client that sends twenty requests no longer puts twenty of them in front of
+/// somebody else's one — it puts one in front and nineteen behind.
+///
+/// **With a single caller this is exactly the key it replaces.** Every waiter
+/// then shares a peer, so within a band the rounds run 0, 1, 2… in arrival
+/// order, and ordering by round is ordering by arrival. That is asserted by a
+/// test rather than argued here, because it is the property that makes this
+/// safe to add.
+fn rank(waiter: &Waiter, now: Instant, ceiling: Duration) -> (u8, u32, Instant) {
     let aged_out = now.saturating_duration_since(waiter.enqueued) >= ceiling;
     let tier = if aged_out { 0 } else { waiter.band.tier() };
-    (tier, waiter.enqueued)
+    let round = if aged_out { 0 } else { waiter.round };
+    (tier, round, waiter.enqueued)
 }
 
 /// Why a request did not get a slot.
@@ -602,6 +759,21 @@ pub struct Ticket {
     scheduler: Arc<Scheduler>,
     granted: oneshot::Receiver<()>,
     taken: bool,
+    /// What to count if this ticket leaves the queue without a slot.
+    ///
+    /// Abandonment is the default because it is what a dropped ticket means
+    /// when nobody said otherwise: the future holding it went away, which is a
+    /// client that went away. A timeout says so explicitly.
+    withdrawal: Withdrawal,
+}
+
+/// Why a waiter left the queue without a slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Withdrawal {
+    /// The wait ran out and the gateway gave up on it.
+    TimedOut,
+    /// The client went away while it was still waiting.
+    Abandoned,
 }
 
 impl Ticket {
@@ -614,28 +786,47 @@ impl Ticket {
         self.enqueued.elapsed()
     }
 
+    /// Record that this request gave up because its wait ran out.
+    ///
+    /// Called by both timeout paths before the ticket is dropped. Without it a
+    /// timeout is indistinguishable from a disconnect, and the streamed and
+    /// non-streamed timeouts — which are the same event reported two ways —
+    /// counted differently from each other.
+    pub fn timed_out(&mut self) {
+        self.withdrawal = Withdrawal::TimedOut;
+    }
+
     /// How many requests would be served before this one.
     ///
-    /// Zero means next. Computed with the same key the scheduler picks by, so
-    /// a reported position cannot contradict the order actually served — though
-    /// it is a snapshot, and a later arrival in a higher band can still move it.
-    pub fn position(&self) -> u32 {
+    /// `Some(0)` is next. `None` is not in the queue at all — already granted,
+    /// or withdrawn — which used to be reported as `Some(0)` and is a different
+    /// fact: one says "you are about to run", the other says "you are not
+    /// waiting for anything".
+    ///
+    /// Computed with the same key the scheduler picks by, so a reported
+    /// position cannot contradict the order actually served — though it is a
+    /// snapshot, and a later arrival in a higher band can still move it.
+    ///
+    /// It counts requests, not slots. With four slots free, "three ahead of
+    /// you" still means three ahead of you; all four then start together. The
+    /// alternative — reporting a place among those about to start — would need
+    /// the client to know the capacity, and the capacity is ours.
+    pub fn position(&self) -> Option<u32> {
         let inner = self.scheduler.lock();
         let now = Instant::now();
         let ceiling = self.scheduler.config.starvation_ceiling;
-        let Some(mine) = inner
+        let mine = inner
             .waiting
             .iter()
             .find(|waiter| waiter.id == self.id)
-            .map(|waiter| rank(waiter, now, ceiling))
-        else {
-            return 0;
-        };
-        inner
-            .waiting
-            .iter()
-            .filter(|waiter| rank(waiter, now, ceiling) < mine)
-            .count() as u32
+            .map(|waiter| rank(waiter, now, ceiling))?;
+        Some(
+            inner
+                .waiting
+                .iter()
+                .filter(|waiter| rank(waiter, now, ceiling) < mine)
+                .count() as u32,
+        )
     }
 
     /// Wait until this request's turn.
@@ -661,7 +852,7 @@ impl Drop for Ticket {
             // The permit is out in the world and will release itself.
             return;
         }
-        if self.scheduler.withdraw(self.id) {
+        if self.scheduler.withdraw(self.id, self.withdrawal) {
             return;
         }
         // Not in the queue and no permit taken: a slot was granted to a ticket
@@ -707,6 +898,15 @@ mod tests {
     }
 
     /// Grant a ticket if the slot is already its turn, without waiting.
+    /// The peer every single-client test shares.
+    ///
+    /// Named rather than written as `PeerKey::default()` at thirty call sites,
+    /// because what these tests are asserting is that one caller's requests are
+    /// ordered exactly as they always were.
+    fn one_client() -> PeerKey {
+        PeerKey::default()
+    }
+
     fn granted_now(ticket: &mut Ticket) -> Option<SlotPermit> {
         ticket.granted().now_or_never().flatten()
     }
@@ -799,10 +999,10 @@ mod tests {
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
 
-        let mut long = scheduler.enqueue(Band::Bulk);
-        let mut short = scheduler.enqueue(Band::Interactive);
-        assert_eq!(short.position(), 0, "the short request is next");
-        assert_eq!(long.position(), 1, "even though it arrived second");
+        let mut long = scheduler.enqueue(Band::Bulk, one_client());
+        let mut short = scheduler.enqueue(Band::Interactive, one_client());
+        assert_eq!(short.position(), Some(0), "the short request is next");
+        assert_eq!(long.position(), Some(1), "even though it arrived second");
 
         drop(running);
         // Held, not dropped: releasing it here would hand the slot straight to
@@ -830,11 +1030,15 @@ mod tests {
             },
         );
         let running = scheduler.try_admit().expect("a free slot");
-        let mut long = scheduler.enqueue(Band::Bulk);
+        let mut long = scheduler.enqueue(Band::Bulk, one_client());
 
         tokio::time::advance(Duration::from_secs(61)).await;
-        let mut short = scheduler.enqueue(Band::Interactive);
-        assert_eq!(long.position(), 0, "it has aged out of being overtakeable");
+        let mut short = scheduler.enqueue(Band::Interactive, one_client());
+        assert_eq!(
+            long.position(),
+            Some(0),
+            "it has aged out of being overtakeable"
+        );
 
         drop(running);
         let _long_permit = granted_now(&mut long).expect("the aged-out request runs");
@@ -845,9 +1049,9 @@ mod tests {
     async fn requests_in_one_band_are_served_in_the_order_they_arrived() {
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
-        let mut first = scheduler.enqueue(Band::Interactive);
-        let mut second = scheduler.enqueue(Band::Interactive);
-        assert_eq!((first.position(), second.position()), (0, 1));
+        let mut first = scheduler.enqueue(Band::Interactive, one_client());
+        let mut second = scheduler.enqueue(Band::Interactive, one_client());
+        assert_eq!((first.position(), second.position()), (Some(0), Some(1)));
 
         drop(running);
         let _first_permit = granted_now(&mut first).expect("the earlier request runs");
@@ -855,17 +1059,240 @@ mod tests {
         assert_eq!(scheduler.snapshot().overtakes, 0, "nobody was passed over");
     }
 
+    /// A second caller, distinct from [`one_client`].
+    fn another_client() -> PeerKey {
+        PeerKey::from_socket(SocketAddr::from(([10, 0, 0, 1], 50_000)))
+    }
+
+    #[tokio::test]
+    async fn one_clients_requests_keep_the_order_they_always_had() {
+        // The property that makes fair queuing safe to add: with a single
+        // caller the rounds run 0, 1, 2 in arrival order, so ordering by round
+        // is ordering by arrival and the key is the one it replaced.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut tickets: Vec<_> = (0..4)
+            .map(|_| scheduler.enqueue(Band::Bulk, one_client()))
+            .collect();
+
+        assert_eq!(
+            tickets
+                .iter()
+                .map(Ticket::position)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+
+        drop(running);
+        assert!(
+            granted_now(&mut tickets[0]).is_some(),
+            "the first to arrive should be the first to run"
+        );
+        assert_eq!(scheduler.snapshot().overtakes, 0, "nobody was passed over");
+    }
+
+    #[tokio::test]
+    async fn a_second_client_waits_behind_one_request_rather_than_behind_ten() {
+        // The failure fair queuing exists to prevent: one caller with a batch
+        // of work, and another with a single request, on a shared gateway.
+        // Bands cannot help here - every request is in the same band - and
+        // first-come-first-served would put the newcomer eleventh.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut busy: Vec<_> = (0..10)
+            .map(|_| scheduler.enqueue(Band::Bulk, one_client()))
+            .collect();
+        let mut quiet = scheduler.enqueue(Band::Bulk, another_client());
+
+        assert_eq!(
+            quiet.position(),
+            Some(1),
+            "behind one of the busy client's requests, not behind all ten"
+        );
+
+        drop(running);
+        let first = granted_now(&mut busy[0]).expect("the busy client's first request runs");
+        drop(first);
+        assert!(
+            granted_now(&mut quiet).is_some(),
+            "the quiet client should be served second, not eleventh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_keeps_arriving_does_not_keep_the_front_of_the_queue() {
+        // Each new request from a caller joins the back of that caller's own
+        // rotation, so arriving repeatedly cannot buy a better place.
+        let scheduler = scheduler(1);
+        let _running = scheduler.try_admit().expect("a free slot");
+        let _first = scheduler.enqueue(Band::Bulk, one_client());
+        let other = scheduler.enqueue(Band::Bulk, another_client());
+        let second = scheduler.enqueue(Band::Bulk, one_client());
+
+        assert_eq!(other.position(), Some(1));
+        assert_eq!(
+            second.position(),
+            Some(2),
+            "the busy client's second request sorts behind the other client's first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_request_still_overtakes_a_long_one_from_the_same_client() {
+        // The band dominates the rotation: cost is still the first thing the
+        // scheduler reads, and the round only breaks ties within a band.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut long = scheduler.enqueue(Band::Bulk, one_client());
+        let mut short = scheduler.enqueue(Band::Interactive, one_client());
+
+        assert_eq!(short.position(), Some(0), "even at a later round");
+
+        drop(running);
+        // Bound, not dropped: an unbound permit is released at the end of the
+        // statement and the long request would be granted the slot it just
+        // gave back, which would say nothing about the order.
+        let _short_permit = granted_now(&mut short).expect("the short request runs");
+        assert!(granted_now(&mut long).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aged_out_request_is_not_overtaken_by_a_quieter_clients_first() {
+        // The round is zeroed once a request has aged out, or the starvation
+        // guarantee would hold only within a caller: a fresher request at
+        // round 0 from a quiet client would still pass a request that had
+        // waited past the ceiling at round 3.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut ahead: Vec<_> = (0..3)
+            .map(|_| scheduler.enqueue(Band::Bulk, one_client()))
+            .collect();
+        let aged = scheduler.enqueue(Band::Bulk, one_client());
+        assert_eq!(aged.position(), Some(3));
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let mut newcomer = scheduler.enqueue(Band::Interactive, another_client());
+        assert_eq!(
+            newcomer.position(),
+            Some(4),
+            "an aged-out request outranks every band, whoever it came from"
+        );
+
+        drop(running);
+        // Among aged-out requests the longest wait wins, and all four of the
+        // busy client's have aged out together - so the first of them runs,
+        // not the one at the front of the rotation and not the newcomer.
+        let _first = granted_now(&mut ahead[0]).expect("the longest wait runs first");
+        assert!(granted_now(&mut newcomer).is_none());
+    }
+
+    #[tokio::test]
+    async fn four_clients_are_served_at_once_before_anybody_waits() {
+        let scheduler = scheduler(4);
+        let permits: Vec<_> = (0..4)
+            .map(|_| scheduler.try_admit().expect("a free slot"))
+            .collect();
+        assert_eq!(scheduler.snapshot().running, 4);
+
+        let fifth = scheduler.enqueue(Band::Interactive, another_client());
+        assert_eq!(fifth.position(), Some(0), "next, but not yet running");
+        assert_eq!(scheduler.snapshot().waiting, 1);
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn a_drain_at_four_slots_waits_for_the_last_of_them() {
+        // A model swap must not replace the engine under three generations
+        // because the fourth finished.
+        let scheduler = scheduler(4);
+        let permits: Vec<_> = (0..4)
+            .map(|_| scheduler.try_admit().expect("a free slot"))
+            .collect();
+        let mut permits = permits;
+
+        let last = permits.pop().expect("four permits");
+        drop(permits);
+        assert!(
+            !scheduler.drain(Duration::from_millis(20)).await,
+            "three of four finishing is not an idle engine"
+        );
+
+        drop(last);
+        assert!(scheduler.drain(Duration::from_millis(20)).await);
+    }
+
+    #[tokio::test]
+    async fn a_slot_released_while_a_request_joins_the_queue_is_not_left_idle() {
+        // `try_admit` then `enqueue` were two locks with a gap between them,
+        // and a slot released inside that gap found an empty queue, went idle,
+        // and left the arriving request waiting for the *next* release. One
+        // locked decision closes it.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut ticket = match scheduler.admit_or_enqueue(Band::Bulk, one_client()) {
+            Ok(_) => panic!("the only slot was taken"),
+            Err(ticket) => ticket,
+        };
+        drop(running);
+        assert!(
+            granted_now(&mut ticket).is_some(),
+            "the freed slot should have found the waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ticket_that_is_no_longer_queued_reports_no_position() {
+        // `Some(0)` says "you are next"; `None` says "you are not waiting for
+        // anything". Reporting the first for both is how a granted request
+        // came to look like the head of a queue it had already left.
+        let scheduler = scheduler(1);
+        let running = scheduler.try_admit().expect("a free slot");
+        let mut ticket = match scheduler.admit_or_enqueue(Band::Bulk, one_client()) {
+            Ok(_) => panic!("the only slot was taken"),
+            Err(ticket) => ticket,
+        };
+        assert_eq!(ticket.position(), Some(0), "next, and still waiting");
+
+        drop(running);
+        let _permit = granted_now(&mut ticket).expect("the slot is handed over");
+        assert_eq!(
+            ticket.position(),
+            None,
+            "a granted request is not at the head of a queue it has left"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_ran_out_is_counted_as_a_timeout_and_not_as_a_disconnect() {
+        // These were counted as both: `admit` incremented `timed_out` and the
+        // ticket's own departure then incremented `abandoned` for the same
+        // request, while the streamed path incremented only `abandoned`. Two
+        // counters describing overlapping sets of requests are two numbers
+        // nobody can act on.
+        let scheduler = scheduler(1);
+        let _running = scheduler.try_admit().expect("a free slot");
+        let outcome = scheduler
+            .admit(Band::Bulk, one_client(), Duration::from_millis(20))
+            .await;
+
+        assert_eq!(outcome.err(), Some(Queued::TimedOut));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.timed_out, 1);
+        assert_eq!(snapshot.abandoned, 0, "nobody disconnected");
+    }
+
     #[tokio::test]
     async fn a_client_that_disconnects_while_queued_leaves_the_queue() {
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
-        let waiting = scheduler.enqueue(Band::Bulk);
-        let mut behind = scheduler.enqueue(Band::Bulk);
+        let waiting = scheduler.enqueue(Band::Bulk, one_client());
+        let mut behind = scheduler.enqueue(Band::Bulk, one_client());
         assert_eq!(scheduler.snapshot().waiting, 2);
 
         drop(waiting);
         assert_eq!(scheduler.snapshot().waiting, 1);
-        assert_eq!(behind.position(), 0);
+        assert_eq!(behind.position(), Some(0));
 
         drop(running);
         assert!(
@@ -882,7 +1309,7 @@ mod tests {
         // gateway serves nothing for the rest of the process's life.
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
-        let ticket = scheduler.enqueue(Band::Bulk);
+        let ticket = scheduler.enqueue(Band::Bulk, one_client());
 
         drop(running); // the grant is now sitting in the ticket's channel
         assert_eq!(scheduler.snapshot().running, 1, "reserved for the ticket");
@@ -897,7 +1324,7 @@ mod tests {
         let scheduler = scheduler(1);
         let _running = scheduler.try_admit().expect("a free slot");
         let outcome = scheduler
-            .admit(Band::Interactive, Duration::from_millis(20))
+            .admit(Band::Interactive, one_client(), Duration::from_millis(20))
             .await;
         assert_eq!(outcome.err(), Some(Queued::TimedOut));
         assert_eq!(scheduler.snapshot().timed_out, 1);
@@ -911,7 +1338,7 @@ mod tests {
         let waiter = Arc::clone(&scheduler);
         let task = tokio::spawn(async move {
             waiter
-                .admit(Band::Interactive, Duration::from_secs(5))
+                .admit(Band::Interactive, one_client(), Duration::from_secs(5))
                 .await
                 .map(drop)
         });
@@ -931,7 +1358,7 @@ mod tests {
         // request that never runs.
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
-        let mut queued = scheduler.enqueue(Band::Bulk);
+        let mut queued = scheduler.enqueue(Band::Bulk, one_client());
         drop(running);
         assert!(
             scheduler.try_admit().is_none(),
@@ -959,7 +1386,7 @@ mod tests {
         tokio::time::pause();
         let scheduler = scheduler(1);
         let running = scheduler.try_admit().expect("a free slot");
-        let mut ticket = scheduler.enqueue(Band::Interactive);
+        let mut ticket = scheduler.enqueue(Band::Interactive, one_client());
         tokio::time::advance(Duration::from_secs(3)).await;
         drop(running);
         let _permit = granted_now(&mut ticket).expect("granted");
@@ -1013,8 +1440,8 @@ mod tests {
         let scheduler = Scheduler::new(1, SchedulerConfig::default());
         let guard = scheduler.pause();
 
-        let mut first = scheduler.enqueue(Band::Bulk);
-        let mut second = scheduler.enqueue(Band::Bulk);
+        let mut first = scheduler.enqueue(Band::Bulk, one_client());
+        let mut second = scheduler.enqueue(Band::Bulk, one_client());
         assert_eq!(scheduler.snapshot().waiting, 2);
         assert_eq!(scheduler.snapshot().running, 0);
 
@@ -1035,7 +1462,9 @@ mod tests {
         // hand out up to capacity.
         let scheduler = Scheduler::new(3, SchedulerConfig::default());
         let guard = scheduler.pause();
-        let mut waiters: Vec<_> = (0..3).map(|_| scheduler.enqueue(Band::Bulk)).collect();
+        let mut waiters: Vec<_> = (0..3)
+            .map(|_| scheduler.enqueue(Band::Bulk, one_client()))
+            .collect();
         drop(guard);
 
         // The permits are held, not dropped: dropping one releases its slot

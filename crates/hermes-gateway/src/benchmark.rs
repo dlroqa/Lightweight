@@ -18,6 +18,7 @@ use hermes_bench::{BenchError, BenchmarkStore, RunPlan, Runner};
 use crate::catalog::ResidentModel;
 use crate::control::BenchmarkBody;
 use crate::jobs::{Job, Stage};
+use crate::scheduler::PeerKey;
 use crate::state::GatewayState;
 
 /// Run the plan against whatever is resident, and save what it measured.
@@ -42,7 +43,21 @@ pub async fn run(
     // A slot, like any other request. Held for the whole run so that a
     // benchmark and a user's generation never interleave on one engine and
     // report each other's contention as their own speed.
-    let _permit = state.acquire_slot(crate::scheduler::Band::Bulk).await;
+    //
+    // The refusal matters as much as the slot: this used to discard the
+    // `Option`, so a queue timeout ran the benchmark with no slot at all -
+    // producing exactly the interleaved measurement the line above says it
+    // prevents, and producing it silently.
+    let _permit = state
+        .acquire_slot(crate::scheduler::Band::Bulk, PeerKey::default())
+        .await
+        .ok_or(BenchError::Busy {
+            seconds: state
+                .config
+                .queue_timeout
+                .as_secs()
+                .min(u64::from(u32::MAX)) as u32,
+        })?;
 
     let params = resident.effective;
     let runner = Runner::new(

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::AuthPolicy;
 use crate::catalog::Catalog;
 use crate::metrics::{Metrics, MetricsSnapshot, ModelSnapshot};
-use crate::scheduler::{Band, Scheduler, SchedulerConfig, SlotPermit, Ticket};
+use crate::scheduler::{Band, PeerKey, Scheduler, SchedulerConfig, SlotPermit, Ticket};
 use crate::system::Probed;
 use hermes_core::Actionable as _;
 
@@ -359,9 +359,9 @@ impl GatewayState {
     ///
     /// Returns `None` when the wait ran out, which the caller turns into a 503
     /// with a `Retry-After` rather than a request that hangs forever.
-    pub async fn acquire_slot(&self, band: Band) -> Option<SlotPermit> {
+    pub async fn acquire_slot(&self, band: Band, peer: PeerKey) -> Option<SlotPermit> {
         self.scheduler
-            .admit(band, self.config.queue_timeout)
+            .admit(band, peer, self.config.queue_timeout)
             .await
             .ok()
     }
@@ -376,8 +376,29 @@ impl GatewayState {
     }
 
     /// Join the queue, keeping the place so it can be reported and released.
-    pub fn enqueue(&self, band: Band) -> Ticket {
-        self.scheduler.enqueue(band)
+    pub fn enqueue(&self, band: Band, peer: PeerKey) -> Ticket {
+        self.scheduler.enqueue(band, peer)
+    }
+
+    /// A slot if one is free, and a place in the queue if not — decided at one
+    /// instant, so a slot released between the two cannot go idle.
+    pub fn admit_or_enqueue(&self, band: Band, peer: PeerKey) -> Result<SlotPermit, Ticket> {
+        self.scheduler.admit_or_enqueue(band, peer)
+    }
+
+    /// Wait for a ticket's turn, up to the queue timeout.
+    ///
+    /// `None` is a wait that ran out, which the caller turns into a 503. The
+    /// ticket is told so before it is dropped, or its departure would be
+    /// counted as a client that walked away.
+    pub async fn wait_for_slot(&self, mut ticket: Ticket) -> Option<SlotPermit> {
+        match tokio::time::timeout(self.config.queue_timeout, ticket.granted()).await {
+            Ok(permit) => permit,
+            Err(_) => {
+                ticket.timed_out();
+                None
+            }
+        }
     }
 
     /// A cancellation token for one job, rooted in the gateway's own.
@@ -427,7 +448,10 @@ mod tests {
     #[tokio::test]
     async fn one_request_runs_at_a_time_by_default() {
         let state = state(GatewayConfig::default());
-        let first = state.acquire_slot(Band::Bulk).await.expect("first permit");
+        let first = state
+            .acquire_slot(Band::Bulk, PeerKey::default())
+            .await
+            .expect("first permit");
         assert_eq!(state.scheduler().snapshot().running, 1);
         drop(first);
         assert_eq!(state.scheduler().snapshot().running, 0);
@@ -439,9 +463,15 @@ mod tests {
             queue_timeout: std::time::Duration::from_millis(20),
             ..GatewayConfig::default()
         });
-        let _held = state.acquire_slot(Band::Bulk).await.expect("first permit");
+        let _held = state
+            .acquire_slot(Band::Bulk, PeerKey::default())
+            .await
+            .expect("first permit");
         assert!(
-            state.acquire_slot(Band::Bulk).await.is_none(),
+            state
+                .acquire_slot(Band::Bulk, PeerKey::default())
+                .await
+                .is_none(),
             "the second request must time out rather than wait forever"
         );
     }
@@ -466,7 +496,12 @@ mod tests {
         });
         let mut permits = Vec::new();
         for _ in 0..4 {
-            permits.push(state.acquire_slot(Band::Bulk).await.expect("permit"));
+            permits.push(
+                state
+                    .acquire_slot(Band::Bulk, PeerKey::default())
+                    .await
+                    .expect("permit"),
+            );
         }
         assert_eq!(state.scheduler().snapshot().running, 4);
     }

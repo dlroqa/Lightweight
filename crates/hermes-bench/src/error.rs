@@ -40,6 +40,15 @@ pub enum BenchError {
 
     #[error("no benchmark `{id}` has been saved")]
     NoSuchRun { id: String },
+
+    /// The gateway was busy for longer than the benchmark was willing to wait.
+    ///
+    /// A refusal rather than a measurement taken anyway: a benchmark that ran
+    /// without a slot would interleave with whatever the gateway is actually
+    /// serving and report the contention as this machine's speed, which is a
+    /// wrong number that looks exactly like a right one.
+    #[error("the gateway was busy for {seconds}s and the benchmark never got a slot")]
+    Busy { seconds: u32 },
 }
 
 impl Actionable for BenchError {
@@ -54,6 +63,7 @@ impl Actionable for BenchError {
             Self::Read { .. } => "benchmark_not_read",
             Self::MalformedId { .. } => "malformed_benchmark_id",
             Self::NoSuchRun { .. } => "unknown_benchmark",
+            Self::Busy { .. } => "server_busy",
         }
     }
 
@@ -63,6 +73,7 @@ impl Actionable for BenchError {
                 ErrorKind::InvalidRequest
             }
             Self::NoSuchRun { .. } => ErrorKind::NotFound,
+            Self::Busy { .. } => ErrorKind::Unavailable,
             _ => ErrorKind::Internal,
         }
     }
@@ -93,6 +104,10 @@ impl Actionable for BenchError {
                 RemedyAction::OpenSettings {
                     section: SettingsSection::Models,
                 },
+            )],
+            Self::Busy { seconds } => vec![Remedy::new(
+                "Wait for the gateway to finish what it is serving, then run it again",
+                RemedyAction::RetryAfter { seconds: *seconds },
             )],
             Self::MalformedId { .. } | Self::NoSuchRun { .. } => vec![Remedy::new(
                 "List the saved benchmarks and use an id from there",

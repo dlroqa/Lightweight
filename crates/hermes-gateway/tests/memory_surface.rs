@@ -82,7 +82,7 @@ impl Server {
         Self {
             base: format!("http://127.0.0.1:{port}"),
             _task: tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                let _ = axum::serve(listener, hermes_gateway::service(app)).await;
             }),
         }
     }

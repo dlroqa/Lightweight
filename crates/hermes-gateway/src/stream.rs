@@ -392,11 +392,20 @@ async fn wait_for_a_slot(encoder: &mut Encoder) {
                 position = ticket.position(),
                 "gave up waiting for a slot"
             );
+            // Said before the ticket goes, so this counts as a wait that ran
+            // out rather than as a client that walked away. The streamed and
+            // the non-streamed timeout are the same event reported two ways,
+            // and they used to reach two different counters.
+            ticket.timed_out();
             drop(ticket);
             fail_with(encoder, "server_busy", queue_timeout_envelope());
         }
         () = tokio::time::sleep(notice_interval) => {
-            let notice = encoder.builder.queued(ticket.position(), ticket.waited());
+            // A request granted a slot between the timer firing and this line
+            // is no longer in the queue and reports no position; it is about
+            // to run, so "nothing ahead of you" is the true thing to say.
+            let ahead = ticket.position().unwrap_or(0);
+            let notice = encoder.builder.queued(ahead, ticket.waited());
             encoder.pending.push_back(notice);
             encoder.source = Source::Queued { ticket, start, deadline, notice_interval };
         }

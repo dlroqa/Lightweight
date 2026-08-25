@@ -208,6 +208,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, hermes_gateway::service(app)).await?;
     Ok(())
 }

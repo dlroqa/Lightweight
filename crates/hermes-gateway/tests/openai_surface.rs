@@ -12,7 +12,7 @@ use std::time::Duration;
 use hermes_backend_mock::{MockBackend, MockConfig, Script};
 use hermes_core::{ModelId, SseDecoder, SseEvent};
 use hermes_gateway::catalog::{Catalog, ResidentModel};
-use hermes_gateway::scheduler::Band;
+use hermes_gateway::scheduler::{Band, PeerKey};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_inference::InferenceBackend;
 use hermes_inference::generation::{Prompt, ToolChoice};
@@ -59,7 +59,7 @@ impl Harness {
                 .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, hermes_gateway::service(app)).await;
         });
 
         Self {
@@ -553,7 +553,11 @@ async fn a_client_that_disconnects_mid_stream_frees_the_slot() {
     // so a slow machine does not turn this into a flake.
     let freed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(permit) = harness.state.acquire_slot(Band::Bulk).await {
+            if let Some(permit) = harness
+                .state
+                .acquire_slot(Band::Bulk, PeerKey::default())
+                .await
+            {
                 return permit;
             }
         }
@@ -1633,20 +1637,22 @@ async fn a_short_request_is_served_before_a_long_one_that_was_already_waiting() 
 
     // A long request queues first — a big stated output budget is what makes it
     // long, and the gateway knows that number before it admits anything.
-    let long = harness.state.enqueue(Band::classify(
-        11,
-        Some(4000),
-        harness.state.config.scheduler.interactive,
-    ));
-    let short = harness.state.enqueue(Band::classify(
-        11,
-        Some(16),
-        harness.state.config.scheduler.interactive,
-    ));
+    let long = harness.state.enqueue(
+        Band::classify(11, Some(4000), harness.state.config.scheduler.interactive),
+        PeerKey::default(),
+    );
+    let short = harness.state.enqueue(
+        Band::classify(11, Some(16), harness.state.config.scheduler.interactive),
+        PeerKey::default(),
+    );
     assert_eq!(long.band(), Band::Bulk);
     assert_eq!(short.band(), Band::Interactive);
-    assert_eq!(short.position(), 0, "the later, shorter request is next");
-    assert_eq!(long.position(), 1);
+    assert_eq!(
+        short.position(),
+        Some(0),
+        "the later, shorter request is next"
+    );
+    assert_eq!(long.position(), Some(1));
 
     drop(permit);
     drop(long);

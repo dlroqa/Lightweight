@@ -40,6 +40,22 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 
+/// The service `axum::serve` is handed, with the peer address attached.
+///
+/// Separate from [`app`] rather than folded into it because the router is
+/// merged into and layered on before it is served - the mock gateway adds its
+/// own test routes to it - and because this is the one line that decides
+/// whether the scheduler can tell two clients apart. A server built without it
+/// still works and still serves: every request then arrives with the same
+/// scheduling key, and the queue is ordered exactly as it was before there were
+/// clients in it. That degradation is silent, which is why the incantation
+/// lives here instead of being retyped at every call site.
+pub fn service(
+    app: Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, std::net::SocketAddr> {
+    app.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 /// Build the router.
 ///
 /// The OpenAI surface lives under `/v1`; `/health`, `/props`, `/version` and

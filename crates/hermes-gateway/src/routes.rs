@@ -41,7 +41,7 @@ use crate::auth::AuthFailure;
 use crate::catalog::ResidentModel;
 use crate::completions::{self as completions_run, PendingCompletion};
 use crate::metrics::{Endpoint, Outcome};
-use crate::scheduler::Band;
+use crate::scheduler::{Band, PeerKey};
 use crate::state::GatewayState;
 use crate::stream::{self as sse_stream, RequestGuard, StartGeneration};
 
@@ -206,6 +206,9 @@ pub async fn metrics_json(State(state): State<Arc<GatewayState>>, headers: Heade
 pub async fn chat_completions(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
+    // Before the body, because a body extractor consumes the request and must
+    // come last. Cannot fail: see `PeerKey`.
+    peer: PeerKey,
     body: Bytes,
 ) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
@@ -230,7 +233,7 @@ pub async fn chat_completions(
     }
 
     let metrics = Arc::clone(&state);
-    let response = match serve_chat(state, request).await {
+    let response = match serve_chat(state, request, peer).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     };
@@ -248,6 +251,7 @@ pub async fn chat_completions(
 pub async fn completions(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
+    peer: PeerKey,
     body: Bytes,
 ) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
@@ -269,7 +273,7 @@ pub async fn completions(
     }
 
     let metrics = Arc::clone(&state);
-    let response = match serve_completions(state, request).await {
+    let response = match serve_completions(state, request, peer).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     };
@@ -298,6 +302,7 @@ fn outcome_of(status: StatusCode) -> Outcome {
 async fn serve_completions(
     state: Arc<GatewayState>,
     request: CompletionRequest,
+    peer: PeerKey,
 ) -> Result<Response, ApiError> {
     let model = state
         .catalog
@@ -362,7 +367,7 @@ async fn serve_completions(
     );
     let cancel = state.job_token();
     let waiting_since = std::time::Instant::now();
-    let permit = state.acquire_slot(band).await.ok_or_else(|| {
+    let permit = state.acquire_slot(band, peer).await.ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorEnvelope::invalid_request(
@@ -458,6 +463,7 @@ fn require_matching_model(model: &ResidentModel, requested: Option<&str>) -> Res
 async fn serve_chat(
     state: Arc<GatewayState>,
     request: ChatCompletionRequest,
+    peer: PeerKey,
 ) -> Result<Response, ApiError> {
     let model = state
         .catalog
@@ -515,30 +521,39 @@ async fn serve_chat(
         "generating"
     );
 
-    // The uncontended path, unchanged: take the slot, start the generation, and
-    // report any failure to start as an HTTP status, because nothing has been
-    // written to the client yet.
-    if let Some(permit) = state.try_acquire_slot() {
-        let guard = RequestGuard::new(cancel.clone(), Some(permit))
-            .reporting_to(Arc::clone(state.metrics()))
-            .describing(builder.id(), model.id.to_string())
-            .in_band(band);
-        let events = state
-            .backend
-            .generate(model.instance, generation, cancel)
-            .await
-            .map_err(|err| ApiError::from_backend(&err))?;
-        return Ok(if request.stream {
-            streamed_response(sse_stream::encode(
-                events,
-                builder,
-                guard,
-                request.wants_usage(),
-            ))
-        } else {
-            aggregate(events, builder, guard, &model).await
-        });
-    }
+    // A slot, or a place in the queue, decided under one lock. Asking twice —
+    // "is one free?" and then "put me in the queue" — leaves a gap in which a
+    // slot released between the two questions finds an empty queue, goes idle,
+    // and leaves the request that was on its way in waiting for the *next*
+    // release. At capacity one that is a client waiting out the whole queue
+    // timeout in front of a gateway doing nothing.
+    let ticket = match state.admit_or_enqueue(band, peer) {
+        // The uncontended path, unchanged: take the slot, start the
+        // generation, and report any failure to start as an HTTP status,
+        // because nothing has been written to the client yet.
+        Ok(permit) => {
+            let guard = RequestGuard::new(cancel.clone(), Some(permit))
+                .reporting_to(Arc::clone(state.metrics()))
+                .describing(builder.id(), model.id.to_string())
+                .in_band(band);
+            let events = state
+                .backend
+                .generate(model.instance, generation, cancel)
+                .await
+                .map_err(|err| ApiError::from_backend(&err))?;
+            return Ok(if request.stream {
+                streamed_response(sse_stream::encode(
+                    events,
+                    builder,
+                    guard,
+                    request.wants_usage(),
+                ))
+            } else {
+                aggregate(events, builder, guard, &model).await
+            });
+        }
+        Err(ticket) => ticket,
+    };
 
     // Contended. A streamed request is answered *now* and waits inside its own
     // response, so the client can see that it is queued and where; anything
@@ -552,7 +567,6 @@ async fn serve_chat(
     );
 
     if request.stream {
-        let ticket = state.enqueue(band);
         let deadline = tokio::time::Instant::now() + state.config.queue_timeout;
         let guard = RequestGuard::new(cancel.clone(), None)
             .reporting_to(Arc::clone(state.metrics()))
@@ -575,7 +589,10 @@ async fn serve_chat(
     }
 
     let waiting_since = std::time::Instant::now();
-    let permit = state.acquire_slot(band).await.ok_or_else(|| {
+    // The place already taken above, waited on rather than joined again: a
+    // second enqueue would go to the back of a queue this request is already
+    // in.
+    let permit = state.wait_for_slot(ticket).await.ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorEnvelope::invalid_request(

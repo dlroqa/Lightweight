@@ -299,7 +299,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         let app = hermes_gateway::app(Arc::clone(&state));
         let stopping = state.shutdown_token();
         servers.push(tokio::spawn(async move {
-            axum::serve(listener, app)
+            axum::serve(listener, hermes_gateway::service(app))
                 .with_graceful_shutdown(async move { stopping.cancelled().await })
                 .await
         }));
