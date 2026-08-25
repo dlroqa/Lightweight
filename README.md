@@ -15,9 +15,37 @@ The inference engine itself sits behind a trait boundary, so the current
 llama.cpp backend can later be replaced by a proprietary runtime without
 touching the UI or the API.
 
+## Download
+
+Every artifact is built and then *run* on the platform it is for, by
+[`release.yml`](.github/workflows/release.yml).
+
+| Platform | File |
+|---|---|
+| macOS, Apple Silicon and Intel | `Hermes-*-mac-universal.dmg` |
+| Windows x86-64 | `Hermes-Setup-*.exe` |
+| Linux x86-64, sandboxed | `Hermes-*.flatpak` |
+| Linux x86-64, portable | `Hermes-*.AppImage` |
+| Command line only | `hermes-*-<target-triple>.tar.gz` / `.zip` |
+
+Two facts worth knowing before the first launch:
+
+- **Nothing is code-signed.** There is no Apple Developer ID and no
+  Authenticode certificate for this project, so macOS asks you to right-click →
+  Open the first time and SmartScreen offers *More info* → *Run anyway*. Each
+  release carries `SHA256SUMS` and a build-provenance attestation naming the
+  workflow run that produced the bytes; neither is a code signature.
+- **The inference engine is downloaded, not bundled.** On first use Hermes
+  fetches the pinned llama.cpp build for your platform and checks it against a
+  SHA-256 recorded in this source tree. Nothing is compiled on your machine.
+
+Of the two Linux builds, prefer the Flatpak: it keeps its Chromium sandbox on a
+host that does not allow unprivileged user namespaces, where the AppImage
+refuses to start rather than run unsandboxed.
+
 ## Status
 
-Milestones 0 through 9 are complete. The gateway serves an OpenAI-compatible
+Milestones 0 through 10 are complete. The gateway serves an OpenAI-compatible
 API over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
@@ -55,8 +83,9 @@ Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, keeps serving
 after its window is closed, and generates an API key only when the bind is
 reachable from another machine — passed in the environment, never in `argv`.
-`npm run package` builds an AppImage carrying the release binary and the built
-panel.
+`npm run package` builds this platform's installers — a Flatpak and an AppImage
+on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
+the release binary and the built panel.
 
 The three quantities that decide whether a model runs at all — the KV cache, the
 memory budget and the context window — are now **honest about what they cannot
@@ -94,9 +123,21 @@ requests, keyed on the address the kernel put on the connection: observed, never
 claimed, and never logged, labelled or stored. And the panel can finally show
 what is running *while* it is running.
 
-What remains of the plan is M10. See [docs/PROGRESS.md](docs/PROGRESS.md)
-for the current checkpoint, and [docs/M9-PLAN.md](docs/M9-PLAN.md) for what the
-last milestone deliberately left undone.
+And it now **runs on the three platforms it ships to, and can calibrate itself
+on the machine it lands on**. All four platform runners execute the same
+`scripts/check.sh` the contributor runs — no YAML copy of it — and each artifact
+is built and then started on its own platform, including the x86-64 half of the
+universal DMG on genuine Intel hardware. The estimator will take a compute model
+measured here in place of its shipped guesses, but only when the fit is
+trustworthy: it is scoped to this machine, this engine build and this ggml
+variant, and it is refused when the model behind it does not hold. On the
+development machine no fit earns that trust, and the conservative shipped
+numbers stand — which is the design working, not a gap in it.
+
+The approved plan M0–M10 is complete. See
+[docs/PROGRESS.md](docs/PROGRESS.md) for the current checkpoint, and
+[docs/M10-PLAN.md](docs/M10-PLAN.md) for what the last milestone deliberately
+left undone.
 
 ## Verified constraints
 
