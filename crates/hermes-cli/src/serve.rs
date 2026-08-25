@@ -256,7 +256,15 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             catalog,
             GatewayConfig {
                 auth,
-                max_concurrent_requests: concurrency.slots,
+                // What the engine confirmed it is running, where one was
+                // loaded, rather than what was asked for. The two agree unless
+                // the engine opened fewer slots than it was told to - and
+                // handing out permits for slots that do not exist would queue
+                // requests inside the engine, where this gateway cannot see
+                // them or tell anybody they are waiting.
+                max_concurrent_requests: loaded
+                    .as_ref()
+                    .map_or(concurrency.slots, |model| model.effective.n_parallel.max(1)),
                 scheduler: SchedulerConfig {
                     interactive: bands,
                     ..SchedulerConfig::default()
@@ -1196,5 +1204,35 @@ mod tests {
         assert!(message.contains("192.0.2.10"), "{message}");
         assert!(!message.contains("127.0.0.1"), "{message}");
         assert!(message.contains(API_KEY_ENV), "{message}");
+    }
+
+    #[test]
+    fn a_concurrency_of_auto_is_a_value_rather_than_a_magic_number() {
+        use std::str::FromStr as _;
+
+        assert_eq!(Concurrency::from_str("auto"), Ok(Concurrency::Auto));
+        assert_eq!(Concurrency::from_str("AUTO"), Ok(Concurrency::Auto));
+        assert_eq!(Concurrency::from_str("4"), Ok(Concurrency::Fixed(4)));
+        assert_eq!(Concurrency::Auto.requested(), None);
+        assert_eq!(Concurrency::Fixed(4).requested(), Some(4));
+        // Round-trips, because clap renders the default value through Display
+        // and parses it back.
+        assert_eq!(
+            Concurrency::from_str(&Concurrency::default().to_string()),
+            Ok(Concurrency::Auto)
+        );
+    }
+
+    #[test]
+    fn a_concurrency_of_zero_is_refused_rather_than_clamped() {
+        use std::str::FromStr as _;
+
+        // Zero slots is not a smaller gateway, it is a gateway that serves
+        // nobody. Silently reading it as one would answer a typo with
+        // behaviour the person did not ask for.
+        let refusal = Concurrency::from_str("0").expect_err("zero is not a slot count");
+        assert!(refusal.contains("auto"), "{refusal}");
+        assert!(Concurrency::from_str("two").is_err());
+        assert!(Concurrency::from_str("-1").is_err());
     }
 }

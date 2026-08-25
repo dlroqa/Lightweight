@@ -548,7 +548,10 @@ impl Scheduler {
     /// of this module.
     pub fn try_admit(self: &Arc<Self>) -> Option<SlotPermit> {
         let mut inner = self.lock();
-        self.take_free_slot(&mut inner)
+        // No band to state, so the slot is recorded in the default one until
+        // whoever holds it says otherwise. Every caller on the request path
+        // goes through `admit_or_enqueue`, which knows the band already.
+        self.take_free_slot(&mut inner, Band::default())
     }
 
     /// Take a slot, or join the queue — deciding under one lock.
@@ -566,7 +569,7 @@ impl Scheduler {
         peer: PeerKey,
     ) -> Result<SlotPermit, Ticket> {
         let mut inner = self.lock();
-        if let Some(permit) = self.take_free_slot(&mut inner) {
+        if let Some(permit) = self.take_free_slot(&mut inner, band) {
             return Ok(permit);
         }
         Err(self.push_waiter(&mut inner, band, peer))
@@ -589,7 +592,7 @@ impl Scheduler {
     /// gives the round in [`rank`] its meaning: without it a fresh arrival
     /// would take a free slot ahead of a queue it never joined, and no ordering
     /// among the waiters could matter.
-    fn take_free_slot(self: &Arc<Self>, inner: &mut Inner) -> Option<SlotPermit> {
+    fn take_free_slot(self: &Arc<Self>, inner: &mut Inner, band: Band) -> Option<SlotPermit> {
         if !inner.paused
             && inner.running.len() < self.capacity() as usize
             && inner.waiting.is_empty()
@@ -597,7 +600,7 @@ impl Scheduler {
             self.counters
                 .admitted_immediately
                 .fetch_add(1, Ordering::Relaxed);
-            return Some(self.start_running(inner, Band::default()));
+            return Some(self.start_running(inner, band));
         }
         None
     }
@@ -1420,6 +1423,45 @@ mod tests {
         assert_eq!(fifth.position(), Some(0), "next, but not yet running");
         assert_eq!(scheduler.snapshot().waiting, 1);
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn the_roster_names_the_band_a_slot_was_taken_in() {
+        // The band is known at the moment of admission, so the roster carries
+        // it from the start rather than after whoever took the slot gets round
+        // to saying so.
+        let scheduler = scheduler(2);
+        let _fast = scheduler
+            .admit_or_enqueue(Band::Interactive, one_client())
+            .expect("a free slot");
+        let _slow = scheduler
+            .admit_or_enqueue(Band::Bulk, another_client())
+            .expect("a second free slot");
+
+        let bands: Vec<&str> = scheduler
+            .roster()
+            .running
+            .iter()
+            .map(|running| running.band)
+            .collect();
+        assert!(bands.contains(&"interactive"), "{bands:?}");
+        assert!(bands.contains(&"bulk"), "{bands:?}");
+    }
+
+    #[tokio::test]
+    async fn the_roster_holds_nothing_that_names_the_caller() {
+        // The address decides who goes next and is never shown. This is the
+        // automated half of that promise; the other half is that `PeerKey` has
+        // no `Display` and a redacting `Debug`.
+        let scheduler = scheduler(1);
+        let _running = scheduler
+            .admit_or_enqueue(Band::Bulk, another_client())
+            .expect("a free slot");
+        let queued = scheduler.enqueue(Band::Bulk, another_client());
+
+        let rendered = serde_json::to_string(&scheduler.roster()).expect("the roster serializes");
+        assert!(!rendered.contains("10.0.0.1"), "{rendered}");
+        drop(queued);
     }
 
     #[tokio::test]
