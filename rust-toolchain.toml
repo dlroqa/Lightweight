@@ -3,3 +3,7 @@
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt"]
+# Both halves of the macOS universal binary, so they come from the same pinned
+# compiler as everything else rather than from an ad-hoc `rustup target add` in
+# a workflow file. `lipo` merges them into the one `hermes` the DMG ships.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]

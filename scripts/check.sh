@@ -58,11 +58,11 @@ fi
 # gateway, asserting what the client ends up with rather than what we sent.
 # Needs python3 and one package from PyPI, so it is allowed to be absent - but
 # it says so, rather than passing quietly.
-if command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
   echo "== test (openai contract suite) =="
   ./scripts/contract-test.sh
 else
-  echo "== test (openai contract suite) == skipped: python3 unavailable"
+  echo "== test (openai contract suite) == skipped: no python interpreter (tried python3, python)"
 fi
 
 # The control panel. Type-checked and built, because a panel that does not

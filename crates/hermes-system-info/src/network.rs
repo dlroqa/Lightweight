@@ -25,7 +25,15 @@
 //!   empty list or an error narrows what can be said; it never changes what the
 //!   gateway does. That is why a partial read is kept rather than discarded.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+// The v4/v6 types are named by the Linux text parsers, and by the reachability
+// tests, which run everywhere. Splitting the two imports is what keeps a
+// non-Linux `--all-targets` build free of an unused-import warning, which CI
+// treats as an error.
+#[cfg(any(target_os = "linux", test))]
+use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
+use std::net::Ipv6Addr;
 
 use hermes_core::{Actionable, ErrorKind, Remedy, RemedyAction, SettingsSection};
 
@@ -220,18 +228,32 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", windows))]
 mod platform {
     use super::{IpAddr, NetworkError};
 
-    /// Not yet implemented off Linux.
+    /// Every address on every interface, from `getifaddrs` on macOS and
+    /// `GetAdaptersAddresses` on Windows.
+    ///
+    /// Unfiltered on purpose: which of these another machine could reach is
+    /// decided once, above, for every platform.
+    pub(super) fn reachable_addresses() -> Result<Vec<IpAddr>, NetworkError> {
+        hermes_sys::net::read().map_err(|error| NetworkError::Read {
+            source_path: error.api,
+            source: error.source,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+mod platform {
+    use super::{IpAddr, NetworkError};
+
+    /// Not implemented on this platform.
     ///
     /// An error rather than an empty list, because the two mean opposite things
     /// to a caller: "this machine holds nothing another machine can reach" is a
-    /// diagnosis, and "I did not look" is not. macOS and Windows enumerate
-    /// addresses through `getifaddrs` and `GetAdaptersAddresses`, both of which
-    /// need `unsafe` or a new dependency, so they belong to the cross-platform
-    /// milestone where they can be verified on those systems.
+    /// diagnosis, and "I did not look" is not.
     pub(super) fn reachable_addresses() -> Result<Vec<IpAddr>, NetworkError> {
         Err(NetworkError::UnsupportedPlatform {
             platform: std::env::consts::OS,

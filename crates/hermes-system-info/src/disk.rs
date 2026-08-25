@@ -152,7 +152,28 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+mod platform {
+    use super::{Bytes, DiskError, DiskSpace, Path};
+
+    /// `GetDiskFreeSpaceExW`, which answers in bytes.
+    ///
+    /// No block size and so no zero-unit case: the whole class of failure the
+    /// `statvfs` path above has to defend against does not exist here.
+    pub(super) fn space_for(path: &Path) -> Result<DiskSpace, DiskError> {
+        let raw = hermes_sys::disk::space_for(path).map_err(|error| DiskError::Query {
+            path: path.to_path_buf(),
+            source: error.source,
+        })?;
+        Ok(DiskSpace {
+            total: Bytes(raw.total),
+            available: Bytes(raw.available),
+            free: Bytes(raw.free),
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     use super::{DiskError, DiskSpace, Path};
 
@@ -161,8 +182,7 @@ mod platform {
     /// An error rather than a guess, for the reason [`crate::memory`] gives:
     /// "nothing to report" and "I did not look" are opposite answers, and a
     /// pre-flight check that silently approves every download is worse than no
-    /// pre-flight check at all. Windows needs `GetDiskFreeSpaceEx`, which
-    /// belongs to the cross-platform milestone where it can be verified.
+    /// pre-flight check at all.
     pub(super) fn space_for(_path: &Path) -> Result<DiskSpace, DiskError> {
         Err(DiskError::UnsupportedPlatform {
             platform: std::env::consts::OS,

@@ -11,14 +11,32 @@ cd "$(dirname "$0")/.."
 
 VENV="target/contract-venv"
 
-if [ ! -x "$VENV/bin/pytest" ]; then
+# Windows puts a venv's executables in `Scripts/` and everything else uses
+# `bin/`; the interpreter is `python3` on Unix and usually just `python` on a
+# Windows runner. Both are resolved here rather than in `check.sh`, so the
+# tier either runs on all four platforms or says which one it could not run on.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW* | MSYS* | CYGWIN* | Windows_NT) VENV_BIN="$VENV/Scripts"; EXE=".exe" ;;
+  *) VENV_BIN="$VENV/bin"; EXE="" ;;
+esac
+
+PYTHON=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1; then PYTHON="$candidate"; break; fi
+done
+if [ -z "$PYTHON" ]; then
+  echo "no python interpreter found (tried python3, python)" >&2
+  exit 1
+fi
+
+if [ ! -x "$VENV_BIN/pytest$EXE" ]; then
   echo "== creating the contract test environment =="
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install --quiet --disable-pip-version-check openai pytest pyyaml
+  "$PYTHON" -m venv "$VENV"
+  "$VENV_BIN/pip$EXE" install --quiet --disable-pip-version-check openai pytest pyyaml
 fi
 
 echo "== building the mock gateway =="
 cargo build -p hermes-gateway --features mock --bin hermes-mock-gateway
 
 echo "== contract suite =="
-exec "$VENV/bin/pytest" tests/contract -q "$@"
+exec "$VENV_BIN/pytest$EXE" tests/contract -q "$@"

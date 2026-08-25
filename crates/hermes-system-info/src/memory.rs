@@ -171,6 +171,25 @@ impl MemoryProbe for FixedMemoryProbe {
     }
 }
 
+/// Fails every time, the way an unreadable `/proc/meminfo` or an unimplemented
+/// platform does.
+///
+/// It exists so the "forced past a failed probe" path is provable on the
+/// machine the suite actually runs on. Before this, that path could only be
+/// reached on a platform with no probe at all - which is to say it was never
+/// tested anywhere, which is how it came to be unreachable in the first place.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FailingMemoryProbe;
+
+impl MemoryProbe for FailingMemoryProbe {
+    fn snapshot(&self) -> Result<MemorySnapshot, MemoryError> {
+        Err(MemoryError::Read {
+            source_path: "/proc/meminfo",
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        })
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{Bytes, MemoryError, MemorySnapshot};
@@ -228,17 +247,42 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", windows))]
+mod platform {
+    use super::{Bytes, MemoryError, MemorySnapshot};
+
+    /// The same reading, from the platform's own C API.
+    ///
+    /// What each field means is argued in `hermes-sys`, next to the call that
+    /// produces it; the short version is that `available` is what this machine
+    /// could hand out without swapping, which is what the estimator spends, and
+    /// that it is derived the same way Activity Monitor derives it on macOS.
+    pub(super) fn snapshot() -> Result<MemorySnapshot, MemoryError> {
+        let raw = hermes_sys::memory::read().map_err(|error| MemoryError::Read {
+            source_path: error.api,
+            source: error.source,
+        })?;
+        Ok(MemorySnapshot {
+            total: Bytes(raw.total),
+            available: Bytes(raw.available),
+            free: Bytes(raw.free),
+            swap_total: Bytes(raw.swap_total),
+            swap_free: Bytes(raw.swap_free),
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     use super::{MemoryError, MemorySnapshot};
 
-    /// Not yet implemented off Linux.
+    /// Not implemented on this platform.
     ///
     /// Deliberately an error rather than a guess. Every admission decision
     /// rests on this number, and an invented one would produce confident,
     /// wrong verdicts - the exact failure mode spec section 7 warns against.
-    /// macOS and Windows probes belong to the cross-platform milestone, where
-    /// they can be verified on those systems.
+    /// Linux, macOS and Windows are implemented; a fourth platform gets this
+    /// until someone can verify a probe on it.
     pub(super) fn snapshot() -> Result<MemorySnapshot, MemoryError> {
         Err(MemoryError::UnsupportedPlatform {
             platform: std::env::consts::OS,
@@ -251,6 +295,8 @@ mod tests {
     use super::*;
 
     /// Captured from the development machine.
+    /// A real `/proc/meminfo`, so only the Linux parser tests below want it.
+    #[cfg(target_os = "linux")]
     const SAMPLE: &str = "\
 MemTotal:        8033316 kB
 MemFree:          447752 kB
@@ -277,7 +323,9 @@ SwapFree:        2400508 kB
                 source_path: "/proc/meminfo",
                 field: "MemTotal",
             },
-            MemoryError::UnsupportedPlatform { platform: "macos" },
+            MemoryError::UnsupportedPlatform {
+                platform: "freebsd",
+            },
         ];
 
         let mut labels = Vec::new();
@@ -373,12 +421,59 @@ SwapFree:        2400508 kB
         assert_eq!(snapshot.total, Bytes::from_gib(16));
     }
 
-    #[cfg(target_os = "linux")]
+    /// The one test that proves a platform probe actually works.
+    ///
+    /// No longer Linux-only: it is what a macOS or Windows CI runner executes
+    /// to show that `hermes-sys` returned a real reading rather than compiling
+    /// and returning nonsense. The assertions are deliberately relationships
+    /// rather than magnitudes - a runner's memory is whatever the hypervisor
+    /// gave it, and pinning a number here would be fitting the suite to one
+    /// machine, which is the thing this project refuses everywhere else.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn the_real_probe_returns_plausible_numbers() {
         let snapshot = SystemMemoryProbe.snapshot().expect("probe this machine");
-        assert!(snapshot.total.get() > 0);
-        assert!(snapshot.available <= snapshot.total);
-        assert!(snapshot.free <= snapshot.total);
+        assert!(
+            snapshot.total.get() > 0,
+            "a machine with no memory: {snapshot:?}"
+        );
+        assert!(snapshot.available <= snapshot.total, "{snapshot:?}");
+        assert!(snapshot.free <= snapshot.total, "{snapshot:?}");
+        assert!(snapshot.swap_free <= snapshot.swap_total, "{snapshot:?}");
+        // `used` and `pressure` are what the dashboard and the estimator read;
+        // a probe that satisfied the bounds above but produced a nonsensical
+        // pressure would still be broken.
+        assert!(snapshot.used() <= snapshot.total, "{snapshot:?}");
+        let pressure = snapshot.pressure();
+        assert!(
+            (0.0..=1.0).contains(&pressure),
+            "pressure {pressure} from {snapshot:?}"
+        );
+    }
+
+    /// The probe the platform actually has, end to end through `CpuInfo`.
+    ///
+    /// `default_threads` feeds `--threads` to a real engine, so a topology
+    /// probe that returned zero or something wilder than the machine has would
+    /// misconfigure every load on that platform.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn the_real_topology_probe_agrees_with_itself() {
+        let cpu = crate::cpu::CpuInfo::detect();
+        assert!(cpu.logical_cores >= 1, "{cpu:?}");
+        assert!(cpu.physical_cores >= 1, "{cpu:?}");
+        assert!(
+            cpu.physical_cores <= cpu.logical_cores,
+            "more physical cores than hardware threads: {cpu:?}"
+        );
+        if let Some(performance) = cpu.performance_cores {
+            assert!(performance >= 1, "{cpu:?}");
+            assert!(
+                performance <= cpu.physical_cores,
+                "more performance cores than cores: {cpu:?}"
+            );
+        }
+        assert!(cpu.default_threads() >= 1, "{cpu:?}");
+        assert!(cpu.default_threads() <= cpu.logical_cores, "{cpu:?}");
     }
 }

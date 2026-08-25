@@ -840,11 +840,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hermes-system-info"
 version = "0.1.0"
 dependencies = [
  "directories",
  "hermes-core",
+ "hermes-sys",
  "rustix",
  "serde",
  "serde_json",

@@ -89,6 +89,12 @@ pub struct CpuInfo {
     pub physical_cores: u32,
     /// Hardware threads, including SMT siblings.
     pub logical_cores: u32,
+    /// Cores in the fastest performance class, where the platform distinguishes
+    /// them - Apple Silicon's P cores, as against its E cores. `None` on every
+    /// platform and part that does not draw the distinction, which is why
+    /// `default_threads` falls back to the physical count rather than to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_cores: Option<u32>,
     /// Detected instruction-set extensions, sorted.
     pub features: Vec<IsaFeature>,
 }
@@ -100,17 +106,18 @@ impl CpuInfo {
             .map(|n| n.get() as u32)
             .unwrap_or(1);
 
-        let (model, physical_from_os) = platform::topology();
+        let topology = platform::topology();
 
         Self {
-            model,
+            model: topology.model,
             architecture: std::env::consts::ARCH,
             // Fall back to the logical count rather than to 1: over-reporting
             // cores costs some oversubscription, but under-reporting to a
             // single core would make the default thread count useless on every
             // machine where the probe fails.
-            physical_cores: physical_from_os.unwrap_or(logical_cores).max(1),
+            physical_cores: topology.physical_cores.unwrap_or(logical_cores).max(1),
             logical_cores: logical_cores.max(1),
+            performance_cores: topology.performance_cores.filter(|n| *n > 0),
             features: detect_features(),
         }
     }
@@ -133,8 +140,18 @@ impl CpuInfo {
     /// Physical cores, per spec section 9. Hyperthread siblings share execution
     /// units, and matrix multiplication already saturates those, so counting
     /// them typically costs throughput rather than adding it. Capped at 1 below.
+    ///
+    /// Performance cores in preference to physical ones where the platform
+    /// distinguishes them. On a heterogeneous part the efficiency cores are
+    /// materially slower, and a matrix multiply split evenly across both
+    /// classes finishes at the pace of the slowest share - so counting them
+    /// costs throughput for the same reason counting hyperthreads does. This is
+    /// the same choice llama.cpp's own `cpu_get_num_math` makes.
     pub fn default_threads(&self) -> u32 {
-        self.physical_cores.max(1)
+        self.performance_cores
+            .filter(|n| *n > 0)
+            .unwrap_or(self.physical_cores)
+            .max(1)
     }
 
     /// Thread counts to offer in the UI: `Auto` plus the sensible explicit
@@ -229,17 +246,31 @@ fn detect_features() -> Vec<IsaFeature> {
     Vec::new()
 }
 
+/// What a platform probe managed to determine.
+///
+/// Every field is optional and none of it fails: the caller's fallback is the
+/// logical core count, which is safe everywhere, and a probe that refused to
+/// answer would turn a cosmetic gap into a machine that cannot start.
+#[derive(Debug, Default)]
+struct Topology {
+    model: Option<String>,
+    physical_cores: Option<u32>,
+    performance_cores: Option<u32>,
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
+    use super::Topology;
+
     /// Read the model name and physical core count from `/proc/cpuinfo`.
     ///
     /// Physical cores are counted as distinct `(physical id, core id)` pairs,
     /// which is what distinguishes real cores from SMT siblings. Machines
     /// without those fields (many VMs, and some ARM kernels) yield `None`, and
     /// the caller falls back to the logical count.
-    pub(super) fn topology() -> (Option<String>, Option<u32>) {
+    pub(super) fn topology() -> Topology {
         let Ok(contents) = std::fs::read_to_string("/proc/cpuinfo") else {
-            return (None, None);
+            return Topology::default();
         };
 
         let mut model = None;
@@ -272,20 +303,45 @@ mod platform {
         }
 
         let physical = (!cores.is_empty()).then_some(cores.len() as u32);
-        (model, physical)
+        Topology {
+            model,
+            physical_cores: physical,
+            // Linux does publish per-core capacity for heterogeneous parts, but
+            // through a different interface and with no machine here able to
+            // check it. `None` leaves the physical count standing, which is
+            // right on every uniform part and conservative on the rest.
+            performance_cores: None,
+        }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", windows))]
 mod platform {
-    /// Topology detection is only implemented for Linux so far.
+    use super::Topology;
+
+    /// The same three facts, from `sysctl` on macOS and from
+    /// `GetLogicalProcessorInformationEx` plus the registry on Windows.
+    pub(super) fn topology() -> Topology {
+        let raw = hermes_sys::topology::read();
+        Topology {
+            model: raw.model,
+            physical_cores: raw.physical_cores,
+            performance_cores: raw.performance_cores,
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+mod platform {
+    use super::Topology;
+
+    /// Topology detection is not implemented on this platform.
     ///
-    /// Returning `None` rather than a guess means the caller falls back to the
-    /// logical core count, which is a safe default everywhere. macOS and
-    /// Windows topology is part of the cross-platform milestone; reporting an
+    /// Returning nothing rather than a guess means the caller falls back to the
+    /// logical core count, which is a safe default everywhere. Reporting an
     /// unverified number here would be worse than reporting none.
-    pub(super) fn topology() -> (Option<String>, Option<u32>) {
-        (None, None)
+    pub(super) fn topology() -> Topology {
+        Topology::default()
     }
 }
 

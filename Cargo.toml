@@ -16,6 +16,7 @@ members = [
     "crates/hermes-cli",
     "crates/hermes-system-info",
     "crates/hermes-observability",
+    "crates/hermes-sys",
 ]
 
 [workspace.package]
@@ -95,6 +96,23 @@ zip = "8.6.0"
 
 # --- platform ---
 libc = "0.2.189"
+# Windows' own numbers - physical memory, processor topology, free disk space,
+# adapter addresses - are published only through C APIs. `windows-sys` is
+# declarations and nothing else: no build script, no cmake, no libclang, no
+# proc macros, so the dependency policy above is satisfied unchanged. It is
+# already in `Cargo.lock` (tokio, mio, socket2, rustix and getrandom all pull
+# it on Windows), so naming it here adds feature modules rather than a crate.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_IpHelper",
+    # `GetAdaptersAddresses` is gated on both of these upstream, not just on
+    # IpHelper - checked in windows-sys-0.61.2's own source rather than guessed.
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 getrandom = "0.4.3"   # OS entropy for the per-run engine API key
 
 # --- internal ---
@@ -112,6 +130,7 @@ hermes-api = { path = "crates/hermes-api" }
 hermes-gateway = { path = "crates/hermes-gateway" }
 hermes-system-info = { path = "crates/hermes-system-info" }
 hermes-observability = { path = "crates/hermes-observability" }
+hermes-sys = { path = "crates/hermes-sys" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.

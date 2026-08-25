@@ -15,7 +15,7 @@ use hermes_core::units::Bytes;
 use hermes_gateway::manager::{ModelManager, RuntimeDefaults};
 use hermes_gateway::{GatewayConfig, GatewayState};
 use hermes_gguf::fixture::{GgufBuilder, TempDir};
-use hermes_system_info::FixedMemoryProbe;
+use hermes_system_info::{FailingMemoryProbe, FixedMemoryProbe};
 use serde_json::Value;
 
 fn ensure_provider() {
@@ -269,6 +269,64 @@ async fn a_credit_is_never_taken_when_the_probe_could_not_read_it() {
         "with no reading there is nothing to credit, so the answer must not change: {swapped}"
     );
     assert_eq!(swapped["error"]["code"], "insufficient_memory");
+}
+
+/// The remedy `MemoryError` advertises has to actually work.
+///
+/// Every variant of that error offers exactly one remedy - `ForceLoad` - and a
+/// test in `memory.rs` has asserted so since M7. On this path it was a dead
+/// end: `state.memory_snapshot()?` ran before `options.force` was ever read, so
+/// the gateway told the user to force the load and then refused the forced load
+/// for the same reason. The error was honest and the advice was unreachable.
+///
+/// Checked against the defect it exists for: restore the `?` on the probe and
+/// this fails, while the refusal test below still passes.
+#[tokio::test]
+async fn a_load_can_be_forced_past_a_probe_that_cannot_read() {
+    ensure_provider();
+
+    let (_dir, state, id) = gateway("mem-probe-fails", 64, MockBackend::default()).await;
+    let state = Arc::new(
+        Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("the gateway state is not shared yet"))
+            .with_memory_probe(Arc::new(FailingMemoryProbe)),
+    );
+    let server = Server::start(Arc::clone(&state)).await;
+
+    let forced = server.load(&id, serde_json::json!({ "force": true })).await;
+    assert_eq!(
+        forced["state"], "succeeded",
+        "the one remedy the error offers must reach the load: {forced}"
+    );
+
+    // And what was skipped is admitted rather than papered over: a load nobody
+    // judged must not report a verdict as though somebody had.
+    let (_status, resident) = server.get("/api/v1/models/resident").await;
+    assert!(
+        resident["ram_verdict"].is_null(),
+        "an unjudged load must not carry a verdict: {resident}"
+    );
+}
+
+/// Without `--force`, a probe that cannot read is still a refusal.
+///
+/// The fix above must not have turned an unreadable machine into a silently
+/// unjudged one for every caller - only for the caller who asked.
+#[tokio::test]
+async fn a_load_is_still_refused_when_the_probe_cannot_read_and_nobody_forced_it() {
+    ensure_provider();
+
+    let (_dir, state, id) = gateway("mem-probe-fails-hard", 64, MockBackend::default()).await;
+    let state = Arc::new(
+        Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("the gateway state is not shared yet"))
+            .with_memory_probe(Arc::new(FailingMemoryProbe)),
+    );
+    let server = Server::start(Arc::clone(&state)).await;
+
+    let refused = server.load(&id, serde_json::json!({})).await;
+    assert_eq!(refused["state"], "failed", "{refused}");
+    assert_eq!(refused["error"]["code"], "memory_probe_failed", "{refused}");
 }
 
 #[tokio::test]

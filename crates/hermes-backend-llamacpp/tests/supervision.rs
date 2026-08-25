@@ -17,6 +17,62 @@ use hermes_backend_llamacpp::supervisor::{self, EngineConfig, ExitClassification
 use hermes_core::{Actionable, RuntimeParams};
 use tokio_util::sync::CancellationToken;
 
+/// Whether a process still exists, without waiting on it.
+///
+/// Three implementations because the honest answer is platform-shaped:
+/// `/proc` does not exist on macOS, and Windows has neither `/proc` nor signals.
+/// The Linux arm keeps its zombie tolerance - a reaped-but-not-collected child
+/// is not an orphan, and treating it as one made this test flake.
+fn alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from(format!("/proc/{pid}")).exists()
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|stat| stat.contains(" Z "))
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // `kill -0` asks whether the process exists without signalling it.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        // Filtered `tasklist` prints the process when it exists and an
+        // informational line when it does not, so the pid itself is the test.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+    }
+}
+
+/// Kill a process the hardest way the platform offers, from outside.
+///
+/// The point of these tests is that the supervisor survives a death it did not
+/// arrange, so the kill has to come from outside the process rather than from
+/// the handle the supervisor holds.
+fn kill_hard(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
 /// Path to the stand-in engine. Cargo sets this for binaries in this package.
 fn fake_engine() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hermes-fake-engine"))
@@ -81,18 +137,21 @@ async fn a_healthy_engine_reaches_ready_and_reports_its_endpoint() {
     assert_eq!(engine.api_key().len(), 48);
 
     let pid = engine.pid().expect("a pid");
-    assert_eq!(
-        engine.shutdown().await,
-        ExitClassification::Signalled { signal: 15 }
+    let stopped = engine.shutdown().await;
+    // SIGTERM is what a graceful stop *is* on Unix. Windows has no signals, so
+    // the same intent arrives as a different classification; asserting the Unix
+    // shape there would be asserting a lie the supervisor used to tell.
+    #[cfg(unix)]
+    assert_eq!(stopped, ExitClassification::Signalled { signal: 15 });
+    #[cfg(windows)]
+    assert_ne!(
+        stopped,
+        ExitClassification::Running,
+        "the engine did not stop"
     );
 
     // Nothing left behind.
-    assert!(
-        !PathBuf::from(format!("/proc/{pid}")).exists()
-            || std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .is_ok_and(|stat| stat.contains(" Z ")),
-        "the engine process outlived its supervisor"
-    );
+    assert!(!alive(pid), "the engine process outlived its supervisor");
 }
 
 #[tokio::test]
@@ -220,13 +279,7 @@ async fn a_killed_engine_is_observed_rather_than_taking_us_down_with_it() {
     assert_eq!(engine.poll_exit(), ExitClassification::Running);
 
     // The whole point of the process boundary: this is survivable.
-    let killed = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status();
-    assert!(
-        killed.is_ok_and(|status| status.success()),
-        "could not kill the engine"
-    );
+    assert!(kill_hard(pid), "could not kill the engine");
 
     // Give the kernel a moment to reap it.
     let mut classification = ExitClassification::Running;
@@ -238,7 +291,18 @@ async fn a_killed_engine_is_observed_rather_than_taking_us_down_with_it() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // On Unix an external `kill -9` is observable as the signal it was. Windows
+    // has no signals, so `taskkill /F` surfaces as an exit code instead - the
+    // classification differs, but the property under test does not: the
+    // supervisor noticed, and is still alive to say so.
+    #[cfg(unix)]
     assert_eq!(classification, ExitClassification::Signalled { signal: 9 });
+    #[cfg(windows)]
+    assert_ne!(
+        classification,
+        ExitClassification::Running,
+        "the supervisor did not notice the engine had been killed"
+    );
     // And it turns into something a user can be shown.
     let err = classification.into_error(engine.stderr_tail());
     assert!(matches!(

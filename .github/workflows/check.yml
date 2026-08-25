@@ -1,0 +1,89 @@
+# The gate, run on every platform the product ships to.
+#
+# It runs `scripts/check.sh` and does not reimplement it. That script is the
+# contributor contract and says so at the top of itself; a YAML copy of it
+# would be a second place for the two to disagree, and the one that runs in CI
+# would win silently.
+#
+# What each runner skips it announces, because `check.sh` announces every
+# skipped tier rather than passing quietly. That is what makes partial coverage
+# on a platform readable in the log instead of invisible behind a green tick.
+name: check
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      # A Windows failure must not hide a macOS one. Every runner reports.
+      fail-fast: false
+      matrix:
+        include:
+          # One runner per architecture: a test proves something only on the
+          # architecture it ran on, and the macOS DMG ships both.
+          - { os: macos-15, label: macos-arm64, arch: arm64 }
+          # Intel macOS is a larger runner now that `macos-13` has been retired
+          # from actions/runner-images. It is what proves the x86-64 half of the
+          # universal DMG actually runs, rather than merely having been built.
+          - { os: macos-15-large, label: macos-x64, arch: x64 }
+          - { os: windows-latest, label: windows-x64, arch: x64 }
+          - { os: ubuntu-latest, label: linux-x64, arch: x64 }
+
+    defaults:
+      run:
+        # Git Bash on Windows. This plus `.gitattributes` checking scripts out
+        # with LF is the whole answer to "how does a bash gate run on Windows".
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No toolchain action: `rust-toolchain.toml` already pins the compiler and
+      # its components, and `rustup show` installs what it names. Restating the
+      # pin in YAML would create a second place for the two to disagree.
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+
+      # Invoked through `bash` rather than executed, so the answer does not also
+      # depend on the executable bit surviving a Windows checkout.
+      - name: scripts/check.sh
+        run: bash ./scripts/check.sh
+
+      # The probes, read rather than asserted. A checkpoint that quotes four
+      # real machines is worth more than one that quotes four assertions, and
+      # this is where those numbers come from.
+      - name: What this machine reports
+        run: cargo run -q -p hermes-cli --bin hermes -- sysinfo
