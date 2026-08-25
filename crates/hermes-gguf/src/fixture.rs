@@ -318,14 +318,46 @@ fn write_array_header(out: &mut Vec<u8>, element_tag: u32, len: usize) {
 /// A temporary directory that cleans up after itself.
 pub struct TempDir(std::path::PathBuf);
 
+/// The name of a fixture directory, from a clock reading it is *given*.
+///
+/// Taking the instant as an argument rather than reading it is what makes the
+/// invariant testable: hand it the same instant twice and the two names must
+/// still differ. That is not a hypothetical - it is precisely what a platform
+/// whose timer is coarser than this call does, and the sequence number is the
+/// part that answers it. The pid separates the several test binaries cargo runs
+/// at once; the instant is kept only so a leftover directory says when it is
+/// from.
+fn directory_name(tag: &str, nanos: u128) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "hermes-gguf-{tag}-{}-{nanos}-{sequence}",
+        std::process::id()
+    )
+}
+
 impl TempDir {
+    /// A directory no other `TempDir` can be given, however coarse the clock.
+    ///
+    /// It used to be named from `SystemTime::now()` alone, and that is only as
+    /// fine-grained as the platform's timer. Cargo runs these tests in parallel
+    /// threads, so on macOS two of them were built within one tick, were handed
+    /// the same directory, and wrote the same `model.gguf`: `fs::write`
+    /// truncates before it writes, so one test read the other's file in the
+    /// window where it was zero bytes long. It surfaced as
+    /// `Truncated { offset: 0, needed: 4, available: 0 }` from the reader -
+    /// a message about the fixture that was really about the harness.
+    ///
+    /// The counter settles it within a process and the pid across the several
+    /// test binaries cargo runs at once. The clock stays for readability: it
+    /// says when a leftover directory is from.
     pub fn new(tag: &str) -> Self {
-        let unique = std::time::SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("hermes-gguf-{tag}-{unique}"));
-        let _ = std::fs::create_dir_all(&path);
+        let path = std::env::temp_dir().join(directory_name(tag, nanos));
+        std::fs::create_dir_all(&path).expect("create the fixture directory");
         Self(path)
     }
 
@@ -334,9 +366,14 @@ impl TempDir {
     }
 
     /// Write `bytes` to a file in this directory and return its path.
+    ///
+    /// Loud on failure. A discarded error here meant a fixture that was never
+    /// written came back as a parse error about its contents, which is how the
+    /// collision above stayed hidden: every symptom pointed at the reader.
     pub fn write(&self, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = self.0.join(name);
-        let _ = std::fs::write(&path, bytes);
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|cause| panic!("write the fixture {}: {cause}", path.display()));
         path
     }
 }
@@ -344,5 +381,70 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// One instant, handed over twice, must still be two directories.
+    ///
+    /// Checked against the defect it exists for: name the directory from the
+    /// clock reading alone and this fails everywhere, immediately. Testing it
+    /// through the real clock instead would have proved nothing - on Linux the
+    /// timer is fine enough that even the broken version passes, which is why
+    /// the collision reached a macOS runner before anything caught it.
+    #[test]
+    fn one_instant_twice_is_still_two_directories() {
+        let frozen = 1_700_000_000_000_000_000u128;
+        let first = directory_name("collision", frozen);
+        let second = directory_name("collision", frozen);
+        assert_ne!(
+            first, second,
+            "a stopped clock collapsed two fixtures into one"
+        );
+    }
+
+    /// And across threads, because cargo runs these tests on several of them.
+    /// A per-thread counter would satisfy the test above and still collide.
+    #[test]
+    fn one_instant_across_threads_is_still_distinct_directories() {
+        let frozen = 1_700_000_000_000_000_000u128;
+        let names: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(move || {
+                        (0..32)
+                            .map(|_| directory_name("threaded", frozen))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("worker"))
+                .collect()
+        });
+        let distinct: HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "two threads shared a directory"
+        );
+    }
+
+    /// The whole thing, end to end: real directories, really created, and no
+    /// two of them the same.
+    #[test]
+    fn fixtures_created_together_do_not_share_a_directory() {
+        let made: Vec<TempDir> = (0..64).map(|_| TempDir::new("together")).collect();
+        let distinct: HashSet<&Path> = made.iter().map(TempDir::path).collect();
+        assert_eq!(
+            distinct.len(),
+            made.len(),
+            "two fixtures shared a directory"
+        );
     }
 }

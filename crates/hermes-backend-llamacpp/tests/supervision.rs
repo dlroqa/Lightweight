@@ -90,13 +90,18 @@ struct FakeModel(PathBuf);
 
 impl FakeModel {
     fn new(mode: &str) -> Self {
+        // The clock alone is not unique: on a coarse timer two tests running in
+        // parallel are handed the same name. The counter and the pid settle it.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "hermes-fake-model-{}-{unique}.gguf",
-            mode.replace(':', "-")
+            "hermes-fake-model-{}-{}-{unique}-{sequence}.gguf",
+            mode.replace(':', "-"),
+            std::process::id()
         ));
         std::fs::write(&path, mode).expect("write the fake model");
         Self(path)

@@ -410,11 +410,18 @@ mod tests {
     /// `-D dead-code` is part of the gate.
     #[cfg(target_os = "linux")]
     fn scratch_root(tag: &str) -> PathBuf {
+        // The clock alone is not unique: on a coarse timer two tests running in
+        // parallel are handed the same name. The counter and the pid settle it.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("hermes-system-{tag}-{unique}"))
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hermes-system-{tag}-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[cfg(target_os = "linux")]
