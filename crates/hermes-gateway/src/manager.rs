@@ -519,6 +519,26 @@ pub struct ContextChoice {
 /// it, so setting one can make a load smaller than it might have been, never
 /// larger than it should be. A context the model was previously loaded with is
 /// deliberately not consulted; see `InstalledModel::last_n_ctx`.
+/// One phrase for the log, naming where this load's coefficients came from.
+///
+/// A verdict is only as good as the numbers behind it, and until M10 those
+/// numbers were always the shipped guesses. Now that they are sometimes a
+/// measurement, the log line that records the verdict has to say which - an
+/// admission that later ends in an OOM kill is read backwards from this line.
+fn describe_calibration(outcome: &hermes_bench::Outcome) -> String {
+    match outcome {
+        hermes_bench::Outcome::Applied(calibrated) => {
+            format!("measured (fitted at {})", calibrated.fit_at_unix)
+        }
+        hermes_bench::Outcome::Rejected(untrusted) => {
+            format!("shipped defaults: {}", untrusted.reason())
+        }
+        hermes_bench::Outcome::Unreadable(detail) => {
+            format!("shipped defaults: the calibration file could not be read ({detail})")
+        }
+    }
+}
+
 pub fn choose_context(
     requested: Option<u32>,
     stored_default: Option<u32>,
@@ -715,6 +735,27 @@ pub async fn load_model(
             &estimator,
         );
         let fitted_params = base.with_context(chosen.n_ctx);
+
+        // The first point at which this load's bucket is known: a calibration
+        // is keyed by context and slot count, and both were decided just above.
+        //
+        // So the conservative model chooses the shape and a measured one judges
+        // it, which is the safe order rather than an awkward one. A fit only
+        // ever lowers the compute and overhead terms - the exact half is
+        // untouchable - so a window fitted against the shipped coefficients is
+        // never larger than one fitted against a measurement of the same
+        // machine, and the verdict below is passed on a window this machine has
+        // already been shown to manage.
+        let (estimator, calibration) = state.estimator_for(&metadata, fitted_params);
+        if let hermes_bench::Outcome::Unreadable(detail) = &calibration {
+            tracing::warn!(
+                target: targets::MEMORY,
+                model = %model.id,
+                detail = %detail,
+                "the calibration file could not be read; \
+                 this load is estimated with the shipped coefficients"
+            );
+        }
         let estimate = estimator.estimate_against(&metadata, fitted_params, budget);
 
         // Every admission decision is recorded, admitted or refused. An OOM kill
@@ -735,6 +776,7 @@ pub async fn load_model(
                 budget = %estimate.budget,
                 margin = %estimate.margin,
                 reclaimable = %estimate.reclaimable,
+                calibration = %describe_calibration(&calibration),
                 "admitting a load that leaves less headroom than the safety margin"
             );
         } else {
@@ -751,6 +793,7 @@ pub async fn load_model(
                 margin = %estimate.margin,
                 reclaimable = %estimate.reclaimable,
                 forced = options.force,
+                calibration = %describe_calibration(&calibration),
                 "admission verdict"
             );
         }

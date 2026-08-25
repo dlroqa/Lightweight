@@ -462,10 +462,33 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 ..RuntimeParams::default()
             };
 
-            let estimator = if *headless {
-                Estimator::headless()
+            let base = if *headless {
+                hermes_memory::ComputeModel::headless()
             } else {
-                Estimator::default()
+                hermes_memory::ComputeModel::default()
+            };
+            // This machine's own coefficients when `hermes bench --fit` has
+            // earned them for exactly these settings, and the shipped ones
+            // otherwise. A data directory that cannot be discovered is not a
+            // reason to refuse an estimate: it means there is nowhere a fit
+            // could have been written, which is the same answer as no fit.
+            let estimator = match hermes_system_info::DataPaths::discover() {
+                Ok(paths) => {
+                    hermes_bench::estimator_for(
+                        &paths.calibration_file(),
+                        &hermes_bench::engine_fingerprint(
+                            &hermes_backend_llamacpp::backend::ProcessBackend::new(
+                                paths.runtime_dir(),
+                            )
+                            .map_err(describe)?,
+                        ),
+                        &metadata,
+                        params,
+                        base,
+                    )
+                    .0
+                }
+                Err(_) => Estimator::new(base),
             };
             // `describe`, not `to_string`: without a reading there is no
             // verdict at all, and the remedy is the only thing that tells the

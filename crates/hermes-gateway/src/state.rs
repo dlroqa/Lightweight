@@ -222,6 +222,49 @@ impl GatewayState {
             .map(|paths| hermes_bench::BenchmarkStore::new(paths.benchmarks_dir()))
     }
 
+    /// This gateway's engine, in the form a benchmark record and a calibration
+    /// are keyed by.
+    ///
+    /// One definition, because a benchmark taken through this gateway and a fit
+    /// looked up by it have to agree about what "the same engine" means. The
+    /// build is stated by the backend rather than guessed here, which is what
+    /// makes a run taken by `hermes bench` comparable with one taken through
+    /// the API.
+    pub fn engine_fingerprint(&self) -> hermes_bench::EngineFingerprint {
+        hermes_bench::engine_fingerprint(self.backend.as_ref())
+    }
+
+    /// Everything needed to look a calibration up, owned.
+    ///
+    /// Owned because one of its two callers runs inside `spawn_blocking` -
+    /// reading a header and probing memory both block - and cannot hold a
+    /// borrow of the state across it.
+    pub fn calibration_lookup(&self) -> CalibrationLookup {
+        CalibrationLookup {
+            path: self
+                .config
+                .paths
+                .as_ref()
+                .map(hermes_system_info::DataPaths::calibration_file),
+            engine: self.engine_fingerprint(),
+        }
+    }
+
+    /// The estimator to use for one load, and what the calibration file had to
+    /// say about it.
+    ///
+    /// Calibrated only when this machine, this engine build and these exact
+    /// settings have a fit that passes every rule in `hermes_bench::apply`;
+    /// otherwise the headless defaults this gateway has always used. Never an
+    /// error: a damaged calibration file may not cost somebody their model.
+    pub fn estimator_for(
+        &self,
+        metadata: &hermes_gguf::ModelMetadata,
+        params: hermes_core::RuntimeParams,
+    ) -> (hermes_memory::Estimator, hermes_bench::Outcome) {
+        self.calibration_lookup().estimator_for(metadata, params)
+    }
+
     /// Where this gateway keeps settings, when it has a data directory.
     pub fn settings_store(&self) -> Option<hermes_store::SettingsStore> {
         self.config
@@ -429,6 +472,40 @@ fn unavailable<T>(code: &'static str, message: &str) -> Probed<T> {
     Probed::Unavailable {
         code,
         message: message.to_owned(),
+    }
+}
+
+/// Where this gateway's fitted coefficients live, and which engine they must
+/// describe.
+///
+/// A value rather than two arguments, because the pair is meaningless split up:
+/// a fit found by path and applied to a different engine build is exactly the
+/// confident wrong number `hermes_bench::apply` refuses.
+#[derive(Clone, Debug)]
+pub struct CalibrationLookup {
+    path: Option<std::path::PathBuf>,
+    engine: hermes_bench::EngineFingerprint,
+}
+
+impl CalibrationLookup {
+    /// The estimator for one load, calibrated when this machine has earned it.
+    ///
+    /// A gateway with no data directory has nowhere to have written a fit, so
+    /// it reports the same `NoFit` an empty file would: the shipped defaults
+    /// stand, which is what every estimate did before M10.
+    pub fn estimator_for(
+        &self,
+        metadata: &hermes_gguf::ModelMetadata,
+        params: hermes_core::RuntimeParams,
+    ) -> (hermes_memory::Estimator, hermes_bench::Outcome) {
+        let base = hermes_memory::ComputeModel::headless();
+        let Some(path) = self.path.as_ref() else {
+            return (
+                hermes_memory::Estimator::new(base),
+                hermes_bench::Outcome::Rejected(hermes_bench::Untrusted::NoFit),
+            );
+        };
+        hermes_bench::estimator_for(path, &self.engine, metadata, params, base)
     }
 }
 

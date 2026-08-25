@@ -67,6 +67,15 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
 
     let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
     let store = BenchmarkStore::new(paths.benchmarks_dir());
+    // Deliberately *not* calibrated, unlike the load paths.
+    //
+    // A run records the prediction beside the measurement so a later pass can
+    // fit the difference. Priming that prediction with this machine's previous
+    // fit would make each run a measurement of the run before it, and the
+    // residual column would shrink towards zero whether or not the estimator
+    // had got any better. The fit itself is computed from `Prediction::exact()`
+    // - weights plus KV cache - which no calibration touches, so this changes
+    // what is *reported*, never what is fitted.
     let estimator = Estimator::headless();
 
     let machine = MachineFingerprint::detect();
@@ -156,7 +165,7 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
     let path = store.save(&run).map_err(describe)?;
 
     let fitted = if options.fit {
-        let calibration_path = paths.data_dir().join("calibration.json");
+        let calibration_path = paths.calibration_file();
         let mut calibration = Calibration::load(&calibration_path).map_err(describe)?;
         let fits = fit_run(&run);
         for fit in fits.clone() {

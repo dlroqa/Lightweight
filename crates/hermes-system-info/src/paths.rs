@@ -185,6 +185,17 @@ impl DataPaths {
         self.data.join("catalog.json")
     }
 
+    /// Fitted memory coefficients, written by `hermes bench --fit`.
+    ///
+    /// Beside the catalog rather than in `benchmarks_dir`: a benchmark run is a
+    /// record of one measurement and there are many of them, while this is the
+    /// single conclusion drawn from all of them, and the load path reads it on
+    /// every estimate. Under the data root, because losing it costs a
+    /// measurement that cannot simply be downloaded again.
+    pub fn calibration_file(&self) -> PathBuf {
+        self.data.join("calibration.json")
+    }
+
     /// Every directory this layout uses.
     pub fn all_dirs(&self) -> Vec<PathBuf> {
         vec![
@@ -294,6 +305,7 @@ mod tests {
             paths.settings_file(),
             paths.api_config_file(),
             paths.catalog_file(),
+            paths.calibration_file(),
         ] {
             assert!(
                 file.starts_with(&temp.0),

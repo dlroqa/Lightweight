@@ -620,9 +620,11 @@ pub async fn model_detail(
 
     // Reading a header and probing memory are both blocking.
     let memory = state.memory_probe();
-    let probed =
-        tokio::task::spawn_blocking(move || describe_file(&path, defaults, asked, memory.as_ref()))
-            .await;
+    let calibration = state.calibration_lookup();
+    let probed = tokio::task::spawn_blocking(move || {
+        describe_file(&path, defaults, asked, memory.as_ref(), &calibration)
+    })
+    .await;
     let (header, estimate, context_source) = match probed {
         Ok(described) => described,
         Err(err) => {
@@ -708,6 +710,7 @@ fn describe_file(
     defaults: manager::RuntimeDefaults,
     asked: DetailOptions,
     memory: &dyn hermes_system_info::MemoryProbe,
+    calibration: &crate::state::CalibrationLookup,
 ) -> (
     Option<HeaderDetail>,
     Option<Probed<hermes_memory::Estimate>>,
@@ -774,7 +777,13 @@ fn describe_file(
         hermes_memory::Budget::of(snapshot),
         &estimator,
     );
-    let estimate = estimator.estimate(&metadata, base.with_context(chosen.n_ctx), snapshot);
+    // Priced the way the load path prices it: once the context and the slot
+    // count are known, this bucket may have a measurement behind it, and the
+    // screen has to show the number the button would produce - including its
+    // confidence, which is the whole point of a calibration being visible.
+    let fitted = base.with_context(chosen.n_ctx);
+    let (estimator, _outcome) = calibration.estimator_for(&metadata, fitted);
+    let estimate = estimator.estimate(&metadata, fitted, snapshot);
     (
         Some(detail),
         Some(Probed::Read { reading: estimate }),
