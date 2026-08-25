@@ -2,7 +2,7 @@
  * Put the `hermes` binary the installer will carry where electron-builder can
  * find it, and refuse to continue if it is the wrong one.
  *
- * Three problems this solves, all of which were live before it existed:
+ * Four problems this solves, all of which were live before it existed:
  *
  * 1. **The stale binary.** `extraResources` pointed straight at
  *    `target/release/hermes`, so whatever happened to be there got shipped. A
@@ -21,9 +21,13 @@
  *    file before staging. The staged file is then byte-identical in both
  *    halves, the merge never sees a conflict, and the declaration is not
  *    needed at all.
+ * 4. **The target directory.** `cargo build --target <triple>` puts the binary
+ *    under `target/<triple>/release`, and `release.yml` builds that way while
+ *    `check.yml` does not. Staging from `target/release` alone therefore worked
+ *    on every CI run and failed in the release - the one place it mattered.
  */
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 const repoRoot = join(import.meta.dirname, "..", "..");
@@ -88,18 +92,47 @@ function stageMacUniversal() {
   verify(merged);
 }
 
+/**
+ * Where `cargo build --release` left the binary, in the two places it can be.
+ *
+ * The triple-qualified path is tried first, so a `--target` build wins over
+ * whatever an earlier host build happened to leave behind. `verify()` then has
+ * the last word either way: a candidate of the wrong version is a sentence at
+ * build time rather than a stale binary inside an installer. This is the same
+ * two-candidate resolution `scripts/package-cli.sh` does.
+ */
+function builtBinary(executable) {
+  const candidates = [];
+  let triple;
+  try {
+    triple = run("rustc", ["-vV"]).match(/^host: (.+)$/m)?.[1].trim();
+  } catch {
+    // No rustc on PATH is not fatal here. The host path below may still exist,
+    // and if it does not, the message names the file rather than the toolchain.
+  }
+  if (triple) {
+    candidates.push(join(repoRoot, "target", triple, "release", executable));
+  }
+  candidates.push(join(repoRoot, "target", "release", executable));
+  return { found: candidates.find((candidate) => existsSync(candidate)), candidates };
+}
+
 function stageHost() {
   const executable = process.platform === "win32" ? "hermes.exe" : "hermes";
-  const built = join(repoRoot, "target", "release", executable);
+  const { found, candidates } = builtBinary(executable);
   const staged = join(stagingBin, executable);
-  try {
-    copyFileSync(built, staged);
-  } catch (cause) {
+  if (!found) {
     die(
-      `${built} is not there: ${cause instanceof Error ? cause.message : cause}\n` +
+      `no binary at ${candidates.join(" or ")}\n` +
         "       Build it first: cargo build --release -p hermes-cli",
     );
   }
+  try {
+    copyFileSync(found, staged);
+  } catch (cause) {
+    die(`${found} could not be staged: ${cause instanceof Error ? cause.message : cause}`);
+  }
+  console.log(`stage: from ${found}`);
   verify(staged);
 }
 

@@ -121,7 +121,13 @@ jobs:
       # The artifact tests need a real release binary and a real built panel:
       # `extraResources` copies both into the package, and a stale one has
       # shipped before (PROGRESS.md:919-922).
-      - run: cargo build --release -p hermes-cli
+      #
+      # `--target` deliberately, because `release.yml` builds that way and this
+      # job did not: the binary then lands under `target/<triple>/release`, and
+      # staging it from `target/release` alone was green here every time while
+      # failing in the release. The `flatpak` job below builds without a triple,
+      # so the two jobs exercise one resolution branch each.
+      - run: cargo build --release -p hermes-cli --target x86_64-unknown-linux-gnu
       - run: npm run build --prefix frontend
 
       - name: Package the AppImage
