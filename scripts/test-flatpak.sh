@@ -148,9 +148,17 @@ flatpak run --command=sh "$APP_ID" -c 'rm -rf "$XDG_DATA_HOME/probe"' 2>/dev/nul
 #    --no-sandbox. Needs a display; says so rather than passing quietly.
 # ---------------------------------------------------------------------------
 if [ -n "${DISPLAY:-}" ]; then
+  # zypak - the sandbox helper this artifact exists for - talks to the session
+  # bus, and a CI runner has none: the first run of this script failed here with
+  # `Failed to connect to session bus`, which says nothing about the artifact.
+  # `dbus-run-session` provides one for the length of the launch.
+  bus=()
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    bus=(dbus-run-session --)
+  fi
   home="$(mktemp -d)"
   set +e
-  flatpak run --env=HERMES_GATEWAY_HOME=/tmp/hermes-flatpak-home --env=HERMES_PORT=18781 \
+  "${bus[@]}" flatpak run --env=HERMES_GATEWAY_HOME=/tmp/hermes-flatpak-home --env=HERMES_PORT=18781 \
     "$APP_ID" >/tmp/flatpak-run.log 2>&1 &
   launched=$!
   sleep 25

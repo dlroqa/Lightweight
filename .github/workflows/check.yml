@@ -180,7 +180,7 @@ jobs:
       # engine it downloads. `xvfb` because the launch check opens a window.
       - name: Artifact checks
         run: |
-          sudo apt-get install -y xvfb
+          sudo apt-get install -y xvfb dbus-x11
           xvfb-run --auto-servernum ./scripts/test-flatpak.sh
 
       - name: What was installed

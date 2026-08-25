@@ -16,10 +16,17 @@ use hermes_core::{InstanceId, ModelId, RuntimeParams, units::Bytes};
 use hermes_gguf::architecture;
 use hermes_inference::generation::GenerationRequest;
 use hermes_inference::{
-    BackendCapabilities, BackendError, BackendHealth, BackendId, CpuTicks, DeviceKind,
-    EngineCounters, GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel,
-    ResourceSnapshot,
+    BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, EngineCounters,
+    GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
 };
+// Processor time is read out of `/proc/<pid>/stat`, so every use of this type
+// sits behind the same `cfg` the reader does. Imported unconditionally it is an
+// unused import off Linux, which `-D warnings` makes a build failure - caught by
+// the macOS runners on the matrix's first run, and invisible to a cross-target
+// clippy here, which cannot get as far as type-checking without a C toolchain
+// for `ring` and `zstd-sys`.
+#[cfg(target_os = "linux")]
+use hermes_inference::CpuTicks;
 use hermes_observability::targets;
 use hermes_system_info::CpuInfo;
 use tokio::sync::{Mutex, mpsc};
