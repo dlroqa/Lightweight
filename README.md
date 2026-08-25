@@ -173,7 +173,7 @@ inscrutable build-script error rather than as "you broke the policy".
 ## Build and test
 
 ```sh
-cargo test --workspace       # 556 tests, no network, no model downloads
+cargo test --workspace       # 777 tests, no network, no model downloads
 ./scripts/check.sh           # fmt, clippy, tests, contract suite, dependency + secret gates
 ./scripts/contract-test.sh   # the real openai SDK against the gateway
 ```
