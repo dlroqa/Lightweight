@@ -15,11 +15,14 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "electron": "^43.4.1",
-    "electron-builder": "^26.15.3",
+    "electron-builder": "^26.15.7",
     "typescript": "^5.7.2"
   },
   "build": {
     "appId": "ai.hermes.cpu-inference-gateway",
+    "toolsets": {
+      "appimage": "1.0.3"
+    },
     "productName": "Hermes",
     "icon": "build/icons",
     "files": [
@@ -38,8 +41,10 @@
     ],
     "linux": {
       "target": [
+        "flatpak",
         "AppImage"
       ],
+      "executableArgs": [],
       "category": "Development",
       "syncDesktopName": true,
       "synopsis": "Local CPU inference gateway"
@@ -49,6 +54,19 @@
         "dmg"
       ],
       "category": "public.app-category.developer-tools"
+    },
+    "flatpak": {
+      "runtimeVersion": "24.08",
+      "baseVersion": "24.08",
+      "license": "LICENSE",
+      "finishArgs": [
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--share=ipc",
+        "--device=dri",
+        "--share=network",
+        "--filesystem=xdg-download"
+      ]
     },
     "win": {
       "target": [

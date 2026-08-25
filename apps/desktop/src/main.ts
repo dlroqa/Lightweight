@@ -31,6 +31,7 @@ import {
   resolveBinary,
   type GatewayState,
 } from "./gateway.ts";
+import { inspectSandbox, sandboxFailureText } from "./sandbox.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 
@@ -253,6 +254,27 @@ async function start(): Promise<void> {
 
 // The panel asks for this once, to show what it is attached to.
 ipcMain.handle("gateway:current", () => supervisor.current());
+
+// Refuse before anything else, including before the app is ready.
+//
+// The AppImage launcher adds `--no-sandbox` by itself on a host without
+// unprivileged user namespaces, preferring - in its own words - to start
+// without sandboxing rather than crash. That trade is not ours to accept
+// silently on the user's behalf, so the shell stops here and says what
+// happened and what to do instead. `sandbox.ts` explains why the check cannot
+// live in the packaging.
+const sandbox = inspectSandbox(process.argv, process.platform);
+if (!sandbox.sandboxed) {
+  const message = sandboxFailureText(sandbox);
+  // Both channels: a terminal launch reads stderr, and a launcher click sees
+  // only the dialog. `showErrorBox` is one of the few dialogs that works
+  // before `whenReady`.
+  process.stderr.write(`${message}\n`);
+  dialog.showErrorBox("Hermes cannot start unsandboxed", message);
+  // Non-zero: a wrapper or a service manager must be able to tell that this
+  // was a refusal rather than a normal quit.
+  app.exit(1);
+}
 
 app.whenReady().then(start).catch((cause: unknown) => {
   showStartupFailure(cause instanceof Error ? cause.message : String(cause));

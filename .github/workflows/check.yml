@@ -87,3 +87,96 @@ jobs:
       # this is where those numbers come from.
       - name: What this machine reports
         run: cargo run -q -p hermes-cli --bin hermes -- sysinfo
+
+  linux-artifacts:
+    name: linux artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-artifacts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+
+      # The artifact tests need a real release binary and a real built panel:
+      # `extraResources` copies both into the package, and a stale one has
+      # shipped before (PROGRESS.md:919-922).
+      - run: cargo build --release -p hermes-cli
+      - run: npm run build --prefix frontend
+
+      - name: Package the AppImage
+        run: npm --prefix apps/desktop run package -- --linux AppImage
+
+      # Unlike the development machine, a GitHub runner can create unprivileged
+      # user namespaces - so this is where the *supported* case is exercised and
+      # the assertion that no live process carries `--no-sandbox` actually runs.
+      # `xvfb` because that launch opens a real window.
+      - name: Artifact checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum ./scripts/test-artifacts.sh
+
+  # The Flatpak build, which is the primary public Linux artifact.
+  #
+  # Separate from the job above because it needs packages installed with sudo,
+  # which is exactly why it has never been built on the development machine.
+  flatpak:
+    name: flatpak
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: flatpak
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+
+      - name: Install flatpak and the runtimes the manifest names
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.electronjs.Electron2.BaseApp//24.08
+
+      - run: cargo build --release -p hermes-cli
+      - run: npm run build --prefix frontend
+      - run: npm --prefix apps/desktop run package -- --linux flatpak
+
+      - name: The bundle exists and is installable
+        run: |
+          bundle="$(find apps/desktop/release -maxdepth 1 -name '*.flatpak' -print -quit)"
+          test -n "$bundle" || { echo "no flatpak bundle was produced" >&2; exit 1; }
+          ls -lh "$bundle"
+          flatpak install --user -y --bundle "$bundle"
+          flatpak list --user --app
