@@ -48,22 +48,69 @@ cargo build --release -p hermes-cli
 (cd apps/desktop && npm run package -- --linux flatpak)
 ```
 
+## What can be checked here, and what cannot
+
+`flatpak-builder` runs every build step inside `bwrap`, and on this machine
+`bwrap` is not setuid while `kernel.apparmor_restrict_unprivileged_userns = 1`
+with no bwrap profile loaded — so `bwrap --ro-bind / / true` fails at the uid
+map, and no bundle can be produced here at all. Installing the packages would
+not change that; the block is the kernel's, and lifting it needs root.
+
+What *can* be checked here is everything electron-builder does before it calls
+`flatpak`, and that turned out to matter. Running `electron-builder --linux
+flatpak` on 2026-08-25 failed with
+
+```
+cannot find specified resource "LICENSE", nor relative to ".../apps/desktop/build",
+neither relative to project dir (".../apps/desktop")
+```
+
+because `license` is resolved against `buildResources` and then the project
+directory, and the only `LICENSE` in the tree is at the repository root. The
+first CI run would have died there without ever reaching flatpak-builder. It is
+`../../LICENSE` now, and the same command gets past the staging step and stops
+at `spawn flatpak ENOENT`, which is this machine's real limit rather than a
+configuration mistake.
+
+The staging directory it leaves behind (`apps/desktop/release/__flatpak-*`) is
+worth reading: it holds the desktop entry, the `electron-wrapper` script and the
+icons exactly as they will be installed.
+
+**The application id is `ai.hermes.cpu_inference_gateway`, not the `appId` in
+`package.json`.** `FlatpakTarget`'s `filterFlatpakAppIdentifier` replaces every
+hyphen with an underscore, so `ai.hermes.cpu-inference-gateway` becomes the
+underscored form in the desktop entry, the icon names, the D-Bus name and the
+data directory — `~/.var/app/ai.hermes.cpu_inference_gateway/`. Read out of the
+generated stage directory rather than inferred.
+
+`scripts/test-flatpak.sh` asserts the rest against an *installed bundle*, and
+runs in the `flatpak` job of `.github/workflows/check.yml`. It covers the three
+risks below, plus the sandbox grants and the absence of `--no-sandbox` in the
+wrapper.
+
 ## What is not yet proven
 
-**This build has never been produced.** `flatpak-builder` needs packages that
-cannot be installed on the development machine, which has no `sudo`, so the
-configuration above is written and unexercised. It is built and smoke-tested on
-CI, and until that run exists nothing here should be described as working.
+**This build has never been produced on the development machine, and until a CI
+run exists nothing here should be described as working.** The configuration is
+written and — apart from the staging step above — unexercised.
 
 Three things that must be checked the first time it does build, because each is
 a real way a Flatpak of *this* application can be broken while still starting:
 
 - **The engine is downloaded at run time and then executed.** If the sandbox
   mounts the data directory `noexec`, `llama-server` will not start. This is the
-  highest-risk unknown in the Flatpak work.
+  highest-risk unknown in the Flatpak work, and `scripts/test-flatpak.sh`
+  answers it directly: it copies a real executable into `$XDG_DATA_HOME` inside
+  the sandbox and runs it from there.
 - **Paths move.** `directories::ProjectDirs` resolves inside the sandbox, to
-  `~/.var/app/ai.hermes.cpu-inference-gateway/`. `HERMES_GATEWAY_HOME` overrides
-  it, and the desktop shell already passes that through.
+  `~/.var/app/ai.hermes.cpu_inference_gateway/` — the underscored id above.
+  `HERMES_GATEWAY_HOME` overrides it, and the desktop shell already passes that
+  through.
 - **Models the user picks from `$HOME` need a `--filesystem=` grant.** The list
   starts narrow, at `xdg-download`. Widen it only when a test asks for it, and
   say in the release notes what is reachable.
+
+One more, added when the tray was noticed: the shell creates a `Tray`, and a
+Flatpak may not register a status icon without
+`--talk-name=org.kde.StatusNotifierWatcher`. It is in `finishArgs` now, and
+asserted from the installed metadata rather than from the block that set it.

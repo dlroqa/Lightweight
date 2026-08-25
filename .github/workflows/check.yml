@@ -173,10 +173,16 @@ jobs:
       - run: npm run build --prefix frontend
       - run: npm --prefix apps/desktop run package -- --linux flatpak
 
-      - name: The bundle exists and is installable
+      # `scripts/test-flatpak.sh` installs the bundle and asserts against the
+      # installed application rather than against the configuration that built
+      # it - including the two things the manifest cannot show: the rewritten
+      # application id, and whether the app data directory will execute the
+      # engine it downloads. `xvfb` because the launch check opens a window.
+      - name: Artifact checks
         run: |
-          bundle="$(find apps/desktop/release -maxdepth 1 -name '*.flatpak' -print -quit)"
-          test -n "$bundle" || { echo "no flatpak bundle was produced" >&2; exit 1; }
-          ls -lh "$bundle"
-          flatpak install --user -y --bundle "$bundle"
-          flatpak list --user --app
+          sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum ./scripts/test-flatpak.sh
+
+      - name: What was installed
+        if: always()
+        run: flatpak list --user --app

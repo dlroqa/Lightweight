@@ -70,14 +70,15 @@
     "flatpak": {
       "runtimeVersion": "24.08",
       "baseVersion": "24.08",
-      "license": "LICENSE",
+      "license": "../../LICENSE",
       "finishArgs": [
         "--socket=wayland",
         "--socket=fallback-x11",
         "--share=ipc",
         "--device=dri",
         "--share=network",
-        "--filesystem=xdg-download"
+        "--filesystem=xdg-download",
+        "--talk-name=org.kde.StatusNotifierWatcher"
       ]
     },
     "win": {
