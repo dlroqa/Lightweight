@@ -120,7 +120,16 @@ async fn the_real_engine_loads_a_real_model_and_reports_its_memory() {
         "implausibly small resident set: {}",
         usage.rss
     );
-    assert!(usage.peak_rss >= usage.rss);
+    // Against the quantity the platform's peak is a peak of: macOS publishes a
+    // peak *footprint*, which legitimately sits below a resident set that
+    // includes the mapped weights. Everywhere else it is a peak resident set.
+    match usage.peak_kind {
+        hermes_inference::PeakKind::ResidentSet => assert!(usage.peak_rss >= usage.rss),
+        hermes_inference::PeakKind::Footprint => assert!(
+            usage.anon_rss.is_none_or(|anon| usage.peak_rss >= anon),
+            "a peak footprint below the current footprint: {usage:?}"
+        ),
+    }
 
     backend.shutdown().await.expect("shutdown");
     assert_eq!(backend.health().await, BackendHealth::Stopped);

@@ -106,12 +106,27 @@ mod tests {
     fn a_live_process_reports_a_resident_set_and_a_peak() {
         let me = usage(std::process::id()).expect("read this process");
         assert!(me.rss > Bytes::ZERO, "a process with no memory: {me:?}");
-        assert!(
-            me.peak_rss >= me.rss,
-            "a peak below the current reading: {me:?}"
-        );
-        if let Some(anon) = me.anon_rss {
-            assert!(anon > Bytes::ZERO, "no private memory at all: {me:?}");
+        let anon = me
+            .anon_rss
+            .expect("both platforms publish a private figure");
+        assert!(anon > Bytes::ZERO, "no private memory at all: {me:?}");
+
+        // The peak is compared against the quantity it is a peak *of*, which is
+        // the whole reason `peak_is_footprint` is carried. Asserting
+        // `peak >= rss` here failed on macOS against a perfectly good reading -
+        // 1.64 MiB of peak footprint under 2.53 MiB of resident set - because
+        // the difference is the clean file-backed pages a footprint excludes,
+        // starting with this test binary itself.
+        if me.peak_is_footprint {
+            assert!(
+                me.peak_rss >= anon,
+                "a peak footprint below the current footprint: {me:?}"
+            );
+        } else {
+            assert!(
+                me.peak_rss >= me.rss,
+                "a peak resident set below the current one: {me:?}"
+            );
         }
     }
 
