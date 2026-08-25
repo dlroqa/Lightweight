@@ -36,3 +36,6 @@ pub mod disk;
 
 #[cfg(any(target_os = "macos", windows))]
 pub mod net;
+
+#[cfg(any(target_os = "macos", windows))]
+pub mod process;

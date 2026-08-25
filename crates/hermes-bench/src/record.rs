@@ -10,7 +10,8 @@
 //! fixed pattern, and the fields below have nowhere to put one — the same
 //! structural guarantee the metrics module relies on, for the same reason.
 
-use hermes_core::{RuntimeParams, units::Bytes};
+use hermes_core::{LoadMode, RuntimeParams, units::Bytes};
+use hermes_inference::PeakKind;
 use hermes_memory::Confidence;
 use serde::{Deserialize, Serialize};
 
@@ -218,6 +219,16 @@ pub struct Sample {
     /// The high-water mark, which is what an OOM kill would have been measured
     /// against and what a calibration pass fits.
     pub peak_rss: Option<Bytes>,
+    /// What that mark is a mark *of*.
+    ///
+    /// Recorded because the answer differs by platform and a run outlives the
+    /// machine it was taken on: a peak resident set contains the mapped
+    /// weights and a peak footprint does not, so the exactly-computed term a
+    /// fit subtracts differs by the size of the model. Defaulted on read, so
+    /// every run recorded before this field existed parses as the resident-set
+    /// peak it was.
+    #[serde(default)]
+    pub peak_kind: PeakKind,
     /// What the estimator predicted for these exact parameters.
     ///
     /// `weights` and `kv_cache` are exact; the residual between `peak_rss` and
@@ -306,5 +317,32 @@ impl Prediction {
     /// re-fit them.
     pub fn exact(&self) -> u64 {
         self.weights.get().saturating_add(self.kv_cache.get())
+    }
+
+    /// The exact part that a peak of this kind actually contains.
+    ///
+    /// This is the whole of what [`PeakKind`] is for. A residual is
+    /// `peak - exact`, and subtracting a term the peak never counted would
+    /// under-state it by exactly that term:
+    ///
+    /// * a **resident-set** peak counts every resident page, so both the
+    ///   mapped weights and the KV cache are inside it;
+    /// * a **footprint** peak excludes clean file-backed pages, and a mapped
+    ///   GGUF's weights are precisely that - so only the KV cache is inside it;
+    /// * unless the load **locked** its weights, which wires them: locked
+    ///   pages are no longer reclaimable file cache, they are charged to the
+    ///   process, and a footprint counts them like any other dirty page. This
+    ///   is the same argument `Budget` already makes for crediting `VmLck` on a
+    ///   swap, applied to the other side of the same accounting.
+    pub fn exact_within(&self, peak: PeakKind, params: RuntimeParams) -> u64 {
+        let counts_weights = match peak {
+            PeakKind::ResidentSet => true,
+            PeakKind::Footprint => params.load_mode.is_some_and(LoadMode::locks_weights),
+        };
+        if counts_weights {
+            self.exact()
+        } else {
+            self.kv_cache.get()
+        }
     }
 }

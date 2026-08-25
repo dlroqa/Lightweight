@@ -198,6 +198,32 @@ impl CpuTicks {
     }
 }
 
+/// What a high-water mark is a mark *of*.
+///
+/// Two platforms count a peak in one way and one counts it in another, and the
+/// difference is the size of the model: a peak resident set includes the pages
+/// a mapped GGUF occupies, and a peak footprint deliberately does not, because
+/// clean file-backed pages are ones the kernel can drop without asking.
+///
+/// Recorded rather than inferred at the point of use. A benchmark file travels,
+/// which is why it carries a machine fingerprint at all, so "which platform am
+/// I on now" is not an answer to "what does this number in this file mean".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeakKind {
+    /// Every resident page, mapped files included: Linux `VmHWM`, Windows
+    /// `PeakWorkingSetSize`. The default, because it is what every recording
+    /// made before this type existed was.
+    #[default]
+    ResidentSet,
+    /// The process's own dirty and compressed pages, with clean file-backed
+    /// ones excluded: macOS `ri_lifetime_max_phys_footprint`, which is the only
+    /// lifetime maximum that platform publishes for another process - and the
+    /// number jetsam judges a process by, so it is the one that would have
+    /// killed the engine.
+    Footprint,
+}
+
 /// What the engine is consuming.
 ///
 /// Read from the operating system rather than estimated. This is a real benefit
@@ -208,7 +234,18 @@ impl CpuTicks {
 pub struct ResourceSnapshot {
     pub rss: Bytes,
     /// High-water mark since the process started.
+    ///
+    /// What it is a high-water mark *of* differs by platform, which is why
+    /// [`ResourceSnapshot::peak_kind`] travels beside it: subtracting the wrong
+    /// exactly-computed term from it produces a residual that is wrong by the
+    /// size of the model.
     pub peak_rss: Bytes,
+    /// Which kind of peak `peak_rss` is.
+    ///
+    /// Defaulted on read so that runs recorded before this existed - every one
+    /// of which was taken on Linux - still parse as what they were.
+    #[serde(default)]
+    pub peak_kind: PeakKind,
     /// The part of `rss` that is anonymous, and so genuinely returned to the
     /// free pool when this process exits.
     ///

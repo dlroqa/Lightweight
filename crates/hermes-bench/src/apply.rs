@@ -11,8 +11,10 @@
 //! match may still be too thin to use, and then the shipped defaults stand,
 //! which is the outcome the estimator has always had.
 //!
-//! **What a fit may change, and what it may not.** `Prediction::exact()` is
-//! weights plus KV cache and `peak_rss` is the *engine* process's, so a
+//! **What a fit may change, and what it may not.** A residual is a peak minus
+//! the exactly-computed terms that peak contains - `Prediction::exact_within`,
+//! which is weights plus KV cache on Linux and Windows and the KV cache alone
+//! against a macOS footprint - and `peak_rss` is the *engine* process's. So a
 //! residual describes the engine's compute buffers and its baseline. It
 //! therefore never touches [`ComputeModel::host_overhead`], which is the
 //! desktop shell: no benchmark in this workspace has ever observed that

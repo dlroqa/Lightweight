@@ -182,37 +182,63 @@ The numbers, the run ids and the conclusion belong in `PROGRESS.md` when they
 exist, next to M8's and M9's, and in the doc comment of any constant they set —
 the rule `CORES_PER_SLOT` follows.
 
-## 4b. The gap the matrix found, and what it costs calibration
+## 4b. The gap the matrix found, and how much of it is closed
 
 `ResourceSnapshot` for the *engine process* - its resident set, its high-water
-mark and its processor ticks - is read from `/proc/<pid>/status` and
-`/proc/<pid>/stat`. M10a.1 gave the workspace macOS and Windows probes for the
-**machine**; there is no equivalent yet for a **process**, and the first macOS
-run of the matrix said so by failing
-`a_dead_engine_is_reported_as_failed_and_cleared`.
+mark and its processor ticks - was a `/proc` reading and nothing else. M10a.1
+gave the workspace macOS and Windows probes for the **machine**; there was no
+equivalent for a **process**, and the first macOS run of the matrix said so by
+failing `a_dead_engine_is_reported_as_failed_and_cleared`.
 
-The test states the per-platform truth now rather than skipping, so
-implementing the reading elsewhere makes it fail until it is updated. What the
-gap costs, in order of how much it matters:
+M10a.11 closes most of it. `hermes-sys` gains one system call per platform -
+`proc_pid_rusage` on macOS, `OpenProcess` + `GetProcessMemoryInfo` +
+`GetProcessTimes` on Windows - wrapped by `hermes_system_info::process` and
+delegated to by the backend's non-Linux arm. The Linux path is untouched: its
+parsers keep the tests that pin them, and moving working code for symmetry
+alone is not an improvement. Both new readings are normalised to the units
+`/proc` publishes, because `CpuTicks` is documented as ticks at 100 Hz and a
+second unit under the same field would wrong every ratio drawn from it.
 
-1. **`hermes bench --fit` can fit nothing off Linux.** `fit_run` skips any
-   sample without a `peak_rss`, so a run on macOS or Windows records timings
-   and no residuals, and `calibration.json` stays empty. Everything in M10b
-   still behaves correctly there - it reports `NoFit` and the shipped
-   coefficients stand - but the milestone's whole point is unavailable on two
-   of the three platforms it now ships to.
-2. **Engine RSS and peak are absent from `/api/v1/metrics`**, and the two
-   Prometheus gauges M7.2 added report nothing.
-3. **A swap credits nothing**, because `anon_rss` is the credit and there is
-   none to read. The safe direction: a swap is judged against memory the
-   outgoing engine still holds, so it is refused more often rather than less.
+What that restores off Linux: engine RSS and the two Prometheus gauges; the
+swap credit, which is now a real `anon_rss` rather than nothing; and - on
+Windows - `hermes bench --fit`, because `PeakWorkingSetSize` is a true peak
+working set.
 
-Closing it is `proc_pid_rusage` on macOS - `ri_resident_size` and
-`ri_lifetime_max_phys_footprint`, which is the peak - and
-`GetProcessMemoryInfo` plus `GetProcessTimes` on Windows, both in
-`crates/hermes-sys` beside the machine probes and behind the same single
-`#[allow(unsafe_code)]`. Neither can be executed on the development machine,
-so the matrix is what would prove it.
+**macOS needed one more thing, and it was not a bigger probe.** macOS
+publishes no per-process maximum resident set: the only lifetime maximum in
+`rusage_info` is `ri_lifetime_max_phys_footprint`, and `task_info`'s
+`resident_size_max` needs `task_for_pid`, which one process may not call on
+another without an entitlement. The footprint is the right number for what
+`peak_rss` is documented to mean - jetsam judges a process by its footprint, so
+it is what would have killed the engine - but it is not the same quantity as
+Linux's `VmHWM`: a footprint excludes the clean file-backed pages a mapped
+model's weights live in.
+
+`fit_run` computed its residual as `peak - (weights + kv_cache)`. Against a
+footprint that subtraction underflows by most of the model, the sample is
+skipped, and `hermes bench --fit` reports a run with no fits and no reason why.
+
+So the peak now says what kind of peak it is. `PeakKind` travels on
+`ResourceSnapshot` and is recorded on every `Sample`, defaulted on read so that
+every run already on disk parses as the resident-set peak it was, and
+`Prediction::exact_within` subtracts only what that kind of peak contains:
+
+| peak | contains the weights? |
+|---|---|
+| resident set (Linux `VmHWM`, Windows `PeakWorkingSetSize`) | yes |
+| footprint (macOS) | no |
+| footprint, weights locked (`mlock`, `mmap+mlock`) | yes - wired pages are charged to the process |
+
+The third row is the same argument `Budget` already makes for crediting `VmLck`
+on a swap, applied to the other side of the same accounting. It is recorded
+rather than derived from `cfg!` for the reason the machine fingerprint exists:
+a benchmark file outlives the machine that wrote it, and "which platform am I
+on now" does not answer "what does this number in this file mean".
+
+Machine-wide processor time is also still Linux-only (`load.rs` names
+`host_processor_info` and `GetSystemTimes` as what it needs). Its only consumer
+is the panel's "cores in use", which reports nothing rather than something
+wrong.
 
 ## 5. Deliberately left
 

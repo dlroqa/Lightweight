@@ -195,7 +195,12 @@ pub fn fit_run(run: &BenchmarkRun) -> Vec<Fit> {
         let (Some(prediction), Some(peak)) = (sample.predicted, sample.peak_rss) else {
             continue;
         };
-        let Some(residual) = peak.get().checked_sub(prediction.exact()) else {
+        // The exact term this peak actually contains, which is not the same on
+        // every platform: a macOS footprint excludes the mapped weights, and
+        // subtracting them anyway underflowed and silently threw the sample
+        // away - which is why `hermes bench --fit` could fit nothing there.
+        let exact = prediction.exact_within(sample.peak_kind, sample.params);
+        let Some(residual) = peak.get().checked_sub(exact) else {
             // The engine used less than the exactly-computed half. That is not
             // a residual, it is a sign the weights were not all resident - a
             // partially paged mmap, most likely - and fitting compute buffers
@@ -273,6 +278,7 @@ mod tests {
     use super::*;
     use crate::record::{ModelFingerprint, Prediction, Sample, Scenario};
     use hermes_core::RuntimeParams;
+    use hermes_inference::PeakKind;
     use hermes_memory::Confidence;
 
     fn machine() -> MachineFingerprint {
@@ -318,6 +324,7 @@ mod tests {
             machine_ticks: Some(400),
             rss: Some(Bytes(exact)),
             peak_rss: Some(Bytes(exact + intercept + slope * u64::from(n_ubatch))),
+            peak_kind: PeakKind::ResidentSet,
             predicted: Some(Prediction {
                 weights: Bytes(exact),
                 kv_cache: Bytes(0),
@@ -344,6 +351,88 @@ mod tests {
             },
             samples,
         }
+    }
+
+    /// A footprint peak is fitted against the term it actually contains.
+    ///
+    /// The defect this exists for is silent: subtracting weights a macOS
+    /// footprint never counted underflows, `fit_run` skips the sample, and
+    /// `hermes bench --fit` reports a run with no fits in it and no reason why.
+    #[test]
+    fn a_footprint_peak_is_not_asked_to_contain_the_weights() {
+        let weights = Bytes::from_mib(700).get();
+        let kv = Bytes::from_mib(200).get();
+        let residual = Bytes::from_mib(150).get();
+
+        // What macOS would record: the peak holds the KV cache and the
+        // residual, and not the mapped weights.
+        let mut sample = sample(512, weights, 0, 0);
+        sample.peak_kind = PeakKind::Footprint;
+        sample.peak_rss = Some(Bytes(kv + residual));
+        sample.predicted = Some(Prediction {
+            weights: Bytes(weights),
+            kv_cache: Bytes(kv),
+            compute: Bytes::ZERO,
+            overhead: Bytes::ZERO,
+            total: Bytes(weights + kv),
+            confidence: Confidence::Coarse,
+        });
+
+        let fits = fit_run(&run(vec![sample]));
+        assert_eq!(fits.len(), 1, "the sample must not be thrown away");
+        assert_eq!(
+            fits[0].max_residual_bytes, residual,
+            "the residual must be the peak minus the KV cache alone"
+        );
+    }
+
+    /// Unless the load locked its weights, which puts them in the footprint.
+    #[test]
+    fn a_locked_load_puts_the_weights_back_inside_a_footprint() {
+        let weights = Bytes::from_mib(700).get();
+        let kv = Bytes::from_mib(200).get();
+        let residual = Bytes::from_mib(150).get();
+
+        let mut sample = sample(512, weights, 0, 0);
+        sample.peak_kind = PeakKind::Footprint;
+        sample.params.load_mode = Some(hermes_core::LoadMode::MmapMlock);
+        // Locked weights are wired and charged to the process, so they are in
+        // the peak - and the residual is what is left after all of it.
+        sample.peak_rss = Some(Bytes(weights + kv + residual));
+        sample.predicted = Some(Prediction {
+            weights: Bytes(weights),
+            kv_cache: Bytes(kv),
+            compute: Bytes::ZERO,
+            overhead: Bytes::ZERO,
+            total: Bytes(weights + kv),
+            confidence: Confidence::Coarse,
+        });
+
+        let fits = fit_run(&run(vec![sample]));
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].max_residual_bytes, residual);
+    }
+
+    /// A run recorded before the field existed is what it always was.
+    #[test]
+    fn a_run_from_before_this_field_reads_as_a_resident_set_peak() {
+        // Every recording made until now was taken on Linux, where the peak is
+        // `VmHWM`. Defaulting to anything else would silently re-interpret
+        // every benchmark already on disk.
+        let stored = serde_json::json!({
+            "scenario": "decode",
+            "params": hermes_core::RuntimeParams::default(),
+            "threads": 4,
+            "repetition": 0,
+            "prompt_tokens": 10,
+            "cached_tokens": 0,
+            "prefilled_tokens": 10,
+            "generated_tokens": 10,
+            "wall_ms": 1_200,
+            "peak_rss": 1_000,
+        });
+        let sample: Sample = serde_json::from_value(stored).expect("an older sample still parses");
+        assert_eq!(sample.peak_kind, PeakKind::ResidentSet);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod load;
 pub mod memory;
 pub mod network;
 pub mod paths;
+pub mod process;
 
 pub use cpu::{CpuInfo, IsaFeature};
 pub use disk::{DiskError, DiskSpace, space_for};
@@ -24,3 +25,4 @@ pub use memory::{
 };
 pub use network::{NetworkError, reachable_addresses};
 pub use paths::{DataPaths, PathsError};
+pub use process::{ProcessError, ProcessUsage};

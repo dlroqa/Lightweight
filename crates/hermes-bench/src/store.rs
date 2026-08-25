@@ -241,6 +241,7 @@ mod tests {
                 machine_ticks: Some(10_000),
                 rss: Some(Bytes::from_mib(180)),
                 peak_rss: Some(Bytes::from_mib(190)),
+                peak_kind: hermes_inference::PeakKind::ResidentSet,
                 predicted: None,
                 busy_slots_per_decode: None,
             }],

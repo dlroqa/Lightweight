@@ -372,6 +372,7 @@ impl InferenceBackend for MockBackend {
         Ok(Some(ResourceSnapshot {
             rss: Bytes::from_mib(512),
             peak_rss: Bytes::from_mib(600),
+            peak_kind: hermes_inference::PeakKind::ResidentSet,
             anon_rss: config.anon_rss,
             cpu_ticks: config.cpu_ticks,
         }))

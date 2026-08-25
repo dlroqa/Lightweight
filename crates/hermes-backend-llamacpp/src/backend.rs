@@ -19,13 +19,9 @@ use hermes_inference::{
     BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, EngineCounters,
     GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
 };
-// Processor time is read out of `/proc/<pid>/stat`, so every use of this type
-// sits behind the same `cfg` the reader does. Imported unconditionally it is an
-// unused import off Linux, which `-D warnings` makes a build failure - caught by
-// the macOS runners on the matrix's first run, and invisible to a cross-target
-// clippy here, which cannot get as far as type-checking without a C toolchain
-// for `ring` and `zstd-sys`.
-#[cfg(target_os = "linux")]
+// Unconditional again, and only because both arms of `read_process_usage` now
+// build one: while the reading was `/proc`-only this import was unused off
+// Linux, which `-D warnings` turned into a failed build on two runners.
 use hermes_inference::CpuTicks;
 use hermes_observability::targets;
 use hermes_system_info::CpuInfo;
@@ -541,6 +537,8 @@ fn parse_process_status(status: &str) -> Option<ResourceSnapshot> {
         // The high-water mark is the number that matters for calibration: the
         // peak is what would have triggered an OOM kill, not the current value.
         peak_rss: field("VmHWM").unwrap_or_default(),
+        // `VmHWM` counts every resident page, the mapped weights included.
+        peak_kind: hermes_inference::PeakKind::ResidentSet,
         // Absent before Linux 4.5. `None` rather than a default, because a
         // swap spends this number: a zero would be silently correct and an
         // absent reading treated as zero would silently refuse the swap.
@@ -571,11 +569,33 @@ fn parse_process_stat(stat: &str) -> Option<CpuTicks> {
     })
 }
 
+/// The same reading, where there is no `/proc` to read.
+///
+/// macOS and Windows publish it through one system call each, wrapped in
+/// `hermes-system-info` on top of the workspace's only FFI crate - so this is
+/// a delegation rather than a second implementation, and the Linux path above
+/// keeps the parsers its own tests pin.
+///
+/// A failure is still `None`, exactly as an unreadable `/proc` entry is: the
+/// engine may have exited between the poll and the read, and inventing a
+/// number here would corrupt the calibration that consumes it.
 #[cfg(not(target_os = "linux"))]
-fn read_process_usage(_pid: u32) -> Option<ResourceSnapshot> {
-    // Only implemented for Linux so far. Reporting `None` is honest; inventing
-    // a number here would corrupt the estimator calibration that consumes it.
-    None
+fn read_process_usage(pid: u32) -> Option<ResourceSnapshot> {
+    let usage = hermes_system_info::process::usage(pid).ok()?;
+    Some(ResourceSnapshot {
+        rss: usage.rss,
+        peak_rss: usage.peak_rss,
+        peak_kind: if usage.peak_is_footprint {
+            hermes_inference::PeakKind::Footprint
+        } else {
+            hermes_inference::PeakKind::ResidentSet
+        },
+        anon_rss: usage.anon_rss,
+        cpu_ticks: Some(CpuTicks {
+            user: usage.user_ticks,
+            system: usage.system_ticks,
+        }),
+    })
 }
 
 use std::path::Path;
