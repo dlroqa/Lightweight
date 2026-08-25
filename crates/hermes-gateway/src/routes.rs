@@ -382,7 +382,8 @@ async fn serve_completions(
     let mut guard = RequestGuard::new(cancel, Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
         .describing(builder.id(), model.id.to_string())
-        .in_band(band);
+        .in_band(band)
+        .counting(largest_prompt);
     guard.waited(waiting_since.elapsed());
 
     tracing::info!(
@@ -535,7 +536,8 @@ async fn serve_chat(
             let guard = RequestGuard::new(cancel.clone(), Some(permit))
                 .reporting_to(Arc::clone(state.metrics()))
                 .describing(builder.id(), model.id.to_string())
-                .in_band(band);
+                .in_band(band)
+                .counting(prompt_tokens);
             let events = state
                 .backend
                 .generate(model.instance, generation, cancel)
@@ -571,7 +573,8 @@ async fn serve_chat(
         let guard = RequestGuard::new(cancel.clone(), None)
             .reporting_to(Arc::clone(state.metrics()))
             .describing(builder.id(), model.id.to_string())
-            .in_band(band);
+            .in_band(band)
+            .counting(prompt_tokens);
         let backend = Arc::clone(&state.backend);
         let instance = model.instance;
         let start: StartGeneration = Box::new(move || {
@@ -604,7 +607,8 @@ async fn serve_chat(
     let mut guard = RequestGuard::new(cancel.clone(), Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
         .describing(builder.id(), model.id.to_string())
-        .in_band(band);
+        .in_band(band)
+        .counting(prompt_tokens);
     guard.waited(waiting_since.elapsed());
 
     let events = state

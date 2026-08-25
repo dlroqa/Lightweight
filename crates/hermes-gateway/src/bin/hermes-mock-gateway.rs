@@ -132,13 +132,18 @@ async fn set_script(
     StatusCode::NO_CONTENT
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Multi-threaded, deliberately. A suite that drives two clients at once
+// against a current-thread runtime measures the runtime rather than the
+// gateway: the two requests would interleave at await points and never
+// actually overlap.
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut port = 0_u16;
     let mut n_ctx = 4096_u32;
     let mut model_id = "mock-model".to_owned();
     let mut api_key: Option<String> = None;
+    let mut concurrency = 1_u32;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -146,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ctx" => n_ctx = args.next().unwrap_or_default().parse()?,
             "--model" => model_id = args.next().unwrap_or_default(),
             "--api-key" => api_key = args.next(),
+            "--concurrency" => concurrency = args.next().unwrap_or_default().parse()?,
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
@@ -177,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog,
         GatewayConfig {
             auth,
+            max_concurrent_requests: concurrency.max(1),
             ..GatewayConfig::default()
         },
     ));
@@ -203,6 +210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "base_url": format!("http://127.0.0.1:{}/v1", bound.port()),
             "port": bound.port(),
             "instance": loaded.instance.to_string(),
+            // Read by the suite, so a concurrency test cannot silently run
+            // against a gateway that was given one slot.
+            "concurrency": concurrency.max(1),
         })
     );
     use std::io::Write;

@@ -27,7 +27,7 @@ use hermes_gateway::scheduler::{BandLimits, SchedulerConfig};
 use hermes_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use hermes_gguf::{GgufFile, ModelMetadata};
 use hermes_inference::{InferenceBackend, LoadProgress, LoadRequest};
-use hermes_memory::{Estimator, Verdict};
+use hermes_memory::{ConcurrencyChoice, ConcurrencySource, Estimator, Verdict};
 use hermes_observability::targets;
 use hermes_system_info::{CpuInfo, DataPaths, MemoryProbe as _, SystemMemoryProbe};
 use tokio::sync::mpsc;
@@ -67,14 +67,17 @@ pub struct ServeOptions {
     /// Key required on every request. Mandatory as soon as any bind is
     /// reachable from another machine.
     pub api_key: Option<String>,
-    /// Requests the gateway may run at once.
+    /// Requests the gateway may run at once, or `auto`.
     ///
     /// One number, not two: it sizes the engine's slots *and* the gateway's
     /// queue, and the RAM estimate is computed for the same value — the KV
     /// cache is per sequence, so four concurrent sequences cost four caches.
     /// Splitting it into separate settings would let a machine be configured to
     /// promise more concurrency than it budgeted for.
-    pub concurrency: u32,
+    ///
+    /// `auto` resolves it from the machine's cores and, once a model is named,
+    /// from whether that many full-sized windows fit in memory.
+    pub concurrency: Concurrency,
     /// Directory of built control-panel files to serve at `/`.
     ///
     /// Absent means no panel, which is every deployment before M6b.3 exists.
@@ -82,6 +85,59 @@ pub struct ServeOptions {
     /// the panel same-origin with the API, so no CORS policy has to be written
     /// to let a page talk to the gateway it was served by.
     pub web_root: Option<PathBuf>,
+}
+
+/// How many requests to serve at once, as the operator asked for it.
+///
+/// A type rather than a bare number so that "decide for me" is a value rather
+/// than a magic zero, and so the panel and the startup line can say which of
+/// the two it was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Concurrency {
+    /// Derive it from the machine, and from the model when one is loaded.
+    #[default]
+    Auto,
+    /// Exactly this many, whatever the machine looks like.
+    Fixed(u32),
+}
+
+impl Concurrency {
+    /// What the estimator is asked for: `None` is "choose".
+    pub const fn requested(self) -> Option<u32> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(slots) => Some(slots),
+        }
+    }
+}
+
+impl std::str::FromStr for Concurrency {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match value.parse::<u32>() {
+            // Refused rather than clamped: zero slots is not a smaller
+            // gateway, it is a gateway that serves nobody, and somebody who
+            // typed it meant something this cannot guess.
+            Ok(0) => Err("`--concurrency 0` would serve nobody; pass `auto` or a count".to_owned()),
+            Ok(slots) => Ok(Self::Fixed(slots)),
+            Err(_) => Err(format!(
+                "`{value}` is not a request count; pass `auto` or a number"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Concurrency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Fixed(slots) => write!(f, "{slots}"),
+        }
+    }
 }
 
 /// The environment variable holding the API key.
@@ -145,11 +201,15 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     // later `/api/v1/models/{id}/load` will load into.
     let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
     let cpu = CpuInfo::detect();
-    let concurrency = options.concurrency.max(1);
+    // Resolved once, from this machine and - when a model was named - from
+    // what that model's caches would cost. The same number then sizes the
+    // engine's slots, the gateway's queue and the estimate, which is what
+    // keeps "does this fit?" an answerable question.
     let cache_type: GgmlType = options
         .kv_type
         .parse()
         .map_err(|_| format!("unknown KV cache type {:?}", options.kv_type))?;
+    let concurrency = resolve_concurrency(&options, &cpu, cache_type)?;
 
     let loaded = match &options.model {
         Some(model) => Some(
@@ -159,7 +219,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
                 &backend,
                 LoadShape {
                     cache_type,
-                    concurrency,
+                    concurrency: concurrency.slots,
                     cpu,
                 },
             )
@@ -183,7 +243,12 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
 
     // The catalog is opened whether or not a model was named, so
     // `/api/v1/models` can answer and a model can be loaded later.
-    let manager = build_manager(&paths, cache_type, options.threads, concurrency)?;
+    let manager = build_manager(
+        &paths,
+        cache_type,
+        options.threads,
+        options.concurrency.requested(),
+    )?;
 
     let state = Arc::new(
         GatewayState::new(
@@ -191,7 +256,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             catalog,
             GatewayConfig {
                 auth,
-                max_concurrent_requests: concurrency,
+                max_concurrent_requests: concurrency.slots,
                 scheduler: SchedulerConfig {
                     interactive: bands,
                     ..SchedulerConfig::default()
@@ -243,9 +308,18 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         }
     }
     println!(
-        "  requests {concurrency} at a time{}",
-        if concurrency == 1 {
-            " (others queue; short requests go first)"
+        "  requests {} at a time ({}){}",
+        concurrency.slots,
+        match concurrency.source {
+            ConcurrencySource::Requested => "as asked".to_owned(),
+            ConcurrencySource::Fitted => format!("fitted to {} cores", concurrency.cores),
+            ConcurrencySource::ReducedToFit => format!(
+                "fewer than {} cores allow, to fit in memory",
+                concurrency.cores
+            ),
+        },
+        if concurrency.slots == 1 {
+            "; others queue, short requests first"
         } else {
             ""
         }
@@ -350,6 +424,47 @@ async fn watch_for_death(backend: &ProcessBackend) {
             return;
         }
     }
+}
+
+/// Decide how many requests this gateway will serve at once.
+///
+/// A named number is honoured exactly. `auto` asks the estimator, which knows
+/// two things this function does not: how many cores one generation was
+/// measured to occupy, and whether that many caches fit. With no model named
+/// the memory half cannot be answered yet, so the cores rule stands alone and
+/// the first load re-derives it - the same treatment the band ceilings get, and
+/// for the same reason.
+fn resolve_concurrency(
+    options: &ServeOptions,
+    cpu: &CpuInfo,
+    cache_type: GgmlType,
+) -> Result<ConcurrencyChoice, String> {
+    let estimator = Estimator::headless();
+    let metadata = match &options.model {
+        Some(path) => {
+            let file = GgufFile::open(path).map_err(describe)?;
+            Some(ModelMetadata::from_file(&file).map_err(describe)?)
+        }
+        None => None,
+    };
+    let base = RuntimeParams {
+        cache_type_k: cache_type,
+        cache_type_v: cache_type,
+        ..RuntimeParams::default()
+    };
+    // The window each client would get, which is what the memory rule prices.
+    let base = match options.n_ctx {
+        Some(n_ctx) => base.with_context(n_ctx),
+        None => base,
+    };
+    let snapshot = SystemMemoryProbe.snapshot().map_err(describe)?;
+    Ok(estimator.choose_concurrency(
+        options.concurrency.requested(),
+        cpu.logical_cores,
+        metadata.as_ref(),
+        base,
+        hermes_memory::Budget::of(snapshot),
+    ))
 }
 
 /// The machine-shaped parameters a startup load needs.
@@ -602,7 +717,7 @@ fn build_manager(
     paths: &DataPaths,
     kv_type: GgmlType,
     threads: Option<u32>,
-    concurrency: u32,
+    concurrency: Option<u32>,
 ) -> Result<Arc<ModelManager>, String> {
     let store = CatalogStore::open(paths.catalog_file()).map_err(describe)?;
     let installer = Installer::new(paths.models_dir(), paths.downloads_dir()).map_err(describe)?;

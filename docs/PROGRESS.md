@@ -1,7 +1,7 @@
 # Progress
 
 Checkpoint of where the build stands, so work resumes without re-deriving it.
-Milestones follow the approved plan (M0-M10); this pass covers M0-M8.
+Milestones follow the approved plan (M0-M10); this pass covers M0-M9.
 
 Updated after each milestone, and only ever on green: `./scripts/check.sh` must
 pass — fmt, clippy `-D warnings`, the full test suite, the openai-SDK contract
@@ -31,6 +31,9 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M8.1** Make the CPU visible | **done** | `cpu_percent` retired for `cpu_ticks` read from `/proc/<pid>/stat` and published unconverted; the panel differences them into cores; latency histograms with real Prometheus buckets, existing names and values unchanged; per-band generation and wait counters; the engine's own `/metrics` scraped once per pull, which `--metrics` had promised since M2 |
 | **M8.2** The harness that measures | **done** | `hermes-bench`: three deterministic scenarios over the `InferenceBackend` trait, prompts sized by the engine's own tokenizer, runs saved owner-only to the `benchmarks_dir()` M0 chose and nothing had written to; `hermes bench` with its own engine and a per-bucket reload, `POST /api/v1/benchmarks` against what is resident, Run Benchmark wired in the panel; `--fit` writes a slope and an intercept because peak RSS cannot separate two collinear coefficients |
 | **M8.3** The knobs | **done** | `n_ubatch` and `n_batch` reachable and `?ubatch=` priced; `--threads-batch`, `--poll`, `--cache-reuse`, `--load-mode` and CPU affinity reachable and absent by default; a locked-memory pre-flight from `/proc/self/limits`, `VmLck` credited on a swap, and `Tight` refused for a locking load; the panel reads the `thread_choices` served since M6b.1 |
+| **M9.1** Engine truth | **done** | `--ctx-size` multiplied by the slot count at the one boundary that knows the engine's convention, so each client gets the window every surface advertises; `--no-kv-unified` and `--cont-batching` stated; the engine's own `/props` read back once it is ready and the recorded parameters reconciled with it; three hardcoded `max_concurrent_requests: 1` capabilities retired |
+| **M9.2** Clients, not only requests | **done** | `PeerKey` from the connection — observed, never claimed, never logged or labelled; a fair-queuing round in the sort key that degenerates to today's order for one caller; `Ticket::position` an `Option`; `timed_out` and `abandoned` made to mean what they say; admission one locked decision; the benchmark's discarded permit |
+| **M9.3** The number, and the clients | **done** | `--concurrency auto` derived from cores and memory, with the divisor set by a sweep rather than chosen; the scheduler's capacity re-derived per load; `/api/v1/requests` and a Running Now card, because a running request was a bare `usize`; `hermes bench --parallel` with a concurrent scenario; two genuinely concurrent clients in the contract suite |
 
 ## Verified by execution, not only by unit tests
 
@@ -461,10 +464,10 @@ Three decisions worth keeping:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 644 | no network, no model downloads — checked with outbound HTTP blocked |
-| openai-SDK contract (`scripts/contract-test.sh`) | 30 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser |
+| Default (`cargo test --workspace`) | 745 | no network, no model downloads — checked with outbound HTTP blocked |
+| openai-SDK contract (`scripts/contract-test.sh`) | 32 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser; two clients driven at once from two threads |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
-| Real engine | 9 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
+| Real engine | 10 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
 | Model downloads | 8 | needs `HERMES_TEST_NETWORK=1`; fetches a real 100 MB model from HuggingFace |
 
 Measured on this machine, and recorded as a property of *this* box rather than
@@ -586,7 +589,7 @@ Still open:
   off Linux rather than a guess. Cross-platform work is M10.
 - **Calibration**: the estimator's compute and overhead terms are still the
   shipped conservative defaults, so estimates report `Confidence::Coarse`.
-  Fitting them from observed peak RSS is M9.
+  Fitting them from observed peak RSS is M10.
 - **The live harness cutover** — pointing the user's own `~/.hermes/config.yaml`
   at this gateway — has **not** been made and still needs explicit permission;
   that file is protected. It is no longer needed for evidence: the same
@@ -1009,19 +1012,85 @@ timing-sensitive on four contended cores. The assertion is not weakened to make
 it green: it encodes the behaviour that matters, and the flakiness is the
 machine, recorded here so the next person to see it knows it has been seen.
 
+## M9, verified by execution on 2026-08-24
+
+**`--concurrency` had never worked, and the engine said so when it was finally
+asked.** Launched with `--ctx-size 4096 --parallel 2`, the pinned build reports
+`n_slots = 2, n_ctx_slot = 2048, kv_unified = 'false'`: `-c` is the total and
+the engine divides it. So every deployment that had raised the slot count was
+handing each client a fraction of the window `/props`, `/v1/models`, the
+overflow check, `clamp_max_tokens` and the band ceilings all advertised, while
+the estimator priced the caches at N times what the engine allocated. It was
+found by reading `--help` and `strings libllama.so` rather than by a failure,
+because nothing in the tree had ever built the engine's arguments at more than
+one slot.
+
+- **Four slots, each with the whole window.** A real engine loaded at
+  `n_ctx: 1024, n_parallel: 4` reports `default_generation_settings.n_ctx` of
+  **1024** and `total_slots` of **4** — the multiplication checked against the
+  engine's own answer rather than against our reading of its `--help`.
+- **Two clients served at once, and the engine confirms they were batched.**
+  Two real streamed requests against SmolLM2-135M at `--concurrency 2`: both
+  ran, `/api/v1/requests` listed both with their bands and prompt counts, and
+  `hermes_engine_busy_slots_per_decode` read **1.267** — above one, so the
+  engine served them in shared decode steps rather than in turn. The sweep
+  measured 1.30 for the same shape.
+- **The advertised window and the engine's window agree**, checked live on the
+  same gateway: `/props` reports 1024 with `total_slots` 2, and
+  `hermes.engine.default_generation_settings.n_ctx` — which had no caller in
+  three milestones — reports 1024 beside it.
+- **`auto` resolves out loud.** On this four-core box `hermes serve` prints
+  `requests 1 at a time (fitted to 4 cores)`, and `/api/v1/gateway` reports
+  `requested: null` beside a live capacity of 1. The number this machine has
+  always used, for the first time because a measurement supports it.
+- **The sweep that set the rule.** `hermes bench --parallel 1,2,4` at 1024
+  tokens per client: aggregate decode 3.95 → ~4.8 → ~4.9 t/s while per-client
+  decode fell 3.95 → 2.39 → 1.23, and peak RSS rose 184 → 222 → 283 MiB. A
+  single generation already kept 3.0-3.8 of four cores busy, so a second slot
+  takes a core rather than finding one. `CORES_PER_SLOT` is four because of
+  that column, and the run id is in the constant's doc comment.
+- **Two clients are told apart by the connection, over real sockets.** The
+  test binds one client to a second loopback address, and asserts the newcomer
+  is placed behind *one* of the busy client's requests rather than behind both.
+  Checked against the defect it exists for: with peer identity removed it fails
+  three times out of three, while the single-client ordering test beside it
+  still passes.
+- **A flake in that test was fixed rather than retried.** Its first version
+  read one client's queue notice before the other's, and reading a notice
+  consumes the response — which disconnects that client and reorders the queue
+  it was measuring. The reader borrows the response now, and skips the first
+  notice, so the position it reports was computed after every request in the
+  test had arrived.
+
+Found while building M9, and fixed:
+
+- **A benchmark could run with no slot.** `benchmark.rs` bound the permit as
+  `let _permit = ...await;` — an `Option` — so a queue timeout produced exactly
+  the interleaved measurement the comment above it says it prevents, silently.
+  It is a refusal now, naming the wait it gave up after.
+- **Two queue counters described overlapping sets.** A non-streamed timeout
+  incremented `timed_out` *and* `abandoned`; a streamed one incremented only
+  `abandoned`. Both numbers move on `/metrics` as a result of this fix; no name
+  and no label changed.
+- **Admission was two locks with a gap.** A slot released between "is one free?"
+  and "put me in the queue" found an empty queue and went idle while a request
+  was on its way into it — at capacity one, a client waiting out the whole queue
+  timeout in front of a gateway doing nothing.
+
 ## Next step
 
-M8 is complete. What remains of the approved plan is M9 and M10.
+M9 is complete. What remains of the approved plan is M10.
 
-**M9 is calibration**, and M8 built everything it needs except the decision:
-`hermes bench --fit` already writes a versioned, machine-scoped
-`calibration.json` carrying a slope, an intercept and the raw residual points.
-What M9 owes is the policy — how many buckets make a fit trustworthy, how close
-a fingerprint must match, and when `Confidence::Measured` is earned — plus the
-wiring into the three load paths. `Estimator::new(ComputeModel)` is the seam,
-and it has been there since M1.
-
-**M10 is cross-platform.**
+**M10 is calibration and cross-platform.** M8 built everything calibration
+needs except the decision: `hermes bench --fit` already writes a versioned,
+machine-scoped `calibration.json` carrying a slope, an intercept and the raw
+residual points. What remains is the policy — how many buckets make a fit
+trustworthy, how close a fingerprint must match, and when
+`Confidence::Measured` is earned — plus the wiring into the three load paths.
+`Estimator::new(ComputeModel)` is the seam, and it has been there since M1. It
+sits with cross-platform deliberately: a fit from one machine and one engine
+build is a fact about that machine, and the value of fitting appears when there
+is a second machine to fit against.
 
 The deferrals recorded through M7 stand, with two closed by this milestone:
 `ResourceSnapshot.cpu_percent` is resolved — it became a counter — and Run

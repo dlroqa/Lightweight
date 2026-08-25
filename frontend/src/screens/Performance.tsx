@@ -239,6 +239,11 @@ export function Performance() {
             <Row label="Capacity">{metrics.data?.queue.capacity ?? "—"}</Row>
             <Row label="Running">{metrics.data?.queue.running ?? "—"}</Row>
             <Row label="Waiting">{metrics.data?.queue.waiting ?? "—"}</Row>
+            <Row label="Waiting (short first)">
+              {metrics.data
+                ? `${metrics.data.queue.waiting_interactive} interactive · ${metrics.data.queue.waiting_bulk} bulk`
+                : "—"}
+            </Row>
             <Row label="Admitted without waiting">
               {metrics.data?.queue.admitted_immediately.toLocaleString() ?? "—"}
             </Row>
@@ -251,9 +256,14 @@ export function Performance() {
             <Row label="Gave up waiting">
               {metrics.data?.queue.timed_out.toLocaleString() ?? "—"}
             </Row>
+            <Row label="Client disconnected while queued">
+              {metrics.data?.queue.abandoned.toLocaleString() ?? "—"}
+            </Row>
             <div className="card__note" style={{ marginTop: 10 }}>
               Overtakes are how often a short request was let past a waiting long
-              one. On an uncontended gateway this stays at zero.
+              one. On an uncontended gateway this stays at zero. Giving up and
+              disconnecting are counted apart: the first is a wait that ran out,
+              the second is a client that walked away.
             </div>
           </Card>
         </div>

@@ -17,7 +17,7 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 through 8 are complete. The gateway serves an OpenAI-compatible
+Milestones 0 through 9 are complete. The gateway serves an OpenAI-compatible
 API over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
@@ -81,8 +81,21 @@ affinity; and how the weights are brought into memory, which is checked against
 the kernel's locked-memory allowance before an engine is started rather than
 warned about on its stderr afterwards.
 
-What remains of the plan is M9 and M10. See [docs/PROGRESS.md](docs/PROGRESS.md)
-for the current checkpoint, and [docs/M8-PLAN.md](docs/M8-PLAN.md) for what the
+And it now serves **more than one client at a time, correctly**. That sentence
+was not true before M9 and had never been checked: `--ctx-size` is a total the
+engine divides across its slots, so raising `--concurrency` had been quietly
+handing every client a fraction of the window every endpoint advertised. The
+context is multiplied where the engine's convention is known and nowhere else,
+the engine's own answer is read back and believed, and the slot count is derived
+from the machine — one slot per four cores, because a single generation was
+measured to keep close to four busy, and fewer if a full-sized window for every
+client would not fit. The queue is fair between callers as well as between
+requests, keyed on the address the kernel put on the connection: observed, never
+claimed, and never logged, labelled or stored. And the panel can finally show
+what is running *while* it is running.
+
+What remains of the plan is M10. See [docs/PROGRESS.md](docs/PROGRESS.md)
+for the current checkpoint, and [docs/M9-PLAN.md](docs/M9-PLAN.md) for what the
 last milestone deliberately left undone.
 
 ## Verified constraints
@@ -242,12 +255,24 @@ Authentication is off for a loopback bind — a client that sends
 `Bearer no-key-required`, or no header at all, is accepted — and is **forced on**
 the moment any bind is reachable from another machine.
 
-`--concurrency N` raises how many requests run at once. It is one number on
-purpose: it sizes the engine's slots, the gateway's queue and the RAM estimate
-together, because the KV cache is per sequence and four concurrent sequences
-cost four caches. The default is 1, which is right for a small CPU — a second
-concurrent generation on four slow cores makes both slower than running them in
-turn.
+`--concurrency` decides how many requests run at once, and defaults to `auto`.
+It is one number on purpose: it sizes the engine's slots, the gateway's queue
+and the RAM estimate together, because the KV cache is per sequence and four
+concurrent sequences cost four caches — so each client keeps the whole context
+the gateway advertises rather than a quarter of it.
+
+`auto` takes the smaller of two answers. **Cores**: one slot per four, because a
+single generation was measured to keep 3.0 to 3.8 of this machine's four cores
+busy — a second slot takes a core rather than finding one. **Memory**: at that
+many slots a full-sized window for every client must still fit, and a machine
+that cannot hold them serves fewer clients well rather than more badly. On the
+development box that is one slot, which is what the flag has always defaulted
+to; on a sixteen-core machine it is four. `hermes serve` prints which rule
+decided, and a number overrides both.
+
+The slot count follows the *engine*, not the command line: it is re-derived on
+every model load, beside the band ceilings, because a count that is right for
+one model is not right for the next.
 
 ## Waiting, and being told about it
 
@@ -272,6 +297,13 @@ what the scheduler is for.
 - **Nothing is preempted.** A band decides who *starts* next; a generation
   already running is never paused, because the engine cannot pause one and
   restarting it would throw away the prefill that dominates the cost.
+- **The queue is fair between callers, not only between requests.** Bands answer
+  "what does this cost?" and cannot answer "whose turn is it?" — ten requests
+  from one client and one from another are all in the same band. Each caller's
+  first waiting request competes with every other caller's first, so a client
+  that sends twenty puts one in front of yours and nineteen behind. The key is
+  the address the kernel put on the connection: observed, never claimed, and
+  never logged, labelled or stored.
 
 A streamed request that arrives to a busy gateway is answered immediately and
 waits inside its own response, so `curl -N` shows it moving up the queue:
@@ -281,6 +313,12 @@ waits inside its own response, so `curl -N` shows it moving up the queue:
 : queued position=0 waited=30s
 data: {"choices":[{"delta":{"role":"assistant"},...
 ```
+
+`GET /api/v1/requests` answers the question the counters never could: what is
+being served *right now*, with the band and the prompt each request carries, and
+what is queued behind it. A generation only reaches `/api/v1/events` once it has
+finished, so a gateway serving two clients for two minutes each used to look
+much like an idle one until they both finished at once.
 
 Those are SSE comments, which every client's decoder discards — a queued request
 has produced no tokens, and a `data:` frame would be a completion that is not

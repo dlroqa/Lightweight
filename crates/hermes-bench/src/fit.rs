@@ -326,6 +326,7 @@ mod tests {
                 total: Bytes(exact + Bytes::from_mib(112).get()),
                 confidence: Confidence::Coarse,
             }),
+            busy_slots_per_decode: None,
         }
     }
 

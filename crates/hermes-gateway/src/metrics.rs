@@ -285,6 +285,13 @@ pub struct RequestEvent {
     pub queue_wait_ms: u64,
     pub time_to_first_token_ms: Option<u64>,
     pub total_ms: u64,
+    /// Which queue served this request.
+    ///
+    /// Carried on the record since M8 and never published, so the panel could
+    /// show that a request waited without being able to show what it waited
+    /// *as*. The band's own wire spelling, which is the metric label's
+    /// spelling too — one name for one thing.
+    pub band: Option<&'static str>,
 }
 
 impl RequestEvent {
@@ -311,6 +318,7 @@ impl RequestEvent {
                 .time_to_first_token
                 .map(|ttft| ttft.as_millis() as u64),
             total_ms: record.total.as_millis() as u64,
+            band: record.band.map(Band::as_str),
         }
     }
 }

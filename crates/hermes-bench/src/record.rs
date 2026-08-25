@@ -146,9 +146,24 @@ pub enum Scenario {
     CachedPrefill,
     /// A short prompt and a fixed output budget, measuring generation.
     Decode,
+    /// Several clients decoding at once, one sample each.
+    ///
+    /// Not in [`Scenario::ALL`], so a default run measures exactly what it
+    /// always did: this one is only meaningful when the engine was given more
+    /// than one slot, and running it against a single slot would measure a
+    /// queue rather than a batch. The client count is not a field here because
+    /// it is already recorded, exactly, in each sample's
+    /// `params.n_parallel` - the slot count the engine was actually launched
+    /// with.
+    ConcurrentDecode,
 }
 
 impl Scenario {
+    /// The scenarios a default run measures.
+    ///
+    /// [`Scenario::ConcurrentDecode`] is deliberately absent: adding it here
+    /// would change what every existing `hermes bench` invocation produces,
+    /// and it has nothing to say about an engine with one slot.
     pub const ALL: [Self; 3] = [Self::ColdPrefill, Self::CachedPrefill, Self::Decode];
 
     pub const fn as_str(self) -> &'static str {
@@ -156,6 +171,7 @@ impl Scenario {
             Self::ColdPrefill => "cold_prefill",
             Self::CachedPrefill => "cached_prefill",
             Self::Decode => "decode",
+            Self::ConcurrentDecode => "concurrent_decode",
         }
     }
 }
@@ -208,6 +224,16 @@ pub struct Sample {
     /// their sum is what `compute` and `overhead` are guessing at, and is the
     /// whole reason this is recorded beside the observation.
     pub predicted: Option<Prediction>,
+    /// The engine's own mean of how many slots were busy per decode call.
+    ///
+    /// Read from the engine's counters at the end of the sample, and the only
+    /// direct evidence that several clients were *batched* rather than served
+    /// one after another - a rate alone cannot tell those apart. `None` where
+    /// the engine publishes no such counter.
+    ///
+    /// Defaulted on read, so runs saved before this field existed still parse.
+    #[serde(default)]
+    pub busy_slots_per_decode: Option<f64>,
 }
 
 impl Sample {

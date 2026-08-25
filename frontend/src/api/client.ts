@@ -19,6 +19,7 @@ import type {
   PinnedModel,
   CatalogRow,
   Remedy,
+  RequestRoster,
   Settings,
   SystemReport,
 } from "./types";
@@ -127,6 +128,8 @@ export const api = {
   system: () => request<SystemReport>("/api/v1/system"),
   metrics: () => request<Metrics>("/api/v1/metrics"),
   gateway: () => request<GatewayReport>("/api/v1/gateway"),
+  /** What is being served right now, and what is queued behind it. */
+  requests: () => request<RequestRoster>("/api/v1/requests"),
 
   models: () =>
     request<ListBody<CatalogRow>>("/api/v1/models").then((body) => body.data),

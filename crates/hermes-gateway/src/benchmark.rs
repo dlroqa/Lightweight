@@ -38,6 +38,10 @@ pub async fn run(
         generate_tokens: body.generate_tokens.unwrap_or(16),
         repetitions: body.repeat.unwrap_or(2),
         scenarios: hermes_bench::record::Scenario::ALL.to_vec(),
+        // One client. This benchmark takes a single scheduler slot like any
+        // other request, so driving several at once from inside it would be
+        // measuring a queue it is itself the head of.
+        concurrent: 1,
     };
 
     // A slot, like any other request. Held for the whole run so that a

@@ -113,6 +113,11 @@ export function GatewayScreen() {
                 </Row>
                 <Row label="Concurrent requests">
                   {gateway.data.concurrency.max_concurrent_requests}
+                  <span className="card__note" style={{ marginLeft: 8 }}>
+                    {gateway.data.concurrency.requested === null
+                      ? "derived from this machine"
+                      : "as asked for at startup"}
+                  </span>
                 </Row>
                 <Row label="Queue timeout">
                   {gateway.data.concurrency.queue_timeout_seconds}s

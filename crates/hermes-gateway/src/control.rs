@@ -421,8 +421,15 @@ pub struct AuthReport {
 
 #[derive(Debug, Serialize)]
 pub struct ConcurrencyReport {
+    /// Slots the gateway is handing out right now.
     max_concurrent_requests: u32,
     queue_timeout_seconds: u64,
+    /// What was asked for on the command line, or `null` for `auto`.
+    ///
+    /// Beside the live number rather than instead of it: "four, because you
+    /// said four" and "four, because this machine can" are different answers
+    /// to "why four?", and only one of them changes when a model is swapped.
+    requested: Option<u32>,
 }
 
 /// Where this gateway reads and writes.
@@ -476,7 +483,8 @@ pub struct DefaultsReport {
     kv_type: GgmlType,
     #[serde(skip_serializing_if = "Option::is_none")]
     threads: Option<u32>,
-    concurrency: u32,
+    /// `None` where the operator asked for `auto`.
+    concurrency: Option<u32>,
     /// The physical batch a load uses when a request names none.
     ubatch: u32,
     /// The load modes this engine accepts, in its own spelling.
@@ -731,7 +739,10 @@ fn describe_file(
                 .threads
                 .unwrap_or_else(|| hermes_system_info::CpuInfo::detect().default_threads()),
         ),
-        n_parallel: defaults.concurrency.max(1),
+        // The slot count this model would be loaded with, chosen the way the
+        // load itself chooses it - the price on screen has to be the price the
+        // button pays.
+        n_parallel: 1,
         ..hermes_core::RuntimeParams::default()
     };
     let base = match asked.ubatch {
@@ -739,9 +750,20 @@ fn describe_file(
         _ => base,
     };
 
-    // Exactly how `load` chooses, through the same function it calls, so the
+    // Exactly how `load` chooses, through the same functions it calls, so the
     // number on screen is the number that request would produce.
     let estimator = hermes_memory::Estimator::headless();
+    let slots = estimator.choose_concurrency(
+        defaults.concurrency,
+        hermes_system_info::CpuInfo::detect().logical_cores,
+        Some(&metadata),
+        base,
+        hermes_memory::Budget::of(snapshot),
+    );
+    let base = hermes_core::RuntimeParams {
+        n_parallel: slots.slots,
+        ..base
+    };
     let chosen = manager::choose_context(
         asked.n_ctx,
         asked.stored_default,
@@ -758,6 +780,36 @@ fn describe_file(
         Some(Probed::Read { reading: estimate }),
         Some(chosen.source),
     )
+}
+
+/// `GET /api/v1/requests` — what is being served right now, and what is queued.
+///
+/// The one thing the metrics could never say. `/api/v1/events` reports a
+/// generation once it has *finished*, and the queue snapshot reports how many
+/// are running as a bare number — so a gateway serving four clients for two
+/// minutes each looked, from outside, much like a gateway doing nothing, until
+/// they all finished at once.
+///
+/// It carries what the live feed carries and nothing more: the completion id
+/// the client already has, the model `/v1/models` already advertises, the band,
+/// and the prompt the engine counted. **Not the caller's address** — that is a
+/// scheduling key, and this is a display.
+pub async fn requests(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    axum::Json(state.scheduler().roster()).into_response()
+}
+
+/// The machine defaults a load would use.
+///
+/// The manager owns them; a gateway without one has none to report, and the
+/// shipped defaults are what a load would use anyway.
+fn defaults_of(state: &GatewayState) -> crate::manager::RuntimeDefaults {
+    state
+        .manager()
+        .map(|manager| manager.defaults())
+        .unwrap_or_default()
 }
 
 /// `GET /api/v1/gateway` — how this gateway is configured, and what it is doing.
@@ -810,17 +862,17 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
             required: config.auth.is_enabled(),
         },
         concurrency: ConcurrencyReport {
-            max_concurrent_requests: config.max_concurrent_requests,
+            // What is being handed out right now, which follows the loaded
+            // engine, rather than what the command line asked for at startup.
+            max_concurrent_requests: state.scheduler().capacity(),
             queue_timeout_seconds: config.queue_timeout.as_secs(),
+            requested: defaults_of(state).concurrency,
         },
         engine_capabilities: state.backend.capabilities(),
         defaults: {
             // The manager owns them; a gateway without one has none to report,
             // and the shipped defaults are what a load would use anyway.
-            let defaults = state
-                .manager()
-                .map(|manager| manager.defaults())
-                .unwrap_or_default();
+            let defaults = defaults_of(state);
             DefaultsReport {
                 kv_type: defaults.kv_type,
                 threads: defaults.threads,

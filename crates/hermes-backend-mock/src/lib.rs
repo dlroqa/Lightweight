@@ -158,6 +158,14 @@ pub struct MockBackend {
     /// which is the only way to prove that a request option a client sent was
     /// forwarded rather than quietly dropped in the layers above.
     last_request: Mutex<Option<GenerationRequest>>,
+    /// Generations in flight right now, and the most there have ever been.
+    ///
+    /// The high-water mark is what makes "these ran at the same time" an
+    /// assertion rather than an inference from wall-clock timing: two
+    /// generations that overlapped by a microsecond move it to two, and two
+    /// that ran one after the other never do.
+    in_flight: Arc<AtomicU32>,
+    peak_in_flight: AtomicU32,
     /// Slots the resident instance was loaded with, and 1 when none is.
     ///
     /// The real backend keeps this same number for the same reason: a
@@ -180,6 +188,8 @@ impl MockBackend {
             generations: AtomicU64::new(0),
             loads: AtomicU64::new(0),
             last_request: Mutex::new(None),
+            in_flight: Arc::new(AtomicU32::new(0)),
+            peak_in_flight: AtomicU32::new(0),
             slots: AtomicU32::new(1),
         }
     }
@@ -218,6 +228,14 @@ impl MockBackend {
     ///
     /// The trait's `load` takes a path and parsed metadata, which a test that
     /// only cares about the wire contract should not have to produce.
+    /// The most generations this backend has ever had in flight at once.
+    ///
+    /// One says every generation it was asked for ran alone, whatever the wall
+    /// clock suggests.
+    pub fn peak_concurrent_generations(&self) -> u32 {
+        self.peak_in_flight.load(Ordering::Relaxed)
+    }
+
     pub async fn make_resident(&self, model: ModelId, n_ctx: u32) -> LoadedModel {
         self.make_resident_with(model, RuntimeParams::default().with_context(n_ctx))
             .await
@@ -318,7 +336,11 @@ impl InferenceBackend for MockBackend {
                 detail: detail.clone(),
             });
         }
-        Ok(script_stream(config, cancel))
+        // The guard rides in the stream's state, so it is released when the
+        // stream ends *or* when the caller drops it - the same mechanism the
+        // gateway itself uses to release a slot on a disconnect.
+        let live = LiveGeneration::start(&self.in_flight, &self.peak_in_flight);
+        Ok(script_stream(config, cancel, live))
     }
 
     async fn count_prompt_tokens(
@@ -384,7 +406,32 @@ enum Step {
 }
 
 /// Turn a script into the event sequence a real backend would produce.
-fn script_stream(config: MockConfig, cancel: CancellationToken) -> GenerationStream {
+/// Counts one generation as live for as long as it exists.
+struct LiveGeneration {
+    in_flight: Arc<AtomicU32>,
+}
+
+impl LiveGeneration {
+    fn start(in_flight: &Arc<AtomicU32>, peak: &AtomicU32) -> Self {
+        let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        peak.fetch_max(now, Ordering::Relaxed);
+        Self {
+            in_flight: Arc::clone(in_flight),
+        }
+    }
+}
+
+impl Drop for LiveGeneration {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn script_stream(
+    config: MockConfig,
+    cancel: CancellationToken,
+    live: LiveGeneration,
+) -> GenerationStream {
     let prompt_tokens = config.prompt_tokens;
     let mut steps: Vec<Step> = vec![Step::Event(GenerationEvent::Started {
         prompt_tokens: Some(prompt_tokens),
@@ -476,8 +523,8 @@ fn script_stream(config: MockConfig, cancel: CancellationToken) -> GenerationStr
     };
 
     stream::unfold(
-        (steps.into_iter(), cancel, true),
-        move |(mut steps, cancel, first)| async move {
+        (steps.into_iter(), cancel, true, live),
+        move |(mut steps, cancel, first, live)| async move {
             let delay = if first { prefill } else { interval };
             if !delay.is_zero() {
                 tokio::select! {
@@ -490,8 +537,8 @@ fn script_stream(config: MockConfig, cancel: CancellationToken) -> GenerationStr
 
             let step = steps.next()?;
             match step {
-                Step::Event(event) => Some((Ok(event), (steps, cancel, false))),
-                Step::Error(err) => Some((Err(err), (steps, cancel, false))),
+                Step::Event(event) => Some((Ok(event), (steps, cancel, false, live))),
+                Step::Error(err) => Some((Err(err), (steps, cancel, false, live))),
                 Step::Repeat(fragment) => {
                     // Put the repeat back so the stream never ends on its own.
                     let event = GenerationEvent::ContentDelta {
@@ -505,6 +552,7 @@ fn script_stream(config: MockConfig, cancel: CancellationToken) -> GenerationStr
                                 vec![Step::Repeat(fragment)].into_iter(),
                                 cancel,
                                 false,
+                                live,
                             ),
                         )),
                     }

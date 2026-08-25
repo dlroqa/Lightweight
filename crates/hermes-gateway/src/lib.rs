@@ -96,6 +96,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/system", get(system::system))
         .route("/api/v1/gateway", get(control::gateway))
         .route("/api/v1/events", get(control::events))
+        .route("/api/v1/requests", get(control::requests))
         .route("/api/v1/logs", get(logs::logs))
         .route(
             "/api/v1/conversations",
@@ -176,6 +177,7 @@ fn is_monitoring(path: &str) -> bool {
             | "/api/v1/metrics"
             | "/api/v1/system"
             | "/api/v1/gateway"
+            | "/api/v1/requests"
             | "/api/v1/logs"
             | "/api/v1/events"
     )

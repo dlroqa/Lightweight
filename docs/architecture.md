@@ -148,7 +148,8 @@ progress. They now run under `spawn_blocking`.
 
 Every memory-shaping parameter is passed on the command line even when its
 default already matches: `--ctx-size`, `--batch-size`, `--ubatch-size`,
-`--parallel`, `--threads`, `--cache-type-k`, `--cache-type-v`.
+`--parallel`, `--threads`, `--cache-type-k`, `--cache-type-v`,
+`--no-kv-unified`, `--cont-batching`.
 
 The RAM estimate is computed for exactly those values. Leaving any of them to
 the engine would mean the estimate describes something other than what is
@@ -157,10 +158,97 @@ running, and the engine's defaults are not always what one would guess:
 we did not choose. Verified from `llama-server --help` at the pinned build, not
 from documentation.
 
+The last two were missing until M9, and both are defaults that depend on how
+`--parallel` was given: `--kv-unified` is enabled only when the slot count is
+left at auto, which this argv never does. Stating them changes nothing today and
+stops a future engine build from changing the KV layout under an estimate
+computed for the old one. `--ctx-size` is the one value not passed through as
+given — see "Why the context is multiplied before it reaches the engine".
+
 The KV cache type is also validated before launch. Only nine ggml types are
 accepted there — `f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1` — so `q6_K`,
 which is perfectly good for weights, is refused with the list of alternatives
 rather than surfacing as an opaque engine exit.
+
+## Why the context is multiplied before it reaches the engine
+
+`--ctx-size` is not the window one client gets. llama.cpp reads it as the total
+across the server's slots and divides: `n_ctx_seq = n_ctx / n_seq_max`, rounding
+down and saying so on a line nobody reads. Verified from the pinned build
+itself — `--help` describes `--parallel` as the "number of server slots",
+`libllama.so` carries both `"n_ctx is not divisible by n_seq_max - rounding
+down"` and the `n_ctx_seq` it prints at startup, and a launch with `-c 4096
+--parallel 2` reports `n_slots = 2, n_ctx_slot = 2048`.
+
+So the multiplication has to happen somewhere, and it happens in `build_args`
+and nowhere else. Above that line `RuntimeParams.n_ctx` has exactly one meaning:
+the window one client gets. That is what the overflow check, `clamp_max_tokens`,
+the band ceilings, `/props`, `/v1/models` and the estimator's per-sequence KV
+arithmetic all read it as. Multiplying at the three call sites that build
+params instead would be three places to disagree; redefining the field as a
+total would mean dividing at every site that advertises it, and a site added
+later would get it wrong silently.
+
+Two consequences worth stating. A product is always exactly divisible by its
+factor, so the engine's rounding-down path is never entered — which is asserted,
+because a silent round down is the failure this arithmetic exists to prevent.
+And the engine's own `/props` is read back once it is ready and the recorded
+parameters are reconciled with it: a smaller window is adopted and warned about,
+a larger one is ignored because admission control ran against the smaller
+number, and a read that failed leaves the load standing rather than trading a
+resident model for a metadata call.
+
+## Why the slot count is derived, and follows the engine
+
+Every other shape parameter is measured from the machine — the context is fitted
+against free memory, the thread count comes from the core count — and the slot
+count was a literal `1`. A constant describes whichever machine it was written
+on, which for a product that ships to laptops and workstations alike is the one
+thing it must not be.
+
+`auto` asks two questions and takes the smaller answer. **Cores**: one slot per
+four, because a single generation was *measured* to keep 3.0 to 3.8 of this
+machine's four cores busy — a second slot is not finding an idle core, it is
+taking one. **Memory**: at that many slots a full-sized window for every client
+must still be `Safe`, because the KV cache is per sequence and four clients at
+8192 tokens cost four caches. A machine that cannot hold them should serve fewer
+clients well rather than more badly.
+
+The number then follows the *engine*, not the command line: `Scheduler`'s
+capacity is re-derived on every load, beside the band ceilings and for the same
+reason M6a gives for those. A slot count inherited across a swap is correct for
+the model it was computed for and wrong for the one being served. Raising it
+hands the new slots to whoever is already queued; lowering it preempts nothing,
+because nothing here ever preempts.
+
+## Why fairness between clients is measured from the connection
+
+Bands answer "what does this request cost?" and cannot answer "whose turn is
+it?". Ten requests from one client and one from another are all in the same
+band, so first-come-first-served serves the newcomer eleventh — which is the
+same failure the bands were built for, one level up.
+
+The scheduler therefore keys fairness on the caller's address, taken off the
+connection where the kernel put it. That is the standard section 22 already sets
+for priority, applied to identity: a client cannot assert who it is any more
+than it can assert how important it is. The IP alone and never the port — a port
+is unique per connection, so keying on one would give a client with four
+connections four identities and a client reusing one a single identity for a
+hundred requests, which is the opposite of what fairness needs.
+
+Each caller's first waiting request competes with every other caller's first;
+its second waits behind every other caller's first. With a single caller the
+rounds run 0, 1, 2 in arrival order and the ordering is exactly what it was
+before there were clients in it — asserted by a test, because that is the
+property that makes this safe to add.
+
+**The address is a scheduling key and nothing else.** It is never logged, never
+a metric label, never serialized and never stored: it lives in the queue while a
+request waits and goes away with it. A per-client metric label would be the
+first unbounded dimension this gateway has ever emitted, and the roster on
+`/api/v1/requests` — which exists so that a person can see what is running while
+it is still running — carries the completion id, the model and the band, and no
+address at all.
 
 ## Why the gateway re-emits its own chunks
 

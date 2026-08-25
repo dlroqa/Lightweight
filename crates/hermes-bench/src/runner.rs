@@ -54,6 +54,14 @@ pub struct RunPlan {
     pub repetitions: u32,
     /// Which scenarios to run.
     pub scenarios: Vec<Scenario>,
+    /// How many clients [`Scenario::ConcurrentDecode`] runs at once.
+    ///
+    /// One means the concurrent scenario measures the same thing `Decode`
+    /// does, which is why the CLI only asks for it above one. It is not
+    /// clamped to the engine's slot count here: driving more clients than
+    /// there are slots is a queue measurement, which is a legitimate thing to
+    /// want to see, and the sample records both numbers.
+    pub concurrent: u32,
 }
 
 impl Default for RunPlan {
@@ -67,6 +75,7 @@ impl Default for RunPlan {
             generate_tokens: 32,
             repetitions: 3,
             scenarios: Scenario::ALL.to_vec(),
+            concurrent: 1,
         }
     }
 }
@@ -166,14 +175,55 @@ impl<'a> Runner<'a> {
                     repetition,
                     of: plan.repetitions,
                 });
-                let sample = self.one(*scenario, repetition, plan, &sized).await?;
-                samples.push(sample);
+                match scenario {
+                    Scenario::ConcurrentDecode => {
+                        samples.extend(self.all_at_once(repetition, plan, &sized).await?);
+                    }
+                    _ => samples.push(self.one(*scenario, repetition, plan, &sized).await?),
+                }
             }
         }
         if samples.is_empty() {
             return Err(BenchError::NothingMeasured);
         }
         Ok(samples)
+    }
+
+    /// Drive several clients through one decode at the same moment.
+    ///
+    /// Started together and awaited together, which is the only way the
+    /// measurement means anything: launching them in sequence would measure
+    /// one generation and then another, which is what [`Scenario::Decode`]
+    /// already does. Each client gets a distinct opening so that they do not
+    /// share a prefix — clients that did would have their prefills served from
+    /// each other's cache entries and report a batching win that is really a
+    /// cache hit.
+    ///
+    /// One sample per client, all carrying the same repetition, so a reader can
+    /// see the spread between clients as well as their total.
+    async fn all_at_once(
+        &self,
+        repetition: u32,
+        plan: &RunPlan,
+        sized: &SizedPrompt,
+    ) -> Result<Vec<Sample>, BenchError> {
+        let clients = plan.concurrent.max(1);
+        // A distinguishing lead per client *and* per repetition, so no two
+        // generations anywhere in the run share a prefix.
+        let generations = (0..clients).map(|client| {
+            let seed = repetition
+                .saturating_mul(clients)
+                .saturating_add(client)
+                .saturating_add(1);
+            self.one_with(
+                Scenario::ConcurrentDecode,
+                repetition,
+                sized.with_lead(seed),
+                plan.generate_tokens,
+                sized.tokens,
+            )
+        });
+        futures_util::future::try_join_all(generations).await
     }
 
     async fn one(
@@ -197,9 +247,31 @@ impl<'a> Runner<'a> {
             // The same prompt every time, which is the point: repetitions after
             // the first should find their prefix already in the cache.
             Scenario::CachedPrefill => (sized.text.clone(), 1),
-            Scenario::Decode => (sized.text.clone(), plan.generate_tokens),
+            Scenario::Decode | Scenario::ConcurrentDecode => {
+                (sized.text.clone(), plan.generate_tokens)
+            }
         };
+        // The sizer's count, exactly as every scenario has recorded since M8:
+        // the number the engine evaluated is `prefilled_tokens`, and reading
+        // that as the prompt's length makes every rate computed from it wrong
+        // by the size of the cache hit.
+        self.one_with(scenario, repetition, prompt, max_tokens, sized.tokens)
+            .await
+    }
 
+    /// Measure one generation of an already-chosen prompt.
+    ///
+    /// Split out of [`Runner::one`] so that the concurrent scenario can start
+    /// several of these at the same moment: the choice of prompt is per
+    /// scenario, and the measurement is not.
+    async fn one_with(
+        &self,
+        scenario: Scenario,
+        repetition: u32,
+        prompt: String,
+        max_tokens: u32,
+        prompt_tokens: u32,
+    ) -> Result<Sample, BenchError> {
         let request = Self::request(&prompt, max_tokens);
         let before = self.usage().await;
         let machine_before = hermes_system_info::cpu_times().ok();
@@ -253,7 +325,7 @@ impl<'a> Runner<'a> {
             // cached prompt is a single token — recorded separately below,
             // because reading it as the prompt's length makes every rate
             // computed from it wrong by the size of the cache hit.
-            prompt_tokens: sized.tokens,
+            prompt_tokens,
             cached_tokens: timings.map_or(0, |measured| measured.cached_n),
             prefilled_tokens: timings.map_or(0, |measured| measured.prompt_n),
             generated_tokens,
@@ -269,6 +341,13 @@ impl<'a> Runner<'a> {
             rss: after.as_ref().map(|usage| usage.rss),
             peak_rss: after.as_ref().map(|usage| usage.peak_rss),
             predicted: self.prediction,
+            busy_slots_per_decode: self
+                .backend
+                .engine_counters()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|counters| counters.busy_slots_per_decode),
         })
     }
 

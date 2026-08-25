@@ -242,6 +242,7 @@ mod tests {
                 rss: Some(Bytes::from_mib(180)),
                 peak_rss: Some(Bytes::from_mib(190)),
                 predicted: None,
+                busy_slots_per_decode: None,
             }],
         }
     }

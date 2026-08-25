@@ -55,7 +55,13 @@ pub struct RuntimeDefaults {
     pub threads: Option<u32>,
     /// Requests that may run at once, which the engine is told as `--parallel`
     /// and the RAM estimate is computed for.
-    pub concurrency: u32,
+    ///
+    /// `None` is `--concurrency auto`: the number is derived per load, from
+    /// this machine's cores and from whether that many of *this* model's
+    /// caches fit. Carried unresolved rather than as a number decided at
+    /// startup, because a gateway that starts with no model has nothing to
+    /// price yet, and a swap changes what fits.
+    pub concurrency: Option<u32>,
 }
 
 impl Default for RuntimeDefaults {
@@ -63,7 +69,7 @@ impl Default for RuntimeDefaults {
         Self {
             kv_type: GgmlType::F16,
             threads: None,
-            concurrency: 1,
+            concurrency: Some(1),
         }
     }
 }
@@ -582,7 +588,9 @@ pub async fn load_model(
                 .or(defaults.threads)
                 .unwrap_or_else(|| cpu.default_threads()),
         ),
-        n_parallel: defaults.concurrency.max(1),
+        // A placeholder: the real slot count is chosen below, once the budget
+        // and this model's caches are both known.
+        n_parallel: 1,
         threads_batch: options.threads_batch,
         load_mode: options.load_mode,
         ..RuntimeParams::default()
@@ -641,6 +649,22 @@ pub async fn load_model(
         hermes_core::units::Bytes::ZERO
     };
     let budget = hermes_memory::Budget::of(snapshot).reclaiming(reclaimable);
+
+    // How many clients this machine should serve *this* model to, decided
+    // before the context is fitted: the two are coupled through the KV cache,
+    // and fitting a window first would size it for a slot count that has not
+    // been chosen yet.
+    let slots = estimator.choose_concurrency(
+        defaults.concurrency,
+        cpu.logical_cores,
+        Some(&metadata),
+        base,
+        budget,
+    );
+    let base = RuntimeParams {
+        n_parallel: slots.slots,
+        ..base
+    };
 
     let chosen = choose_context(
         options.n_ctx,
@@ -747,8 +771,12 @@ pub async fn load_model(
     report_pump(pump.await);
     let loaded = loaded?;
 
-    // The ceilings follow the context that is actually running.
+    // The ceilings follow the context that is actually running, and the slot
+    // count follows the engine that is actually running. Inheriting either
+    // across a swap is the same failure: a number that was correct for the
+    // model it was computed for and is wrong for the one being served.
     scheduler.set_band_limits(BandLimits::for_context(loaded.effective.n_ctx));
+    scheduler.set_capacity(loaded.effective.n_parallel);
 
     let resident = ResidentModel {
         id: loaded.model.clone(),

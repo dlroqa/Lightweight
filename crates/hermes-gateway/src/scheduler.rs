@@ -30,7 +30,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -263,6 +263,49 @@ struct Counters {
     wait_ms_max: AtomicU64,
 }
 
+/// One request holding a slot, as a reader outside this module sees it.
+///
+/// Everything here is already published elsewhere - the completion id in the
+/// response, the model on `/v1/models`, the band in the metrics - so the roster
+/// adds a view rather than a new kind of disclosure. What it deliberately does
+/// not carry is the caller's address: that is a scheduling key, and this is a
+/// display.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RunningRequest {
+    /// The completion id the client was given, when the slot has been
+    /// described. Absent for a slot held by something with no completion - a
+    /// benchmark, most obviously.
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub band: &'static str,
+    /// How long this request has held its slot.
+    pub running_ms: u64,
+    /// The prompt the engine counted, when the slot has been described.
+    pub prompt_tokens: u32,
+}
+
+/// One request still waiting, as a reader outside this module sees it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct WaitingRequest {
+    /// The scheduler's own ticket number.
+    ///
+    /// Not a completion id: a queued request does not have one yet, because it
+    /// has not been given to the engine.
+    pub ticket: u64,
+    pub band: &'static str,
+    pub waited_ms: u64,
+    /// How many requests would be served before this one.
+    pub position: u32,
+}
+
+/// Who is running and who is waiting, at one instant.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Roster {
+    pub capacity: u32,
+    pub running: Vec<RunningRequest>,
+    pub waiting: Vec<WaitingRequest>,
+}
+
 /// A point-in-time reading of the queue.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QueueSnapshot {
@@ -306,18 +349,40 @@ struct Waiter {
     /// the advantage this exists to remove.
     round: u32,
     enqueued: Instant,
-    /// Signals that a slot is now this waiter's.
+    /// Signals that a slot is now this waiter's, and which slot it is.
     ///
-    /// A bare grant rather than the permit itself, deliberately: handing an
+    /// The slot's id rather than the permit itself, deliberately: handing an
     /// owned permit through the channel would mean a failed send returns it to
     /// a caller that is holding the queue lock, and dropping it there would
-    /// re-enter the release path against a lock it already owns.
-    grant: oneshot::Sender<()>,
+    /// re-enter the release path against a lock it already owns. An id is a
+    /// number, and the sender - which still holds the lock - simply removes
+    /// the entry again if nobody was there to receive it.
+    grant: oneshot::Sender<u64>,
+}
+
+/// One request that holds a slot right now.
+///
+/// The roster and the running count are the same collection, so they cannot
+/// disagree: a slot is held by exactly one [`SlotPermit`], and a permit is
+/// exactly one entry here.
+#[derive(Debug)]
+struct Running {
+    /// The permit's own id, so a permit can find its entry to describe it or
+    /// to remove it. Not the completion id, which a request does not have
+    /// until after it has been admitted.
+    id: u64,
+    band: Band,
+    started: Instant,
+    /// The completion id and model, once the request path has said what this
+    /// slot is being used for. Absent for a slot taken by something with no
+    /// such names - a benchmark, or a test.
+    id_and_model: Option<(String, String)>,
+    prompt_tokens: u32,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
-    running: usize,
+    running: Vec<Running>,
     waiting: VecDeque<Waiter>,
     next_id: u64,
     /// While paused, no new request starts.
@@ -331,7 +396,15 @@ struct Inner {
 /// Admission control for the engine's slots.
 #[derive(Debug)]
 pub struct Scheduler {
-    capacity: usize,
+    /// Slots this gateway hands out.
+    ///
+    /// Atomic rather than fixed because it follows the engine: the slot count
+    /// is derived from the machine *and* from the model being loaded, so a
+    /// swap to a model whose caches no longer fit must lower it. Inheriting it
+    /// across a swap would be the M5 band-ceiling failure in a new place —
+    /// a number that is correct for the model it was computed for and wrong
+    /// for the one actually running.
+    capacity: AtomicUsize,
     config: SchedulerConfig,
     /// The interactive ceilings, live.
     ///
@@ -352,7 +425,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(capacity: u32, config: SchedulerConfig) -> Arc<Self> {
         Arc::new(Self {
-            capacity: (capacity.max(1)) as usize,
+            capacity: AtomicUsize::new(capacity.max(1) as usize),
             config,
             interactive_prompt_tokens: AtomicU32::new(config.interactive.prompt_tokens),
             interactive_output_tokens: AtomicU32::new(config.interactive.output_tokens),
@@ -371,6 +444,35 @@ impl Scheduler {
         BandLimits {
             prompt_tokens: self.interactive_prompt_tokens.load(Ordering::Relaxed),
             output_tokens: self.interactive_output_tokens.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Slots this gateway is handing out right now.
+    pub fn capacity(&self) -> u32 {
+        self.capacity.load(Ordering::Relaxed) as u32
+    }
+
+    /// Set the slot count for a newly loaded engine.
+    ///
+    /// Raising it hands the new slots to whoever is already waiting, exactly as
+    /// lifting a pause does — otherwise they would sit in the queue until the
+    /// next release, in front of an engine with idle slots. Lowering it
+    /// preempts nothing: what is running finishes, and no further slot is
+    /// handed out until the count is back under the new limit.
+    pub fn set_capacity(self: &Arc<Self>, capacity: u32) {
+        let capacity = capacity.max(1) as usize;
+        self.capacity.store(capacity, Ordering::Relaxed);
+        let mut inner = self.lock();
+        if inner.paused {
+            // The pause will hand them out when it lifts, in one place.
+            return;
+        }
+        let now = Instant::now();
+        while inner.running.len() < capacity {
+            let Some(waiter) = self.take_next(&mut inner, now) else {
+                break;
+            };
+            self.hand_over(&mut inner, waiter);
         }
     }
 
@@ -408,17 +510,17 @@ impl Scheduler {
     pub async fn drain(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.lock().running == 0 {
+            if self.lock().running.is_empty() {
                 return true;
             }
             // Armed before the second check so a release that lands between the
             // two is not a lost wakeup.
             let waiting = self.drained.notified();
-            if self.lock().running == 0 {
+            if self.lock().running.is_empty() {
                 return true;
             }
             if tokio::time::timeout_at(deadline, waiting).await.is_err() {
-                return self.lock().running == 0;
+                return self.lock().running.is_empty();
             }
         }
     }
@@ -488,14 +590,40 @@ impl Scheduler {
     /// would take a free slot ahead of a queue it never joined, and no ordering
     /// among the waiters could matter.
     fn take_free_slot(self: &Arc<Self>, inner: &mut Inner) -> Option<SlotPermit> {
-        if !inner.paused && inner.running < self.capacity && inner.waiting.is_empty() {
-            inner.running += 1;
+        if !inner.paused
+            && inner.running.len() < self.capacity() as usize
+            && inner.waiting.is_empty()
+        {
             self.counters
                 .admitted_immediately
                 .fetch_add(1, Ordering::Relaxed);
-            return Some(SlotPermit::new(Arc::clone(self)));
+            return Some(self.start_running(inner, Band::default()));
         }
         None
+    }
+
+    /// Record a slot as taken and hand back the permit that holds it.
+    ///
+    /// The only place a running entry is created, as `release` is the only
+    /// place one is removed - which is what keeps the roster and the count of
+    /// busy slots the same fact rather than two facts that agree by habit.
+    fn start_running(self: &Arc<Self>, inner: &mut Inner, band: Band) -> SlotPermit {
+        let id = self.reserve_running(inner, band);
+        SlotPermit::new(Arc::clone(self), id)
+    }
+
+    /// Record a slot as taken, returning the entry's id.
+    fn reserve_running(&self, inner: &mut Inner, band: Band) -> u64 {
+        inner.next_id += 1;
+        let id = inner.next_id;
+        inner.running.push(Running {
+            id,
+            band,
+            started: Instant::now(),
+            id_and_model: None,
+            prompt_tokens: 0,
+        });
+        id
     }
 
     /// Add a waiter, under a lock already held.
@@ -570,8 +698,8 @@ impl Scheduler {
             .filter(|waiter| waiter.band == Band::Interactive)
             .count();
         QueueSnapshot {
-            capacity: self.capacity as u32,
-            running: inner.running as u32,
+            capacity: self.capacity(),
+            running: inner.running.len() as u32,
             waiting: inner.waiting.len() as u32,
             waiting_interactive: waiting_interactive as u32,
             waiting_bulk: (inner.waiting.len() - waiting_interactive) as u32,
@@ -585,15 +713,82 @@ impl Scheduler {
         }
     }
 
+    /// Who holds a slot and who is queued, at this instant.
+    ///
+    /// Taken under the same lock as the queue itself, so the roster and the
+    /// counts in [`Scheduler::snapshot`] cannot describe two different moments.
+    pub fn roster(&self) -> Roster {
+        let inner = self.lock();
+        let now = Instant::now();
+        let ceiling = self.config.starvation_ceiling;
+        let mut waiting: Vec<WaitingRequest> = inner
+            .waiting
+            .iter()
+            .map(|waiter| WaitingRequest {
+                ticket: waiter.id,
+                band: waiter.band.as_str(),
+                waited_ms: now.saturating_duration_since(waiter.enqueued).as_millis() as u64,
+                // The same key the scheduler picks by, so the roster cannot
+                // contradict the order actually served.
+                position: inner
+                    .waiting
+                    .iter()
+                    .filter(|other| rank(other, now, ceiling) < rank(waiter, now, ceiling))
+                    .count() as u32,
+            })
+            .collect();
+        waiting.sort_by_key(|entry| entry.position);
+        Roster {
+            capacity: self.capacity(),
+            running: inner
+                .running
+                .iter()
+                .map(|running| RunningRequest {
+                    id: running.id_and_model.as_ref().map(|(id, _)| id.clone()),
+                    model: running
+                        .id_and_model
+                        .as_ref()
+                        .map(|(_, model)| model.clone()),
+                    band: running.band.as_str(),
+                    running_ms: now.saturating_duration_since(running.started).as_millis() as u64,
+                    prompt_tokens: running.prompt_tokens,
+                })
+                .collect(),
+            waiting,
+        }
+    }
+
+    /// Give a waiter the slot, and say whether it took it.
+    ///
+    /// The entry is made before the grant is sent and removed again if the
+    /// send fails, so a slot is never recorded as running for a client that
+    /// has gone. What travels through the channel is the entry's id rather
+    /// than a permit: sending an owned permit would mean a failed send returns
+    /// it to a caller holding the queue lock, and dropping it there would
+    /// re-enter the release path against a lock it already owns.
+    fn hand_over(&self, inner: &mut Inner, waiter: Waiter) -> bool {
+        let id = self.reserve_running(inner, waiter.band);
+        if waiter.grant.send(id).is_ok() {
+            return true;
+        }
+        if let Some(index) = inner.running.iter().position(|running| running.id == id) {
+            inner.running.remove(index);
+        }
+        self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
     /// Give the slot back and hand it to whoever should have it next.
     ///
     /// Called from [`SlotPermit`]'s `Drop`, which is the only place a slot is
     /// ever released — there is no path that returns a permit by any other
     /// route, and therefore no path that leaks one.
-    fn release(&self) {
+    fn release(&self, id: u64) {
         let mut inner = self.lock();
-        inner.running = inner.running.saturating_sub(1);
-        if inner.running == 0 {
+        if let Some(index) = inner.running.iter().position(|running| running.id == id) {
+            inner.running.remove(index);
+        }
+        if inner.running.is_empty() {
             // Tell a swap that the engine is now idle. Notifying under the lock
             // is deliberate: the waiter re-checks `running` after being woken,
             // so it cannot observe a stale zero.
@@ -609,11 +804,9 @@ impl Scheduler {
         // in the microseconds between being picked and being told) must not
         // consume the slot: try the next waiter instead, until one takes it.
         while let Some(waiter) = self.take_next(&mut inner, now) {
-            if waiter.grant.send(()).is_ok() {
-                inner.running += 1;
+            if self.hand_over(&mut inner, waiter) {
                 return;
             }
-            self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -659,15 +852,11 @@ impl Scheduler {
         let mut inner = self.lock();
         inner.paused = false;
         let now = Instant::now();
-        while inner.running < self.capacity {
+        while inner.running.len() < self.capacity() as usize {
             let Some(waiter) = self.take_next(&mut inner, now) else {
                 break;
             };
-            if waiter.grant.send(()).is_ok() {
-                inner.running += 1;
-            } else {
-                self.counters.abandoned.fetch_add(1, Ordering::Relaxed);
-            }
+            self.hand_over(&mut inner, waiter);
         }
     }
 
@@ -757,7 +946,7 @@ pub struct Ticket {
     band: Band,
     enqueued: Instant,
     scheduler: Arc<Scheduler>,
-    granted: oneshot::Receiver<()>,
+    granted: oneshot::Receiver<u64>,
     taken: bool,
     /// What to count if this ticket leaves the queue without a slot.
     ///
@@ -834,12 +1023,12 @@ impl Ticket {
     /// `None` when the scheduler went away, which only happens at shutdown.
     pub async fn granted(&mut self) -> Option<SlotPermit> {
         match (&mut self.granted).await {
-            Ok(()) => {
+            Ok(slot) => {
                 // Set before returning and with no await in between, so a
                 // future dropped at this point cannot lose the slot: either the
                 // permit exists, or `Drop` still finds the grant unclaimed.
                 self.taken = true;
-                Some(SlotPermit::new(Arc::clone(&self.scheduler)))
+                Some(SlotPermit::new(Arc::clone(&self.scheduler), slot))
             }
             Err(_) => None,
         }
@@ -859,8 +1048,8 @@ impl Drop for Ticket {
         // that went away before claiming it. Nothing else knows about that
         // slot, so it has to be given back here or the gateway loses it for the
         // life of the process.
-        if self.granted.try_recv().is_ok() {
-            self.scheduler.release();
+        if let Ok(slot) = self.granted.try_recv() {
+            self.scheduler.release(slot);
         }
     }
 }
@@ -874,17 +1063,49 @@ impl Drop for Ticket {
 #[derive(Debug)]
 pub struct SlotPermit {
     scheduler: Arc<Scheduler>,
+    /// Which running entry this permit holds.
+    slot: u64,
 }
 
 impl SlotPermit {
-    fn new(scheduler: Arc<Scheduler>) -> Self {
-        Self { scheduler }
+    fn new(scheduler: Arc<Scheduler>, slot: u64) -> Self {
+        Self { scheduler, slot }
+    }
+
+    /// Say what this slot is being used for, for the roster.
+    ///
+    /// Called once the request path knows the completion id, the model and the
+    /// prompt it counted - all of which are decided after admission. A slot
+    /// nobody describes still appears in the roster with its band and its
+    /// elapsed time, which is what a benchmark or a test looks like.
+    pub fn describe(&self, id: impl Into<String>, model: impl Into<String>, prompt_tokens: u32) {
+        let mut inner = self.scheduler.lock();
+        if let Some(running) = inner
+            .running
+            .iter_mut()
+            .find(|running| running.id == self.slot)
+        {
+            running.id_and_model = Some((id.into(), model.into()));
+            running.prompt_tokens = prompt_tokens;
+        }
+    }
+
+    /// Record which band this slot was granted for.
+    pub fn in_band(&self, band: Band) {
+        let mut inner = self.scheduler.lock();
+        if let Some(running) = inner
+            .running
+            .iter_mut()
+            .find(|running| running.id == self.slot)
+        {
+            running.band = band;
+        }
     }
 }
 
 impl Drop for SlotPermit {
     fn drop(&mut self) {
-        self.scheduler.release();
+        self.scheduler.release(self.slot);
     }
 }
 
@@ -1199,6 +1420,49 @@ mod tests {
         assert_eq!(fifth.position(), Some(0), "next, but not yet running");
         assert_eq!(scheduler.snapshot().waiting, 1);
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn raising_the_slot_count_hands_the_new_slots_to_whoever_is_waiting() {
+        // A model swap can raise the count. Without this the new slots sit
+        // idle in front of a queue until the next release, which on a gateway
+        // that has just been given more capacity is the opposite of what the
+        // operator asked for.
+        let scheduler = scheduler(1);
+        let _running = scheduler.try_admit().expect("a free slot");
+        let mut waiting: Vec<_> = (0..2)
+            .map(|_| scheduler.enqueue(Band::Bulk, one_client()))
+            .collect();
+
+        scheduler.set_capacity(3);
+
+        assert_eq!(scheduler.snapshot().capacity, 3);
+        assert!(granted_now(&mut waiting[0]).is_some());
+        assert!(granted_now(&mut waiting[1]).is_some());
+        assert_eq!(scheduler.snapshot().waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn lowering_the_slot_count_preempts_nothing() {
+        // The other direction: a swap to a model whose caches cost more can
+        // only lower the count, and lowering it must not disturb a generation
+        // that is already running - the engine cannot pause one, and killing
+        // it would discard the prefill that dominates its cost.
+        let scheduler = scheduler(3);
+        let permits: Vec<_> = (0..3)
+            .map(|_| scheduler.try_admit().expect("a free slot"))
+            .collect();
+
+        scheduler.set_capacity(1);
+
+        assert_eq!(scheduler.snapshot().running, 3, "nothing was preempted");
+        let mut queued = scheduler.enqueue(Band::Bulk, one_client());
+        drop(permits);
+        assert!(
+            granted_now(&mut queued).is_some(),
+            "the queue should resume once the count is back under the limit"
+        );
+        assert_eq!(scheduler.snapshot().capacity, 1);
     }
 
     #[tokio::test]

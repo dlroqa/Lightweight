@@ -12,6 +12,7 @@ like "the model returns nothing at all" is one HTTP call rather than an
 unreproducible accident.
 """
 
+import contextlib
 import json
 import os
 import pathlib
@@ -32,9 +33,9 @@ MODEL = "mock-model@4k"
 N_CTX = 4096
 
 
-@pytest.fixture(scope="session")
-def gateway():
-    """Start the mock gateway once, and stop it when the session ends."""
+@contextlib.contextmanager
+def _gateway(concurrency=1):
+    """Start a mock gateway, yield what it printed, and stop it afterwards."""
     if not BINARY.exists():
         pytest.fail(
             f"{BINARY} is missing. Build it with:\n"
@@ -42,7 +43,13 @@ def gateway():
         )
 
     process = subprocess.Popen(
-        [str(BINARY), "--port", "0", "--ctx", str(N_CTX), "--model", "mock-model"],
+        [
+            str(BINARY),
+            "--port", "0",
+            "--ctx", str(N_CTX),
+            "--model", "mock-model",
+            "--concurrency", str(concurrency),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -77,29 +84,59 @@ def gateway():
             process.kill()
 
 
+@pytest.fixture(scope="session")
+def gateway():
+    """One gateway, one slot, for the whole session."""
+    with _gateway() as info:
+        yield info
+
+
+@pytest.fixture
+def two_slot_gateway():
+    """A gateway with two slots, for tests that drive two clients at once.
+
+    Its own process rather than the session one: the slot count is settled
+    before the first listener binds, and a test that needs two must not change
+    what every other test in the suite is running against.
+    """
+    with _gateway(concurrency=2) as info:
+        assert info["concurrency"] == 2, info
+        yield info
+
+
 @pytest.fixture
 def script(gateway):
     """Tell the mock engine what to produce for the next request."""
 
     def apply(**spec):
-        # The control route takes the script as a nested object, with the knobs
-        # that are not part of the script - the prompt size it reports, the
-        # prefill it simulates - beside it.
-        body = {"script": {key: value for key, value in spec.items()
-                           if key not in ("prompt_tokens", "prefill_ms")}}
-        for key in ("prompt_tokens", "prefill_ms"):
-            if key in spec:
-                body[key] = spec[key]
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{gateway['port']}/__test__/script",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            assert response.status == 204, response.status
+        set_script(gateway, **spec)
 
     return apply
+
+
+def set_script(info, **spec):
+    """Tell one gateway's mock engine what to produce next.
+
+    A function as well as a fixture because a test with its own gateway - a
+    two-slot one, say - still needs to script it, and the fixture is bound to
+    the session's.
+    """
+    # The control route takes the script as a nested object, with the knobs
+    # that are not part of the script - the prompt size it reports, the
+    # prefill it simulates - beside it.
+    body = {"script": {key: value for key, value in spec.items()
+                       if key not in ("prompt_tokens", "prefill_ms")}}
+    for key in ("prompt_tokens", "prefill_ms"):
+        if key in spec:
+            body[key] = spec[key]
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{info['port']}/__test__/script",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        assert response.status == 204, response.status
 
 
 @pytest.fixture

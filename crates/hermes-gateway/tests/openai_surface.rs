@@ -1966,6 +1966,10 @@ async fn the_event_stream_reports_a_generation_the_client_abandoned() {
     // No finish reason: this generation ended because the client left, which is
     // a deliberate act and not an error.
     assert!(event["finish_reason"].is_null(), "{event}");
+    // Which queue served it, in the same spelling the metrics label uses. It
+    // has been measured since M8 and was never published, so a reader could
+    // see that a request waited without seeing what it waited as.
+    assert_eq!(event["band"], "interactive", "{event}");
 
     // The feed carries what the log carries, and no more.
     assert!(

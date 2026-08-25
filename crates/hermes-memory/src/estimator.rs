@@ -14,6 +14,64 @@ const MARGIN_FRACTION: f64 = 0.15;
 /// Below this, reducing the context is not worth offering as a remedy.
 const MIN_USEFUL_CONTEXT: u32 = 512;
 
+/// Cores one slot needs before a second slot is worth opening.
+///
+/// **Measured, not chosen.** Benchmark run `18ceefe0aa03aba1` on the
+/// development machine - a 4-core Pentium Silver J5005 without AVX - swept one,
+/// two and four slots against SmolLM2-135M at a 1024-token window per client:
+///
+/// | slots | aggregate decode | per client | busy slots per decode |
+/// |------:|-----------------:|-----------:|----------------------:|
+/// | 1     | 3.95 t/s         | 3.95 t/s   | 1.00                  |
+/// | 2     | ~4.8 t/s         | 2.39 t/s   | 1.30                  |
+/// | 4     | ~4.9 t/s         | 1.23 t/s   | 1.90                  |
+///
+/// A second slot buys about a fifth more total throughput and costs each client
+/// close to half its speed; a fourth buys nothing further and costs three
+/// quarters. The reason is in the last column of the same run: a *single*
+/// generation already kept 3.0 to 3.8 of the four cores busy, so a second slot
+/// is not finding an idle core, it is taking one.
+///
+/// Four is therefore the number of cores one slot needs to run without stealing
+/// from another, and on this machine the rule yields exactly one slot. On a
+/// sixteen-core machine it yields four. That is the point of deriving it: the
+/// box this was measured on is not frozen into the product, and no machine is
+/// promised concurrency it cannot spend.
+const CORES_PER_SLOT: u32 = 4;
+
+/// Where a slot count came from.
+///
+/// The same shape and the same purpose as the context's source: so the operator
+/// can be told *why* the number is what it is, rather than being handed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConcurrencySource {
+    /// The operator asked for exactly this many.
+    Requested,
+    /// What this machine's cores support, and its memory affords.
+    Fitted,
+    /// Fewer than the cores would allow, because the memory would not hold it.
+    ReducedToFit,
+}
+
+impl ConcurrencySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Fitted => "fitted",
+            Self::ReducedToFit => "reduced_to_fit",
+        }
+    }
+}
+
+/// How many requests to serve at once, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConcurrencyChoice {
+    pub slots: u32,
+    pub source: ConcurrencySource,
+    /// Cores the rule was derived from, for the sentence that explains it.
+    pub cores: u32,
+}
+
 /// Computes memory estimates and admission verdicts.
 #[derive(Clone, Debug, Default)]
 pub struct Estimator {
@@ -1053,6 +1111,91 @@ impl Estimator {
         self.largest_safe_context_against(metadata, base, Budget::of(snapshot), ceiling)
     }
 
+    /// How many requests this machine should serve at once.
+    ///
+    /// Two rules, and the smaller wins.
+    ///
+    /// 1. **Cores.** One slot per [`CORES_PER_SLOT`], because that is what a
+    ///    single generation was measured to occupy. A slot with no core to
+    ///    decode on does not add throughput; it divides the throughput that
+    ///    was already there and makes every client slower.
+    /// 2. **Memory.** At that many slots a full-sized window for every client
+    ///    must still be `Safe`. The KV cache is per sequence, so this is the
+    ///    rule that binds on a small machine: four clients at 8192 tokens cost
+    ///    four caches, and a machine that cannot hold them should serve fewer
+    ///    clients well rather than more badly.
+    ///
+    /// Stepping down rather than solving, because the memory rule is not
+    /// invertible: `estimate_against` is what decides `Safe`, and the honest
+    /// way to ask it a question is to ask it. The loop runs at most as many
+    /// times as the cores allow slots, which is a single-digit number, once per
+    /// load.
+    ///
+    /// A requested count is honoured exactly, the way a requested context is:
+    /// an operator who asks for four slots has said something about their
+    /// machine that this function cannot know. The estimate still runs, and an
+    /// unaffordable choice is still refused by admission control - being told
+    /// what you asked for is not the same as being promised it will fit.
+    pub fn choose_concurrency(
+        &self,
+        requested: Option<u32>,
+        cores: u32,
+        metadata: Option<&ModelMetadata>,
+        base: RuntimeParams,
+        budget: Budget,
+    ) -> ConcurrencyChoice {
+        if let Some(slots) = requested {
+            return ConcurrencyChoice {
+                slots: slots.max(1),
+                source: ConcurrencySource::Requested,
+                cores,
+            };
+        }
+
+        let from_cores = (cores / CORES_PER_SLOT).max(1);
+        let Some(metadata) = metadata else {
+            // No model to price. The cores rule alone is an upper bound, and
+            // the memory rule is applied by the load that names a model - which
+            // is where the caches it would have to hold are finally known.
+            return ConcurrencyChoice {
+                slots: from_cores,
+                source: ConcurrencySource::Fitted,
+                cores,
+            };
+        };
+        for slots in (1..=from_cores).rev() {
+            let params = RuntimeParams {
+                n_parallel: slots,
+                ..base
+            };
+            if self.estimate_against(metadata, params, budget).verdict == Verdict::Safe {
+                return ConcurrencyChoice {
+                    slots,
+                    source: if slots == from_cores {
+                        ConcurrencySource::Fitted
+                    } else {
+                        ConcurrencySource::ReducedToFit
+                    },
+                    cores,
+                };
+            }
+        }
+
+        // Nothing fit, including one slot. One is still the answer: a gateway
+        // that serves nobody is not a smaller version of a gateway that serves
+        // one client badly, and the load itself is refused by admission
+        // control with the remedies that belong to it.
+        ConcurrencyChoice {
+            slots: 1,
+            source: if from_cores == 1 {
+                ConcurrencySource::Fitted
+            } else {
+                ConcurrencySource::ReducedToFit
+            },
+            cores,
+        }
+    }
+
     /// The same search, against a budget that may include memory about to be
     /// released.
     ///
@@ -1085,6 +1228,106 @@ impl Estimator {
 mod scaling_tests {
     use super::tests_support::*;
     use super::*;
+
+    #[test]
+    fn four_cores_serve_one_client_because_one_generation_uses_four_cores() {
+        // The development machine, and the measurement the rule is built on:
+        // a single generation kept 3.0-3.8 of these four cores busy, so a
+        // second slot takes a core rather than finding one.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let choice = estimator.choose_concurrency(
+            None,
+            4,
+            Some(&metadata),
+            RuntimeParams::default().with_context(2048),
+            Budget::of(machine(64)),
+        );
+        assert_eq!(choice.slots, 1);
+        assert_eq!(choice.source, ConcurrencySource::Fitted);
+    }
+
+    #[test]
+    fn a_bigger_machine_serves_more_clients_at_once() {
+        // The other half of "derived from the machine": the same build on a
+        // sixteen-core box should not serve one client at a time because the
+        // box it was written on could only do that.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let choice = estimator.choose_concurrency(
+            None,
+            16,
+            Some(&metadata),
+            RuntimeParams::default().with_context(2048),
+            Budget::of(machine(64)),
+        );
+        assert_eq!(choice.slots, 4);
+        assert_eq!(choice.source, ConcurrencySource::Fitted);
+    }
+
+    #[test]
+    fn slots_are_given_up_before_the_memory_runs_out() {
+        // The KV cache is per sequence, so the cores' answer is only an upper
+        // bound. A machine with cores for four clients and memory for two
+        // serves two - and says that is why.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let roomy = estimator.choose_concurrency(
+            None,
+            16,
+            Some(&metadata),
+            RuntimeParams::default().with_context(8192),
+            Budget::of(machine(64)),
+        );
+        // Four GiB available against this model's 1 GiB of KV per client. The
+        // search steps down one slot at a time rather than halving, so it
+        // finds three: 3.06 GiB estimated plus a 0.6 GiB margin fits in four,
+        // and a fourth client would not.
+        let cramped = estimator.choose_concurrency(
+            None,
+            16,
+            Some(&metadata),
+            RuntimeParams::default().with_context(8192),
+            Budget::of(machine(4)),
+        );
+        assert_eq!(roomy.slots, 4, "the cores allow four");
+        assert_eq!(cramped.slots, 3, "and the memory allows three");
+        assert_eq!(cramped.source, ConcurrencySource::ReducedToFit);
+    }
+
+    #[test]
+    fn an_operator_who_names_a_number_is_given_that_number() {
+        // The same rule a requested context follows: somebody who asks has
+        // said something about their machine this cannot know. Admission
+        // control still judges whether it fits.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let choice = estimator.choose_concurrency(
+            Some(8),
+            4,
+            Some(&metadata),
+            RuntimeParams::default().with_context(8192),
+            Budget::of(machine(4)),
+        );
+        assert_eq!(choice.slots, 8);
+        assert_eq!(choice.source, ConcurrencySource::Requested);
+    }
+
+    #[test]
+    fn a_machine_that_can_hold_nothing_still_serves_one_client() {
+        // Zero slots is not a smaller gateway, it is no gateway. The load is
+        // refused by admission control, with the remedies that belong to it.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let choice = estimator.choose_concurrency(
+            None,
+            16,
+            Some(&metadata),
+            RuntimeParams::default().with_context(32768),
+            Budget::of(machine(1)),
+        );
+        assert_eq!(choice.slots, 1);
+    }
 
     #[test]
     fn a_bigger_machine_is_offered_a_bigger_context() {

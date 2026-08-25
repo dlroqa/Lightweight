@@ -11,7 +11,7 @@ pub mod estimate;
 pub mod estimator;
 
 pub use estimate::{Budget, ComputeModel, Confidence, Estimate, Verdict};
-pub use estimator::Estimator;
+pub use estimator::{ConcurrencyChoice, ConcurrencySource, Estimator};
 /// Re-exported from `hermes-core`: the estimator and the inference backend must
 /// agree on exactly these parameters, so they share one definition.
 pub use hermes_core::RuntimeParams;

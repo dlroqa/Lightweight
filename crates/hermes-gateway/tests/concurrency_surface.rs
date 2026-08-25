@@ -118,33 +118,42 @@ fn body(max_tokens: u32) -> Value {
     })
 }
 
-/// The first queue notice a streamed response carries.
+/// A queue notice from a streamed response, skipping the ones already sent.
 ///
 /// A queued request is answered immediately with headers and then says where it
-/// stands in an SSE comment, so this reads the body incrementally and stops at
-/// the first one. Reading the body to completion instead would wait for a
-/// generation that has not started yet.
+/// stands in an SSE comment every notice interval, so this reads the body
+/// incrementally rather than to completion — the generation has not started
+/// yet, and waiting for it would wait for the slot these tests are holding.
 ///
 /// **The response is borrowed, never consumed.** Dropping it disconnects that
 /// client, which withdraws it from the queue and moves everybody behind it — so
 /// a reader that took ownership would change the queue it was measuring the
-/// moment it returned, and the position another client read a moment later
-/// would depend on which read happened to finish first.
-async fn first_queue_notice(response: &mut reqwest::Response) -> Option<String> {
+/// moment it returned.
+///
+/// **`skip` is why a test can assert a position at all.** The first notice is
+/// emitted one interval after *that* request was queued, which may be before a
+/// later client has arrived — so it reports a queue that was still forming.
+/// Skipping it means the notice returned was computed after every request in
+/// the test had been sent, whatever order the machine got round to them in.
+async fn queue_notice(response: &mut reqwest::Response, skip: usize) -> Option<String> {
     let mut body = String::new();
+    let mut seen = 0;
     let read = async {
         while let Ok(Some(chunk)) = response.chunk().await {
             body.push_str(&String::from_utf8_lossy(&chunk));
-            if let Some(line) = body
+            let notices: Vec<&str> = body
                 .lines()
-                .find(|line| line.starts_with(": queued position="))
-            {
-                return Some(line.to_owned());
+                .filter(|line| line.starts_with(": queued position="))
+                .collect();
+            if notices.len() > skip {
+                return Some(notices[skip].to_owned());
             }
+            seen = notices.len();
         }
+        let _ = seen;
         None
     };
-    tokio::time::timeout(Duration::from_secs(5), read)
+    tokio::time::timeout(Duration::from_secs(10), read)
         .await
         .ok()
         .flatten()
@@ -205,9 +214,10 @@ async fn two_clients_are_told_apart_by_the_connection_they_arrived_on() {
     // the response, and consuming it disconnects that client - which withdraws
     // it from the queue and moves everybody behind it. Sequential reads would
     // measure the queue as it was left by the previous read.
+    // The second notice from each, not the first: see `queue_notice`.
     let (notice_b, notice_c) = tokio::join!(
-        first_queue_notice(&mut queued_b),
-        first_queue_notice(&mut queued_c)
+        queue_notice(&mut queued_b, 1),
+        queue_notice(&mut queued_c, 1)
     );
     let notice_b = notice_b.expect("a queue notice");
     let notice_c = notice_c.expect("a queue notice");
@@ -261,8 +271,8 @@ async fn one_client_sending_twice_keeps_the_order_it_sent_in() {
     // Together, for the reason the two-client test gives: reading one notice
     // disconnects that client and reorders the queue behind it.
     let (notice_a, notice_b) = tokio::join!(
-        first_queue_notice(&mut queued_a),
-        first_queue_notice(&mut queued_b)
+        queue_notice(&mut queued_a, 1),
+        queue_notice(&mut queued_b, 1)
     );
     let notice_a = notice_a.expect("a queue notice");
     let notice_b = notice_b.expect("a queue notice");
@@ -326,4 +336,127 @@ async fn two_clients_are_served_at_once_when_the_gateway_has_two_slots() {
     drop(two);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(harness.state.scheduler().snapshot().running, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_is_running_now_can_be_asked_for_while_it_is_still_running() {
+    ensure_provider();
+    // The gap this closes: `/api/v1/events` reports a generation once it has
+    // finished, so a gateway serving two clients for two minutes each looked
+    // from outside much like an idle one until they both finished at once.
+    let harness = Harness::start(
+        MockConfig {
+            script: Script::Endless {
+                fragment: "tick ".into(),
+                interval: Duration::from_millis(20),
+            },
+            prompt_tokens: 37,
+            ..MockConfig::default()
+        },
+        GatewayConfig {
+            max_concurrent_requests: 2,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let client = client_from(None);
+    let one = client
+        .post(format!("{}/v1/chat/completions", harness.base))
+        .json(&body(4000))
+        .send()
+        .await
+        .expect("request");
+    let two = client
+        .post(format!("{}/v1/chat/completions", harness.base))
+        .json(&body(4000))
+        .send()
+        .await
+        .expect("request");
+
+    let roster: Value = client
+        .get(format!("{}/api/v1/requests", harness.base))
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+
+    assert_eq!(roster["capacity"], 2);
+    let running = roster["running"].as_array().expect("a running list");
+    assert_eq!(running.len(), 2, "both clients should be listed: {roster}");
+    for entry in running {
+        assert!(
+            entry["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("chatcmpl-")),
+            "a running request should carry the id its client was given: {entry}"
+        );
+        assert_eq!(entry["model"], "mock-model@4k");
+        assert_eq!(entry["prompt_tokens"], 37);
+        assert_eq!(entry["band"], "bulk");
+    }
+    assert!(
+        roster["waiting"]
+            .as_array()
+            .expect("a waiting list")
+            .is_empty()
+    );
+
+    // Nothing in the body names the caller. The address decides who goes next
+    // and is never shown.
+    let rendered = roster.to_string();
+    assert!(
+        !rendered.contains("127.0.0."),
+        "an address reached the roster: {rendered}"
+    );
+
+    drop(one);
+    drop(two);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_request_appears_in_the_roster_with_its_place() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            max_concurrent_requests: 1,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let busy = harness
+        .state
+        .try_acquire_slot()
+        .expect("the gateway starts idle");
+
+    let client = client_from(None);
+    let mut queued = client
+        .post(format!("{}/v1/chat/completions", harness.base))
+        .json(&body(4000))
+        .send()
+        .await
+        .expect("request");
+
+    let roster: Value = client
+        .get(format!("{}/api/v1/requests", harness.base))
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+
+    let waiting = roster["waiting"].as_array().expect("a waiting list");
+    assert_eq!(waiting.len(), 1, "{roster}");
+    assert_eq!(waiting[0]["position"], 0, "next, and still waiting");
+    assert_eq!(waiting[0]["band"], "bulk");
+    // A queued request has no completion id yet - it has not been given to the
+    // engine - so it is identified by its ticket instead of pretending to one.
+    assert!(waiting[0]["ticket"].as_u64().is_some());
+
+    drop(busy);
+    let _ = queue_notice(&mut queued, 0).await;
 }

@@ -116,16 +116,21 @@ enum Command {
         /// Port to bind. `0` picks a free one and prints it.
         #[arg(long, default_value_t = 8737)]
         port: u16,
-        /// Requests to run at once.
+        /// Requests to run at once, or `auto`.
         ///
-        /// One by default, because the engine serves one sequence at a time and
-        /// a second concurrent generation on a small CPU makes both slower than
-        /// running them in turn. Raise it on a machine with cores and memory to
-        /// spare: the engine is given the same number of slots and the RAM
-        /// estimate is computed for it, so the answer to "does this fit?" stays
-        /// honest.
-        #[arg(long, default_value_t = 1)]
-        concurrency: u32,
+        /// `auto` derives it from this machine and says where the number came
+        /// from: one slot per four cores, because a single generation was
+        /// measured to keep close to four busy, and fewer than that if a
+        /// full-sized window for every client would not fit in memory. On a
+        /// small CPU that is one, which is what this has always defaulted to;
+        /// on a machine with cores and memory to spare it is more, without
+        /// anybody having to know to ask.
+        ///
+        /// A number overrides it and is honoured exactly. The engine is given
+        /// the same number of slots and the RAM estimate is computed for it,
+        /// so the answer to "does this fit?" stays honest either way.
+        #[arg(long, default_value = "auto")]
+        concurrency: serve::Concurrency,
         /// Serve the control panel's built files at `/`.
         ///
         /// The directory a `vite build` produced. Serving it from the gateway
@@ -197,6 +202,14 @@ enum Command {
         /// single value cannot separate them.
         #[arg(long, value_delimiter = ',', default_values_t = [512_u32])]
         ubatch: Vec<u32>,
+        /// Slot counts to sweep, reloading the engine for each.
+        ///
+        /// Above one, the run adds a scenario that drives that many clients at
+        /// the same moment - which is the only way to see whether the engine
+        /// batches them or serves them in turn. Each client is given the whole
+        /// `--ctx`, so the memory cost rises with this.
+        #[arg(long, value_delimiter = ',', default_values_t = [1_u32])]
+        parallel: Vec<u32>,
         /// Fit the measured residuals into `calibration.json`.
         ///
         /// Nothing reads that file yet: the estimator keeps its shipped
@@ -396,6 +409,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             generate_tokens,
             repeat,
             ubatch,
+            parallel,
             fit,
         } => {
             let options = bench::BenchOptions {
@@ -407,6 +421,7 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 generate_tokens: *generate_tokens,
                 repetitions: *repeat,
                 ubatch: ubatch.clone(),
+                parallel: parallel.clone(),
                 fit: *fit,
                 json: cli.json,
             };

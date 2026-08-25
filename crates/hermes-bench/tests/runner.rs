@@ -78,6 +78,7 @@ async fn a_run_produces_one_sample_per_scenario_per_repetition() {
         prompt_tokens: 64,
         generate_tokens: 8,
         repetitions: 2,
+        concurrent: 1,
         scenarios: vec![Scenario::ColdPrefill, Scenario::Decode],
     };
 
@@ -128,6 +129,7 @@ async fn what_is_recorded_is_what_the_engine_reported() {
         prompt_tokens: 32,
         generate_tokens: 4,
         repetitions: 1,
+        concurrent: 1,
         scenarios: vec![Scenario::Decode],
     };
 
@@ -155,6 +157,7 @@ async fn nothing_a_run_records_can_hold_the_prompt_it_used() {
         prompt_tokens: 32,
         generate_tokens: 2,
         repetitions: 1,
+        concurrent: 1,
         scenarios: vec![Scenario::ColdPrefill],
     };
 
@@ -176,6 +179,7 @@ async fn a_prompt_that_will_not_reach_its_target_is_refused_rather_than_measured
     let plan = RunPlan {
         prompt_tokens: 512,
         repetitions: 1,
+        concurrent: 1,
         scenarios: vec![Scenario::ColdPrefill],
         ..RunPlan::default()
     };
@@ -183,4 +187,61 @@ async fn a_prompt_that_will_not_reach_its_target_is_refused_rather_than_measured
     let error = runner.run(&plan, |_| {}).await.expect_err("refused");
     let text = error.to_string();
     assert!(text.contains("512") && text.contains("11"), "{text}");
+}
+
+#[tokio::test]
+async fn concurrent_clients_are_measured_at_the_same_moment() {
+    // The scenario is worthless if the clients run one after another: it would
+    // measure what `Decode` already measures and report it under a name that
+    // claims otherwise. Asserted from the backend's own high-water mark rather
+    // than from wall-clock timing, which on a contended box measures the box.
+    let (backend, instance) = loaded(MockConfig {
+        // A little work per client, so an implementation that awaited them in
+        // sequence would have finished the first before starting the second.
+        token_interval: std::time::Duration::from_millis(5),
+        ..counting(64)
+    })
+    .await;
+    let params = RuntimeParams {
+        n_parallel: 3,
+        ..RuntimeParams::default()
+    };
+    let runner = Runner::new(&backend, instance, params, 4);
+    let plan = RunPlan {
+        prompt_tokens: 64,
+        generate_tokens: 4,
+        repetitions: 2,
+        concurrent: 3,
+        scenarios: vec![Scenario::ConcurrentDecode],
+    };
+
+    let samples = runner.run(&plan, |_| {}).await.expect("a run");
+
+    assert_eq!(
+        samples.len(),
+        6,
+        "one sample per client per repetition, so the spread between clients is visible"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|sample| sample.scenario == Scenario::ConcurrentDecode)
+    );
+    assert_eq!(
+        backend.peak_concurrent_generations(),
+        3,
+        "the clients did not overlap, so this measured a queue rather than a batch"
+    );
+    // The slot count is not a field on the sample because it is already here,
+    // exactly as the engine was launched with it.
+    assert!(samples.iter().all(|sample| sample.params.n_parallel == 3));
+}
+
+#[tokio::test]
+async fn a_default_run_measures_one_client_and_nothing_else() {
+    // Adding a scenario must not change what every existing invocation
+    // produces.
+    assert_eq!(Scenario::ALL.len(), 3);
+    assert!(!Scenario::ALL.contains(&Scenario::ConcurrentDecode));
+    assert_eq!(RunPlan::default().concurrent, 1);
 }

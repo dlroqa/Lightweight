@@ -197,7 +197,12 @@ export interface GatewayReport {
   listeners: Listener[];
   restart_required: string[];
   auth: { required: boolean };
-  concurrency: { max_concurrent_requests: number; queue_timeout_seconds: number };
+  concurrency: {
+    max_concurrent_requests: number;
+    queue_timeout_seconds: number;
+    /** What was asked for on the command line; null when it was `auto`. */
+    requested: number | null;
+  };
   queue: QueueSnapshot;
   paths: { data: string; models: string; logs: string } | null;
   /** What this engine accepts. The source of the KV type choices offered. */
@@ -408,6 +413,33 @@ export interface RequestEvent {
   queue_wait_ms: number;
   time_to_first_token_ms: number | null;
   total_ms: number;
+  /** Which queue served it: "interactive" or "bulk". */
+  band: string | null;
+}
+
+/** One request holding a slot right now. */
+export interface RunningRequest {
+  id: string | null;
+  model: string | null;
+  band: string;
+  running_ms: number;
+  prompt_tokens: number;
+}
+
+/** One request still waiting for a slot. */
+export interface WaitingRequest {
+  /** The scheduler's ticket number: a queued request has no completion id yet. */
+  ticket: number;
+  band: string;
+  waited_ms: number;
+  position: number;
+}
+
+/** Who is being served, and who is waiting, at one instant. */
+export interface RequestRoster {
+  capacity: number;
+  running: RunningRequest[];
+  waiting: WaitingRequest[];
 }
 
 /** The error envelope every failing endpoint returns. */

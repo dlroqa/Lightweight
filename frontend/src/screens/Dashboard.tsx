@@ -30,6 +30,13 @@ export function Dashboard() {
   const models = usePoll(api.models, 5000);
   const gateway = usePoll(api.gateway, 5000);
   const events = useRequestEvents(12);
+  // The same one-second tick: what is running now changes while a request is
+  // still open, which is exactly when the finished-generation feed says
+  // nothing.
+  const roster = usePoll(api.requests, 1000);
+  const waiting = roster.data?.waiting ?? [];
+  // The one at the front, which is the only wait a reader can act on.
+  const next = waiting[0];
 
   const times = wasRead(system.data?.cpu_times) ? system.data.cpu_times : null;
   const utilization = useUtilization(times);
@@ -260,6 +267,71 @@ export function Dashboard() {
           </Card>
 
           <Card
+            title="Running Now"
+            action={
+              <span className="card__note tnum">
+                {roster.data
+                  ? `${roster.data.running.length} of ${roster.data.capacity} slots`
+                  : "—"}
+              </span>
+            }
+          >
+            {roster.data && roster.data.running.length > 0 ? (
+              <ul style={{ margin: 0, padding: 0, listStyle: "none" }}>
+                {roster.data.running.map((request, index) => (
+                  <li
+                    key={request.id ?? `slot-${index}`}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 10,
+                      padding: "8px 10px",
+                      borderRadius: "var(--radius)",
+                      background:
+                        index % 2 === 0 ? "var(--surface-sunken)" : "transparent",
+                      fontSize: 12.5,
+                    }}
+                  >
+                    <Pill tone={bandTone(request.band)}>{request.band}</Pill>
+                    <span className="tnum" style={{ color: "var(--text-muted)" }}>
+                      {duration(request.running_ms)}
+                    </span>
+                    <span
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {request.prompt_tokens} prompt tokens
+                      {request.model ? ` · ${request.model}` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="empty">
+                <strong>Nothing running</strong>
+                <span>
+                  Requests appear here while they are being served, and in the
+                  feed below once they finish.
+                </span>
+              </div>
+            )}
+
+            {next && (
+              <div className="card__note" style={{ marginTop: 10 }}>
+                {waiting.length === 1
+                  ? "1 request is waiting for a slot"
+                  : `${waiting.length} requests are waiting for a slot`}
+                , the next after {duration(next.waited_ms)} so far.
+              </div>
+            )}
+          </Card>
+
+          <Card
             title="Inference Live Feed"
             action={
               <span className="card__note tnum">
@@ -293,6 +365,9 @@ export function Dashboard() {
                     <Pill tone={toneFor(event.finish_reason)}>
                       {event.finish_reason ?? "cancelled"}
                     </Pill>
+                    {event.band && (
+                      <Pill tone={bandTone(event.band)}>{event.band}</Pill>
+                    )}
                     <span className="tnum" style={{ color: "var(--text-muted)" }}>
                       {new Date(event.at_unix_ms).toLocaleTimeString([], {
                         hour: "2-digit",
@@ -367,6 +442,15 @@ function Unavailable({ what }: { what: string }) {
       {what} is not measured on this platform yet.
     </div>
   );
+}
+
+/// Which band a request was served in, as a tone.
+///
+/// Never the only signal: the band's name is always beside it, because a
+/// reader who cannot separate the two tones must still be able to read which
+/// queue served the request.
+function bandTone(band: string): "info" | "neutral" {
+  return band === "interactive" ? "info" : "neutral";
 }
 
 function toneFor(

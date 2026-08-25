@@ -74,6 +74,8 @@ pub struct RequestGuard {
     /// on the `Copy` record they describe.
     id: Option<String>,
     model: Option<String>,
+    /// The prompt the engine counted, for the roster.
+    prompt_tokens: u32,
     started: Instant,
 }
 
@@ -86,6 +88,7 @@ impl RequestGuard {
             record: GenerationRecord::default(),
             id: None,
             model: None,
+            prompt_tokens: 0,
             started: Instant::now(),
         }
     }
@@ -106,7 +109,38 @@ impl RequestGuard {
     pub fn describing(mut self, id: impl Into<String>, model: impl Into<String>) -> Self {
         self.id = Some(id.into());
         self.model = Some(model.into());
+        self.publish();
         self
+    }
+
+    /// Name the prompt this request is carrying, for the roster.
+    ///
+    /// Additive in the same way `describing` is: a guard that is never told
+    /// still holds its slot and still reports its counters, and only shows a
+    /// prompt of zero in the list of what is running.
+    #[must_use]
+    pub fn counting(mut self, prompt_tokens: u32) -> Self {
+        self.prompt_tokens = prompt_tokens;
+        self.publish();
+        self
+    }
+
+    /// Tell the slot what it is being used for.
+    ///
+    /// Called from every point where either half of the description can
+    /// arrive, because they arrive in different orders: a request admitted
+    /// immediately is described after it has its permit, and a queued one is
+    /// described before it has one.
+    fn publish(&self) {
+        let Some(permit) = &self.permit else {
+            return;
+        };
+        if let Some(band) = self.record.band {
+            permit.in_band(band);
+        }
+        if let (Some(id), Some(model)) = (&self.id, &self.model) {
+            permit.describe(id, model, self.prompt_tokens);
+        }
     }
 
     /// Record how long this request waited for its slot.
@@ -118,6 +152,7 @@ impl RequestGuard {
     /// carry one enum.
     pub fn in_band(mut self, band: crate::scheduler::Band) -> Self {
         self.record.band = Some(band);
+        self.publish();
         self
     }
 
@@ -129,6 +164,9 @@ impl RequestGuard {
     /// started.
     pub fn admitted(&mut self, permit: SlotPermit) {
         self.permit = Some(permit);
+        // A queued request was described before it had a slot to describe, so
+        // the description is applied now rather than lost.
+        self.publish();
     }
 
     /// The measurements this request is accumulating.

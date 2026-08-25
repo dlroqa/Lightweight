@@ -37,6 +37,14 @@ pub struct BenchOptions {
     pub repetitions: u32,
     /// Physical batch sizes to sweep. One value means one bucket and no sweep.
     pub ubatch: Vec<u32>,
+    /// Slot counts to sweep, one engine per value.
+    ///
+    /// The second sweep axis, and it crosses with `ubatch`: a bucket is one
+    /// pair. Any value above one adds the concurrent scenario, which drives
+    /// that many clients at the same moment - without it a multi-slot engine
+    /// would be measured one client at a time and would report exactly what a
+    /// single-slot engine does.
+    pub parallel: Vec<u32>,
     /// Write a calibration fit beside the runs.
     pub fit: bool,
     pub json: bool,
@@ -74,22 +82,40 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
         parameters: metadata.param_count,
     };
 
-    let plan = RunPlan {
-        prompt_tokens: options.prompt_tokens,
-        generate_tokens: options.generate_tokens,
-        repetitions: options.repetitions,
-        scenarios: hermes_bench::record::Scenario::ALL.to_vec(),
-    };
+    // One bucket per (ubatch, slots) pair. Ordered with slots on the outside so
+    // that a sweep of both reads as "this many clients, at each batch size".
+    let buckets: Vec<(u32, u32)> = options
+        .parallel
+        .iter()
+        .flat_map(|slots| options.ubatch.iter().map(move |ubatch| (*slots, *ubatch)))
+        .collect();
 
     let mut samples = Vec::new();
-    for (index, ubatch) in options.ubatch.iter().enumerate() {
-        let params = params_for(options, &metadata, &estimator, cache_type, &cpu, *ubatch)?;
+    for (index, (slots, ubatch)) in buckets.iter().enumerate() {
+        let params = params_for(
+            options, &metadata, &estimator, cache_type, &cpu, *ubatch, *slots,
+        )?;
+        // The concurrent scenario is added only where there is something for
+        // it to measure. At one slot it would be `Decode` under another name.
+        let mut scenarios = hermes_bench::record::Scenario::ALL.to_vec();
+        if *slots > 1 {
+            scenarios.push(hermes_bench::record::Scenario::ConcurrentDecode);
+        }
+        let plan = RunPlan {
+            prompt_tokens: options.prompt_tokens,
+            generate_tokens: options.generate_tokens,
+            repetitions: options.repetitions,
+            scenarios,
+            concurrent: *slots,
+        };
+
         if !options.json {
             println!(
-                "\nbucket {}/{}: ctx {}, ubatch {}, batch {}, threads {}",
+                "\nbucket {}/{}: ctx {} per client, slots {}, ubatch {}, batch {}, threads {}",
                 index + 1,
-                options.ubatch.len(),
+                buckets.len(),
                 params.n_ctx,
+                params.n_parallel,
                 params.n_ubatch,
                 params.n_batch,
                 params.threads.unwrap_or_else(|| cpu.default_threads()),
@@ -241,12 +267,17 @@ fn params_for(
     cache_type: GgmlType,
     cpu: &CpuInfo,
     ubatch: u32,
+    slots: u32,
 ) -> Result<RuntimeParams, String> {
     let mut params = RuntimeParams {
         cache_type_k: cache_type,
         cache_type_v: cache_type,
         threads: Some(options.threads.unwrap_or_else(|| cpu.default_threads())),
         n_ubatch: ubatch,
+        // Priced and launched for the slots this bucket measures: `n_ctx` is
+        // the window one client gets, and the engine is asked for that many
+        // times as many cells.
+        n_parallel: slots.max(1),
         ..RuntimeParams::default()
     };
     // `n_ubatch` may not exceed `n_batch`; the engine refuses the pair, and
@@ -299,7 +330,19 @@ fn render_human(
         run.engine.build.as_deref().unwrap_or("(unpinned)")
     );
 
-    for scenario in hermes_bench::record::Scenario::ALL {
+    // Every scenario the run actually measured, not only the default three:
+    // a concurrent bucket that was measured and not printed is a measurement
+    // nobody reads.
+    let mut scenarios = hermes_bench::record::Scenario::ALL.to_vec();
+    if run
+        .samples
+        .iter()
+        .any(|sample| sample.scenario == hermes_bench::record::Scenario::ConcurrentDecode)
+    {
+        scenarios.push(hermes_bench::record::Scenario::ConcurrentDecode);
+    }
+
+    for scenario in scenarios {
         let samples: Vec<&Sample> = run
             .samples
             .iter()
@@ -315,7 +358,8 @@ fn render_human(
             // not a property of the machine, and printing it beside a real one
             // invites somebody to quote it.
             let rate = match scenario {
-                hermes_bench::record::Scenario::Decode => format!(
+                hermes_bench::record::Scenario::Decode
+                | hermes_bench::record::Scenario::ConcurrentDecode => format!(
                     "decode {:>10}",
                     per_second(sample.decode_tokens_per_second())
                 ),
@@ -326,8 +370,9 @@ fn render_human(
             };
             let _ = writeln!(
                 out,
-                "  ubatch {:>5}  prompt {:>6}  prefilled {:>6}  cached {:>6}  gen {:>4}  \
-                 {rate}  ttft {:>8}  cores {:>5}",
+                "  slots {:>2}  ubatch {:>5}  prompt {:>6}  prefilled {:>6}  cached {:>6}  \
+                 gen {:>4}  {rate}  ttft {:>8}  cores {:>5}{}",
+                sample.params.n_parallel,
                 sample.params.n_ubatch,
                 sample.prompt_tokens,
                 sample.prefilled_tokens,
@@ -339,6 +384,12 @@ fn render_human(
                 sample
                     .cores_used(cores)
                     .map_or_else(|| "—".to_owned(), |used| format!("{used:.2}")),
+                // The engine's own answer to "were these batched together, or
+                // served one after another?" - shown only where more than one
+                // client was in flight, because at one slot it is always 1.
+                sample
+                    .busy_slots_per_decode
+                    .map_or_else(String::new, |busy| format!("  busy {busy:>5.2}"),),
             );
         }
     }
