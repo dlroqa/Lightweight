@@ -22,7 +22,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures_util::stream::{self, StreamExt};
@@ -104,6 +104,13 @@ pub struct MockConfig {
     /// to be able to say how much that is. `None` stands for a kernel or a
     /// platform that does not publish it.
     pub anon_rss: Option<Bytes>,
+    /// What the pretend engine reports about itself on `/props`.
+    ///
+    /// `None` is an engine with nothing to say, which is what a mock normally
+    /// is. A test that wants to prove the gateway attaches the engine's own
+    /// answer - and, more to the point, that it does not attach it for an
+    /// unauthenticated caller - sets one.
+    pub engine_props: Option<serde_json::Value>,
     /// Processor time the pretend engine has been charged for.
     ///
     /// Configurable for the same reason `anon_rss` is: a test that wants to
@@ -120,6 +127,7 @@ impl Default for MockConfig {
             token_interval: Duration::ZERO,
             prompt_tokens: 11,
             load_error: None,
+            engine_props: None,
             n_ctx: RuntimeParams::default().n_ctx,
             // Most of the 512 MiB below, but not all of it: the weights are
             // mmapped and so file-backed, exactly as with a real engine.
@@ -150,6 +158,12 @@ pub struct MockBackend {
     /// which is the only way to prove that a request option a client sent was
     /// forwarded rather than quietly dropped in the layers above.
     last_request: Mutex<Option<GenerationRequest>>,
+    /// Slots the resident instance was loaded with, and 1 when none is.
+    ///
+    /// The real backend keeps this same number for the same reason: a
+    /// capability that always says "one" stops describing the engine the
+    /// moment anyone asks for two, and `capabilities()` cannot await a lock.
+    slots: AtomicU32,
 }
 
 impl Default for MockBackend {
@@ -166,6 +180,7 @@ impl MockBackend {
             generations: AtomicU64::new(0),
             loads: AtomicU64::new(0),
             last_request: Mutex::new(None),
+            slots: AtomicU32::new(1),
         }
     }
 
@@ -204,14 +219,26 @@ impl MockBackend {
     /// The trait's `load` takes a path and parsed metadata, which a test that
     /// only cares about the wire contract should not have to produce.
     pub async fn make_resident(&self, model: ModelId, n_ctx: u32) -> LoadedModel {
+        self.make_resident_with(model, RuntimeParams::default().with_context(n_ctx))
+            .await
+    }
+
+    /// The same, for a test that cares about more than the context.
+    ///
+    /// Kept beside [`MockBackend::make_resident`] rather than replacing it:
+    /// most tests want a context and nothing else, and making all of them
+    /// build a `RuntimeParams` to say so would be noise in every one of them.
+    pub async fn make_resident_with(&self, model: ModelId, runtime: RuntimeParams) -> LoadedModel {
         let loaded = LoadedModel {
             model,
             backend: BACKEND_ID,
             instance: InstanceId::new(),
-            effective: RuntimeParams::default().with_context(n_ctx),
+            effective: runtime,
             loaded_at: SystemTime::now(),
         };
         self.loads.fetch_add(1, Ordering::Relaxed);
+        self.slots
+            .store(runtime.n_parallel.max(1), Ordering::Relaxed);
         *self.resident.lock().await = Some(loaded.clone());
         loaded
     }
@@ -229,7 +256,7 @@ impl InferenceBackend for MockBackend {
             streaming: true,
             tool_calls: true,
             reasoning_content: true,
-            max_concurrent_requests: 1,
+            max_concurrent_requests: self.slots.load(Ordering::Relaxed),
             build: None,
             kv_cache_types: vec![GgmlType::F16, GgmlType::Q8_0],
         }
@@ -257,7 +284,7 @@ impl InferenceBackend for MockBackend {
         }
         let _ = progress.try_send(LoadProgress::LoadingWeights);
         let loaded = self
-            .make_resident(request.model.clone(), request.runtime.n_ctx)
+            .make_resident_with(request.model.clone(), request.runtime)
             .await;
         let _ = progress.try_send(LoadProgress::Ready);
         Ok(loaded)
@@ -270,6 +297,7 @@ impl InferenceBackend for MockBackend {
             .is_some_and(|loaded| loaded.instance == instance)
         {
             *resident = None;
+            self.slots.store(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -325,6 +353,10 @@ impl InferenceBackend for MockBackend {
             anon_rss: config.anon_rss,
             cpu_ticks: config.cpu_ticks,
         }))
+    }
+
+    async fn engine_props(&self) -> Option<serde_json::Value> {
+        self.config.lock().await.engine_props.clone()
     }
 
     async fn shutdown(&self) -> Result<(), BackendError> {

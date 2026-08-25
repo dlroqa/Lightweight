@@ -1,0 +1,17 @@
+{
+  "default_generation_settings": {
+    "params": {
+      "n_predict": -1
+    },
+    "n_ctx": 2048
+  },
+  "total_slots": 2,
+  "model_path": "/models/m.gguf",
+  "model_alias": "/models/m.gguf",
+  "chat_template": "...elided...",
+  "build_info": "b10590-6657ded4f",
+  "endpoint_slots": true,
+  "endpoint_props": false,
+  "endpoint_metrics": true,
+  "is_sleeping": false
+}

@@ -142,7 +142,14 @@ pub async fn props(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -
     // context and the slot count are what it came for; the filesystem path is
     // not.
     let body = if is_authorized(&state, &headers) {
-        body
+        // The engine's own answer, for whoever is diagnosing a disagreement
+        // between what was asked for and what is being served. Authorized
+        // callers only, and not because it is secret: it carries the engine's
+        // model path, which is the one thing `redacted` exists to remove.
+        match state.backend.engine_props().await {
+            Some(props) => body.with_engine_props(props),
+            None => body,
+        }
     } else {
         body.redacted()
     };

@@ -127,6 +127,51 @@ async fn the_real_engine_loads_a_real_model_and_reports_its_memory() {
 }
 
 #[tokio::test]
+async fn a_real_engine_gives_every_slot_the_whole_context_it_was_asked_for() {
+    // The defect M9 exists to fix, checked against the engine rather than
+    // against our reading of its `--help`. `--ctx-size` is a total the engine
+    // divides across slots, so a gateway serving four clients at 1024 tokens
+    // each must ask for 4096 - and the proof is the engine's own `/props`,
+    // which reports the per-slot number.
+    let Some(model) = model_path() else {
+        eprintln!("skipping: set {MODEL_ENV} to a .gguf file to run this");
+        return;
+    };
+    let profile = Profile::new("slots");
+    let backend = ProcessBackend::new(profile.runtime_dir()).expect("backend");
+
+    let params = RuntimeParams {
+        n_parallel: 4,
+        ..RuntimeParams::default().with_context(1024)
+    };
+    let (tx, mut drain) = mpsc::channel(64);
+    tokio::spawn(async move { while drain.recv().await.is_some() {} });
+    let loaded = backend
+        .load(request(&model, params), tx, CancellationToken::new())
+        .await
+        .expect("the real engine should load with four slots");
+
+    // What the gateway will advertise, after reconciliation with the engine.
+    assert_eq!(
+        loaded.effective.n_ctx, 1024,
+        "each client should keep the window it was promised"
+    );
+    assert_eq!(loaded.effective.n_parallel, 4);
+
+    let props = backend
+        .engine_props()
+        .await
+        .expect("a running engine reports its properties");
+    assert_eq!(
+        props["default_generation_settings"]["n_ctx"], 1024,
+        "the engine's own per-slot context disagrees with what we advertise: {props}"
+    );
+    assert_eq!(props["total_slots"], 4);
+
+    backend.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn the_ram_estimate_is_an_upper_bound_on_what_the_engine_actually_uses() {
     // The estimate is deliberately conservative - it does not discount a
     // declared sliding window, and its compute term is uncalibrated. Being

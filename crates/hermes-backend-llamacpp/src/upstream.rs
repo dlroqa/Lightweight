@@ -52,6 +52,45 @@ use tokio_util::sync::CancellationToken;
 /// a number chosen on a faster machine.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What the engine reports it is actually running, read back from `/props`.
+///
+/// The gateway asks for a window per client and the engine is given a total to
+/// divide, so these two numbers are the only proof that the division came out
+/// where it was meant to. Both are read from the body the engine publishes
+/// rather than computed a second time from what it was asked for - a second
+/// computation would agree with the first by construction and prove nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EngineWindow {
+    /// The context one slot has. `default_generation_settings.n_ctx` in the
+    /// engine's body, which is `--ctx-size` divided by the slot count -
+    /// captured from the pinned build at two slots in
+    /// `fixtures/engine/props-b10590.json`.
+    pub(crate) n_ctx: u32,
+    /// How many slots the engine says it opened.
+    pub(crate) total_slots: u32,
+}
+
+/// Read the window out of an engine `/props` body.
+///
+/// `None` when either number is missing or is not a positive integer, which is
+/// what a different engine build - or a proxy in between - would produce. A
+/// caller must treat that as "could not check", never as "zero": see
+/// `parse_engine_counters`, which draws the same line for the same reason.
+pub(crate) fn window_from_props(props: &Value) -> Option<EngineWindow> {
+    let n_ctx = props
+        .get("default_generation_settings")?
+        .get("n_ctx")?
+        .as_u64()?;
+    let total_slots = props.get("total_slots")?.as_u64()?;
+    if n_ctx == 0 || total_slots == 0 {
+        return None;
+    }
+    Some(EngineWindow {
+        n_ctx: u32::try_from(n_ctx).ok()?,
+        total_slots: u32::try_from(total_slots).ok()?,
+    })
+}
+
 /// A client for one running engine.
 #[derive(Clone, Debug)]
 pub struct UpstreamClient {
@@ -1291,6 +1330,50 @@ mod tests {
         assert_eq!(json[0]["content"], "be brief");
         assert_eq!(json[1]["role"], "tool");
         assert_eq!(json[1]["tool_call_id"], "call_1");
+    }
+}
+
+#[cfg(test)]
+mod props_tests {
+    use super::*;
+
+    /// The pinned engine's own `/props`, captured while it served two slots.
+    ///
+    /// Trimmed rather than invented: the sampler defaults, the chat template
+    /// and the modality lists are elided and the model path is replaced,
+    /// because a fixture may not carry one machine's filesystem. Every field
+    /// the parser reads is the engine's own.
+    const CAPTURED: &str = include_str!("../../../fixtures/engine/props-b10590.json");
+
+    #[test]
+    fn the_pinned_engine_reports_the_window_one_slot_actually_has() {
+        // Captured from `--ctx-size 4096 --parallel 2`, which is the whole
+        // point: the engine answers 2048, not the 4096 it was given.
+        let props: Value = serde_json::from_str(CAPTURED).expect("valid json");
+        let window = window_from_props(&props).expect("the pinned build reports both numbers");
+        assert_eq!(window.n_ctx, 2048);
+        assert_eq!(window.total_slots, 2);
+    }
+
+    #[test]
+    fn a_body_without_a_context_is_unknown_rather_than_zero() {
+        // Zero is a legitimate-looking answer that would be adopted as the
+        // advertised window and refuse every prompt. Absent must stay absent.
+        assert_eq!(window_from_props(&json!({"total_slots": 1})), None);
+        assert_eq!(
+            window_from_props(&json!({
+                "default_generation_settings": {"n_ctx": 0},
+                "total_slots": 1
+            })),
+            None
+        );
+        assert_eq!(
+            window_from_props(&json!({
+                "default_generation_settings": {"n_ctx": "2048"},
+                "total_slots": 1
+            })),
+            None
+        );
     }
 }
 

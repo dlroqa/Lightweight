@@ -447,8 +447,39 @@ async fn await_ready(
 /// under it, and `--parallel` in particular defaults to `-1` (auto), which
 /// would size the KV cache for a slot count we did not choose.
 ///
+/// The one value that is not passed through as given is `--ctx-size`, which the
+/// engine reads as a total and divides across the slots; see `engine_context`.
+///
 /// One thing deliberately absent: the API key. It travels in the environment,
 /// because a command line is readable by every user on the machine.
+/// The `--ctx-size` that gives every slot the window it was promised.
+///
+/// llama.cpp reads `--ctx-size` as the total across slots and divides it:
+/// `n_ctx_seq = n_ctx / n_seq_max`. Read out of the pinned build itself rather
+/// than out of documentation - `llama-server --help` describes `--parallel` as
+/// "number of server slots", and `libllama.so` carries both
+/// `"%s: n_ctx is not divisible by n_seq_max - rounding down to %u"` and the
+/// `n_ctx_seq` it reports at startup.
+///
+/// So the multiplication has to happen somewhere, and here is the only place
+/// that should know about it. Everywhere above, `RuntimeParams.n_ctx` keeps one
+/// meaning - *the window one client gets* - which is what `/props`,
+/// `/v1/models`, the overflow check, `clamp_max_tokens`, the band ceilings and
+/// the estimator's per-sequence KV arithmetic all already assume it means.
+/// Multiplying at the three call sites that build params instead would be three
+/// places to disagree; redefining `n_ctx` as the total would mean dividing at
+/// every site that advertises it, each of which can forget.
+///
+/// A product is always exactly divisible by its factor, so the engine's
+/// rounding-down path is never entered - asserted, because a silent round down
+/// is exactly the kind of quiet difference this function exists to prevent.
+///
+/// Saturating: an absurd product should arrive at the engine's own admission
+/// arithmetic as an absurd number, not wrap into a plausible small one.
+fn engine_context(params: &RuntimeParams) -> u32 {
+    params.n_ctx.saturating_mul(params.n_parallel.max(1))
+}
+
 pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
     let params = &config.params;
     let mut args = vec![
@@ -460,8 +491,10 @@ pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string(),
+        // The total across the slots, not the window one client gets - see
+        // `engine_context`.
         "--ctx-size".into(),
-        params.n_ctx.to_string(),
+        engine_context(params).to_string(),
         "--batch-size".into(),
         params.n_batch.to_string(),
         "--ubatch-size".into(),
@@ -469,6 +502,15 @@ pub fn build_args(config: &EngineConfig, port: u16) -> Vec<String> {
         // Explicit, not left at auto.
         "--parallel".into(),
         params.n_parallel.max(1).to_string(),
+        // Both stated for the reason every other shaping parameter is: the
+        // engine's defaults for them depend on how `--parallel` was given.
+        // `--kv-unified` is enabled by default only when the slot count is
+        // auto, which this argv never leaves it at, so the value in force
+        // today is the non-unified one and that is what is written down.
+        // Neither flag changes behaviour here; both stop a future engine
+        // build from changing it for us.
+        "--no-kv-unified".into(),
+        "--cont-batching".into(),
         "--threads".into(),
         config.threads.max(1).to_string(),
         // Stated rather than inherited, so the KV arithmetic in the estimator
@@ -740,6 +782,69 @@ mod tests {
         // `llama-server --parallel` defaults to -1, which sizes the KV cache
         // for a slot count we did not choose. Verified from `--help` at b10590.
         assert_eq!(value_of(&args(), "--parallel").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn the_context_asked_for_is_the_context_each_client_gets() {
+        // The defect this milestone exists to fix. `--ctx-size` is the total
+        // across slots, so passing the per-client window through unchanged
+        // would hand four clients a quarter each of what every endpoint
+        // advertises. No test built these arguments at more than one slot
+        // before, which is how it went unnoticed.
+        let mut four = config();
+        four.params.n_parallel = 4;
+        let args = build_args(&four, 1);
+        assert_eq!(value_of(&args, "--parallel").as_deref(), Some("4"));
+        assert_eq!(
+            value_of(&args, "--ctx-size").as_deref(),
+            Some("32768"),
+            "four slots of the 8192-token window each need 32768 in total"
+        );
+    }
+
+    #[test]
+    fn every_slot_divides_the_context_exactly() {
+        // The engine rounds `n_ctx / n_seq_max` down and reports it on a line
+        // nobody reads, so a context that did not divide would quietly give
+        // every client slightly less than it was promised. A product cannot.
+        for n_ctx in [512_u32, 2048, 4096, 8192, 32768] {
+            for n_parallel in 1..=8_u32 {
+                let mut config = config();
+                config.params.n_ctx = n_ctx;
+                config.params.n_parallel = n_parallel;
+                let total: u32 = value_of(&build_args(&config, 1), "--ctx-size")
+                    .and_then(|value| value.parse().ok())
+                    .expect("a context is always passed");
+                assert_eq!(
+                    total % n_parallel,
+                    0,
+                    "{total} does not divide across {n_parallel} slots"
+                );
+                assert_eq!(
+                    total / n_parallel,
+                    n_ctx,
+                    "each of {n_parallel} slots should get {n_ctx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_slot_asks_for_exactly_the_window_it_wants() {
+        // The multiplication must be invisible at one slot, which is what
+        // every deployment before this milestone ran.
+        assert_eq!(value_of(&args(), "--ctx-size").as_deref(), Some("8192"));
+    }
+
+    #[test]
+    fn the_kv_layout_and_batching_are_stated_rather_than_inherited() {
+        // Both defaults depend on how `--parallel` was given: `--kv-unified`
+        // is on by default only when the slot count is left at auto, which
+        // this argv never does. Stating them changes nothing today and stops
+        // a future engine build from changing it for us.
+        let args = args();
+        assert!(args.iter().any(|arg| arg == "--no-kv-unified"));
+        assert!(args.iter().any(|arg| arg == "--cont-batching"));
     }
 
     #[test]

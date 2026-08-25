@@ -806,6 +806,58 @@ async fn an_unauthenticated_caller_is_told_the_context_but_not_the_path() {
 }
 
 #[tokio::test]
+async fn the_engines_own_properties_reach_an_authorized_caller_and_no_one_else() {
+    ensure_provider();
+    // The engine answers with a per-slot context and its own model path. The
+    // number is worth publishing to whoever is diagnosing a disagreement
+    // between what was asked for and what is being served; the path is the one
+    // thing redaction exists to remove, so the whole object travels only with
+    // a key.
+    let harness = Harness::start(
+        MockConfig {
+            engine_props: Some(serde_json::json!({
+                "default_generation_settings": {"n_ctx": 1024},
+                "total_slots": 4,
+                "model_path": "/engine/side/model.gguf",
+            })),
+            ..MockConfig::default()
+        },
+        GatewayConfig {
+            auth: AuthPolicy::Required {
+                key: "shared-secret".into(),
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let anonymous: Value = harness.get("/props").await.json().await.expect("json");
+    assert!(
+        anonymous.get("hermes").is_none(),
+        "the engine's own props reached an unauthenticated caller: {anonymous}"
+    );
+
+    let authorized: Value = Harness::client()
+        .get(format!("{}/props", harness.base))
+        .header("Authorization", "Bearer shared-secret")
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    // Ours stays ours: the advertised context is the gateway's, and the
+    // engine's is beside it under our own key rather than in place of it.
+    assert_eq!(authorized["default_generation_settings"]["n_ctx"], N_CTX);
+    assert_eq!(authorized["total_slots"], 1);
+    assert_eq!(
+        authorized["hermes"]["engine"]["default_generation_settings"]["n_ctx"],
+        1024
+    );
+    assert_eq!(authorized["hermes"]["engine"]["total_slots"], 4);
+}
+
+#[tokio::test]
 async fn an_authenticated_caller_sees_everything() {
     ensure_provider();
     let harness = Harness::start(

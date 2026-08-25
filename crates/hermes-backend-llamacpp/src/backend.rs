@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use hermes_core::{InstanceId, ModelId, RuntimeParams, units::Bytes};
@@ -50,6 +51,17 @@ struct Running {
     /// connection for every turn.
     client: UpstreamClient,
     effective: RuntimeParams,
+    /// The engine's own `/props`, read once when it became ready.
+    ///
+    /// Captured rather than fetched per call. A running engine's properties
+    /// cannot change - the geometry is fixed at startup and a new geometry is
+    /// a new instance - so a live read would put a 30-second upstream timeout
+    /// on the endpoint clients use to size a prompt, in exchange for an answer
+    /// that is the same every time.
+    ///
+    /// `None` when the read failed, which is "we could not ask", never "it has
+    /// none".
+    props: Option<serde_json::Value>,
     loaded_at: SystemTime,
 }
 
@@ -62,6 +74,13 @@ pub struct ProcessBackend {
     /// At most one resident model. Section 22 says to serialize first and add
     /// batching later; the trait's shape does not change when that happens.
     running: Arc<Mutex<Option<Running>>>,
+    /// Slots the resident engine was given, and 1 when nothing is resident.
+    ///
+    /// Separate from `running` because `capabilities()` is synchronous and
+    /// `running` is behind an async mutex, which cannot be taken there. An
+    /// atomic is the whole of the state it needs: one number, written on a
+    /// successful load and cleared when the engine goes away.
+    slots: AtomicU32,
 }
 
 impl ProcessBackend {
@@ -72,6 +91,7 @@ impl ProcessBackend {
             cpu: CpuInfo::detect(),
             start_timeout: DEFAULT_START_TIMEOUT,
             running: Arc::new(Mutex::new(None)),
+            slots: AtomicU32::new(1),
         })
     }
 
@@ -174,9 +194,10 @@ impl InferenceBackend for ProcessBackend {
             streaming: true,
             tool_calls: true,
             reasoning_content: true,
-            // One at a time for now. Section 22: serialize first, and design so
-            // continuous batching is an internal change later.
-            max_concurrent_requests: 1,
+            // What the resident engine was actually given, not a ceiling: a
+            // number nobody can act on is not a capability. One when nothing
+            // is loaded, which is what an engine with no slots can serve.
+            max_concurrent_requests: self.slots.load(Ordering::Relaxed),
             build: Some(crate::manifest::PINNED_BUILD.to_owned()),
             kv_cache_types: ALLOWED_KV_CACHE_TYPES
                 .iter()
@@ -247,10 +268,15 @@ impl InferenceBackend for ProcessBackend {
         let loaded_at = SystemTime::now();
         // The engine may clamp what it was asked for, so record the thread
         // count actually used rather than the request.
-        let effective = RuntimeParams {
+        let requested = RuntimeParams {
             threads: Some(config.threads),
             ..request.runtime
         };
+
+        let client = UpstreamClient::new(engine.base_url(), engine.api_key())?;
+        // What the engine says it is running, not what it was asked to run.
+        let props = client.props().await.ok();
+        let effective = reconciled(requested, props.as_ref());
 
         tracing::info!(
             target: targets::MODEL,
@@ -262,7 +288,8 @@ impl InferenceBackend for ProcessBackend {
             "model loaded"
         );
 
-        let client = UpstreamClient::new(engine.base_url(), engine.api_key())?;
+        self.slots
+            .store(effective.n_parallel.max(1), Ordering::Relaxed);
 
         *self.running.lock().await = Some(Running {
             instance,
@@ -270,6 +297,7 @@ impl InferenceBackend for ProcessBackend {
             engine,
             client,
             effective,
+            props,
             loaded_at,
         });
 
@@ -297,6 +325,9 @@ impl InferenceBackend for ProcessBackend {
         if let Some(state) = running.take() {
             tracing::info!(target: targets::MODEL, model = %state.model, "unloading");
             let _ = state.engine.shutdown().await;
+            // Back to what an engine with no model can serve, so the reported
+            // capability never describes a process that is no longer running.
+            self.slots.store(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -365,10 +396,20 @@ impl InferenceBackend for ProcessBackend {
         client.engine_counters().await.map(Some)
     }
 
+    /// Served from the copy taken when the engine became ready.
+    ///
+    /// See `Running::props`: a running engine's geometry cannot change, so a
+    /// live read would put a thirty-second upstream timeout on the endpoint
+    /// clients use to size a prompt in exchange for the same answer every time.
+    async fn engine_props(&self) -> Option<serde_json::Value> {
+        self.running.lock().await.as_ref()?.props.clone()
+    }
+
     async fn shutdown(&self) -> Result<(), BackendError> {
         let mut running = self.running.lock().await;
         if let Some(state) = running.take() {
             let _ = state.engine.shutdown().await;
+            self.slots.store(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -389,18 +430,6 @@ impl ProcessBackend {
         Ok(state.client.clone())
     }
 
-    /// The engine's own properties, read from the running child.
-    ///
-    /// Used by the gateway's `/props`, so what is reported is what the engine
-    /// is actually running rather than what it was asked for.
-    pub async fn engine_props(&self) -> Result<serde_json::Value, BackendError> {
-        let running = self.running.lock().await;
-        let state = running.as_ref().ok_or(BackendError::NoModelLoaded)?;
-        let client = state.client.clone();
-        drop(running);
-        client.props().await
-    }
-
     /// The resident model, if any.
     pub async fn resident(&self) -> Option<(ModelId, InstanceId, RuntimeParams, SystemTime)> {
         let running = self.running.lock().await;
@@ -412,6 +441,57 @@ impl ProcessBackend {
                 state.loaded_at,
             )
         })
+    }
+}
+
+/// The parameters as the engine reports them, rather than as it was asked.
+///
+/// The engine divides `--ctx-size` across its slots, so the arithmetic in
+/// `supervisor::engine_context` is a claim about what one client will get. This
+/// is where that claim is checked against a number the engine itself published.
+/// Computing it a second time from what we asked for would agree by
+/// construction and prove nothing.
+///
+/// Three cases, and the direction to be wrong in is settled by the rule that
+/// governs every estimate here - never promise a window that does not exist:
+///
+/// * **The engine reports less.** Adopt it. One assignment corrects everything
+///   downstream at once, because `/props`, `/v1/models`, the overflow check,
+///   `clamp_max_tokens` and the band ceilings are all derived from this field.
+/// * **The engine reports more.** Ignore it. A larger window is memory nobody
+///   budgeted for, and admission control was run against the smaller number.
+/// * **Nothing could be read.** Keep what was asked for. The engine has already
+///   reported ready and the weights are already resident; losing a working
+///   model because a metadata call failed would be the worse answer.
+///
+/// Refusing the load is deliberately not among them. A refusal is right when a
+/// pre-flight can catch the problem before the cost is paid - which is what
+/// `admit` does for KV cache types and memory - and wrong once several seconds
+/// and several gigabytes have already been spent on something the gateway can
+/// simply describe correctly.
+fn reconciled(requested: RuntimeParams, props: Option<&serde_json::Value>) -> RuntimeParams {
+    let Some(window) = props.and_then(crate::upstream::window_from_props) else {
+        tracing::debug!(
+            target: targets::MODEL,
+            "the engine did not report a context length; recording what it was asked for"
+        );
+        return requested;
+    };
+    if window.n_ctx >= requested.n_ctx && window.total_slots >= requested.n_parallel.max(1) {
+        return requested;
+    }
+    tracing::warn!(
+        target: targets::MODEL,
+        requested_n_ctx = requested.n_ctx,
+        engine_n_ctx = window.n_ctx,
+        requested_slots = requested.n_parallel.max(1),
+        engine_slots = window.total_slots,
+        "the engine is serving less than it was asked for; advertising what it has"
+    );
+    RuntimeParams {
+        n_ctx: window.n_ctx.min(requested.n_ctx),
+        n_parallel: window.total_slots.min(requested.n_parallel.max(1)),
+        ..requested
     }
 }
 
@@ -596,5 +676,65 @@ RssShmem:\t       0 kB
         // Across an engine restart the counters begin again, and a replaced
         // engine did not consume negative processor time.
         assert_eq!(earlier.since(&later), None);
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn asked_for(n_ctx: u32, n_parallel: u32) -> RuntimeParams {
+        RuntimeParams {
+            n_ctx,
+            n_parallel,
+            ..RuntimeParams::default()
+        }
+    }
+
+    fn engine_says(n_ctx: u32, total_slots: u32) -> serde_json::Value {
+        json!({
+            "default_generation_settings": {"n_ctx": n_ctx},
+            "total_slots": total_slots,
+        })
+    }
+
+    #[test]
+    fn an_engine_serving_the_window_it_was_asked_for_changes_nothing() {
+        let requested = asked_for(2048, 4);
+        let effective = reconciled(requested, Some(&engine_says(2048, 4)));
+        assert_eq!(effective, requested);
+    }
+
+    #[test]
+    fn an_engine_serving_a_smaller_window_is_believed_rather_than_overruled() {
+        // The shape of the defect this milestone fixes: ask for 2048 per
+        // client, and an engine that divided rather than multiplied hands back
+        // 512. What is advertised must be what a client actually has.
+        let effective = reconciled(asked_for(2048, 4), Some(&engine_says(512, 4)));
+        assert_eq!(effective.n_ctx, 512);
+    }
+
+    #[test]
+    fn an_engine_claiming_more_than_was_budgeted_for_is_not_believed() {
+        // Admission control ran against 2048. A larger window is memory that
+        // was never priced, and adopting it would spend it.
+        let effective = reconciled(asked_for(2048, 1), Some(&engine_says(8192, 1)));
+        assert_eq!(effective.n_ctx, 2048);
+    }
+
+    #[test]
+    fn fewer_slots_than_were_asked_for_are_recorded_as_the_slots_that_exist() {
+        let effective = reconciled(asked_for(2048, 4), Some(&engine_says(2048, 2)));
+        assert_eq!(effective.n_parallel, 2);
+    }
+
+    #[test]
+    fn props_that_could_not_be_read_leave_the_load_standing() {
+        // The engine is running and the weights are resident. Losing that over
+        // a metadata call is a worse answer than an unverified context.
+        let requested = asked_for(4096, 2);
+        assert_eq!(reconciled(requested, None), requested);
+        assert_eq!(reconciled(requested, Some(&json!({}))), requested);
     }
 }

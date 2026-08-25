@@ -71,8 +71,13 @@ pub struct BackendCapabilities {
     pub streaming: bool,
     pub tool_calls: bool,
     pub reasoning_content: bool,
-    /// Requests that can run at once. One today; the scheduler is written so
-    /// that raising it is an internal change.
+    /// Requests this engine will serve at once, as it is loaded right now.
+    ///
+    /// Not a ceiling on what the backend could ever do: it is the slot count
+    /// the resident engine was actually given, and one when nothing is
+    /// resident. A ceiling would be a number nobody can act on, while this one
+    /// answers the question the panel and the gateway both ask - how many are
+    /// being served at once *here*.
     pub max_concurrent_requests: u32,
     /// KV cache element types the engine accepts.
     ///
@@ -338,6 +343,22 @@ pub trait InferenceBackend: Send + Sync + 'static {
     /// renders that as "not reported" rather than as a row of zeroes.
     async fn engine_counters(&self) -> Result<Option<EngineCounters>, BackendError> {
         Ok(None)
+    }
+
+    /// The engine's own description of itself, or `None` when it has none.
+    ///
+    /// Defaulted for the same reason `engine_counters` is: an engine that
+    /// publishes nothing about itself is a legitimate engine, and a mock one
+    /// has nothing to publish.
+    ///
+    /// A failed read is `None` here rather than an error, which is a
+    /// distinction this crate normally insists on. It is dropped in this one
+    /// place because nothing branches on the answer: it is attached to `/props`
+    /// for a person diagnosing a disagreement, and "the engine did not say" and
+    /// "we could not ask" lead that person to the same next step. Everything
+    /// the gateway *acts* on is reconciled at load time instead.
+    async fn engine_props(&self) -> Option<serde_json::Value> {
+        None
     }
 
     /// Stop everything and leave no child processes behind.

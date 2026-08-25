@@ -173,6 +173,13 @@ impl Estimator {
         }
 
         let n_ctx = u64::from(params.n_ctx);
+        // The cache is per sequence, so N concurrent clients cost N caches of
+        // `n_ctx` cells each. That is a claim about the engine, and it is true
+        // because `supervisor::engine_context` asks for `n_ctx * n_parallel`
+        // cells in total with the per-slot partition stated - so the engine
+        // allocates exactly what is priced here. Before that, the same
+        // multiplication described a partition the engine was never given: the
+        // estimate charged for N caches while the engine divided one.
         let n_parallel = u64::from(params.n_parallel.max(1));
 
         // The whole sum is fallible, so it is written as one fallible pass
@@ -496,6 +503,57 @@ mod tests {
         params.n_parallel = 4;
         let four = estimator.estimate(&metadata, params, machine(64)).kv_cache;
         assert_eq!(four.get(), one.get() * 4);
+    }
+
+    #[test]
+    fn four_clients_at_a_window_cost_what_one_client_at_four_windows_costs() {
+        // The engine is given a single total to divide - `n_ctx * n_parallel`
+        // cells, partitioned per slot - so these two descriptions of the same
+        // allocation must price identically. If they ever diverge, either the
+        // estimate or the command line has stopped describing the engine, and
+        // this is the assertion that says which.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+
+        let shared = estimator
+            .estimate(
+                &metadata,
+                RuntimeParams::default().with_context(8192),
+                machine(64),
+            )
+            .kv_cache;
+        let split = estimator
+            .estimate(
+                &metadata,
+                RuntimeParams {
+                    n_parallel: 4,
+                    ..RuntimeParams::default().with_context(2048)
+                },
+                machine(64),
+            )
+            .kv_cache;
+
+        assert_eq!(split.get(), shared.get());
+    }
+
+    #[test]
+    fn the_marginal_cost_of_a_token_carries_the_slot_count() {
+        // `solve_max_context` divides spare bytes by this number to answer
+        // "reduce the context to N". At four slots a token is bought four
+        // times, and a remedy computed against a single-slot price would name
+        // a context four times too large.
+        let metadata = model(32, 32, vec![8], 128);
+        let estimator = bare_estimator();
+        let mut params = RuntimeParams::default().with_context(4096);
+        let one = estimator
+            .estimate(&metadata, params, machine(64))
+            .kv_bytes_per_token;
+        params.n_parallel = 4;
+        let four = estimator
+            .estimate(&metadata, params, machine(64))
+            .kv_bytes_per_token;
+        assert_ne!(one, 0, "a sizeable model prices its tokens");
+        assert_eq!(four, one * 4);
     }
 
     #[test]
