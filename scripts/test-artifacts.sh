@@ -128,9 +128,21 @@ fi
 #    no process of it may carry the flag.
 #
 #    On a host without them there is nothing to assert here - and saying so is
-#    the point, rather than reporting a pass for a case that never ran.
+#    the point, rather than reporting a pass for a case that never ran. The same
+#    goes for a host with no display: this launch opens a real window, so with
+#    no `$DISPLAY` the app cannot start for a reason that is nothing to do with
+#    the artifact, and reporting that as a failure would be a lie about it. The
+#    sibling check in `test-flatpak.sh` has said so since it was written; this
+#    one asserted into a headless runner instead, which is what
+#    `release.yml`'s Linux job would have hit.
 # ---------------------------------------------------------------------------
-if unshare -Ur true 2>/dev/null; then
+if ! unshare -Ur true 2>/dev/null; then
+  echo "  skip  the supported case: this host cannot create user namespaces, so a"
+  echo "        sandboxed launch cannot be exercised here. It is checked on CI."
+elif [ -z "${DISPLAY:-}" ]; then
+  echo "  skip  the supported case: no DISPLAY, and this launch opens a real"
+  echo "        window. Run under xvfb-run to include it."
+else
   home="$(mktemp -d)"
   port=18779
   set +e
@@ -159,9 +171,6 @@ if unshare -Ur true 2>/dev/null; then
   else
     pass "it runs, and no live process carries --no-sandbox"
   fi
-else
-  echo "  skip  the supported case: this host cannot create user namespaces, so a"
-  echo "        sandboxed launch cannot be exercised here. It is checked on CI."
 fi
 
 echo

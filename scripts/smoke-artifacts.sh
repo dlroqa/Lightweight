@@ -101,12 +101,30 @@ Darwin)
 Linux)
   echo "== appimage =="
   if [ -n "$(find apps/desktop/release -maxdepth 1 -name '*.AppImage' -print -quit 2>/dev/null || true)" ]; then
-    ./scripts/test-artifacts.sh
+    # The sandboxed-launch check inside opens a real window, and a release
+    # runner has no display. Supplying one here rather than in the workflow
+    # keeps the rule the gate is built on: the script is the contract, and a
+    # workflow that wrapped it would be a second place to keep in step.
+    if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+      xvfb-run --auto-servernum ./scripts/test-artifacts.sh
+    else
+      ./scripts/test-artifacts.sh
+    fi
   else
     echo "  skip  no AppImage was produced by this run"
   fi
-  echo "  note  the glibc floor of this binary is $(objdump -T target/release/hermes 2>/dev/null \
-          | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+  # Wherever `cargo build` put it: with `--target` that is under the triple,
+  # and the release builds that way. Reading only `target/release` printed an
+  # empty floor into the release notes, which is worse than printing none.
+  triple="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+  binary="target/${triple:-none}/release/hermes"
+  [ -f "$binary" ] || binary="target/release/hermes"
+  if [ -f "$binary" ]; then
+    echo "  note  the glibc floor of $binary is $(objdump -T "$binary" 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+  else
+    echo "  note  no release binary on disk; the glibc floor was not read"
+  fi
   ;;
 
 # ---------------------------------------------------------------------------
