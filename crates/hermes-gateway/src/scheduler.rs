@@ -144,6 +144,18 @@ impl Band {
 
     /// Every band, for iterating counters.
     pub const ALL: [Self; 2] = [Self::Interactive, Self::Bulk];
+
+    /// Position in a fixed-size counter array.
+    ///
+    /// Deliberately not `as usize` on the enum: the discriminants are an
+    /// implementation detail and reordering the variants must not silently
+    /// swap two bands' counters, which is a wrong number nobody would notice.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Interactive => 0,
+            Self::Bulk => 1,
+        }
+    }
 }
 
 /// How the scheduler behaves.

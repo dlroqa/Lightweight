@@ -156,6 +156,35 @@ impl BackendHealth {
     }
 }
 
+/// Processor time a process has been charged for, in kernel clock ticks.
+///
+/// Ticks — jiffies, `USER_HZ`, normally 100 per second — exactly as
+/// `/proc/<pid>/stat` publishes them, and unconverted for the same reason
+/// [`ResourceSnapshot::cpu_ticks`] gives. User and system time are kept apart
+/// because they answer different questions: an engine accumulating system time
+/// is usually paging or contending rather than computing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuTicks {
+    pub user: u64,
+    pub system: u64,
+}
+
+impl CpuTicks {
+    /// Every tick this process has been charged for.
+    pub const fn total(&self) -> u64 {
+        self.user.saturating_add(self.system)
+    }
+
+    /// Ticks consumed between an earlier reading and this one.
+    ///
+    /// `None` when the counters went backwards. They cannot for one live
+    /// process, but they can across a restart, and an engine that was replaced
+    /// did not consume negative processor time.
+    pub fn since(&self, earlier: &Self) -> Option<u64> {
+        self.total().checked_sub(earlier.total())
+    }
+}
+
 /// What the engine is consuming.
 ///
 /// Read from the operating system rather than estimated. This is a real benefit
@@ -179,8 +208,56 @@ pub struct ResourceSnapshot {
     /// `None` where the kernel did not publish it or the platform has no probe.
     /// Never zero standing in for a reading: zero is a real answer.
     pub anon_rss: Option<Bytes>,
-    /// CPU use since the previous sample, as a percentage of one core.
-    pub cpu_percent: Option<f64>,
+    /// Processor time the engine has consumed, in kernel clock ticks.
+    ///
+    /// A counter, not a rate, and published unconverted for the reason
+    /// `hermes_system_info::load` gives about `/proc/stat`: a rate cannot be
+    /// read at an instant, and converting to seconds would divide by a
+    /// `USER_HZ` this crate would have to guess at. Two readings and the
+    /// interval between them mean something exact; one reading is a level a
+    /// caller differences.
+    ///
+    /// `None` where the platform has no probe. Never zero standing in for a
+    /// reading — zero is a real answer, and it is the right answer for an
+    /// engine that has not been asked to do anything yet.
+    pub cpu_ticks: Option<CpuTicks>,
+}
+
+/// What the engine says about its own work, in terms this crate can name.
+///
+/// Everything here is something the gateway **cannot** compute for itself:
+/// how long the longest sequence has grown, how many slots a decode step
+/// actually kept busy, how many requests the engine deferred internally. What
+/// the gateway already measures — tokens, times, throughput — is deliberately
+/// absent, because two implementations of one number are two numbers waiting
+/// to disagree in public.
+///
+/// Every field is `Option`, and the reason is the whole design: an engine
+/// publishes what its build publishes, and a counter this build does not have
+/// must read as "not reported" rather than as zero. `kv_cache_usage_ratio`
+/// exists in some llama.cpp builds and not in the pinned one, which is exactly
+/// the case this shape exists to survive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EngineCounters {
+    /// Longest sequence the engine has seen, prompt plus generation.
+    ///
+    /// The honest answer to "is the context we loaded larger than anything
+    /// anyone has used?", which is a memory question before it is a speed one.
+    pub max_sequence_tokens: Option<u64>,
+    /// `llama_decode()` calls. Against tokens generated, this is how batching
+    /// becomes visible: one decode per token means none is happening.
+    pub decode_calls: Option<u64>,
+    /// Average slots busy per decode step.
+    ///
+    /// The number that says whether raising the slot count did anything at
+    /// all, rather than whether it was configured.
+    pub busy_slots_per_decode: Option<f64>,
+    /// Requests the engine is working on this instant.
+    pub requests_processing: Option<u64>,
+    /// Requests the engine has put aside for lack of a free slot.
+    ///
+    /// Queueing *inside* the engine, which our own queue depth cannot see.
+    pub requests_deferred: Option<u64>,
 }
 
 /// An inference engine.
@@ -243,6 +320,17 @@ pub trait InferenceBackend: Send + Sync + 'static {
 
     /// What the engine is consuming, or `None` when nothing is running.
     async fn resource_usage(&self) -> Result<Option<ResourceSnapshot>, BackendError>;
+
+    /// What the engine reports about its own work, or `None` when it reports
+    /// nothing.
+    ///
+    /// Defaulted rather than required, because "this engine publishes no
+    /// counters" is a legitimate engine. A backend that has them overrides
+    /// this; one that does not says so by saying nothing, and the gateway
+    /// renders that as "not reported" rather than as a row of zeroes.
+    async fn engine_counters(&self) -> Result<Option<EngineCounters>, BackendError> {
+        Ok(None)
+    }
 
     /// Stop everything and leave no child processes behind.
     async fn shutdown(&self) -> Result<(), BackendError>;

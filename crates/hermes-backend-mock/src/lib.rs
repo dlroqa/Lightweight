@@ -31,8 +31,8 @@ use hermes_inference::generation::{
     FinishReason, GenerationEvent, GenerationRequest, Timings, Usage,
 };
 use hermes_inference::{
-    BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, GenerationStream,
-    InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
+    BackendCapabilities, BackendError, BackendHealth, BackendId, CpuTicks, DeviceKind,
+    GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -104,6 +104,12 @@ pub struct MockConfig {
     /// to be able to say how much that is. `None` stands for a kernel or a
     /// platform that does not publish it.
     pub anon_rss: Option<Bytes>,
+    /// Processor time the pretend engine has been charged for.
+    ///
+    /// Configurable for the same reason `anon_rss` is: a test that wants to
+    /// prove the gateway differences two readings has to be able to say what
+    /// the two readings are. `None` stands for a platform with no probe.
+    pub cpu_ticks: Option<CpuTicks>,
 }
 
 impl Default for MockConfig {
@@ -118,6 +124,12 @@ impl Default for MockConfig {
             // Most of the 512 MiB below, but not all of it: the weights are
             // mmapped and so file-backed, exactly as with a real engine.
             anon_rss: Some(Bytes::from_mib(384)),
+            // Non-zero, so that a test asserting the reading travelled cannot
+            // pass against a field that was never populated.
+            cpu_ticks: Some(CpuTicks {
+                user: 1_200,
+                system: 40,
+            }),
         }
     }
 }
@@ -301,11 +313,16 @@ impl InferenceBackend for MockBackend {
         if self.resident.lock().await.is_none() {
             return Ok(None);
         }
+        // One lock, held once. Two `lock().await` calls inside a single struct
+        // literal deadlock: the first guard is a temporary that lives until the
+        // end of the statement, so the second waits on a mutex this task
+        // already holds.
+        let config = self.config.lock().await;
         Ok(Some(ResourceSnapshot {
             rss: Bytes::from_mib(512),
             peak_rss: Bytes::from_mib(600),
-            anon_rss: self.config.lock().await.anon_rss,
-            cpu_percent: Some(0.0),
+            anon_rss: config.anon_rss,
+            cpu_ticks: config.cpu_ticks,
         }))
     }
 

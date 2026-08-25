@@ -239,6 +239,7 @@ impl GatewayState {
             n_ctx: model.n_ctx,
         });
         let limits = self.scheduler.band_limits();
+        let (memory, cpu) = self.engine_usage().await;
         self.metrics.snapshot(
             self.scheduler.snapshot(),
             model,
@@ -246,11 +247,34 @@ impl GatewayState {
                 interactive_prompt_tokens: limits.prompt_tokens,
                 interactive_output_tokens: limits.output_tokens,
             },
-            self.engine_memory().await,
+            memory,
+            cpu,
+            self.engine_counters().await,
         )
     }
 
-    /// What the engine process is holding, or why that is not knowable.
+    /// What the engine says about its own work, or why that is not knowable.
+    ///
+    /// A second per-pull reading, and unlike the two above it costs a loopback
+    /// request rather than a `/proc` read. That is affordable exactly once per
+    /// scrape and is why there is no sampler behind it.
+    async fn engine_counters(&self) -> Probed<hermes_inference::EngineCounters> {
+        match self.backend.engine_counters().await {
+            Ok(Some(reading)) => Probed::Read { reading },
+            Ok(None) if !self.backend.health().await.is_ready() => unavailable(
+                "no_engine_running",
+                "no engine is running, so it is counting nothing",
+            ),
+            Ok(None) => unavailable(
+                "engine_counters_unsupported",
+                "this engine publishes no counters of its own",
+            ),
+            Err(err) => unavailable(err.code(), &err.to_string()),
+        }
+    }
+
+    /// What the engine process is holding and spending, or why that is not
+    /// knowable.
     ///
     /// Read on demand, once per pull. There is no sampler and no retained
     /// reading: `rss` is a level, so a single read is a complete answer, and
@@ -261,27 +285,62 @@ impl GatewayState {
     /// for "this platform has no probe". Those need different words on screen,
     /// so they are told apart here by asking the engine whether it is up -
     /// which is cheaper than widening the trait for one caller.
-    async fn engine_memory(&self) -> Probed<crate::metrics::EngineMemory> {
+    async fn engine_usage(
+        &self,
+    ) -> (
+        Probed<crate::metrics::EngineMemory>,
+        Probed<crate::metrics::EngineCpu>,
+    ) {
         match self.backend.resource_usage().await {
-            Ok(Some(usage)) => Probed::Read {
-                reading: crate::metrics::EngineMemory {
-                    rss: usage.rss,
-                    peak_rss: usage.peak_rss,
-                    anon_rss: usage.anon_rss,
+            Ok(Some(usage)) => (
+                Probed::Read {
+                    reading: crate::metrics::EngineMemory {
+                        rss: usage.rss,
+                        peak_rss: usage.peak_rss,
+                        anon_rss: usage.anon_rss,
+                    },
                 },
-            },
-            Ok(None) if !self.backend.health().await.is_ready() => Probed::Unavailable {
-                code: "no_engine_running",
-                message: "no engine is running, so it is holding nothing".to_owned(),
-            },
-            Ok(None) => Probed::Unavailable {
-                code: "engine_memory_probe_unsupported",
-                message: "this platform does not publish a process's resident set".to_owned(),
-            },
-            Err(err) => Probed::Unavailable {
-                code: err.code(),
-                message: err.to_string(),
-            },
+                // The memory fields and the processor-time fields come from two
+                // different files, so one can be readable while the other is
+                // not. Reporting ticks of zero for an engine whose `stat` could
+                // not be read would be indistinguishable from an engine that
+                // has genuinely done nothing yet.
+                match usage.cpu_ticks {
+                    Some(ticks) => Probed::Read {
+                        reading: crate::metrics::EngineCpu {
+                            user_ticks: ticks.user,
+                            system_ticks: ticks.system,
+                        },
+                    },
+                    None => Probed::Unavailable {
+                        code: "engine_cpu_probe_unsupported",
+                        message: "this platform does not publish a process's processor time"
+                            .to_owned(),
+                    },
+                },
+            ),
+            Ok(None) if !self.backend.health().await.is_ready() => {
+                const CODE: &str = "no_engine_running";
+                const MESSAGE: &str = "no engine is running, so it is holding nothing";
+                (unavailable(CODE, MESSAGE), unavailable(CODE, MESSAGE))
+            }
+            Ok(None) => (
+                Probed::Unavailable {
+                    code: "engine_memory_probe_unsupported",
+                    message: "this platform does not publish a process's resident set".to_owned(),
+                },
+                Probed::Unavailable {
+                    code: "engine_cpu_probe_unsupported",
+                    message: "this platform does not publish a process's processor time".to_owned(),
+                },
+            ),
+            Err(err) => {
+                let message = err.to_string();
+                (
+                    unavailable(err.code(), &message),
+                    unavailable(err.code(), &message),
+                )
+            }
         }
     }
 
@@ -326,6 +385,18 @@ impl GatewayState {
     /// Stop accepting work and cancel what is running.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+}
+
+/// One unavailability, for readings of two different shapes.
+///
+/// A closure would infer a single concrete `T` from its first use, and these
+/// two readings come from the same probe failing once: saying so twice is the
+/// honest report, and a generic function is what lets it be said twice.
+fn unavailable<T>(code: &'static str, message: &str) -> Probed<T> {
+    Probed::Unavailable {
+        code,
+        message: message.to_owned(),
     }
 }
 

@@ -1,14 +1,14 @@
 import { Activity, Cpu, Gauge, MemoryStick } from "lucide-react";
 
 import { api } from "../api/client";
-import { bytes, percent, rate } from "../api/format";
+import { bytes, percent, quantile, rate } from "../api/format";
 import { wasRead } from "../api/types";
 import { Card } from "../components/Card";
 import { Row } from "../components/Bits";
 import { StatTile } from "../components/StatTile";
 import { TopBar } from "../components/Shell";
 import { usePoll } from "../hooks/usePoll";
-import { useSeries, useUtilization } from "../hooks/useSeries";
+import { useEngineCores, useSeries, useUtilization } from "../hooks/useSeries";
 
 export function Performance() {
   const metrics = usePoll(api.metrics, 1000);
@@ -39,6 +39,21 @@ export function Performance() {
 
   const ttft = metrics.data?.time_to_first_token;
   const queueWait = metrics.data?.queue_wait;
+
+  // What the engine is doing with the processor, as opposed to how much of it
+  // is held. Both counters are cumulative, so this is a difference across two
+  // polls, and it is `null` rather than zero until there are two.
+  const engineCpu = wasRead(metrics.data?.engine_cpu)
+    ? metrics.data.engine_cpu
+    : null;
+  const engineCores = useEngineCores(
+    engineCpu,
+    times,
+    system.data?.cpu.logical_cores ?? null,
+  );
+  const counters = wasRead(metrics.data?.engine_counters)
+    ? metrics.data.engine_counters
+    : null;
 
   return (
     <>
@@ -72,7 +87,15 @@ export function Performance() {
             tint="var(--series-1)"
             label="CPU Usage"
             value={utilization === null ? "—" : percent(utilization)}
-            sub={system.data ? `${system.data.cpu.physical_cores} cores` : ""}
+            sub={
+              engineCores === null
+                ? system.data
+                  ? `${system.data.cpu.physical_cores} cores`
+                  : ""
+                : `engine using ${engineCores.toFixed(1)} of ${
+                    system.data?.cpu.logical_cores
+                  } cores`
+            }
             series={cpuSeries}
           />
           <StatTile
@@ -110,9 +133,17 @@ export function Performance() {
                 ? `${Math.round(ttft.total_ms / ttft.count)} ms`
                 : "no samples yet"}
             </Row>
+            <Row label="Median time to first token">{quantile(ttft, 0.5)}</Row>
+            <Row label="95th percentile first token">
+              {quantile(ttft, 0.95)}
+            </Row>
             <Row label="Longest queue wait">
               {queueWait ? `${queueWait.max_ms} ms` : "—"}
             </Row>
+            <div className="card__note" style={{ marginTop: 10 }}>
+              Percentiles are bucket bounds, not interpolated values: at least
+              that share of requests finished within the figure shown.
+            </div>
           </Card>
 
           <Card title="Hardware">
@@ -142,6 +173,41 @@ export function Performance() {
                 accordingly.
               </div>
             )}
+          </Card>
+
+          <Card title="Engine">
+            <Row label="Processor time">
+              {engineCpu
+                ? `${engineCpu.user_ticks + engineCpu.system_ticks} ticks`
+                : "not reported"}
+            </Row>
+            <Row label="Cores in use">
+              {engineCores === null ? "—" : engineCores.toFixed(2)}
+            </Row>
+            <Row label="Longest sequence served">
+              {counters?.max_sequence_tokens === undefined
+                ? "not reported"
+                : `${counters.max_sequence_tokens.toLocaleString()} tokens`}
+            </Row>
+            <Row label="Decode steps">
+              {counters?.decode_calls === undefined
+                ? "not reported"
+                : counters.decode_calls.toLocaleString()}
+            </Row>
+            <Row label="Slots busy per decode">
+              {counters?.busy_slots_per_decode === undefined
+                ? "not reported"
+                : counters.busy_slots_per_decode.toFixed(2)}
+            </Row>
+            <Row label="Deferred by the engine">
+              {counters?.requests_deferred === undefined
+                ? "not reported"
+                : counters.requests_deferred.toLocaleString()}
+            </Row>
+            <div className="card__note" style={{ marginTop: 10 }}>
+              The longest sequence served against the loaded context is the
+              cheapest signal that a model is holding a window nobody is using.
+            </div>
           </Card>
 
           <Card title="Queue">

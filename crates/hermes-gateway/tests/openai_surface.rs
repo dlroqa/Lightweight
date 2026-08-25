@@ -1637,13 +1637,41 @@ async fn metrics_report_what_the_gateway_actually_did() {
         "{text}"
     );
     // Every metric a scraper reads must have been declared first.
+    //
+    // A histogram declares its `# TYPE` on the family name, and `_bucket`,
+    // `_sum` and `_count` are series *within* that family rather than metrics
+    // of their own - so the suffix is stripped before looking for the
+    // declaration. This is the same invariant as before ("nothing is emitted
+    // that a scraper was not told about"), expressed in the exposition
+    // format's own terms now that a family in it has more than one series.
     for line in text.lines().filter(|line| !line.starts_with('#')) {
         let name = line.split(['{', ' ']).next().unwrap_or_default();
+        let family = ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|suffix| name.strip_suffix(*suffix))
+            .unwrap_or(name);
         assert!(
-            text.contains(&format!("# TYPE {name} ")),
+            text.contains(&format!("# TYPE {name} "))
+                || text.contains(&format!("# TYPE {family} histogram")),
             "{name} was emitted without a TYPE line"
         );
     }
+    // The distribution, not just the mean: a p95 is unanswerable from a sum
+    // and a count, and the tail is the whole complaint on a slow machine.
+    assert!(
+        text.contains("# TYPE hermes_time_to_first_token_seconds histogram"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hermes_time_to_first_token_seconds_bucket{le=\"+Inf\"} 1"),
+        "every observation must reach the overflow bucket: {text}"
+    );
+    assert!(
+        text.contains("hermes_queue_wait_seconds_bucket{le=\"0.050\"} 1"),
+        "an unqueued request waited under 50ms and must be counted there: {text}"
+    );
+    // The two series that existed before keep their names and their meaning.
+    assert!(text.contains("hermes_queue_wait_seconds_count 1"), "{text}");
     assert!(
         !text.contains("/mock/model.gguf"),
         "a scrape must not carry the model's path: {text}"

@@ -369,7 +369,8 @@ async fn serve_completions(
     let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
     let mut guard = RequestGuard::new(cancel, Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
-        .describing(builder.id(), model.id.to_string());
+        .describing(builder.id(), model.id.to_string())
+        .in_band(band);
     guard.waited(waiting_since.elapsed());
 
     tracing::info!(
@@ -513,7 +514,8 @@ async fn serve_chat(
     if let Some(permit) = state.try_acquire_slot() {
         let guard = RequestGuard::new(cancel.clone(), Some(permit))
             .reporting_to(Arc::clone(state.metrics()))
-            .describing(builder.id(), model.id.to_string());
+            .describing(builder.id(), model.id.to_string())
+            .in_band(band);
         let events = state
             .backend
             .generate(model.instance, generation, cancel)
@@ -547,7 +549,8 @@ async fn serve_chat(
         let deadline = tokio::time::Instant::now() + state.config.queue_timeout;
         let guard = RequestGuard::new(cancel.clone(), None)
             .reporting_to(Arc::clone(state.metrics()))
-            .describing(builder.id(), model.id.to_string());
+            .describing(builder.id(), model.id.to_string())
+            .in_band(band);
         let backend = Arc::clone(&state.backend);
         let instance = model.instance;
         let start: StartGeneration = Box::new(move || {
@@ -576,7 +579,8 @@ async fn serve_chat(
     })?;
     let mut guard = RequestGuard::new(cancel.clone(), Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
-        .describing(builder.id(), model.id.to_string());
+        .describing(builder.id(), model.id.to_string())
+        .in_band(band);
     guard.waited(waiting_since.elapsed());
 
     let events = state

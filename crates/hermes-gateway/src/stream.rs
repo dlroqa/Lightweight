@@ -110,6 +110,17 @@ impl RequestGuard {
     }
 
     /// Record how long this request waited for its slot.
+    /// Record which band decided when this request started.
+    ///
+    /// A builder step beside `reporting_to` and `describing`, for the same
+    /// reason those are: the band is known where the request is classified, and
+    /// threading it through every constructor would change four signatures to
+    /// carry one enum.
+    pub fn in_band(mut self, band: crate::scheduler::Band) -> Self {
+        self.record.band = Some(band);
+        self
+    }
+
     pub fn waited(&mut self, queue_wait: Duration) {
         self.record.queue_wait = queue_wait;
     }
@@ -534,6 +545,14 @@ fn close(encoder: &mut Encoder, finish_reason: FinishReason) {
 
 #[cfg(test)]
 mod tests {
+    /// A reading from a test that has no engine to read.
+    fn no_engine<T>() -> crate::system::Probed<T> {
+        crate::system::Probed::Unavailable {
+            code: "no_engine_running",
+            message: "this test has no engine".to_owned(),
+        }
+    }
+
     use super::*;
     use futures_util::stream as futures_stream;
     use hermes_core::{SseDecoder, SseEvent};
@@ -693,10 +712,9 @@ mod tests {
             Default::default(),
             None,
             Default::default(),
-            crate::system::Probed::Unavailable {
-                code: "no_engine_running",
-                message: "this test has no engine".to_owned(),
-            },
+            no_engine(),
+            no_engine(),
+            no_engine(),
         );
         assert_eq!(
             snapshot.tokens.decoded, 20,

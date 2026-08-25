@@ -27,10 +27,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use hermes_inference::EngineCounters;
 use hermes_inference::generation::FinishReason;
 use serde::Serialize;
 
-use crate::scheduler::QueueSnapshot;
+use crate::scheduler::{Band, QueueSnapshot};
 use crate::system::Probed;
 use hermes_core::units::Bytes;
 
@@ -115,14 +116,52 @@ pub struct GenerationRecord {
     pub decode: Option<Duration>,
     /// Wall-clock from admission to the last byte.
     pub total: Duration,
+    /// Which queue this request was classified into.
+    ///
+    /// `Option`, because the classification belongs to the request path and a
+    /// record assembled without one is still a complete record of a
+    /// generation. It stays `Copy`: a two-variant enum, not a label.
+    pub band: Option<Band>,
 }
 
-/// A counter that also remembers its largest single observation.
+/// Upper bounds of the latency buckets, in milliseconds.
+///
+/// Chosen for the machines this runs on rather than copied from a web service.
+/// A ladder ending at ten seconds would put every prefill on a CPU without AVX
+/// into the overflow bucket and measure nothing about it; the top of this one
+/// is two minutes, which a long agentic prompt genuinely reaches. The cost of
+/// the wide end is one `u64` per tally on a machine fast enough never to use
+/// it.
+///
+/// Milliseconds because that is the unit `observe` is handed, so a bucket is
+/// chosen by integer comparison and no float rounding decides which side of a
+/// boundary an observation falls on.
+pub const LATENCY_BOUNDS_MS: [u64; 11] = [
+    50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
+
+/// Buckets, plus the `+Inf` overflow that every histogram ends with.
+const BUCKETS: usize = LATENCY_BOUNDS_MS.len() + 1;
+
+/// A counter that also remembers its largest single observation, and the shape
+/// of the observations it has seen.
+///
+/// The distribution is what a mean cannot say: on a gateway where one slow
+/// request in fifty is the whole complaint, the mean moves by milliseconds
+/// while the tail moves by minutes.
 #[derive(Debug, Default)]
 struct Tally {
     count: AtomicU64,
     total_ms: AtomicU64,
     max_ms: AtomicU64,
+    /// Observations falling in each bucket, **not** cumulative.
+    ///
+    /// Cumulative counts are what Prometheus wants and what [`Self::read`]
+    /// produces, but storing them that way would cost one atomic add per bucket
+    /// on every observation instead of one in total. The accumulation is done
+    /// once per scrape rather than once per request, on the side of the fence
+    /// where nobody is waiting.
+    buckets: [AtomicU64; BUCKETS],
 }
 
 impl Tally {
@@ -131,23 +170,67 @@ impl Tally {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_ms.fetch_add(ms, Ordering::Relaxed);
         self.max_ms.fetch_max(ms, Ordering::Relaxed);
+        // The first bucket whose bound this observation does not exceed, or the
+        // overflow when it exceeds them all.
+        let index = LATENCY_BOUNDS_MS.partition_point(|bound| *bound < ms);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
     }
 
     fn read(&self) -> TallySnapshot {
+        let mut buckets = [Bucket::default(); BUCKETS];
+        let mut running = 0;
+        for (index, bucket) in buckets.iter_mut().enumerate() {
+            running += self.buckets[index].load(Ordering::Relaxed);
+            *bucket = Bucket {
+                le_ms: LATENCY_BOUNDS_MS.get(index).copied(),
+                count: running,
+            };
+        }
         TallySnapshot {
             count: self.count.load(Ordering::Relaxed),
             total_ms: self.total_ms.load(Ordering::Relaxed),
             max_ms: self.max_ms.load(Ordering::Relaxed),
+            buckets,
         }
     }
 }
 
-/// A tally as read out.
+/// One cumulative histogram bucket.
+///
+/// `le_ms` is the bucket's upper bound and `None` is the `+Inf` bucket, so the
+/// series describes itself: a reader does not have to hold a copy of
+/// [`LATENCY_BOUNDS_MS`] to know what it is looking at, and the panel cannot
+/// drift out of step with the gateway by keeping its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Bucket {
+    pub le_ms: Option<u64>,
+    pub count: u64,
+}
+
+/// A tally as read out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct TallySnapshot {
     pub count: u64,
     pub total_ms: u64,
     pub max_ms: u64,
+    /// Cumulative counts: each entry is every observation at or below its
+    /// bound, which is the convention Prometheus histograms are read with.
+    pub buckets: [Bucket; BUCKETS],
+}
+
+impl Default for TallySnapshot {
+    fn default() -> Self {
+        let mut buckets = [Bucket::default(); BUCKETS];
+        for (index, bucket) in buckets.iter_mut().enumerate() {
+            bucket.le_ms = LATENCY_BOUNDS_MS.get(index).copied();
+        }
+        Self {
+            count: 0,
+            total_ms: 0,
+            max_ms: 0,
+            buckets,
+        }
+    }
 }
 
 impl TallySnapshot {
@@ -158,6 +241,25 @@ impl TallySnapshot {
     /// has never answered at all.
     pub fn mean_ms(&self) -> Option<f64> {
         (self.count > 0).then(|| self.total_ms as f64 / self.count as f64)
+    }
+
+    /// The bound of the first bucket holding the given share of observations.
+    ///
+    /// A quantile read off buckets is a bound, not a value: "at least 95% of
+    /// requests finished within this many milliseconds" is what the data
+    /// supports, and interpolating inside a bucket would invent precision the
+    /// counters never had. `None` when nothing has been observed, and `None`
+    /// for the overflow bucket - "longer than the longest bound" is honest
+    /// where a number would not be.
+    pub fn quantile_ms(&self, share: f64) -> Option<u64> {
+        if self.count == 0 {
+            return None;
+        }
+        let target = (self.count as f64 * share).ceil() as u64;
+        self.buckets
+            .iter()
+            .find(|bucket| bucket.count >= target)
+            .and_then(|bucket| bucket.le_ms)
     }
 }
 
@@ -279,6 +381,14 @@ pub struct Metrics {
     /// and the number anybody wants is total tokens over total time.
     decoded_tokens: AtomicU64,
     prefilled_tokens: AtomicU64,
+    /// Generations and waiting, split by the band that decided who started.
+    ///
+    /// The distribution stays whole in `queue_wait` above; what is split here
+    /// is the question the bands exist to answer - whether a short request
+    /// actually gets through sooner than a long one, which a single average
+    /// over both cannot show.
+    band_generations: [AtomicU64; Band::ALL.len()],
+    band_queue_wait: [Tally; Band::ALL.len()],
 }
 
 impl Default for Metrics {
@@ -309,6 +419,8 @@ impl Metrics {
             decode: Tally::default(),
             decoded_tokens: AtomicU64::new(0),
             prefilled_tokens: AtomicU64::new(0),
+            band_generations: Default::default(),
+            band_queue_wait: Default::default(),
         }
     }
 
@@ -384,6 +496,10 @@ impl Metrics {
             .fetch_add(u64::from(record.cached_tokens), Ordering::Relaxed);
 
         self.queue_wait.observe(record.queue_wait);
+        if let Some(band) = record.band {
+            self.band_generations[band.index()].fetch_add(1, Ordering::Relaxed);
+            self.band_queue_wait[band.index()].observe(record.queue_wait);
+        }
         if let Some(ttft) = record.time_to_first_token {
             self.time_to_first_token.observe(ttft);
         }
@@ -411,6 +527,8 @@ impl Metrics {
         model: Option<ModelSnapshot>,
         bands: BandSnapshot,
         engine: Probed<EngineMemory>,
+        engine_cpu: Probed<EngineCpu>,
+        engine_counters: Probed<EngineCounters>,
     ) -> MetricsSnapshot {
         let mut requests = Vec::with_capacity(Endpoint::ALL.len() * Outcome::ALL.len());
         for endpoint in Endpoint::ALL {
@@ -441,6 +559,11 @@ impl Metrics {
                 prefilled: self.prefilled_tokens.load(Ordering::Relaxed),
                 decoded: self.decoded_tokens.load(Ordering::Relaxed),
             },
+            bands_served: Band::ALL.map(|band| BandCount {
+                band: band.as_str(),
+                generations: self.band_generations[band.index()].load(Ordering::Relaxed),
+                queue_wait: self.band_queue_wait[band.index()].read(),
+            }),
             queue_wait: self.queue_wait.read(),
             time_to_first_token: self.time_to_first_token.read(),
             prefill: self.prefill.read(),
@@ -449,8 +572,18 @@ impl Metrics {
             model,
             bands,
             engine,
+            engine_cpu,
+            engine_counters,
         }
     }
+}
+
+/// What one band was served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BandCount {
+    pub band: &'static str,
+    pub generations: u64,
+    pub queue_wait: TallySnapshot,
 }
 
 /// One cell of the request matrix.
@@ -502,6 +635,8 @@ pub struct MetricsSnapshot {
     pub generations: u64,
     pub finish_reasons: FinishReasonCounts,
     pub tokens: TokenCounts,
+    /// What each band was actually served, as opposed to what it was promised.
+    pub bands_served: [BandCount; Band::ALL.len()],
     pub queue_wait: TallySnapshot,
     pub time_to_first_token: TallySnapshot,
     pub prefill: TallySnapshot,
@@ -523,6 +658,39 @@ pub struct MetricsSnapshot {
     /// the gateway tells them apart from the engine's health rather than by
     /// changing the trait.
     pub engine: Probed<EngineMemory>,
+    /// What the engine process has been spending the processor on.
+    ///
+    /// Read from the same single probe as `engine`, so a scrape costs one pass
+    /// over `/proc` rather than two. It carries its own `Probed` state because
+    /// it can be absent while `engine` is present: the memory fields and the
+    /// processor-time fields live in different files, and only one of them may
+    /// be readable.
+    pub engine_cpu: Probed<EngineCpu>,
+    /// What the engine reports about its own work.
+    ///
+    /// Scraped from the engine's private Prometheus endpoint, which has been
+    /// enabled since M2 and read by nothing. Only counters the gateway cannot
+    /// compute for itself appear here; everything it already measures is
+    /// measured once.
+    pub engine_counters: Probed<EngineCounters>,
+}
+
+/// Processor time the engine process has been charged for.
+///
+/// The counterpart to [`EngineMemory`], and the number that was missing while
+/// the product's entire premise was CPU inference: `rss` says how much of the
+/// machine the engine is holding, and this says how much of it the engine is
+/// *using*.
+///
+/// Ticks, unconverted, exactly as `/proc/<pid>/stat` publishes them and for the
+/// same reason `hermes_system_info::load` publishes `/proc/stat` unconverted —
+/// a rate needs two readings and an interval, so this crate publishes the
+/// counter and lets the caller difference it rather than inventing a percentage
+/// from one sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct EngineCpu {
+    pub user_ticks: u64,
+    pub system_ticks: u64,
 }
 
 /// What the engine process is holding, right now.
@@ -665,14 +833,38 @@ impl MetricsSnapshot {
                 self.decode,
             ),
         ] {
-            header(&mut out, &format!("{name}_seconds_sum"), help, "counter");
+            // A histogram in the format's own terms: one `# TYPE` for the
+            // family, then `_bucket`, `_sum` and `_count` under it. The two
+            // series that existed before keep their names and their values -
+            // what changes is that `histogram_quantile()` now has buckets to
+            // work with, so a p95 stops being unanswerable.
+            header(&mut out, &format!("{name}_seconds"), help, "histogram");
+            for bucket in &tally.buckets {
+                match bucket.le_ms {
+                    Some(le_ms) => {
+                        let _ = writeln!(
+                            out,
+                            "{name}_seconds_bucket{{le=\"{:.3}\"}} {}",
+                            le_ms as f64 / 1000.0,
+                            bucket.count
+                        );
+                    }
+                    None => {
+                        let _ =
+                            writeln!(out, "{name}_seconds_bucket{{le=\"+Inf\"}} {}", bucket.count);
+                    }
+                }
+            }
             let _ = writeln!(
                 out,
                 "{name}_seconds_sum {:.3}",
                 tally.total_ms as f64 / 1000.0
             );
-            header(&mut out, &format!("{name}_seconds_count"), help, "counter");
             let _ = writeln!(out, "{name}_seconds_count {}", tally.count);
+            // Not part of the histogram convention, and kept because the
+            // convention has no place for it: the longest single wait is the
+            // number an operator asks for first, and it cannot be recovered
+            // from buckets.
             header(&mut out, &format!("{name}_seconds_max"), help, "gauge");
             let _ = writeln!(
                 out,
@@ -789,6 +981,143 @@ impl MetricsSnapshot {
             );
         }
 
+        // Ticks rather than seconds, because `USER_HZ` is not this process's to
+        // guess at and a scraper computing `rate()` over a counter does not
+        // care what the unit is - only that it is constant, which it is. The
+        // HELP line names it so nobody has to find that out from the numbers.
+        if let Probed::Read { reading } = &self.engine_cpu {
+            header(
+                &mut out,
+                "hermes_engine_cpu_ticks_total",
+                "Processor time charged to the engine process, in kernel clock ticks (USER_HZ).",
+                "counter",
+            );
+            let _ = writeln!(
+                out,
+                "hermes_engine_cpu_ticks_total{{mode=\"user\"}} {}",
+                reading.user_ticks
+            );
+            let _ = writeln!(
+                out,
+                "hermes_engine_cpu_ticks_total{{mode=\"system\"}} {}",
+                reading.system_ticks
+            );
+        }
+
+        // Carried in the JSON snapshot since M5 and rendered nowhere, which
+        // made the scrape and the panel disagree about what the gateway knows.
+        // Measured at the moment a slot is granted, which is why it is a
+        // separate series from `hermes_queue_wait_seconds`: that one is
+        // recorded by the request as it finishes, and a request that gave up
+        // never reaches it.
+        // What the bands were actually served. `hermes_generations_total` is
+        // deliberately left unlabelled - one metric name cannot be both
+        // labelled and not - so the split is its own series.
+        // Absent when the engine did not report them, present when it did, and
+        // never a zero standing in for either.
+        if let Probed::Read { reading } = &self.engine_counters {
+            if let Some(tokens) = reading.max_sequence_tokens {
+                header(
+                    &mut out,
+                    "hermes_engine_max_sequence_tokens",
+                    "Longest sequence the engine has served, prompt and generation together.",
+                    "gauge",
+                );
+                let _ = writeln!(out, "hermes_engine_max_sequence_tokens {tokens}");
+            }
+            if let Some(calls) = reading.decode_calls {
+                header(
+                    &mut out,
+                    "hermes_engine_decode_calls_total",
+                    "Decode steps the engine has run.",
+                    "counter",
+                );
+                let _ = writeln!(out, "hermes_engine_decode_calls_total {calls}");
+            }
+            if let Some(slots) = reading.busy_slots_per_decode {
+                header(
+                    &mut out,
+                    "hermes_engine_busy_slots_per_decode",
+                    "Average slots kept busy per decode step.",
+                    "gauge",
+                );
+                let _ = writeln!(out, "hermes_engine_busy_slots_per_decode {slots:.3}");
+            }
+            if let Some(deferred) = reading.requests_deferred {
+                header(
+                    &mut out,
+                    "hermes_engine_requests_deferred",
+                    "Requests the engine has put aside for lack of a free slot.",
+                    "gauge",
+                );
+                let _ = writeln!(out, "hermes_engine_requests_deferred {deferred}");
+            }
+        }
+
+        header(
+            &mut out,
+            "hermes_band_generations_total",
+            "Generations that reached a finish reason, by the band they were served in.",
+            "counter",
+        );
+        for row in &self.bands_served {
+            let _ = writeln!(
+                out,
+                "hermes_band_generations_total{{band=\"{}\"}} {}",
+                row.band, row.generations
+            );
+        }
+        header(
+            &mut out,
+            "hermes_band_queue_wait_seconds_sum",
+            "Time spent waiting for a slot, by band.",
+            "counter",
+        );
+        for row in &self.bands_served {
+            let _ = writeln!(
+                out,
+                "hermes_band_queue_wait_seconds_sum{{band=\"{}\"}} {:.3}",
+                row.band,
+                row.queue_wait.total_ms as f64 / 1000.0
+            );
+        }
+        header(
+            &mut out,
+            "hermes_band_queue_wait_seconds_count",
+            "Requests that waited for a slot, by band.",
+            "counter",
+        );
+        for row in &self.bands_served {
+            let _ = writeln!(
+                out,
+                "hermes_band_queue_wait_seconds_count{{band=\"{}\"}} {}",
+                row.band, row.queue_wait.count
+            );
+        }
+
+        header(
+            &mut out,
+            "hermes_queue_grant_wait_seconds_sum",
+            "Time waited by requests that were granted a slot, measured at the grant.",
+            "counter",
+        );
+        let _ = writeln!(
+            out,
+            "hermes_queue_grant_wait_seconds_sum {:.3}",
+            self.queue.wait_ms_total as f64 / 1000.0
+        );
+        header(
+            &mut out,
+            "hermes_queue_grant_wait_seconds_max",
+            "Longest wait by a request that was granted a slot.",
+            "gauge",
+        );
+        let _ = writeln!(
+            out,
+            "hermes_queue_grant_wait_seconds_max {:.3}",
+            self.queue.wait_ms_max as f64 / 1000.0
+        );
+
         header(
             &mut out,
             "hermes_band_ceiling_tokens",
@@ -839,4 +1168,133 @@ fn escape_label(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three engine readings a test with no engine has.
+    fn no_engine<T>() -> crate::system::Probed<T> {
+        crate::system::Probed::Unavailable {
+            code: "no_engine_running",
+            message: "no engine".to_owned(),
+        }
+    }
+
+    fn record(queue_wait: Duration, band: Band) -> GenerationRecord {
+        GenerationRecord {
+            queue_wait,
+            band: Some(band),
+            ..GenerationRecord::default()
+        }
+    }
+
+    #[test]
+    fn an_observation_lands_in_the_first_bucket_it_does_not_exceed() {
+        let tally = Tally::default();
+        tally.observe(Duration::from_millis(50));
+        tally.observe(Duration::from_millis(51));
+        let read = tally.read();
+
+        // Cumulative: 50ms is at the bound, so it counts in `le=50` and in
+        // every wider bucket. 51ms misses the first and joins from `le=100`.
+        assert_eq!(read.buckets[0].le_ms, Some(50));
+        assert_eq!(read.buckets[0].count, 1);
+        assert_eq!(read.buckets[1].le_ms, Some(100));
+        assert_eq!(read.buckets[1].count, 2);
+        assert_eq!(read.buckets.last().expect("overflow bucket").le_ms, None);
+        assert_eq!(read.buckets.last().expect("overflow bucket").count, 2);
+    }
+
+    #[test]
+    fn an_observation_past_every_bound_reaches_only_the_overflow() {
+        let tally = Tally::default();
+        tally.observe(Duration::from_secs(600));
+        let read = tally.read();
+        for bucket in read.buckets.iter().filter(|bucket| bucket.le_ms.is_some()) {
+            assert_eq!(bucket.count, 0, "a ten-minute wait is under no bound");
+        }
+        assert_eq!(read.buckets.last().expect("overflow").count, 1);
+        assert_eq!(read.count, 1);
+    }
+
+    #[test]
+    fn a_quantile_is_a_bound_and_never_an_invented_value() {
+        let tally = Tally::default();
+        // Nineteen fast requests and one slow one: the mean is dragged around
+        // by the slow one, and the p95 is what actually names it.
+        for _ in 0..19 {
+            tally.observe(Duration::from_millis(40));
+        }
+        tally.observe(Duration::from_secs(45));
+        let read = tally.read();
+
+        assert_eq!(read.quantile_ms(0.5), Some(50));
+        assert_eq!(read.quantile_ms(0.95), Some(50));
+        assert_eq!(read.quantile_ms(0.99), Some(60_000));
+        // The mean says two and a quarter seconds, which describes no request
+        // that was ever served.
+        assert_eq!(read.mean_ms(), Some(2_288.0));
+    }
+
+    #[test]
+    fn a_quantile_of_nothing_is_not_zero() {
+        // Zero would report a gateway that answers instantly because it has
+        // never answered at all - the same trap `mean_ms` avoids.
+        assert_eq!(TallySnapshot::default().quantile_ms(0.95), None);
+    }
+
+    #[test]
+    fn generations_are_counted_against_the_band_that_admitted_them() {
+        let metrics = Metrics::new();
+        metrics.record_generation(&record(Duration::from_millis(10), Band::Interactive));
+        metrics.record_generation(&record(Duration::from_millis(4_000), Band::Bulk));
+        metrics.record_generation(&record(Duration::from_millis(20), Band::Interactive));
+
+        let snapshot = metrics.snapshot(
+            QueueSnapshot::default(),
+            None,
+            BandSnapshot::default(),
+            no_engine(),
+            no_engine(),
+            no_engine(),
+        );
+
+        let interactive = snapshot
+            .bands_served
+            .iter()
+            .find(|row| row.band == "interactive")
+            .expect("interactive row");
+        let bulk = snapshot
+            .bands_served
+            .iter()
+            .find(|row| row.band == "bulk")
+            .expect("bulk row");
+        assert_eq!(interactive.generations, 2);
+        assert_eq!(bulk.generations, 1);
+        // The point of the split: averaged together these two waits describe
+        // neither band.
+        assert_eq!(interactive.queue_wait.max_ms, 20);
+        assert_eq!(bulk.queue_wait.max_ms, 4_000);
+        assert_eq!(snapshot.queue_wait.count, 3);
+    }
+
+    #[test]
+    fn a_generation_with_no_band_still_counts_everywhere_else() {
+        // `record_generation` has callers that never classified anything, and
+        // an unclassified generation must not vanish from the totals.
+        let metrics = Metrics::new();
+        metrics.record_generation(&GenerationRecord::default());
+        let snapshot = metrics.snapshot(
+            QueueSnapshot::default(),
+            None,
+            BandSnapshot::default(),
+            no_engine(),
+            no_engine(),
+            no_engine(),
+        );
+        assert_eq!(snapshot.generations, 1);
+        assert!(snapshot.bands_served.iter().all(|row| row.generations == 0));
+    }
 }

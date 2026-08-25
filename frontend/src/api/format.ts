@@ -92,3 +92,32 @@ export function rate(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   return value.toFixed(1);
 }
+
+/**
+ * The bound of the first bucket holding the given share of observations.
+ *
+ * A quantile read off buckets is a bound, not a value: "at least 95% of
+ * requests finished within this" is what the counters support, and
+ * interpolating inside a bucket would invent precision they never had. The
+ * gateway computes the same thing the same way — this is here because the
+ * panel reads the buckets directly rather than asking for a number.
+ *
+ * `null` when nothing has been observed, and `"over Xs"` for the overflow
+ * bucket, where the honest answer is a floor rather than a figure.
+ */
+export function quantile(
+  tally: { count: number; buckets: { le_ms: number | null; count: number }[] } | undefined,
+  share: number,
+): string {
+  if (!tally || tally.count === 0) return "no samples yet";
+  const target = Math.ceil(tally.count * share);
+  const bucket = tally.buckets.find((entry) => entry.count >= target);
+  if (!bucket) return "no samples yet";
+  if (bucket.le_ms === null) {
+    const widest = tally.buckets[tally.buckets.length - 2]?.le_ms;
+    return widest ? `over ${widest / 1000}s` : "unbounded";
+  }
+  return bucket.le_ms < 1000
+    ? `${bucket.le_ms} ms`
+    : `${(bucket.le_ms / 1000).toFixed(bucket.le_ms % 1000 === 0 ? 0 : 1)} s`;
+}

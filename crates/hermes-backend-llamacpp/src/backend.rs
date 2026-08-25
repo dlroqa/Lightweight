@@ -15,8 +15,9 @@ use hermes_core::{InstanceId, ModelId, RuntimeParams, units::Bytes};
 use hermes_gguf::architecture;
 use hermes_inference::generation::GenerationRequest;
 use hermes_inference::{
-    BackendCapabilities, BackendError, BackendHealth, BackendId, DeviceKind, GenerationStream,
-    InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
+    BackendCapabilities, BackendError, BackendHealth, BackendId, CpuTicks, DeviceKind,
+    EngineCounters, GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel,
+    ResourceSnapshot,
 };
 use hermes_observability::targets;
 use hermes_system_info::CpuInfo;
@@ -328,7 +329,18 @@ impl InferenceBackend for ProcessBackend {
         let Some(pid) = state.engine.pid() else {
             return Ok(None);
         };
-        Ok(read_process_memory(pid))
+        Ok(read_process_usage(pid))
+    }
+
+    async fn engine_counters(&self) -> Result<Option<EngineCounters>, BackendError> {
+        let Some((base_url, api_key)) = self.engine_endpoint().await else {
+            return Ok(None);
+        };
+        // A scrape failure is not a generation failure: the counters are
+        // reported when they can be read and reported as unavailable when they
+        // cannot, and neither outcome touches anything a client is waiting on.
+        let client = UpstreamClient::new(base_url, api_key)?;
+        client.engine_counters().await.map(Some)
     }
 
     async fn shutdown(&self) -> Result<(), BackendError> {
@@ -388,9 +400,16 @@ impl ProcessBackend {
 /// what lets the RAM estimator be calibrated against observed peak usage rather
 /// than staying an estimate forever.
 #[cfg(target_os = "linux")]
-fn read_process_memory(pid: u32) -> Option<ResourceSnapshot> {
+fn read_process_usage(pid: u32) -> Option<ResourceSnapshot> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    parse_process_status(&status)
+    let mut usage = parse_process_status(&status)?;
+    // Processor time lives in a different file, and its absence is not a
+    // reason to withhold the memory reading that did succeed.
+    usage.cpu_ticks = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(parse_process_stat);
+    Some(usage)
 }
 
 /// Pull the memory fields out of a `/proc/<pid>/status` body.
@@ -417,12 +436,34 @@ fn parse_process_status(status: &str) -> Option<ResourceSnapshot> {
         // swap spends this number: a zero would be silently correct and an
         // absent reading treated as zero would silently refuse the swap.
         anon_rss: field("RssAnon"),
-        cpu_percent: None,
+        // Memory only. Processor time is a second file, read by the caller.
+        cpu_ticks: None,
+    })
+}
+
+/// Pull the processor-time counters out of a `/proc/<pid>/stat` body.
+///
+/// The file is one line, and the second field is the executable name in
+/// parentheses — which may itself contain spaces and parentheses, so the fields
+/// are counted from the **last** `)` rather than by splitting the whole line.
+/// Splitting naively works for `llama-server` and breaks the day the engine is
+/// renamed to something with a space in it, which is exactly the kind of
+/// failure that would be read as "the CPU probe is broken on this machine".
+///
+/// `utime` and `stime` are fields 14 and 15 in `proc(5)`, so they are the
+/// twelfth and thirteenth values after the name.
+#[cfg(target_os = "linux")]
+fn parse_process_stat(stat: &str) -> Option<CpuTicks> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = after_name.split_whitespace().collect();
+    Some(CpuTicks {
+        user: fields.get(11)?.parse().ok()?,
+        system: fields.get(12)?.parse().ok()?,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_process_memory(_pid: u32) -> Option<ResourceSnapshot> {
+fn read_process_usage(_pid: u32) -> Option<ResourceSnapshot> {
     // Only implemented for Linux so far. Reporting `None` is honest; inventing
     // a number here would corrupt the estimator calibration that consumes it.
     None
@@ -482,5 +523,56 @@ RssShmem:\t       0 kB
     #[test]
     fn a_status_with_no_resident_set_is_not_a_reading_at_all() {
         assert!(parse_process_status("Name:\tllama-server\n").is_none());
+    }
+
+    /// Captured from `/proc/<pid>/stat` on the development machine, truncated
+    /// after the fields this parser reads.
+    const STAT_SAMPLE: &str = "4213 (llama-server) S 4190 4213 4190 0 -1 4194304 \
+9821 0 0 0 73142 1885 0 0 20 0 5 0 91544 1798332416 201979";
+
+    #[test]
+    fn a_captured_proc_stat_yields_user_and_system_ticks() {
+        let ticks = parse_process_stat(STAT_SAMPLE).expect("utime and stime are present");
+        assert_eq!(ticks.user, 73_142);
+        assert_eq!(ticks.system, 1_885);
+        assert_eq!(ticks.total(), 75_027);
+    }
+
+    #[test]
+    fn an_executable_name_containing_spaces_and_parens_does_not_shift_the_fields() {
+        // The second field is the executable name in parentheses and the kernel
+        // does not escape it. Counting fields from the start of the line puts
+        // `utime` wherever the name's spaces leave it, which is a wrong number
+        // rather than a missing one - the worst kind. Counting from the last
+        // `)` is what makes this hold.
+        let awkward = STAT_SAMPLE.replace("(llama-server)", "(llama server (dl))");
+        let ticks = parse_process_stat(&awkward).expect("the fields are still findable");
+        assert_eq!(ticks.user, 73_142);
+        assert_eq!(ticks.system, 1_885);
+    }
+
+    #[test]
+    fn a_truncated_stat_line_is_no_reading_rather_than_a_zero() {
+        // Zero ticks is a legitimate answer - an engine that has been asked to
+        // do nothing yet - so an unreadable file must not be able to produce
+        // it, or an idle engine and a broken probe become indistinguishable.
+        assert!(parse_process_stat("4213 (llama-server) S 4190 4213").is_none());
+        assert!(parse_process_stat("no parenthesis here").is_none());
+    }
+
+    #[test]
+    fn ticks_between_two_readings_are_the_difference_and_never_negative() {
+        let earlier = CpuTicks {
+            user: 100,
+            system: 10,
+        };
+        let later = CpuTicks {
+            user: 180,
+            system: 12,
+        };
+        assert_eq!(later.since(&earlier), Some(82));
+        // Across an engine restart the counters begin again, and a replaced
+        // engine did not consume negative processor time.
+        assert_eq!(earlier.since(&later), None);
     }
 }

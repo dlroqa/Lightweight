@@ -40,7 +40,7 @@ use hermes_inference::generation::{
     ChatMessage, FinishReason, GenerationEvent, GenerationRequest, Prompt, ReasoningControl,
     Timings, ToolChoice, ToolDefinition, Usage,
 };
-use hermes_inference::{BackendError, GenerationStream};
+use hermes_inference::{BackendError, EngineCounters, GenerationStream};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -167,6 +167,35 @@ impl UpstreamClient {
             return Err(upstream_error(&payload));
         }
         Ok(payload)
+    }
+
+    /// Scrape the engine's own Prometheus endpoint.
+    ///
+    /// `--metrics` has been on the engine's command line since M2 with a
+    /// comment saying it was "for the metrics provider to scrape", and nothing
+    /// ever scraped it. This is that scrape.
+    ///
+    /// Only series this crate names are lifted, and they are re-emitted as our
+    /// own numbers rather than forwarded — the same rule that governs
+    /// generation chunks, and for the same reason: an upstream rename should
+    /// break a test here, not a dashboard somewhere else.
+    pub async fn engine_counters(&self) -> Result<EngineCounters, BackendError> {
+        let response = self
+            .client
+            .get(format!("{}/metrics", self.base_url))
+            .bearer_auth(&self.api_key)
+            .timeout(METADATA_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        let body = response.text().await.map_err(transport_error)?;
+        if !status.is_success() {
+            return Err(BackendError::GenerationFailed {
+                detail: format!("the engine's metrics endpoint answered {status}"),
+            });
+        }
+        Ok(parse_engine_counters(&body))
     }
 
     /// Start a generation and translate the engine's stream into events.
@@ -745,6 +774,39 @@ fn parse_timings(timings: &Value) -> Option<Timings> {
     })
 }
 
+/// Lift the counters we name out of a Prometheus text body.
+///
+/// Deliberately tolerant in one direction only: a series that is absent yields
+/// `None`, never zero. The pinned build publishes no `kv_cache_usage_ratio`
+/// though older ones do, and a parser that answered "0.0" for a series the
+/// engine never emitted would report a completely empty KV cache on every
+/// scrape — a confident wrong number, which is the one failure this codebase
+/// refuses everywhere else.
+///
+/// Comments and `# HELP` / `# TYPE` lines are skipped rather than parsed: the
+/// value is the last whitespace-separated field of a sample line, and nothing
+/// here needs the metadata.
+fn parse_engine_counters(body: &str) -> EngineCounters {
+    let sample = |name: &str| -> Option<&str> {
+        body.lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| {
+                let (key, value) = line.split_once(char::is_whitespace)?;
+                (key == name).then(|| value.trim())
+            })
+    };
+    let number = |name: &str| -> Option<f64> { sample(name).and_then(|raw| raw.parse().ok()) };
+    let counter = |name: &str| -> Option<u64> { number(name).map(|value| value as u64) };
+
+    EngineCounters {
+        max_sequence_tokens: counter("llamacpp:n_tokens_max"),
+        decode_calls: counter("llamacpp:n_decode_total"),
+        busy_slots_per_decode: number("llamacpp:n_busy_slots_per_decode"),
+        requests_processing: counter("llamacpp:requests_processing"),
+        requests_deferred: counter("llamacpp:requests_deferred"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,5 +1291,74 @@ mod tests {
         assert_eq!(json[0]["content"], "be brief");
         assert_eq!(json[1]["role"], "tool");
         assert_eq!(json[1]["tool_call_id"], "call_1");
+    }
+}
+
+#[cfg(test)]
+mod engine_counter_tests {
+    use super::*;
+
+    /// The pinned engine's own body, captured after one completion.
+    const CAPTURED: &str = include_str!("../../../fixtures/engine/metrics-b10590.txt");
+
+    #[test]
+    fn the_pinned_engines_body_yields_the_counters_we_name() {
+        let counters = parse_engine_counters(CAPTURED);
+        assert_eq!(counters.max_sequence_tokens, Some(47));
+        assert_eq!(counters.decode_calls, Some(12));
+        assert_eq!(counters.busy_slots_per_decode, Some(1.0));
+        assert_eq!(counters.requests_processing, Some(0));
+        assert_eq!(counters.requests_deferred, Some(0));
+    }
+
+    #[test]
+    fn a_series_this_build_does_not_publish_is_absent_rather_than_zero() {
+        // `llamacpp:kv_cache_usage_ratio` is published by some llama.cpp builds
+        // and not by the pinned one. Zero would be a legitimate reading — an
+        // empty cache — so a parser that produced it for a missing series would
+        // report an idle KV cache on a fully loaded engine, forever.
+        assert!(
+            !CAPTURED
+                .lines()
+                .any(|line| !line.starts_with('#') && line.contains("kv_cache_usage_ratio")),
+            "the pinned build publishes no such sample"
+        );
+        let without = CAPTURED
+            .lines()
+            .filter(|line| !line.contains("n_tokens_max"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_engine_counters(&without).max_sequence_tokens, None);
+        // The counters that are still there are still read.
+        assert_eq!(parse_engine_counters(&without).decode_calls, Some(12));
+    }
+
+    #[test]
+    fn help_and_type_lines_are_not_mistaken_for_samples() {
+        // `# HELP llamacpp:n_decode_total Total number of ...` begins with the
+        // metric's name and would parse as a sample whose value is prose.
+        let only_metadata = CAPTURED
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_engine_counters(&only_metadata),
+            EngineCounters::default()
+        );
+    }
+
+    #[test]
+    fn the_engines_metrics_body_carries_nothing_that_could_identify_anyone() {
+        // The reason this scrape is safe to republish: it is numbers and fixed
+        // names. If a future engine build starts labelling series with the
+        // model path, this fails here rather than in a scrape someone else
+        // collects.
+        for line in CAPTURED.lines().filter(|line| !line.starts_with('#')) {
+            assert!(
+                !line.contains('/') && !line.contains('{'),
+                "an engine sample line gained a path or a label: {line}"
+            );
+        }
     }
 }

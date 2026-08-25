@@ -74,6 +74,19 @@ export interface Tally {
   count: number;
   total_ms: number;
   max_ms: number;
+  /**
+   * Cumulative histogram buckets: each entry counts every observation at or
+   * below its bound, and `le_ms: null` is the `+Inf` bucket.
+   *
+   * The bounds travel with the counts rather than being duplicated here, so
+   * this file cannot drift out of step with the gateway's own ladder.
+   */
+  buckets: Bucket[];
+}
+
+export interface Bucket {
+  le_ms: number | null;
+  count: number;
 }
 
 export interface QueueSnapshot {
@@ -120,7 +133,42 @@ export interface Metrics {
     interactive_prompt_tokens: number;
     interactive_output_tokens: number;
   };
+  bands_served: BandCount[];
   engine: Probed<EngineMemory>;
+  engine_cpu: Probed<EngineCpu>;
+  engine_counters: Probed<EngineCounters>;
+}
+
+export interface BandCount {
+  band: string;
+  generations: number;
+  queue_wait: Tally;
+}
+
+/**
+ * Processor time charged to the engine, in kernel clock ticks.
+ *
+ * A counter, so a rate needs two readings — the same discipline `cpu_times`
+ * imposes for the machine as a whole, and the reason `useUtilization` exists.
+ */
+export interface EngineCpu {
+  user_ticks: number;
+  system_ticks: number;
+}
+
+/**
+ * What the engine reports about its own work.
+ *
+ * Every field is optional because an engine publishes what its build
+ * publishes: a counter this build does not have reads as absent, never as
+ * zero.
+ */
+export interface EngineCounters {
+  max_sequence_tokens?: number;
+  decode_calls?: number;
+  busy_slots_per_decode?: number;
+  requests_processing?: number;
+  requests_deferred?: number;
 }
 
 /**
