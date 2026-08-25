@@ -7,6 +7,7 @@
  */
 
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -91,9 +92,29 @@ describe("finding the binary", () => {
     // Nobody debugging this wants to be silently running a stale bundled
     // binary instead of the one they just built.
     const paths = candidatePaths({ repoRoot: "/repo", resourcesPath: "/app" });
-    const built = paths.findIndex((path) => path.startsWith("/repo"));
-    const packaged = paths.findIndex((path) => path.startsWith("/app"));
+    // The prefixes are joined rather than written literally, for the same
+    // reason the message assertion below builds its paths through
+    // `candidatePaths`: Windows joins with a backslash, so `"/repo"` is a
+    // prefix of nothing there and this compared -1 against -1.
+    const built = paths.findIndex((path) => path.startsWith(join("/repo")));
+    const packaged = paths.findIndex((path) => path.startsWith(join("/app")));
+    assert.ok(built >= 0 && packaged >= 0, `neither root is in ${paths}`);
     assert.ok(built < packaged);
+  });
+
+  it("asks for the executable name this platform uses", () => {
+    // A Windows build that looked for `hermes` would search for a file that
+    // cannot exist beside a binary that does - the defect `scripts-stage.mjs`
+    // fixed in the packaging, with nothing pinning it on this side.
+    const expected = process.platform === "win32" ? "hermes.exe" : "hermes";
+    const paths = candidatePaths({ repoRoot: "/repo", resourcesPath: "/app" });
+    assert.ok(paths.length >= 3, `expected every candidate: ${paths}`);
+    for (const path of paths) {
+      assert.ok(
+        path.endsWith(expected),
+        `${path} does not end with ${expected}`,
+      );
+    }
   });
 
   it("names every place it looked when it finds nothing", () => {
