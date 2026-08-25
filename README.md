@@ -17,7 +17,7 @@ touching the UI or the API.
 
 ## Status
 
-Milestones 0 through 7 are complete. The gateway serves an OpenAI-compatible
+Milestones 0 through 8 are complete. The gateway serves an OpenAI-compatible
 API over a supervised llama.cpp child process: streamed and non-streamed chat
 completions, **tool calls**, **`/v1/completions`**, `/v1/models`, `/health` and
 `/props`, with RAM admission control and GGUF metadata underneath it.
@@ -69,8 +69,20 @@ set, because the weights are mmapped and the kernel already counts them. And the
 panel offers a context and a KV cache type per load, priced by the gateway before
 the button is pressed.
 
-What remains of the plan is M8 onward. See [docs/PROGRESS.md](docs/PROGRESS.md)
-for the current checkpoint, and [docs/M7-PLAN.md](docs/M7-PLAN.md) for what the
+And it can now be **measured rather than described**. `hermes bench` brings its
+own engine, sizes its prompts by asking the tokenizer, and records what this
+machine did with a model — prefill, decode, what prefix reuse saves, cores
+actually kept busy, peak memory against what was predicted — beside a
+fingerprint of the machine and the engine build, because a throughput figure
+without those is not a measurement of anything. The knobs that move those
+numbers are reachable at last: the physical batch, priced by the estimator
+before the load; prompt-processing threads; polling; prefix-cache reuse; CPU
+affinity; and how the weights are brought into memory, which is checked against
+the kernel's locked-memory allowance before an engine is started rather than
+warned about on its stderr afterwards.
+
+What remains of the plan is M9 and M10. See [docs/PROGRESS.md](docs/PROGRESS.md)
+for the current checkpoint, and [docs/M8-PLAN.md](docs/M8-PLAN.md) for what the
 last milestone deliberately left undone.
 
 ## Verified constraints
@@ -150,6 +162,38 @@ cargo run -p hermes-cli -- serve model.gguf --port 8737
 # Or start with nothing loaded and choose a model over the control API.
 cargo run -p hermes-cli -- serve --port 8737
 ```
+
+### Benchmarks
+
+```sh
+hermes bench model.gguf                          # its own engine, then gone
+hermes bench model.gguf --ubatch 128,512 --fit   # a sweep, and a calibration fit
+curl -X POST "$BASE/api/v1/benchmarks"           # measure what is already loaded
+```
+
+`hermes bench` never disturbs a running gateway: it starts its own engine,
+reloads between buckets — `VmHWM` is a high-water mark for the life of a
+process, so a second bucket in the same engine would inherit the first one's
+peak — and shuts down after. The gateway's own benchmark is the smaller one, and
+takes a scheduler slot like any other request.
+
+Three scenarios: a prefill the cache has not seen, the same prompt again to
+measure what reuse saves, and a decode. Prompts are built from a fixed filler
+and **sized by asking the engine's own tokenizer**; what is recorded is the
+length that came back, never the length that was asked for.
+
+A run holds no prompt, no completion, no filesystem path and no hostname —
+there is nowhere in the record to put one, which is the same structural
+guarantee the metrics types rely on. Results go to the data directory, and
+never into this repository: a throughput figure is a fact about one machine and
+one engine build, and both travel with every run.
+
+`--fit` writes `calibration.json` beside the runs. It fits a slope against
+`n_ubatch` and an intercept, and no more: the estimator's two free compute
+coefficients are collinear in peak RSS, so a fit that reported both would be
+inventing one of them. **Nothing reads that file yet** — deciding when a fit is
+trustworthy is a separate question from measuring, and belongs to the milestone
+that makes it. See [benchmarks/](benchmarks/).
 
 ### Models
 
@@ -260,6 +304,22 @@ decode are the engine's own measurements; the queue wait and the time to first
 token are measured here, because only the gateway can see them. They are
 reported separately rather than added, since a slow first token and a busy queue
 are different problems with different fixes.
+
+Each of the four is a **histogram**, so `histogram_quantile()` has buckets to
+work with: on a gateway where one slow request in fifty is the whole complaint,
+the mean moves by milliseconds while the tail moves by minutes. The ladder ends
+at two minutes rather than ten seconds, because a prefill on a CPU without AVX
+genuinely reaches it and a web-shaped ladder would file every one of them under
+`+Inf`.
+
+The **engine's own processor time** is there too, in kernel clock ticks and
+unconverted — a rate needs two readings and an interval, and converting would
+divide by a `USER_HZ` this process would have to guess at. The panel differences
+two readings against `/proc/stat` over the same interval and reports cores: a
+ratio of two tick counts, with the unit cancelled rather than assumed. Beside it
+sit the few counters the engine knows and the gateway cannot compute — the
+longest sequence it has served, its decode steps, slots busy per decode, and
+what it deferred internally.
 
 Every field is a number. No prompt text, no completion text, no filesystem path
 — metrics are the easiest accidental route out for exactly the content Privacy
@@ -469,6 +529,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `hermes-api` | OpenAI request and response types, and the SSE chunk codec |
 | `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
 | `hermes-observability` | Structured logging, rotation, privacy-mode wiring |
+| `hermes-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
 | `hermes-cli` | Command-line access to the above |
 
 Two parts of the product are not crates:
@@ -495,6 +556,16 @@ ggml CPU variant is chosen by detected instruction set, so one artifact is
 optimal on a modern CPU and functional on an old one; and `serve` with no
 `--ctx` picks the largest context that still loads safely, which is 8K on a
 small laptop and the model's full maximum on a capable machine.
+
+Every performance knob ships with the **engine's own default**, so nothing
+changes until someone chooses. Where a knob has a plausible better setting on
+some machine and none that can be established on the development one — prefill
+threads on a processor with SMT, polling on an idle box, pinning on hybrid
+cores — it is made reachable and measurable rather than given a default derived
+from four slow cores. The two defaults this project *did* settle in M8 were
+settled by a measurement: a benchmark showed a larger physical batch worth
+offering, and another showed the gateway's own worker threads cost 0.06% of
+what the engine costs, so they were left alone.
 
 The development machine is deliberately a constrained one — four slow cores, no
 AVX, most of its memory already spoken for — but it is one end of the range, not

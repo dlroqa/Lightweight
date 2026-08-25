@@ -535,3 +535,112 @@ merely discouraged: `fetch` has no catalog parameter to hold.
 The one-at-a-time guarantee is separate, and is a second lock: two clients
 loading two models at once would race the engine, and two downloads of the same
 model would fight over one partial file.
+
+## Why processor time is published unconverted
+
+`/proc` reports processor time in kernel clock ticks — jiffies, `USER_HZ`,
+normally 100 per second, and *normally* is doing real work in that sentence. A
+crate that divided by 100 would be guessing at a kernel build parameter in order
+to produce a number every one of its consumers immediately turns back into a
+ratio.
+
+So the engine's ticks are published as ticks, exactly as `/proc/stat`'s already
+were, and the two are differenced together where a rate is wanted. The panel's
+"cores in use" is `engine ticks ÷ (machine ticks ÷ core count)`: `/proc/stat`'s
+total is summed over every core, so dividing it by the core count gives what one
+core could have spent over the same interval. Both counts are in the same
+unknown unit and it cancels.
+
+The alternative — a percentage computed server-side from one reading — is the
+invention `hermes-system-info::load` exists to refuse. A counter and an interval
+mean something exact; a single sample of a counter means nothing at all.
+
+## Why the benchmark harness restarts the engine between buckets
+
+`VmHWM` is a high-water mark for the life of a process. Measuring a second set
+of parameters inside the same engine would report the first set's peak as the
+second's, and the error would be silent and in the direction that looks fine.
+
+Resetting it through `/proc/<pid>/clear_refs` was considered and rejected: it is
+obscure, its behaviour varies by kernel, and a reload is what a real load does
+anyway — the number wanted is what loading *this* configuration costs from
+nothing, which is exactly what a fresh engine measures.
+
+## Why a sweep brings its own engine and a quick run does not
+
+Varying context, batch size or thread count means reloading, which takes minutes
+and holds the gateway's only slot for all of them. Doing that to a gateway
+somebody is being served by would be a strange way to find out how fast it is,
+so `hermes bench` starts an engine of its own and shuts it down afterwards.
+
+The gateway's own benchmark measures the model that is already resident at the
+parameters it is already resident with, and takes a scheduler slot like any
+other request — because that is precisely what it is. It changes nothing, which
+is what makes it safe to offer as a button.
+
+## Why a calibration fit is scoped to the machine that produced it
+
+Two of the estimator's four terms cannot be derived from metadata and are fitted
+from observed peak RSS. What that fit describes is a machine and an engine
+build: the same model on the same build allocates differently under a different
+ggml variant, and a coefficient measured on four cores without AVX describes
+four cores without AVX.
+
+So every fit carries a machine fingerprint and an engine build, and a mismatch
+is a **miss** rather than an approximation — the shipped defaults apply and the
+estimate reports `Coarse`, which is honest, where a near-enough match would be a
+confident wrong number. Several fits coexist in one file, so moving a data
+directory between machines accumulates coverage instead of overwriting it.
+
+The terms are split by what they describe rather than kept together: buffer
+geometry is keyed by the model bucket, and engine and host overhead by the
+machine. Mixing them would let a laptop's overhead follow a model to a server.
+
+## Why the fit reports a slope and not two coefficients
+
+The compute term is `vocab*ub*4 + activation*ub*embd*4 + scratch*ub*max(embd,ffn)*4`.
+Two of those coefficients are free, and **both are proportional to `n_ubatch`**.
+From peak RSS alone they are collinear: no number of samples at one batch size
+separates them, and samples across several determine only their sum.
+
+A fit that reported both would be reporting one measurement and one invention,
+with nothing on the page to say which. So the harness fits a slope against
+`n_ubatch` and an intercept, keeps the raw residual points beside them, and
+returns no slope at all when only one batch size was measured — a hundred
+repetitions of one point is one point.
+
+Separating the two needs a second observable, not more samples. That is a real
+constraint on a later milestone, and recording it is more useful than papering
+over it.
+
+## Why locking weights changes the verdict and not only the load
+
+The memory budget credits a model swap with `RssAnon` — the anonymous part of
+the outgoing engine's resident set — precisely because the weights are mmapped
+and therefore file-backed page cache the kernel already counts inside
+`MemAvailable`.
+
+`--load-mode mlock` makes that false. Locked weights are neither free to
+`MemAvailable` nor reclaimable under pressure, so three things follow, each a
+branch the default path never enters: the swap credit gains what is locked, a
+`Tight` verdict becomes a refusal rather than a warning, and the request is
+checked against `RLIMIT_MEMLOCK` before an engine is launched.
+
+That last one matters because llama.cpp's own response to an insufficient
+allowance is a warning on stderr and a model that pages anyway — which looks
+like success and performs like failure. On the development machine the allowance
+is 969.7 MiB, so a 1.19 GiB model is refused with the number named while the
+memory estimate says `SAFE`: a distinction `InsufficientMemory` could not have
+expressed, which is why it is a separate error with its own remedies.
+
+## Why `--cache-reuse` is reachable and off
+
+Reusing KV entries by shifting them helps exactly the shape an agent loop
+produces: a stable system prompt with a changed message in the middle. It is
+also the only knob in this group that trades **output fidelity** rather than
+memory or time.
+
+Nothing in the estimator judges output fidelity. That is the same reason M7
+refused a stored default KV cache type, and it applies here unchanged: a
+per-load choice made by someone looking at what it buys, measurable by the
+harness, and never a default chosen on their behalf.

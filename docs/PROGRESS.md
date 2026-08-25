@@ -1,7 +1,7 @@
 # Progress
 
 Checkpoint of where the build stands, so work resumes without re-deriving it.
-Milestones follow the approved plan (M0-M10); this pass covers M0-M7.
+Milestones follow the approved plan (M0-M10); this pass covers M0-M8.
 
 Updated after each milestone, and only ever on green: `./scripts/check.sh` must
 pass — fmt, clippy `-D warnings`, the full test suite, the openai-SDK contract
@@ -28,6 +28,9 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M7.1** Say the true number | **done** | the KV arithmetic as one fallible pass, so its two halves cannot disagree about a type this build cannot size; per-variant memory remedies naming `--force` instead of a setting that never existed; `Probed<Estimate>` and `ManagerError::MemoryProbe` so a probe failure says why; `targets::MEMORY` given its call sites; the panel reading `label` rather than a field that does not exist |
 | **M7.2** Spend the right budget | **done** | an injectable `MemoryProbe` on `GatewayState`; `Budget` crediting a swap with the `RssAnon` the outgoing engine is about to release; engine RSS and peak in `/api/v1/metrics` and two new Prometheus gauges, read per pull with no sampler; `Verdict::Tight` warned in the log and said on screen, gating nothing |
 | **M7.3** Controls that change something | **done** | one `choose_context` for the load path and the detail that disagreed; `last_n_ctx` demoted to history; engine capabilities and load defaults on `/api/v1/gateway`; `?ctx=`/`?kv_type=` pricing on the model detail; context and KV type pickers in the panel, which now follows the load job and shows the refusal it had been hiding |
+| **M8.1** Make the CPU visible | **done** | `cpu_percent` retired for `cpu_ticks` read from `/proc/<pid>/stat` and published unconverted; the panel differences them into cores; latency histograms with real Prometheus buckets, existing names and values unchanged; per-band generation and wait counters; the engine's own `/metrics` scraped once per pull, which `--metrics` had promised since M2 |
+| **M8.2** The harness that measures | **done** | `hermes-bench`: three deterministic scenarios over the `InferenceBackend` trait, prompts sized by the engine's own tokenizer, runs saved owner-only to the `benchmarks_dir()` M0 chose and nothing had written to; `hermes bench` with its own engine and a per-bucket reload, `POST /api/v1/benchmarks` against what is resident, Run Benchmark wired in the panel; `--fit` writes a slope and an intercept because peak RSS cannot separate two collinear coefficients |
+| **M8.3** The knobs | **done** | `n_ubatch` and `n_batch` reachable and `?ubatch=` priced; `--threads-batch`, `--poll`, `--cache-reuse`, `--load-mode` and CPU affinity reachable and absent by default; a locked-memory pre-flight from `/proc/self/limits`, `VmLck` credited on a swap, and `Tight` refused for a locking load; the panel reads the `thread_choices` served since M6b.1 |
 
 ## Verified by execution, not only by unit tests
 
@@ -950,53 +953,99 @@ contract suite, the frontend typecheck and build, the desktop shell's 25 tests,
 the dependency gate and the secrets gate — all via `./scripts/check.sh` — plus
 the real-engine tier (`HERMES_TEST_MODEL`, 9 passed, 115 s).
 
+## M8, against a real engine
+
+On 2026-08-25 every claim M8 makes was checked against `llama-server` running
+SmolLM2-135M and Qwen3-1.7B, not only against the mock.
+
+- **The engine's processor time is real and it reaches the scrape.**
+  `hermes_engine_cpu_ticks_total{mode="user"} 3531` and `{mode="system"} 25`
+  against a `/proc` reading taken independently over the same generation. The
+  engine kept **3.21 of 4 cores** busy, derived as a ratio of two tick counts
+  with no `USER_HZ` guessed anywhere.
+- **The gateway costs nothing while the engine works.** Charged **2 ticks
+  against the engine's 3266** — 0.06% — during one generation. That is the
+  measurement that decided *not* to cap the gateway's tokio worker threads:
+  idle workers park on epoll rather than spinning, so the oversubscription that
+  looked real on a 4-core box is not.
+- **The engine publishes less than the plan assumed, and the fixture says so.**
+  b10590 has **no `llamacpp:kv_cache_usage_ratio`**, though older llama.cpp
+  builds do and the plan was written expecting it. Every counter is therefore
+  `Option`, a missing series reads as absent rather than zero, and the captured
+  body is committed as a fixture with a test asserting it carries no path and
+  no label. `hermes_engine_max_sequence_tokens 83` against a 2048 context is
+  the signal that survived: the cheapest evidence a model holds a window nobody
+  is using.
+- **The physical batch earns its control.** At 256 prompt tokens: **ubatch 512
+  prefills at 22 t/s against 11-15 t/s at 128**, with 3.9 of 4 cores busy
+  against 2.4. Measured before the control was added, not after.
+- **Prefix reuse, measured at last.** A fully cached prompt reached its first
+  token in **90 ms against 10-16 s cold** — the single largest performance
+  feature on this hardware, observed in passing since M3 and now a scenario.
+- **Locking weights is refused when it cannot work, and works when it can.**
+  This machine's `Max locked memory` is 969.7 MiB. Qwen3's 1.19 GiB of weights
+  is refused **before any engine is launched**, while the memory estimate says
+  `SAFE` — a distinction `InsufficientMemory` could not have expressed.
+  SmolLM2 loads with `--load-mode mlock` reaching the engine's argv and
+  `VmLck: 101244 kB` genuinely locked, against `VmLck: 0` for a mapped engine.
+- **A benchmark taken through the gateway carries no path, no prompt and no
+  hostname.** Checked against a real saved run, not only against a fixture.
+- **The estimator over-predicts, and now by a recorded amount.** SmolLM2 at
+  2048: predicted 285.1 MiB against an observed peak of 207.3 MiB, of which
+  143.9 MiB is the exactly-computed half. The fit from a two-bucket sweep:
+  10802 bytes per ubatch token, 51.4 MiB fixed. Nothing reads it yet.
+
+Tiers run for this milestone: default (`cargo test --workspace`), the openai
+contract suite, the frontend typecheck and build, the desktop shell's tests,
+the dependency gate and the secrets gate — all via `./scripts/check.sh` — plus
+the real-engine work above by hand.
+
+**One flake observed and not papered over.**
+`a_slow_engine_is_waited_for_rather_than_abandoned`
+(`hermes-backend-llamacpp/tests/supervision.rs`) failed once under a full
+`cargo test --workspace` and passed on every isolated and repeated run. It
+asserts a wall-clock uptime of at least 400 ms against a fake engine, which is
+timing-sensitive on four contended cores. The assertion is not weakened to make
+it green: it encodes the behaviour that matters, and the flakiness is the
+machine, recorded here so the next person to see it knows it has been seen.
+
 ## Next step
 
-M7 is complete. What remains of the approved plan is M8 onward; M9 is
-calibration — fitting the estimator's compute and overhead terms from observed
-peak RSS, which M7 made visible without consuming — and M10 is cross-platform.
-The full plan is `docs/M7-PLAN.md`.
+M8 is complete. What remains of the approved plan is M9 and M10.
 
-The deferrals recorded through M6b — batch size, Run Benchmark, live host/port
-editing, and the browser build never seeing the API key — are still deferred
-deliberately, and `docs/M6B-PLAN.md` records why. Live host/port editing is now
-the one of those that is genuinely unblocked: M6b.4 put the shell in charge of
-the process, so something can restart the listener.
+**M9 is calibration**, and M8 built everything it needs except the decision:
+`hermes bench --fit` already writes a versioned, machine-scoped
+`calibration.json` carrying a slope, an intercept and the raw residual points.
+What M9 owes is the policy — how many buckets make a fit trustworthy, how close
+a fingerprint must match, and when `Confidence::Measured` is earned — plus the
+wiring into the three load paths. `Estimator::new(ComputeModel)` is the seam,
+and it has been there since M1.
 
-M7 adds two of its own:
+**M10 is cross-platform.**
 
-- **No global default KV cache type.** `default_n_ctx` earns its place in
-  settings because context is bounded by memory and the estimate still judges
-  it. A KV type trades output quality, which no estimate judges, and a stored
-  default would shadow the CLI's `--kv-type` with a precedence rule nobody asked
-  for. It is a per-load choice, made while looking at the estimate that prices
-  it.
-- **`ResourceSnapshot.cpu_percent` is still not serialized.** Nothing produces
-  it — the only implementation sets `None` — and a percentage derived from one
-  sample is exactly the invention `hermes-system-info::load` exists to refuse.
-  It awaits either deletion or the counter treatment `CpuTimes` gets.
+The deferrals recorded through M7 stand, with two closed by this milestone:
+`ResourceSnapshot.cpu_percent` is resolved — it became a counter — and Run
+Benchmark is no longer deferred. `benchmarks/` is no longer empty: it holds the
+workload definitions, deliberately not results.
 
-Deliberately left, and recorded so they are chosen rather than forgotten:
+M8 adds its own, each chosen rather than forgotten:
 
-- **`/v1/completions` waits at the door.** A queued request there is refused
-  with a 503 rather than answered and told its position, because one such
-  request can carry many prompts under a single permit and the streaming state
-  machine for that is a second one. The band and the metrics apply to it
-  already.
-- **Nothing is preempted, and nothing can be** until the engine can pause a
-  generation. A swap now waits for the running turn — measured at 116 s above —
-  which is the honest behaviour rather than a fast one.
-- **No pre-flight disk check before a download.** `statvfs` needs `unsafe`, and
-  every crate that would host it is `forbid(unsafe_code)`; weakening that to
-  save a failed download is the wrong trade. A full disk is still reported
-  actionably as `low_disk`, from `ENOSPC` as it happens rather than before it.
-- **A verified file can be orphaned in the downloads directory.** If the final
-  move into `models/` fails — a full disk, a permissions change between the
-  download and the move — the bytes are downloaded and checked but left where
-  they are. The error names the file so it can be moved by hand; a retry
-  re-downloads rather than adopting it, because recognising a staged file as
-  resumable is a second mechanism and this failure is rare.
-- **The catalog is not shared between processes.** Two `hermes` commands writing
-  it at once would have one overwrite the other; each write is atomic, so the
-  file is never corrupt, but there is no lock. A single gateway plus occasional
-  CLI use is the shape this is built for.
+- **`--numa` is not exposed.** It needs a second NUMA node to mean anything,
+  wrong settings degrade silently, and llama.cpp requires it to agree with how
+  the process was launched. Nothing on this machine can exercise it, and a knob
+  validated nowhere is a knob that breaks somewhere else.
+- **`--threads-batch` and `--poll` ship with the engine's defaults.** Both have
+  a plausible better setting on *some* machine and none that can be established
+  on one with four cores and no SMT. Reachable, measurable and unchanged is the
+  honest position.
+- **`--cache-reuse` stays off.** It is reachable and the harness can measure
+  what it buys; enabling it by default trades output fidelity through KV
+  shifting, which no estimate judges — the same argument M7 used against a
+  stored default KV cache type.
+- **A gateway-taken benchmark and a CLI-taken one share a fit key only because
+  `BackendCapabilities` now states the engine build.** Before that they could
+  never have been compared, which was found by running it rather than by
+  reading it.
+- **The fit separates a slope from an intercept and nothing finer.** Two of the
+  estimator's coefficients are collinear in peak RSS. A later pass that wants
+  them apart needs a second observable, not more samples.
