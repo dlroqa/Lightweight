@@ -43,6 +43,7 @@ pub enum JobKind {
     Import,
     Load,
     Unload,
+    Benchmark,
 }
 
 /// Where a job has got to.
@@ -86,6 +87,17 @@ pub enum Stage {
     Load {
         #[serde(flatten)]
         progress: LoadProgress,
+    },
+    /// A benchmark, which reports which workload it is on rather than bytes or
+    /// engine lifecycle. Its own vocabulary for the same reason the two above
+    /// have theirs: a progress bar labelled "downloading" during a decode
+    /// measurement would be inventing information.
+    Benchmark {
+        scenario: &'static str,
+        repetition: u32,
+        /// How many repetitions this scenario will run. Not named `of`, which
+        /// is the tag serde uses to distinguish the stages.
+        repetitions: u32,
     },
 }
 

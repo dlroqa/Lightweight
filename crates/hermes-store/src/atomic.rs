@@ -24,7 +24,7 @@ const OWNER_ONLY_FILE: u32 = 0o600;
 const OWNER_ONLY_DIR: u32 = 0o700;
 
 /// Create a directory the current user alone can read.
-pub(crate) fn create_private_dir(path: &Path) -> Result<(), StoreError> {
+pub fn create_private_dir(path: &Path) -> Result<(), StoreError> {
     std::fs::create_dir_all(path)
         .map_err(|err| StoreError::io("creating a data directory", err))?;
     restrict_dir(path);
@@ -37,7 +37,7 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), StoreError> {
 /// not after: a file that is briefly world-readable while several megabytes of
 /// conversation are written into it has already been readable for as long as it
 /// takes to read it.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

@@ -44,6 +44,7 @@ impl Harness {
             ram_verdict: Some("safe".into()),
             backend: Some("mock".into()),
             model_path: "/mock/model.gguf".into(),
+            effective: hermes_core::RuntimeParams::default(),
         }));
 
         let state = Arc::new(GatewayState::new(

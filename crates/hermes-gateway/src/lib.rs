@@ -15,6 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod auth;
+pub mod benchmark;
 pub mod catalog;
 pub mod completions;
 pub mod control;
@@ -68,6 +69,11 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             get(control::model_detail).delete(control::remove),
         )
         .route("/api/v1/catalog", get(control::pinned))
+        .route(
+            "/api/v1/benchmarks",
+            get(control::benchmarks).post(control::run_benchmark),
+        )
+        .route("/api/v1/benchmarks/{id}", get(control::benchmark))
         .route("/api/v1/jobs", get(control::jobs))
         .route("/api/v1/jobs/{id}", get(control::job))
         .route("/api/v1/jobs/{id}/events", get(control::job_events))

@@ -8,6 +8,7 @@
 
 import type {
   ApiErrorBody,
+  BenchmarkRun,
   Conversation,
   ConversationSummary,
   GatewayReport,
@@ -174,6 +175,20 @@ export const api = {
     request<{ job: number; events: string }>("/api/v1/models/import", {
       method: "POST",
       body: JSON.stringify({ path }),
+    }),
+
+  benchmarks: () =>
+    request<{ runs: BenchmarkRun[] }>("/api/v1/benchmarks").then(
+      (body) => body.runs,
+    ),
+  runBenchmark: (body: {
+    prompt_tokens?: number;
+    generate_tokens?: number;
+    repeat?: number;
+  }) =>
+    request<{ job: number; events: string }>("/api/v1/benchmarks", {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 
   jobs: () => request<ListBody<Job>>("/api/v1/jobs").then((body) => body.data),

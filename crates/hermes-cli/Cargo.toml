@@ -22,6 +22,7 @@ hermes-inference.workspace = true
 hermes-backend-llamacpp.workspace = true
 hermes-gateway.workspace = true
 hermes-catalog.workspace = true
+hermes-bench.workspace = true
 hermes-api.workspace = true
 axum.workspace = true
 tokio.workspace = true

@@ -211,6 +211,17 @@ impl GatewayState {
             .map(|paths| hermes_store::ConversationStore::new(paths.conversations_dir()))
     }
 
+    /// Where this gateway keeps benchmark runs, when it has a data directory.
+    ///
+    /// `paths.benchmarks_dir()` was chosen in M0 and created at every startup
+    /// since; this is the first thing that reads or writes it.
+    pub fn benchmarks(&self) -> Option<hermes_bench::BenchmarkStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| hermes_bench::BenchmarkStore::new(paths.benchmarks_dir()))
+    }
+
     /// Where this gateway keeps settings, when it has a data directory.
     pub fn settings_store(&self) -> Option<hermes_store::SettingsStore> {
         self.config

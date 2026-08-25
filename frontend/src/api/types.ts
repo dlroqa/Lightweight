@@ -431,3 +431,55 @@ export interface ApiErrorBody {
     hermes?: { remedies?: Remedy[] } | null;
   };
 }
+
+/**
+ * One saved benchmark run.
+ *
+ * A record of what this machine did, not a claim about the software: the
+ * machine and engine fingerprints travel with every run precisely so that a
+ * number is never read as a property of the product.
+ */
+export interface BenchmarkRun {
+  id: string;
+  at_unix: number;
+  machine: {
+    cpu_model: string | null;
+    physical_cores: number;
+    logical_cores: number;
+    isa_features: string[];
+    total_memory: number;
+    os: string;
+    architecture: string;
+  };
+  engine: {
+    backend: string;
+    build: string | null;
+    ggml_variant: string | null;
+  };
+  model: {
+    id: string;
+    architecture: string;
+    quantization: string;
+    parameters: number | null;
+  };
+  samples: BenchmarkSample[];
+}
+
+export interface BenchmarkSample {
+  scenario: "cold_prefill" | "cached_prefill" | "decode";
+  params: { n_ctx: number; n_batch: number; n_ubatch: number };
+  threads: number;
+  repetition: number;
+  prompt_tokens: number;
+  cached_tokens: number;
+  /** Tokens the engine actually evaluated, which a cache hit makes far smaller. */
+  prefilled_tokens: number;
+  generated_tokens: number;
+  prefill_ms: number | null;
+  decode_ms: number | null;
+  time_to_first_token_ms: number | null;
+  wall_ms: number;
+  engine_ticks: number | null;
+  machine_ticks: number | null;
+  peak_rss: number | null;
+}

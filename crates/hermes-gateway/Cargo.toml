@@ -17,6 +17,7 @@ hermes-api.workspace = true
 hermes-inference.workspace = true
 hermes-catalog.workspace = true
 hermes-store.workspace = true
+hermes-bench.workspace = true
 hermes-memory.workspace = true
 hermes-system-info.workspace = true
 hermes-gguf.workspace = true

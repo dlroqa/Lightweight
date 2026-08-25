@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ram_verdict: Some("safe".to_owned()),
         backend: Some("mock".to_owned()),
         model_path: "/mock/model.gguf".to_owned(),
+        effective: hermes_core::RuntimeParams::default(),
     }));
 
     let auth = match api_key {

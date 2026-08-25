@@ -7,6 +7,7 @@ members = [
     "crates/hermes-inference",
     "crates/hermes-download",
     "crates/hermes-catalog",
+    "crates/hermes-bench",
     "crates/hermes-store",
     "crates/hermes-backend-llamacpp",
     "crates/hermes-backend-mock",
@@ -103,6 +104,7 @@ hermes-memory = { path = "crates/hermes-memory" }
 hermes-inference = { path = "crates/hermes-inference" }
 hermes-download = { path = "crates/hermes-download" }
 hermes-catalog = { path = "crates/hermes-catalog" }
+hermes-bench = { path = "crates/hermes-bench" }
 hermes-store = { path = "crates/hermes-store" }
 hermes-backend-llamacpp = { path = "crates/hermes-backend-llamacpp" }
 hermes-backend-mock = { path = "crates/hermes-backend-mock" }

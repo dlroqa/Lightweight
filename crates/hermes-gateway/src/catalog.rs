@@ -30,6 +30,14 @@ pub struct ResidentModel {
     /// Where the weights live. Reported by `/props`, which llama.cpp clients
     /// expect to find a path in.
     pub model_path: String,
+    /// What the engine is **actually** running with.
+    ///
+    /// `n_ctx` above is the one number every endpoint advertises and is kept
+    /// where it is; this is the whole set, which the engine may have adjusted.
+    /// Recorded because a benchmark that did not know the batch size it ran at
+    /// would be a measurement of unknown conditions, and because "the effective
+    /// values, never the requested ones" has been the rule since M2.
+    pub effective: hermes_core::RuntimeParams,
 }
 
 impl ResidentModel {
@@ -134,6 +142,7 @@ mod tests {
             ram_verdict: Some("safe".into()),
             backend: Some("llamacpp-process".into()),
             model_path: "/models/lfm2.gguf".into(),
+            effective: hermes_core::RuntimeParams::default().with_context(8192),
         }
     }
 

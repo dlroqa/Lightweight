@@ -1,10 +1,13 @@
-import { Activity, Cpu, Gauge, MemoryStick } from "lucide-react";
+import { useState } from "react";
 
-import { api } from "../api/client";
-import { bytes, percent, quantile, rate } from "../api/format";
+import { Activity, Cpu, Gauge, MemoryStick, Timer } from "lucide-react";
+
+import { api, ApiError, followJob } from "../api/client";
+import { bytes, clock, percent, quantile, rate } from "../api/format";
+import type { BenchmarkRun, BenchmarkSample } from "../api/types";
 import { wasRead } from "../api/types";
 import { Card } from "../components/Card";
-import { Row } from "../components/Bits";
+import { ErrorState, Row } from "../components/Bits";
 import { StatTile } from "../components/StatTile";
 import { TopBar } from "../components/Shell";
 import { usePoll } from "../hooks/usePoll";
@@ -54,6 +57,28 @@ export function Performance() {
   const counters = wasRead(metrics.data?.engine_counters)
     ? metrics.data.engine_counters
     : null;
+
+  const runs = usePoll(api.benchmarks, 10_000);
+  const [running, setRunning] = useState(false);
+  const [failure, setFailure] = useState<ApiError | null>(null);
+
+  // The panel's benchmark measures the model that is already loaded, at the
+  // parameters it is already loaded with. Varying those means reloading the
+  // engine, which is `hermes bench` — and doing it here would interrupt
+  // whoever this gateway is serving.
+  async function runBenchmark() {
+    setRunning(true);
+    setFailure(null);
+    try {
+      const job = await api.runBenchmark({});
+      await followJob(job.job);
+      await runs.refresh();
+    } catch (error) {
+      setFailure(error instanceof ApiError ? error : null);
+    } finally {
+      setRunning(false);
+    }
+  }
 
   return (
     <>
@@ -233,6 +258,77 @@ export function Performance() {
           </Card>
         </div>
 
+        <Card title="Benchmark">
+          <div
+            style={{
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              type="button"
+              className="btn btn--primary"
+              onClick={() => void runBenchmark()}
+              disabled={running || !metrics.data?.model}
+            >
+              <Timer size={15} />
+              {running ? "Measuring…" : "Run benchmark"}
+            </button>
+            <span className="card__note">
+              {metrics.data?.model
+                ? `Measures ${metrics.data.model.id} as it is loaded now.`
+                : "Load a model first: there is nothing resident to measure."}
+            </span>
+          </div>
+
+          {failure && (
+            <div style={{ marginTop: 12 }}>
+              <ErrorState error={failure} />
+            </div>
+          )}
+
+          {runs.data && runs.data.length > 0 && (
+            <div className="scroll-x" style={{ marginTop: 14 }}>
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Model</th>
+                    <th>Prefill</th>
+                    <th>Decode</th>
+                    <th>Cached reuse</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runs.data.slice(0, 8).map((run) => (
+                    <tr key={run.id}>
+                      <td>{clock(run.at_unix)}</td>
+                      <td>{run.model.id}</td>
+                      <td className="tnum">
+                        {rate(best(run, "cold_prefill"))} tok/s
+                      </td>
+                      <td className="tnum">
+                        {rate(best(run, "decode"))} tok/s
+                      </td>
+                      <td className="tnum">{cachedSpeedup(run)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="card__note" style={{ marginTop: 10 }}>
+            These figures describe this machine and this engine build. They are
+            not a property of the software and do not transfer to other
+            hardware. To vary context, batch size or thread count, use{" "}
+            <code>hermes bench</code>, which brings its own engine rather than
+            interrupting this one.
+          </div>
+        </Card>
+
         <div className="notice notice--info">
           These lines are sampled by this page once a second and cover only the
           time since you opened it. The gateway keeps running totals, not a
@@ -241,4 +337,50 @@ export function Performance() {
       </div>
     </>
   );
+}
+
+/**
+ * The best rate a run measured for one scenario.
+ *
+ * The best rather than the mean: repetitions on a contended machine include
+ * whatever else it was doing, and the fastest is the closest thing to what the
+ * hardware can do. It is still one machine's number.
+ */
+function best(run: BenchmarkRun, scenario: BenchmarkSample["scenario"]): number | null {
+  const rates = run.samples
+    .filter((sample) => sample.scenario === scenario)
+    .map((sample) =>
+      scenario === "decode"
+        ? sample.decode_ms && sample.generated_tokens > 1
+          ? (sample.generated_tokens / sample.decode_ms) * 1000
+          : null
+        : sample.prefill_ms && sample.prefilled_tokens > 0
+          ? (sample.prefilled_tokens / sample.prefill_ms) * 1000
+          : null,
+    )
+    .filter((value): value is number => value !== null);
+  return rates.length > 0 ? Math.max(...rates) : null;
+}
+
+/**
+ * What the prefix cache saved, as the ratio of the slowest cold first token to
+ * the fastest cached one.
+ *
+ * Time to first token rather than throughput, because that is what a cache hit
+ * actually changes and what a person waiting actually feels.
+ */
+function cachedSpeedup(run: BenchmarkRun): string {
+  const cold = run.samples
+    .filter((sample) => sample.scenario === "cold_prefill")
+    .map((sample) => sample.time_to_first_token_ms)
+    .filter((value): value is number => value !== null);
+  const cached = run.samples
+    .filter((sample) => sample.scenario === "cached_prefill" && sample.cached_tokens > 0)
+    .map((sample) => sample.time_to_first_token_ms)
+    .filter((value): value is number => value !== null);
+  if (cold.length === 0 || cached.length === 0) return "—";
+  const slowest = Math.max(...cold);
+  const fastest = Math.min(...cached);
+  if (fastest <= 0) return "—";
+  return `${Math.round(slowest / fastest)}x faster`;
 }

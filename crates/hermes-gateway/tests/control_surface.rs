@@ -45,11 +45,18 @@ async fn gateway_with_a_model(tag: &str) -> (TempDir, Arc<GatewayState>, String)
         .await
         .expect("register the fixture");
 
+    // A data directory, as a real gateway has: without one the control API
+    // reports that instead of what the caller asked about, and a test that
+    // never gave it one would only ever exercise that branch.
+    let config = GatewayConfig {
+        paths: Some(hermes_system_info::DataPaths::rooted_at(dir.path())),
+        ..GatewayConfig::default()
+    };
     let state = Arc::new(
         GatewayState::new(
             Arc::new(MockBackend::default()),
             hermes_gateway::catalog::shared(None),
-            GatewayConfig::default(),
+            config,
         )
         .with_manager(Arc::clone(&manager)),
     );
@@ -81,6 +88,18 @@ impl Server {
                 let _ = axum::serve(listener, app).await;
             }),
         }
+    }
+
+    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .post(format!("{}{path}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let value = response.json().await.unwrap_or(Value::Null);
+        (status, value)
     }
 
     async fn get(&self, path: &str) -> (u16, Value) {
@@ -364,4 +383,46 @@ async fn a_gateway_with_no_panel_answers_unmatched_paths_exactly_as_before() {
         .expect("request");
     assert_eq!(response.status(), 404);
     assert!(response.text().await.expect("body").is_empty());
+}
+
+#[tokio::test]
+async fn benchmarking_nothing_is_a_conflict_rather_than_an_empty_result() {
+    // The gateway's benchmark measures what is resident. With nothing resident
+    // there is nothing to measure, and answering 200 with an empty run would
+    // put a result on screen that describes no model.
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("bench-empty").await;
+
+    let server = Server::start(state).await;
+    let (status, body) = server
+        .post("/api/v1/benchmarks", serde_json::json!({}))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "no_model_loaded");
+}
+
+#[tokio::test]
+async fn a_gateway_that_has_run_no_benchmarks_lists_none() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("bench-list").await;
+
+    let server = Server::start(state).await;
+    let (status, body) = server.get("/api/v1/benchmarks").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["runs"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn an_id_that_could_not_have_come_from_the_store_is_refused() {
+    // The same gate the conversation store has: an id reaches the filesystem
+    // only if it is one this store could have produced.
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("bench-traversal").await;
+
+    let server = Server::start(state).await;
+    let (status, _) = server.get("/api/v1/benchmarks/not-an-id").await;
+    assert!(
+        (400..500).contains(&status),
+        "a malformed id must not be a server error: {status}"
+    );
 }

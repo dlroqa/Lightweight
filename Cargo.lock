@@ -662,6 +662,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermes-bench"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hermes-backend-mock",
+ "hermes-core",
+ "hermes-gguf",
+ "hermes-inference",
+ "hermes-memory",
+ "hermes-observability",
+ "hermes-store",
+ "hermes-system-info",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hermes-catalog"
 version = "0.1.0"
 dependencies = [
@@ -688,6 +709,7 @@ dependencies = [
  "clap",
  "hermes-api",
  "hermes-backend-llamacpp",
+ "hermes-bench",
  "hermes-catalog",
  "hermes-core",
  "hermes-gateway",
@@ -736,6 +758,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hermes-api",
  "hermes-backend-mock",
+ "hermes-bench",
  "hermes-catalog",
  "hermes-core",
  "hermes-gguf",

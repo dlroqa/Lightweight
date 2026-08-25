@@ -17,6 +17,7 @@ use std::io::Write as _;
 
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod models;
 mod serve;
 use hermes_core::{Actionable, GgmlType, units::Bytes};
@@ -143,6 +144,44 @@ enum Command {
         headless: bool,
         #[arg(long)]
         header_only: bool,
+    },
+    /// Measure what this machine does with a model.
+    ///
+    /// Brings its own engine and reloads between buckets, so it never disturbs
+    /// a gateway that is serving. Results are saved under the data directory,
+    /// and they are facts about this machine and this engine build rather than
+    /// about the software.
+    Bench {
+        model: PathBuf,
+        /// Context to load with. Sized to the machine when absent.
+        #[arg(long)]
+        ctx: Option<u32>,
+        #[arg(long)]
+        threads: Option<u32>,
+        #[arg(long, default_value = "f16")]
+        kv_type: String,
+        /// Prompt length to measure prefill against.
+        #[arg(long, default_value_t = 512)]
+        prompt_tokens: u32,
+        /// Output budget to measure decode against.
+        #[arg(long, default_value_t = 32)]
+        generate_tokens: u32,
+        /// How many times to repeat each scenario.
+        #[arg(long, default_value_t = 3)]
+        repeat: u32,
+        /// Physical batch sizes to sweep, reloading the engine for each.
+        ///
+        /// Two or more values are what make a calibration fit possible: the
+        /// compute term scales with this and the overhead term does not, so a
+        /// single value cannot separate them.
+        #[arg(long, value_delimiter = ',', default_values_t = [512_u32])]
+        ubatch: Vec<u32>,
+        /// Fit the measured residuals into `calibration.json`.
+        ///
+        /// Nothing reads that file yet: the estimator keeps its shipped
+        /// defaults until a later milestone decides when a fit is trustworthy.
+        #[arg(long)]
+        fit: bool,
     },
     /// Manage the models this machine has.
     ///
@@ -319,6 +358,33 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
         }
         Command::Sysinfo => {
             sysinfo(out, cli.json);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Bench {
+            model,
+            ctx,
+            threads,
+            kv_type,
+            prompt_tokens,
+            generate_tokens,
+            repeat,
+            ubatch,
+            fit,
+        } => {
+            let options = bench::BenchOptions {
+                model: model.clone(),
+                n_ctx: *ctx,
+                threads: *threads,
+                kv_type: kv_type.clone(),
+                prompt_tokens: *prompt_tokens,
+                generate_tokens: *generate_tokens,
+                repetitions: *repeat,
+                ubatch: ubatch.clone(),
+                fit: *fit,
+                json: cli.json,
+            };
+            let report = runtime()?.block_on(bench::run(&options))?;
+            line!(out, "{report}");
             Ok(ExitCode::SUCCESS)
         }
         Command::Models { action } => models_command(cli, out, action),

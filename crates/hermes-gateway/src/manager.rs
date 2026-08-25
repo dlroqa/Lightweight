@@ -710,6 +710,7 @@ pub async fn load_model(
         ram_verdict: Some(estimate.verdict.label().to_owned()),
         backend: Some(state.backend.id().to_string()),
         model_path: model.path.display().to_string(),
+        effective: loaded.effective,
     };
     state.catalog.set_resident(Some(resident.clone())).await;
     manager.mark_loaded(&model.id, loaded.effective.n_ctx).await;

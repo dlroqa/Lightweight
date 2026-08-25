@@ -562,6 +562,7 @@ async fn load_at_startup(
         ram_verdict: Some(estimate.verdict.label().to_owned()),
         backend: Some(hermes_backend_llamacpp::backend::BACKEND_ID.to_string()),
         model_path: model_path.display().to_string(),
+        effective: loaded.effective,
     })
 }
 

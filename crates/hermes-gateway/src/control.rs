@@ -1091,6 +1091,21 @@ fn bad_request(param: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// A refusal with a stable code, in the shape every other error here has.
+fn error_json(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        axum::Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": code,
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// This gateway was started without a catalog.
 fn no_manager() -> Response {
     (
@@ -1104,4 +1119,109 @@ fn no_manager() -> Response {
         })),
     )
         .into_response()
+}
+
+/// Body for `POST /api/v1/benchmarks`.
+///
+/// Every field optional: the ordinary case is "measure what is loaded", and the
+/// defaults are the runner's own.
+#[derive(Debug, Default, Deserialize)]
+pub struct BenchmarkBody {
+    pub prompt_tokens: Option<u32>,
+    pub generate_tokens: Option<u32>,
+    pub repeat: Option<u32>,
+}
+
+/// `POST /api/v1/benchmarks`.
+///
+/// Measures the model that is **already resident**, at the parameters it was
+/// already loaded with. It does not reload, does not change a setting and does
+/// not pause the scheduler: it takes a slot like any other request, because
+/// that is exactly what it is.
+///
+/// Varying the parameters means reloading the engine, which takes minutes and
+/// would interrupt whoever is being served. That is `hermes bench`, which
+/// brings its own engine.
+pub async fn run_benchmark(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(store) = state.benchmarks() else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_data_directory",
+            "this gateway has no data directory, so it cannot save a benchmark",
+        );
+    };
+    let body: BenchmarkBody = if body.is_empty() {
+        BenchmarkBody::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(body) => body,
+            Err(err) => return bad_request("body", &err.to_string()),
+        }
+    };
+
+    let Some(resident) = state.catalog.resident().await else {
+        return error_json(
+            StatusCode::CONFLICT,
+            "no_model_loaded",
+            "load a model before benchmarking; there is nothing resident to measure",
+        );
+    };
+
+    let job = state
+        .jobs()
+        .start(JobKind::Benchmark, &state.shutdown_token());
+    let background = Arc::clone(&job);
+    let state = Arc::clone(&state);
+    tokio::spawn(async move {
+        match crate::benchmark::run(&state, &store, &resident, &body, &background).await {
+            Ok(id) => background.set(JobState::Succeeded { model: Some(id) }),
+            Err(err) => background.set(JobState::Failed {
+                error: hermes_core::ErrorReport::capture(&err),
+            }),
+        }
+    });
+    accepted(&job)
+}
+
+/// `GET /api/v1/benchmarks`.
+pub async fn benchmarks(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(store) = state.benchmarks() else {
+        return axum::Json(json!({ "runs": [] })).into_response();
+    };
+    match store.list() {
+        Ok(runs) => axum::Json(json!({ "runs": runs })).into_response(),
+        Err(err) => error_response(&err),
+    }
+}
+
+/// `GET /api/v1/benchmarks/{id}`.
+pub async fn benchmark(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(store) = state.benchmarks() else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no_data_directory",
+            "this gateway has no data directory, so it has saved no benchmarks",
+        );
+    };
+    match store.get(&id) {
+        Ok(run) => axum::Json(run).into_response(),
+        Err(err) => error_response(&err),
+    }
 }

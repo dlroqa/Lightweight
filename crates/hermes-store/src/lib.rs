@@ -18,7 +18,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-mod atomic;
+/// Atomic, owner-only writes.
+///
+/// Public because a third copy of it was the alternative. `hermes-catalog` has
+/// its own, written first and without the permission hardening; this one added
+/// that, and the module doc there records why the duplication was accepted at
+/// the time. A crate that wants the same guarantees now reuses these rather
+/// than making the same decision a third time.
+pub mod atomic;
 pub mod conversations;
 pub mod error;
 pub mod settings;
