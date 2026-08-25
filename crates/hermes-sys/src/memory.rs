@@ -126,17 +126,36 @@ mod platform {
         // the same number here rather than a Linux distinction invented for a
         // platform that does not draw it.
         //
-        // The page file is reported as a commit limit that already includes
-        // physical memory, so the swap portion is what remains after subtracting
-        // it. That makes these two approximate - acceptable only because swap is
-        // never counted as headroom, so the number reaches the dashboard and no
-        // decision.
+        // The page file is reported as a *commit limit* that already includes
+        // physical memory, so the page file's own size is what remains after
+        // subtracting it. Its free portion cannot be derived the same way:
+        // subtracting available physical from available commit produced
+        // `swap_free` **larger than `swap_total`** on a real runner - 3.37 GiB
+        // free out of 3.09 GiB - because the two availability figures are
+        // accounted separately and the standby list belongs to both.
+        //
+        // Derived through *usage* instead, which is the one quantity commit
+        // accounting states consistently: what is committed beyond what is
+        // resident is what the page file is holding. Saturating, so a machine
+        // whose numbers still disagree reports an empty page file rather than
+        // an impossible one - and never a free figure above the total, which
+        // `MemorySnapshot::swap_used` would turn into a wrong number on screen.
+        //
+        // Both remain approximations, which is acceptable for exactly one
+        // reason: swap is never counted as headroom, so these reach the
+        // dashboard and no decision.
+        let swap_total = status.ullTotalPageFile.saturating_sub(status.ullTotalPhys);
+        let committed = status
+            .ullTotalPageFile
+            .saturating_sub(status.ullAvailPageFile);
+        let resident = status.ullTotalPhys.saturating_sub(status.ullAvailPhys);
+        let swap_used = committed.saturating_sub(resident).min(swap_total);
         Ok(RawMemory {
             total: status.ullTotalPhys,
             available: status.ullAvailPhys,
             free: status.ullAvailPhys,
-            swap_total: status.ullTotalPageFile.saturating_sub(status.ullTotalPhys),
-            swap_free: status.ullAvailPageFile.saturating_sub(status.ullAvailPhys),
+            swap_total,
+            swap_free: swap_total.saturating_sub(swap_used),
         })
     }
 
