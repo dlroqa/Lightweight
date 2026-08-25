@@ -464,7 +464,7 @@ Three decisions worth keeping:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 749 | no network, no model downloads — checked with outbound HTTP blocked |
+| Default (`cargo test --workspace`) | 750 | no network, no model downloads — checked with outbound HTTP blocked |
 | openai-SDK contract (`scripts/contract-test.sh`) | 32 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser; two clients driven at once from two threads |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 10 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
@@ -1067,7 +1067,10 @@ Found while building M9, and fixed:
 - **A benchmark could run with no slot.** `benchmark.rs` bound the permit as
   `let _permit = ...await;` — an `Option` — so a queue timeout produced exactly
   the interleaved measurement the comment above it says it prevents, silently.
-  It is a refusal now, naming the wait it gave up after.
+  It is a refusal now, naming the wait it gave up after, and pinned by a test
+  that holds the only slot and asserts the job fails `server_busy` with nothing
+  measured. Checked against the defect it exists for: restore the discarded
+  `Option` and it fails.
 - **Two queue counters described overlapping sets.** A non-streamed timeout
   incremented `timed_out` *and* `abandoned`; a streamed one incremented only
   `abandoned`. Both numbers move on `/metrics` as a result of this fix; no name

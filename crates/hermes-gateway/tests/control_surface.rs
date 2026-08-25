@@ -402,6 +402,87 @@ async fn benchmarking_nothing_is_a_conflict_rather_than_an_empty_result() {
 }
 
 #[tokio::test]
+async fn a_benchmark_that_cannot_get_a_slot_refuses_rather_than_measuring_contention() {
+    // The benchmark takes a scheduler slot like any other request, so that it
+    // and a user's generation never interleave on one engine and report each
+    // other's contention as their own speed. It used to bind that slot as
+    // `let _permit = ...await` - an `Option` - so a queue timeout ran the
+    // measurement with no slot at all, producing exactly the interleaved
+    // number the slot exists to prevent, and producing it silently.
+    ensure_provider();
+    let dir = TempDir::new("bench-busy");
+    let backend = Arc::new(MockBackend::default());
+    let model = hermes_core::ModelId::with_context("mock-model", 4096);
+    let loaded = backend.make_resident(model.clone(), 4096).await;
+    let catalog = Arc::new(hermes_gateway::catalog::Catalog::with_resident(
+        hermes_gateway::catalog::ResidentModel {
+            id: model,
+            instance: loaded.instance,
+            n_ctx: 4096,
+            architecture: "mock".into(),
+            param_count: None,
+            quantization: None,
+            model_max_context_length: None,
+            ram_verdict: None,
+            backend: Some("mock".into()),
+            model_path: "/mock/model.gguf".into(),
+            effective: hermes_core::RuntimeParams::default(),
+        },
+    ));
+    let state = Arc::new(GatewayState::new(
+        Arc::clone(&backend) as Arc<dyn hermes_inference::InferenceBackend>,
+        catalog,
+        GatewayConfig {
+            paths: Some(hermes_system_info::DataPaths::rooted_at(dir.path())),
+            max_concurrent_requests: 1,
+            // Short, so the test measures the refusal rather than the wait.
+            queue_timeout: std::time::Duration::from_millis(50),
+            ..GatewayConfig::default()
+        },
+    ));
+
+    // Something else is already using the only slot.
+    let _busy = state.try_acquire_slot().expect("the gateway starts idle");
+
+    let server = Server::start(Arc::clone(&state)).await;
+    let (status, body) = server
+        .post("/api/v1/benchmarks", serde_json::json!({}))
+        .await;
+    assert_eq!(status, 202, "the run is accepted and then fails: {body}");
+    let job = body["job"].as_u64().expect("a job id");
+
+    // It is a background job, so the refusal arrives on the job rather than as
+    // a status. Polled rather than slept on, with a bound.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let failure = loop {
+        let (status, body) = server.get(&format!("/api/v1/jobs/{job}")).await;
+        assert_eq!(status, 200, "{body}");
+        if body["status"]["state"] == "failed" {
+            break body;
+        }
+        assert!(
+            body["status"]["state"] != "succeeded",
+            "a benchmark ran without a slot: {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(
+        failure["status"]["error"]["code"], "server_busy",
+        "{failure}"
+    );
+    assert_eq!(
+        backend.generation_count(),
+        0,
+        "nothing should have been measured"
+    );
+}
+
+#[tokio::test]
 async fn a_gateway_that_has_run_no_benchmarks_lists_none() {
     ensure_provider();
     let (_dir, state, _id) = gateway_with_a_model("bench-list").await;
