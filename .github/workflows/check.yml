@@ -36,10 +36,16 @@ jobs:
           # One runner per architecture: a test proves something only on the
           # architecture it ran on, and the macOS DMG ships both.
           - { os: macos-15, label: macos-arm64, arch: arm64 }
-          # Intel macOS is a larger runner now that `macos-13` has been retired
-          # from actions/runner-images. It is what proves the x86-64 half of the
-          # universal DMG actually runs, rather than merely having been built.
-          - { os: macos-15-large, label: macos-x64, arch: x64 }
+          # Intel macOS proves the x86-64 half of the universal DMG actually
+          # runs rather than merely having been built. `macos-15-intel` and not
+          # `macos-15-large`: both are Intel and both appear in
+          # actions/runner-images, but the `-large` one is a *larger runner* and
+          # bills for it. On this repository it stopped starting at all - "the
+          # job was not started because recent account payments have failed or
+          # your spending limit needs to be increased" - which is a billing
+          # setting standing between the product and the only x86-64 macOS
+          # check it has.
+          - { os: macos-15-intel, label: macos-x64, arch: x64 }
           - { os: windows-latest, label: windows-x64, arch: x64 }
           - { os: ubuntu-latest, label: linux-x64, arch: x64 }
 

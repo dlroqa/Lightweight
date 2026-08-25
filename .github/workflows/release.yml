@@ -106,13 +106,16 @@ jobs:
 
   # The other half of the universal DMG, on the architecture it is for.
   #
-  # `macos-15-large` is Intel. It is a larger runner and bills accordingly;
-  # without it the x86-64 slice ships having been built and never executed, and
+  # `macos-15-intel` is the standard Intel runner. Its neighbour in
+  # actions/runner-images, `macos-15-large`, is the same architecture on a
+  # *larger runner*, which bills - and which stopped starting on this
+  # repository when a spending limit was reached. Without an Intel runner of
+  # some kind the x86-64 slice ships having been built and never executed, and
   # that would have to be said in the release notes instead.
   macos-intel:
     name: the Intel half of the DMG, on Intel
     needs: build
-    runs-on: macos-15-large
+    runs-on: macos-15-intel
     timeout-minutes: 30
     defaults:
       run:

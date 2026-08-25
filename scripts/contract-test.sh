@@ -31,7 +31,22 @@ fi
 
 if [ ! -x "$VENV_BIN/pytest$EXE" ]; then
   echo "== creating the contract test environment =="
-  "$PYTHON" -m venv "$VENV"
+  # `--clear` because this lives under `target/`, which CI caches: a restored
+  # half of a virtualenv has a `pyvenv.cfg` and no `bin/`, and `venv` on top of
+  # that leaves it exactly as broken as it found it. That is not hypothetical -
+  # it is how the Linux gate failed on its second CI run, with
+  # `target/contract-venv/bin/pip: No such file or directory`.
+  "$PYTHON" -m venv --clear "$VENV"
+  # A Python built without `ensurepip` produces a venv with no pip at all, and
+  # the failure is worth naming rather than leaving as "no such file".
+  if [ ! -x "$VENV_BIN/pip$EXE" ]; then
+    "$VENV_BIN/python$EXE" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+  if [ ! -x "$VENV_BIN/pip$EXE" ]; then
+    echo "the virtualenv at $VENV has no pip; install python3-venv (or its" >&2
+    echo "equivalent) and try again" >&2
+    exit 1
+  fi
   "$VENV_BIN/pip$EXE" install --quiet --disable-pip-version-check openai pytest pyyaml
 fi
 
