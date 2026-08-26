@@ -173,18 +173,26 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
     # Checked as well as `$target` so that "it installed, elsewhere" is a
     # different sentence from "it installed nothing".
     fallback="${LOCALAPPDATA:-$HOME/AppData/Local}/Programs/Hermes"
+    # Wait for the *bundled* binary, `resources/bin/hermes.exe`, not the
+    # top-level `Hermes.exe` launcher. NSIS extracts the two separately and in
+    # no guaranteed order, so the launcher can land a beat before the resources
+    # do. Gating on the launcher and then, with no second wait, running the
+    # bundled binary is a race: once it broke the instant the launcher appeared
+    # and the `-f` on `resources/bin/hermes.exe` failed in the same millisecond,
+    # reported as "the installed hermes does not run". The file the run
+    # assertion below actually needs is the one the loop must wait for.
     for _ in $(seq 1 180); do
-      [ -f "$target/Hermes.exe" ] && break
-      [ -f "$fallback/Hermes.exe" ] && break
+      [ -f "$target/resources/bin/hermes.exe" ] && break
+      [ -f "$fallback/resources/bin/hermes.exe" ] && break
       sleep 1
     done
-    if [ -f "$target/Hermes.exe" ]; then
+    if [ -f "$target/resources/bin/hermes.exe" ]; then
       pass "the installer wrote an application"
-    elif [ -f "$fallback/Hermes.exe" ]; then
+    elif [ -f "$fallback/resources/bin/hermes.exe" ]; then
       pass "the installer wrote an application (at its default location)"
       target="$fallback"
     else
-      fail "the installer produced no Hermes.exe"
+      fail "the installer produced no resources/bin/hermes.exe"
       # Said here rather than guessed at from a bare failure next time.
       if kill -0 "$installer" 2>/dev/null; then
         echo "        the installer is still running; it is not installing silently"
