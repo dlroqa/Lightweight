@@ -77,7 +77,6 @@ jobs:
         run: bash ./scripts/package-cli.sh ${{ matrix.triple }}
 
       - name: The installer
-        run: npm --prefix apps/desktop run package -- ${{ matrix.targets }}
         env:
           # With no certificate in the keychain, electron-builder would
           # otherwise go looking for one and fail the build rather than produce
@@ -88,6 +87,28 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          # A secret that does not exist arrives as an empty string, and an
+          # empty `CSC_LINK` is not the same as an absent one: electron-builder
+          # reads it as "import this certificate", resolves "" against the
+          # project directory, and dies with `<projectDir> not a file`
+          # (app-builder-lib/out/codeSign/codesign.js:27). That is what failed
+          # the macOS job the first time this workflow ever ran, after the DMG
+          # had already been built and merged.
+          #
+          # Unsetting the empty ones restores the intent above: no certificate
+          # means the unsigned path, a real certificate still signs, and no code
+          # changes either way.
+          for name in CSC_LINK CSC_KEY_PASSWORD WIN_CSC_LINK WIN_CSC_KEY_PASSWORD; do
+            eval "value=\${$name:-}"
+            if [ -z "$value" ]; then
+              unset "$name"
+              echo "  $name is empty; unset so the unsigned path is taken"
+            else
+              echo "  $name is set; signing will be attempted"
+            fi
+          done
+          npm --prefix apps/desktop run package -- ${{ matrix.targets }}
 
       # A display for the launch check, and the user namespaces it needs.
       # Without the second one the AppImage's sandboxed launch skips and the

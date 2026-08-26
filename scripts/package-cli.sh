@@ -70,10 +70,37 @@ case "$TRIPLE" in
   *windows*)
     # Git Bash has no `zip`, and 7-Zip is not something to rely on being on a
     # runner. PowerShell is always there on Windows.
+    #
+    # `pwsh` and `ZipFile::CreateFromDirectory` rather than `Compress-Archive`,
+    # because Windows PowerShell's `Compress-Archive` runs on .NET Framework and
+    # writes **backslashes** as the separator inside the zip. The format's own
+    # specification says forward slash, so the archive it produced was malformed:
+    # `unzip` greeted it with "appears to use backslashes as path separators",
+    # returned its warning exit status, and `set -e` killed the smoke test that
+    # had just been asked to prove the release archive works. Every extraction
+    # of it, on any platform, would have produced one file with a backslash in
+    # its name instead of a directory.
+    #
+    # .NET Core - which is what `pwsh` runs on - writes the separator the
+    # specification asks for. `scripts/smoke-artifacts.sh` asserts that rather
+    # than trusting it.
     ARCHIVE="$OUT/$NAME.zip"
     rm -f "$ARCHIVE"
-    powershell -NoProfile -Command \
-      "Compress-Archive -Path '$STAGE' -DestinationPath '$ARCHIVE'"
+    command -v pwsh >/dev/null 2>&1 || {
+      echo "pwsh (PowerShell 7+) is needed to write a well-formed zip" >&2
+      exit 1
+    }
+    # `includeBaseDirectory` true, so the zip unpacks to a `$NAME/` directory
+    # exactly as the tarball does on the other platforms. Without it the
+    # binary, the LICENSE and the README land in whatever directory the user
+    # happened to be in.
+    pwsh -NoProfile -Command \
+      "Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+       [System.IO.Compression.ZipFile]::CreateFromDirectory( \
+         (Resolve-Path '$STAGE').Path, \
+         (Join-Path (Resolve-Path '$OUT').Path '$NAME.zip'), \
+         [System.IO.Compression.CompressionLevel]::Optimal, \
+         \$true)"
     ;;
   *)
     ARCHIVE="$OUT/$NAME.tar.gz"
