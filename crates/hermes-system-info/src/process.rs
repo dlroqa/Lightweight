@@ -118,9 +118,26 @@ mod tests {
         // the difference is the clean file-backed pages a footprint excludes,
         // starting with this test binary itself.
         if me.peak_is_footprint {
+            // A lifetime maximum is not a synchronous mirror of the value it
+            // tracks, and asserting that it is made this test flaky rather than
+            // strict. Both figures come out of *one* `proc_pid_rusage` struct,
+            // and on a macOS x86-64 runner that single snapshot reported a peak
+            // 4 KiB - one page - below the current footprint: XNU raises the
+            // ledger's high-water mark when it notices, not on every page
+            // fault, so a process still growing reads a current above its own
+            // recorded maximum.
+            //
+            // The tolerance is a margin, not a measurement, and it is picked
+            // the way a margin should be: an order of magnitude above the lag
+            // actually observed - 0.6% of the footprint - and an order of
+            // magnitude below the defect the assertion exists for. That defect
+            // is a peak of a *different quantity*, and the reading that
+            // prompted M10a.12 was out by a third, which 5% still fails loudly.
+            let tolerance = Bytes(anon.get() / 20);
             assert!(
-                me.peak_rss >= anon,
-                "a peak footprint below the current footprint: {me:?}"
+                me.peak_rss + tolerance >= anon,
+                "a peak footprint below the current footprint by more than the \
+                 ledger's own lag: {me:?}"
             );
         } else {
             assert!(
