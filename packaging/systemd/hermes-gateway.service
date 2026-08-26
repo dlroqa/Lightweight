@@ -21,7 +21,7 @@
 
 [Unit]
 Description=Hermes CPU inference gateway
-Documentation=https://github.com/hermes/cpu-inference-gateway
+Documentation=https://github.com/dlroqa/Lightweight
 # The gateway binds a specific address, which may belong to an interface that
 # comes up late - a LAN lease, or an overlay network still connecting.
 After=network-online.target

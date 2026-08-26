@@ -17,6 +17,9 @@ touching the UI or the API.
 
 ## Download
 
+Download the current builds from the
+[GitHub Releases page](https://github.com/dlroqa/Lightweight/releases).
+
 Every artifact is built and then *run* on the platform it is for, by
 [`release.yml`](.github/workflows/release.yml).
 

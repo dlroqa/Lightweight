@@ -392,6 +392,10 @@ jobs:
             echo "On first use Hermes fetches the pinned llama.cpp build for your"
             echo "platform and checks it against a SHA-256 recorded in the source."
             echo
+            echo "Calibration is intentionally deferred for pinned llama.cpp b10590:"
+            echo "\`hermes bench --fit\` safely refuses every honest fit, so the"
+            echo "shipped estimates remain conservative by 1.37×–2.85×."
+            echo
             echo '```'
             cat dist/SHA256SUMS
             echo '```'
