@@ -151,9 +151,21 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
     target="$(mktemp -d)"
     # `/S` is a silent install; `/D` must come last and be unquoted, which is
     # NSIS's own rule rather than a preference.
-    "$setup" /S "/D=$(cygpath -w "$target")" || true
-    # The installer returns before it has finished writing.
-    for _ in $(seq 1 30); do
+    #
+    # Started rather than waited on, because it does not come back.
+    # electron-builder's NSIS launches the application once it has finished
+    # (`runAfterFinish`, on by default), and this application is a gateway that
+    # keeps running - so the installer sits waiting on a process that has no
+    # intention of exiting. The first release run to reach this line hung here
+    # for forty minutes until the job was cancelled, and left the installer
+    # behind as an orphan process. Nothing was wrong with the installer; the
+    # test was waiting for the wrong thing.
+    #
+    # What actually says the install worked is the files appearing, which is
+    # what the loop below already waited for.
+    "$setup" /S "/D=$(cygpath -w "$target")" &
+    installer=$!
+    for _ in $(seq 1 120); do
       [ -f "$target/Hermes.exe" ] && break
       sleep 1
     done
@@ -176,6 +188,15 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
     else
       echo "  note  dumpbin is not on PATH; the DLL dependency list was not captured"
     fi
+
+    # Everything the installer started, stopped. The application it launches on
+    # finishing keeps a gateway alive and holds the installer open behind it;
+    # left running, both survive the step as orphans and the directory below
+    # cannot be removed because its files are still open.
+    taskkill //F //IM Hermes.exe >/dev/null 2>&1 || true
+    taskkill //F //IM "$(basename "$setup")" >/dev/null 2>&1 || true
+    kill "$installer" 2>/dev/null || true
+    wait "$installer" 2>/dev/null || true
     rm -rf "$target" || true
   fi
   ;;
