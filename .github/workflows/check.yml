@@ -133,14 +133,28 @@ jobs:
       - name: Package the AppImage
         run: npm --prefix apps/desktop run package -- --linux AppImage
 
-      # Unlike the development machine, a GitHub runner can create unprivileged
-      # user namespaces - so this is where the *supported* case is exercised and
-      # the assertion that no live process carries `--no-sandbox` actually runs.
+      # This is where the *supported* case is exercised: the app started, and no
+      # live process of it carrying `--no-sandbox`. That claim used to be made
+      # here and was not true. `ubuntu-latest` is 24.04, which ships
+      # `kernel.apparmor_restrict_unprivileged_userns=1` - the same restriction
+      # as the development machine - so `unshare -Ur` failed, the launch skipped,
+      # and the job went green having asserted nothing about it. Lifting the
+      # knob puts the runner in the configuration the AppImage is *for*; the
+      # restricted configuration is already covered by the refusal check above,
+      # which is why both belong in one run. `|| true` because the knob does not
+      # exist on every image, and its absence is the permissive case.
+      #
       # `xvfb` because that launch opens a real window.
       - name: Artifact checks
+        env:
+          # Demanded, not hoped for: with the knob lifted above there is no
+          # reason for the launch to skip, and a skip that stays green is what
+          # hid this in the first place.
+          HERMES_REQUIRE_SANDBOXED_LAUNCH: '1'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           xvfb-run --auto-servernum ./scripts/test-artifacts.sh
 
   # The Flatpak build, which is the primary public Linux artifact.

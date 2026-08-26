@@ -89,19 +89,26 @@ jobs:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
 
-      # The Linux smoke test launches the packaged app to prove it starts
-      # sandboxed, and that opens a real window. Without this the check could
-      # only skip, and the one artifact whose sandbox this release exists to
-      # keep would ship having never been started.
-      - name: A display for the launch check
+      # A display for the launch check, and the user namespaces it needs.
+      # Without the second one the AppImage's sandboxed launch skips and the
+      # release goes green having never started the app: the runner images
+      # restrict unprivileged user namespaces from Ubuntu 24.04 on, exactly as
+      # a user's own 24.04 desktop does - which is why the Flatpak is the
+      # primary Linux artifact and why the refusal path is checked separately.
+      - name: A display and a user namespace for the launch check
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       # Extract it, install it, run it. A file of the right name and size is
       # not evidence that any of it works.
       - name: Run what was built
+        env:
+          # A release must not be able to skip the one check that proves the
+          # packaged app starts at all.
+          HERMES_REQUIRE_SANDBOXED_LAUNCH: '1'
         run: bash ./scripts/smoke-artifacts.sh
 
       - uses: actions/upload-artifact@v4

@@ -136,12 +136,33 @@ fi
 #    one asserted into a headless runner instead, which is what
 #    `release.yml`'s Linux job would have hit.
 # ---------------------------------------------------------------------------
+#    A skip here used to be indistinguishable from a pass, and that is how the
+#    assertion went unexercised for a milestone while a comment in `check.yml`
+#    said it ran: `ubuntu-latest` is 24.04, which restricts unprivileged user
+#    namespaces exactly like the development machine does.
+#    `HERMES_REQUIRE_SANDBOXED_LAUNCH` is the same answer `check.sh` already
+#    gives for the real-model tier - where it can be run, demand it, so a green
+#    run cannot mean the check quietly did nothing.
+require_launch="${HERMES_REQUIRE_SANDBOXED_LAUNCH:-}"
 if ! unshare -Ur true 2>/dev/null; then
-  echo "  skip  the supported case: this host cannot create user namespaces, so a"
-  echo "        sandboxed launch cannot be exercised here. It is checked on CI."
+  if [ -n "$require_launch" ]; then
+    fail "the supported case: this host cannot create user namespaces, and
+        HERMES_REQUIRE_SANDBOXED_LAUNCH demanded it. On Ubuntu 24.04 and
+        later, lift it with:
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+  else
+    echo "  skip  the supported case: this host cannot create user namespaces, so a"
+    echo "        sandboxed launch cannot be exercised here. Set"
+    echo "        HERMES_REQUIRE_SANDBOXED_LAUNCH=1 to make this a failure."
+  fi
 elif [ -z "${DISPLAY:-}" ]; then
-  echo "  skip  the supported case: no DISPLAY, and this launch opens a real"
-  echo "        window. Run under xvfb-run to include it."
+  if [ -n "$require_launch" ]; then
+    fail "the supported case: no DISPLAY, and HERMES_REQUIRE_SANDBOXED_LAUNCH
+        demanded the launch. Run under xvfb-run."
+  else
+    echo "  skip  the supported case: no DISPLAY, and this launch opens a real"
+    echo "        window. Run under xvfb-run to include it."
+  fi
 else
   home="$(mktemp -d)"
   port=18779
