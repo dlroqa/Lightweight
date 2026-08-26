@@ -299,7 +299,14 @@ jobs:
       - name: Draft it
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          # On a tag push this is the tag, which is the whole point. On a
+          # `workflow_dispatch` it would be the *branch* - so a rehearsal on
+          # `master` would stand a draft whose tag name is `master`, and
+          # publishing that draft would create a ref called `master` pointing at
+          # a release, next to the branch of the same name. A rehearsal must not
+          # leave a loaded gun in the releases list, so it gets its own name:
+          # unmistakable in the list, and safe to delete afterwards.
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('dry-run-{0}', github.run_id) }}
         run: |
           {
             echo "## Downloads"
