@@ -15,7 +15,8 @@ pub mod generation;
 
 pub use backend::{
     BackendCapabilities, BackendHealth, BackendId, CpuTicks, DeviceKind, EngineCounters,
-    GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel, ResourceSnapshot,
+    GenerationStream, InferenceBackend, LoadProgress, LoadRequest, LoadedModel, PeakKind,
+    ResourceSnapshot,
 };
 pub use error::BackendError;
 pub use generation::{

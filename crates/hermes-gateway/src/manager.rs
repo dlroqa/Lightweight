@@ -519,6 +519,26 @@ pub struct ContextChoice {
 /// it, so setting one can make a load smaller than it might have been, never
 /// larger than it should be. A context the model was previously loaded with is
 /// deliberately not consulted; see `InstalledModel::last_n_ctx`.
+/// One phrase for the log, naming where this load's coefficients came from.
+///
+/// A verdict is only as good as the numbers behind it, and until M10 those
+/// numbers were always the shipped guesses. Now that they are sometimes a
+/// measurement, the log line that records the verdict has to say which - an
+/// admission that later ends in an OOM kill is read backwards from this line.
+fn describe_calibration(outcome: &hermes_bench::Outcome) -> String {
+    match outcome {
+        hermes_bench::Outcome::Applied(calibrated) => {
+            format!("measured (fitted at {})", calibrated.fit_at_unix)
+        }
+        hermes_bench::Outcome::Rejected(untrusted) => {
+            format!("shipped defaults: {}", untrusted.reason())
+        }
+        hermes_bench::Outcome::Unreadable(detail) => {
+            format!("shipped defaults: the calibration file could not be read ({detail})")
+        }
+    }
+}
+
 pub fn choose_context(
     requested: Option<u32>,
     stored_default: Option<u32>,
@@ -605,7 +625,30 @@ pub async fn load_model(
     // Admission control, exactly as `hermes serve` does it: never promise a
     // model will run because its weights fit.
     let estimator = Estimator::headless();
-    let snapshot = state.memory_snapshot()?;
+    let snapshot = match state.memory_snapshot() {
+        Ok(snapshot) => Some(snapshot),
+        // `--force` is the caller accepting the risk, and a probe failure is
+        // precisely the case where `MemoryError` advertises `ForceLoad` as its
+        // one remedy. Refusing here anyway made that remedy unreachable: the
+        // error told the user to force it, and forcing it changed nothing,
+        // because this `?` ran before `options.force` was ever consulted.
+        //
+        // It is honoured now, and what gets skipped is said out loud. A load
+        // that proceeded with no admission control and no line in the log would
+        // leave an OOM kill twenty minutes later with no antecedent, which is
+        // the reason every other verdict on this path is logged too.
+        Err(error) if options.force => {
+            tracing::warn!(
+                target: targets::MEMORY,
+                model = %model.id,
+                error = %error,
+                "memory could not be probed and the load was forced: \
+                 admission control skipped for this load"
+            );
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     // What the outgoing engine is about to hand back, if there is one.
     //
@@ -627,123 +670,167 @@ pub async fn load_model(
     // occupied and genuinely returned when the engine exits. Crediting only
     // the anonymous set there would under-credit by the size of the model and
     // refuse a swap that fits.
-    let reclaimable = if state.catalog.resident().await.is_some() {
-        let usage = state.backend.resource_usage().await.ok().flatten();
-        let anonymous = usage
-            .and_then(|usage| usage.anon_rss)
-            .unwrap_or(hermes_core::units::Bytes::ZERO);
-        let locked = state
-            .catalog
-            .resident()
-            .await
-            .filter(|resident| {
-                resident
-                    .effective
-                    .load_mode
-                    .is_some_and(hermes_core::LoadMode::locks_weights)
-            })
-            .and_then(|_| usage.map(|usage| usage.rss.get().saturating_sub(anonymous.get())))
-            .unwrap_or(0);
-        hermes_core::units::Bytes(anonymous.get().saturating_add(locked))
-    } else {
-        hermes_core::units::Bytes::ZERO
-    };
-    let budget = hermes_memory::Budget::of(snapshot).reclaiming(reclaimable);
-
-    // How many clients this machine should serve *this* model to, decided
-    // before the context is fitted: the two are coupled through the KV cache,
-    // and fitting a window first would size it for a slot count that has not
-    // been chosen yet.
-    let slots = estimator.choose_concurrency(
-        defaults.concurrency,
-        cpu.logical_cores,
-        Some(&metadata),
-        base,
-        budget,
+    // Without a probe there is no budget, so nothing may be fitted to one.
+    // The caller's own numbers stand, and where they gave none the conservative
+    // default does - never the largest context this machine "could" give, which
+    // is a claim only a budget can support.
+    let mut params = base.with_context(
+        options
+            .n_ctx
+            .or(crate::store_api::gateway_settings(state).default_n_ctx)
+            .unwrap_or(base.n_ctx),
     );
-    let base = RuntimeParams {
-        n_parallel: slots.slots,
-        ..base
-    };
+    // `None` where the load was forced past a probe failure. It reaches the
+    // resident record as a `ram_verdict` of `None`, which is the honest answer:
+    // this load was never judged, and a stored label saying otherwise would be
+    // the confident wrong number this codebase refuses everywhere else.
+    let mut judged: Option<hermes_memory::Estimate> = None;
 
-    let chosen = choose_context(
-        options.n_ctx,
-        crate::store_api::gateway_settings(state).default_n_ctx,
-        &metadata,
-        base,
-        budget,
-        &estimator,
-    );
-    let params = base.with_context(chosen.n_ctx);
-    let estimate = estimator.estimate_against(&metadata, params, budget);
+    if let Some(snapshot) = snapshot {
+        let reclaimable = if state.catalog.resident().await.is_some() {
+            let usage = state.backend.resource_usage().await.ok().flatten();
+            let anonymous = usage
+                .and_then(|usage| usage.anon_rss)
+                .unwrap_or(hermes_core::units::Bytes::ZERO);
+            let locked = state
+                .catalog
+                .resident()
+                .await
+                .filter(|resident| {
+                    resident
+                        .effective
+                        .load_mode
+                        .is_some_and(hermes_core::LoadMode::locks_weights)
+                })
+                .and_then(|_| usage.map(|usage| usage.rss.get().saturating_sub(anonymous.get())))
+                .unwrap_or(0);
+            hermes_core::units::Bytes(anonymous.get().saturating_add(locked))
+        } else {
+            hermes_core::units::Bytes::ZERO
+        };
+        let budget = hermes_memory::Budget::of(snapshot).reclaiming(reclaimable);
 
-    // Every admission decision is recorded, admitted or refused. An OOM kill
-    // twenty minutes from now is classified by the supervisor but has no
-    // antecedent unless the verdict that let the load through is in the same
-    // log. `Tight` is a warning for exactly that reason: it is the verdict that
-    // precedes the kill.
-    if estimate.verdict == Verdict::Tight {
-        tracing::warn!(
-            target: targets::MEMORY,
-            model = %model.id,
-            verdict = estimate.verdict.label(),
-            confidence = ?estimate.confidence,
-            n_ctx = chosen.n_ctx,
-            context_source = ?chosen.source,
-            kv_type = %params.cache_type_k,
-            total = %estimate.total,
-            budget = %estimate.budget,
-            margin = %estimate.margin,
-            reclaimable = %estimate.reclaimable,
-            "admitting a load that leaves less headroom than the safety margin"
+        // How many clients this machine should serve *this* model to, decided
+        // before the context is fitted: the two are coupled through the KV cache,
+        // and fitting a window first would size it for a slot count that has not
+        // been chosen yet.
+        let slots = estimator.choose_concurrency(
+            defaults.concurrency,
+            cpu.logical_cores,
+            Some(&metadata),
+            base,
+            budget,
         );
-    } else {
-        tracing::info!(
-            target: targets::MEMORY,
-            model = %model.id,
-            verdict = estimate.verdict.label(),
-            confidence = ?estimate.confidence,
-            n_ctx = chosen.n_ctx,
-            context_source = ?chosen.source,
-            kv_type = %params.cache_type_k,
-            total = %estimate.total,
-            budget = %estimate.budget,
-            margin = %estimate.margin,
-            reclaimable = %estimate.reclaimable,
-            forced = options.force,
-            "admission verdict"
+        let base = RuntimeParams {
+            n_parallel: slots.slots,
+            ..base
+        };
+
+        let chosen = choose_context(
+            options.n_ctx,
+            crate::store_api::gateway_settings(state).default_n_ctx,
+            &metadata,
+            base,
+            budget,
+            &estimator,
         );
-    }
+        let fitted_params = base.with_context(chosen.n_ctx);
 
-    // A locking load may not proceed on `Tight`.
-    //
-    // Locked pages cannot be reclaimed, so overshooting them is an OOM kill
-    // rather than the paging that `Tight` otherwise means. The verdict that is
-    // merely a warning for a memory-mapped load is a refusal for this one,
-    // and `--force` remains the way to say it anyway.
-    if params
-        .load_mode
-        .is_some_and(hermes_core::LoadMode::locks_weights)
-        && estimate.verdict == Verdict::Tight
-        && !options.force
-    {
-        return Err(ManagerError::Insufficient {
-            model: model.id.clone(),
-            required: estimate.total.to_string(),
-            available: estimate.budget.to_string(),
-            estimate: Box::new(estimate),
-        });
-    }
+        // The first point at which this load's bucket is known: a calibration
+        // is keyed by context and slot count, and both were decided just above.
+        //
+        // So the conservative model chooses the shape and a measured one judges
+        // it, which is the safe order rather than an awkward one. A fit only
+        // ever lowers the compute and overhead terms - the exact half is
+        // untouchable - so a window fitted against the shipped coefficients is
+        // never larger than one fitted against a measurement of the same
+        // machine, and the verdict below is passed on a window this machine has
+        // already been shown to manage.
+        let (estimator, calibration) = state.estimator_for(&metadata, fitted_params);
+        if let hermes_bench::Outcome::Unreadable(detail) = &calibration {
+            tracing::warn!(
+                target: targets::MEMORY,
+                model = %model.id,
+                detail = %detail,
+                "the calibration file could not be read; \
+                 this load is estimated with the shipped coefficients"
+            );
+        }
+        let estimate = estimator.estimate_against(&metadata, fitted_params, budget);
 
-    if estimate.verdict == Verdict::Insufficient && !options.force {
-        return Err(ManagerError::Insufficient {
-            model: model.id.clone(),
-            // Rendered rather than raw: this string reaches the user, and
-            // "2.47 GiB" is the number they can act on.
-            required: estimate.total.to_string(),
-            available: estimate.budget.to_string(),
-            estimate: Box::new(estimate),
-        });
+        // Every admission decision is recorded, admitted or refused. An OOM kill
+        // twenty minutes from now is classified by the supervisor but has no
+        // antecedent unless the verdict that let the load through is in the same
+        // log. `Tight` is a warning for exactly that reason: it is the verdict that
+        // precedes the kill.
+        if estimate.verdict == Verdict::Tight {
+            tracing::warn!(
+                target: targets::MEMORY,
+                model = %model.id,
+                verdict = estimate.verdict.label(),
+                confidence = ?estimate.confidence,
+                n_ctx = chosen.n_ctx,
+                context_source = ?chosen.source,
+                kv_type = %fitted_params.cache_type_k,
+                total = %estimate.total,
+                budget = %estimate.budget,
+                margin = %estimate.margin,
+                reclaimable = %estimate.reclaimable,
+                calibration = %describe_calibration(&calibration),
+                "admitting a load that leaves less headroom than the safety margin"
+            );
+        } else {
+            tracing::info!(
+                target: targets::MEMORY,
+                model = %model.id,
+                verdict = estimate.verdict.label(),
+                confidence = ?estimate.confidence,
+                n_ctx = chosen.n_ctx,
+                context_source = ?chosen.source,
+                kv_type = %fitted_params.cache_type_k,
+                total = %estimate.total,
+                budget = %estimate.budget,
+                margin = %estimate.margin,
+                reclaimable = %estimate.reclaimable,
+                forced = options.force,
+                calibration = %describe_calibration(&calibration),
+                "admission verdict"
+            );
+        }
+
+        // A locking load may not proceed on `Tight`.
+        //
+        // Locked pages cannot be reclaimed, so overshooting them is an OOM kill
+        // rather than the paging that `Tight` otherwise means. The verdict that is
+        // merely a warning for a memory-mapped load is a refusal for this one,
+        // and `--force` remains the way to say it anyway.
+        if fitted_params
+            .load_mode
+            .is_some_and(hermes_core::LoadMode::locks_weights)
+            && estimate.verdict == Verdict::Tight
+            && !options.force
+        {
+            return Err(ManagerError::Insufficient {
+                model: model.id.clone(),
+                required: estimate.total.to_string(),
+                available: estimate.budget.to_string(),
+                estimate: Box::new(estimate),
+            });
+        }
+
+        if estimate.verdict == Verdict::Insufficient && !options.force {
+            return Err(ManagerError::Insufficient {
+                model: model.id.clone(),
+                // Rendered rather than raw: this string reaches the user, and
+                // "2.47 GiB" is the number they can act on.
+                required: estimate.total.to_string(),
+                available: estimate.budget.to_string(),
+                estimate: Box::new(estimate),
+            });
+        }
+
+        params = fitted_params;
+        judged = Some(estimate);
     }
 
     // Nothing new starts, and what is running is left to finish.
@@ -786,7 +873,9 @@ pub async fn load_model(
         param_count: model.param_count,
         quantization: model.quantization.clone(),
         model_max_context_length: model.context_length,
-        ram_verdict: Some(estimate.verdict.label().to_owned()),
+        ram_verdict: judged
+            .as_ref()
+            .map(|estimate| estimate.verdict.label().to_owned()),
         backend: Some(state.backend.id().to_string()),
         model_path: model.path.display().to_string(),
         effective: loaded.effective,
@@ -798,7 +887,7 @@ pub async fn load_model(
         target: targets::MODEL,
         id = %resident.id,
         n_ctx = resident.n_ctx,
-        verdict = ?estimate.verdict,
+        verdict = ?judged.as_ref().map(|estimate| estimate.verdict),
         "model loaded on a running gateway"
     );
     job.set(JobState::Succeeded {

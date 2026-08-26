@@ -17,9 +17,11 @@
 //! coefficients of which one is invented. Deciding how to spend that slope is
 //! the calibration milestone's business, not this one's.
 //!
-//! Nothing here is read by the estimator yet, deliberately. M8 measures and
-//! records; the pass that consumes a fit also has to decide when a fit is
-//! trustworthy, and that decision is not one a benchmark can make for itself.
+//! This module measures and records; it does not decide. Whether a recorded fit
+//! is worth believing is `apply.rs`'s question, and the two are kept apart
+//! because a benchmark cannot know how far its own numbers should travel. What
+//! is recorded here is therefore raw: every observation is kept, including the
+//! ones the trust rules will refuse to spend.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -72,6 +74,18 @@ pub struct Fit {
     /// estimator that budgeted this much for compute and overhead together
     /// would have been right about every sample here.
     pub max_residual_bytes: u64,
+    /// How much of the spread across batch sizes the fitted line accounts for.
+    ///
+    /// `None` under the same condition as the two terms above. Recorded rather
+    /// than judged here: what counts as good enough is policy, and policy lives
+    /// in `apply.rs`. Note that two distinct batch sizes always score 1.0 — a
+    /// line through two points passes through both — so this number only starts
+    /// carrying information at the third, which is why `apply` counts the batch
+    /// sizes before it reads this.
+    ///
+    /// Absent from files written before this field existed, and `None` there.
+    #[serde(default)]
+    pub r_squared: Option<f64>,
     /// The observations behind the numbers above, kept so a later pass can fit
     /// them differently without re-running the benchmark.
     pub points: Vec<ResidualPoint>,
@@ -195,7 +209,12 @@ pub fn fit_run(run: &BenchmarkRun) -> Vec<Fit> {
         let (Some(prediction), Some(peak)) = (sample.predicted, sample.peak_rss) else {
             continue;
         };
-        let Some(residual) = peak.get().checked_sub(prediction.exact()) else {
+        // The exact term this peak actually contains, which is not the same on
+        // every platform: a macOS footprint excludes the mapped weights, and
+        // subtracting them anyway underflowed and silently threw the sample
+        // away - which is why `hermes bench --fit` could fit nothing there.
+        let exact = prediction.exact_within(sample.peak_kind, sample.params);
+        let Some(residual) = peak.get().checked_sub(exact) else {
             // The engine used less than the exactly-computed half. That is not
             // a residual, it is a sign the weights were not all resident - a
             // partially paged mmap, most likely - and fitting compute buffers
@@ -220,14 +239,15 @@ pub fn fit_run(run: &BenchmarkRun) -> Vec<Fit> {
     buckets
         .into_iter()
         .map(|(bucket, points)| {
-            let (slope, intercept) = regress(&points);
+            let line = regress(&points);
             Fit {
                 at_unix: run.at_unix,
                 machine: run.machine.clone(),
                 engine: run.engine.clone(),
                 bucket,
-                compute_bytes_per_ubatch: slope,
-                overhead_bytes: intercept,
+                compute_bytes_per_ubatch: line.map(|line| line.slope),
+                overhead_bytes: line.map(|line| line.intercept),
+                r_squared: line.map(|line| line.r_squared),
                 max_residual_bytes: points
                     .iter()
                     .map(|point| point.residual_bytes)
@@ -239,33 +259,94 @@ pub fn fit_run(run: &BenchmarkRun) -> Vec<Fit> {
         .collect()
 }
 
-/// Least squares of residual against `n_ubatch`.
+/// A straight line through the residuals, and how well it describes them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineFit {
+    /// Bytes of residual per unit of `n_ubatch`.
+    pub slope: f64,
+    /// Residual at `n_ubatch` zero.
+    pub intercept: f64,
+    /// The fraction of the spread across batch sizes the line accounts for.
+    pub r_squared: f64,
+}
+
+/// Least squares of residual against `n_ubatch`, **one point per batch size**.
 ///
-/// `None` for both terms unless at least two *distinct* ubatch values were
-/// measured. Repeating one ubatch a hundred times narrows the noise on a single
-/// point and says nothing whatever about the slope through it.
-fn regress(points: &[ResidualPoint]) -> (Option<f64>, Option<f64>) {
-    let distinct: std::collections::BTreeSet<u32> =
-        points.iter().map(|point| point.n_ubatch).collect();
-    if distinct.len() < 2 {
-        return (None, None);
+/// *The samples inside a bucket are not independent observations.* `peak_rss`
+/// is a high-water mark and every sample in a bucket is read from one engine
+/// process, so the readings only ever climb. Measured on this machine
+/// (2026-08-25, runs `18cf2bfb07298264` and `18cf2c1c92bd4be4`): a bucket's six
+/// samples spread 17.5 MiB from the first to the last, and that spread was
+/// within 0.1 MiB of the same value in all eight buckets swept — four batch
+/// sizes and three contexts — while the entire effect of an eightfold change in
+/// `n_ubatch` was 6 MiB. Regressing the raw samples therefore fits the order
+/// they happened to be taken in far more than the quantity of interest: R² came
+/// out at 0.10 over a four-value sweep whose slope is otherwise stable to
+/// within 1.4% however it is aggregated.
+///
+/// So each batch size contributes one point, its **largest** residual. That is
+/// both the independent observation and the right one to budget: the peak a
+/// configuration reached is what an estimator has to cover, and the mean over a
+/// ratchet is a number no run ever recorded.
+///
+/// `None` unless at least two *distinct* ubatch values were measured. Repeating
+/// one ubatch a hundred times narrows the noise on a single point and says
+/// nothing whatever about the slope through it.
+fn regress(points: &[ResidualPoint]) -> Option<LineFit> {
+    let mut peaks: BTreeMap<u32, u64> = BTreeMap::new();
+    for point in points {
+        let peak = peaks.entry(point.n_ubatch).or_default();
+        *peak = (*peak).max(point.residual_bytes);
+    }
+    if peaks.len() < 2 {
+        return None;
     }
 
-    let n = points.len() as f64;
-    let mean_x = points.iter().map(|p| f64::from(p.n_ubatch)).sum::<f64>() / n;
-    let mean_y = points.iter().map(|p| p.residual_bytes as f64).sum::<f64>() / n;
+    let n = peaks.len() as f64;
+    let mean_x = peaks.keys().map(|ubatch| f64::from(*ubatch)).sum::<f64>() / n;
+    let mean_y = peaks.values().map(|bytes| *bytes as f64).sum::<f64>() / n;
     let mut covariance = 0.0;
     let mut variance = 0.0;
-    for point in points {
-        let dx = f64::from(point.n_ubatch) - mean_x;
-        covariance += dx * (point.residual_bytes as f64 - mean_y);
+    for (ubatch, residual) in &peaks {
+        let dx = f64::from(*ubatch) - mean_x;
+        covariance += dx * (*residual as f64 - mean_y);
         variance += dx * dx;
     }
     if variance == 0.0 {
-        return (None, None);
+        return None;
     }
     let slope = covariance / variance;
-    (Some(slope), Some(mean_y - slope * mean_x))
+    let intercept = mean_y - slope * mean_x;
+
+    let residual_sum: f64 = peaks
+        .iter()
+        .map(|(ubatch, bytes)| {
+            let error = *bytes as f64 - (slope * f64::from(*ubatch) + intercept);
+            error * error
+        })
+        .sum();
+    let total_sum: f64 = peaks
+        .values()
+        .map(|bytes| {
+            let deviation = *bytes as f64 - mean_y;
+            deviation * deviation
+        })
+        .sum();
+    // Every point identical is a flat line that describes them perfectly. The
+    // usual ratio is 0/0 there, and calling that "explains nothing" would refuse
+    // the one case where the line is exactly right. A zero slope is refused
+    // later and for its own reason.
+    let r_squared = if total_sum == 0.0 {
+        1.0
+    } else {
+        1.0 - residual_sum / total_sum
+    };
+
+    Some(LineFit {
+        slope,
+        intercept,
+        r_squared,
+    })
 }
 
 #[cfg(test)]
@@ -273,6 +354,7 @@ mod tests {
     use super::*;
     use crate::record::{ModelFingerprint, Prediction, Sample, Scenario};
     use hermes_core::RuntimeParams;
+    use hermes_inference::PeakKind;
     use hermes_memory::Confidence;
 
     fn machine() -> MachineFingerprint {
@@ -318,6 +400,7 @@ mod tests {
             machine_ticks: Some(400),
             rss: Some(Bytes(exact)),
             peak_rss: Some(Bytes(exact + intercept + slope * u64::from(n_ubatch))),
+            peak_kind: PeakKind::ResidentSet,
             predicted: Some(Prediction {
                 weights: Bytes(exact),
                 kv_cache: Bytes(0),
@@ -346,6 +429,88 @@ mod tests {
         }
     }
 
+    /// A footprint peak is fitted against the term it actually contains.
+    ///
+    /// The defect this exists for is silent: subtracting weights a macOS
+    /// footprint never counted underflows, `fit_run` skips the sample, and
+    /// `hermes bench --fit` reports a run with no fits in it and no reason why.
+    #[test]
+    fn a_footprint_peak_is_not_asked_to_contain_the_weights() {
+        let weights = Bytes::from_mib(700).get();
+        let kv = Bytes::from_mib(200).get();
+        let residual = Bytes::from_mib(150).get();
+
+        // What macOS would record: the peak holds the KV cache and the
+        // residual, and not the mapped weights.
+        let mut sample = sample(512, weights, 0, 0);
+        sample.peak_kind = PeakKind::Footprint;
+        sample.peak_rss = Some(Bytes(kv + residual));
+        sample.predicted = Some(Prediction {
+            weights: Bytes(weights),
+            kv_cache: Bytes(kv),
+            compute: Bytes::ZERO,
+            overhead: Bytes::ZERO,
+            total: Bytes(weights + kv),
+            confidence: Confidence::Coarse,
+        });
+
+        let fits = fit_run(&run(vec![sample]));
+        assert_eq!(fits.len(), 1, "the sample must not be thrown away");
+        assert_eq!(
+            fits[0].max_residual_bytes, residual,
+            "the residual must be the peak minus the KV cache alone"
+        );
+    }
+
+    /// Unless the load locked its weights, which puts them in the footprint.
+    #[test]
+    fn a_locked_load_puts_the_weights_back_inside_a_footprint() {
+        let weights = Bytes::from_mib(700).get();
+        let kv = Bytes::from_mib(200).get();
+        let residual = Bytes::from_mib(150).get();
+
+        let mut sample = sample(512, weights, 0, 0);
+        sample.peak_kind = PeakKind::Footprint;
+        sample.params.load_mode = Some(hermes_core::LoadMode::MmapMlock);
+        // Locked weights are wired and charged to the process, so they are in
+        // the peak - and the residual is what is left after all of it.
+        sample.peak_rss = Some(Bytes(weights + kv + residual));
+        sample.predicted = Some(Prediction {
+            weights: Bytes(weights),
+            kv_cache: Bytes(kv),
+            compute: Bytes::ZERO,
+            overhead: Bytes::ZERO,
+            total: Bytes(weights + kv),
+            confidence: Confidence::Coarse,
+        });
+
+        let fits = fit_run(&run(vec![sample]));
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].max_residual_bytes, residual);
+    }
+
+    /// A run recorded before the field existed is what it always was.
+    #[test]
+    fn a_run_from_before_this_field_reads_as_a_resident_set_peak() {
+        // Every recording made until now was taken on Linux, where the peak is
+        // `VmHWM`. Defaulting to anything else would silently re-interpret
+        // every benchmark already on disk.
+        let stored = serde_json::json!({
+            "scenario": "decode",
+            "params": hermes_core::RuntimeParams::default(),
+            "threads": 4,
+            "repetition": 0,
+            "prompt_tokens": 10,
+            "cached_tokens": 0,
+            "prefilled_tokens": 10,
+            "generated_tokens": 10,
+            "wall_ms": 1_200,
+            "peak_rss": 1_000,
+        });
+        let sample: Sample = serde_json::from_value(stored).expect("an older sample still parses");
+        assert_eq!(sample.peak_kind, PeakKind::ResidentSet);
+    }
+
     #[test]
     fn a_sweep_over_ubatch_recovers_the_slope_and_the_intercept() {
         let exact = Bytes::from_mib(500).get();
@@ -369,6 +534,67 @@ mod tests {
             (fitted_intercept - intercept as f64).abs() < 1.0,
             "intercept was {fitted_intercept}"
         );
+    }
+
+    #[test]
+    fn a_bucket_is_fitted_at_its_peak_rather_than_through_its_climb() {
+        // The measurement behind this: `peak_rss` only ever climbs within one
+        // engine process, so a bucket's samples are one point read at several
+        // moments. On this machine that climb was 17.5 MiB per bucket while the
+        // whole ubatch effect across 64..512 was 6 MiB - fitting the raw
+        // samples fits the order they were taken in.
+        //
+        // Here each batch size is measured three times, climbing by 10 MiB, and
+        // the true relationship is 4096 bytes per ubatch on top of 300 MiB. The
+        // line must come from the peaks, so the climb changes the intercept and
+        // leaves the slope alone.
+        let exact = Bytes::from_mib(500).get();
+        let base = Bytes::from_mib(300).get();
+        let climb = Bytes::from_mib(10).get();
+        let mut samples = Vec::new();
+        for ubatch in [128_u32, 256, 512] {
+            for step in 0..3 {
+                samples.push(sample(ubatch, exact, base + step * climb, 4_096));
+            }
+        }
+        let fits = fit_run(&run(samples));
+
+        let fit = &fits[0];
+        let slope = fit.compute_bytes_per_ubatch.expect("a slope");
+        let intercept = fit.overhead_bytes.expect("an intercept");
+        assert!((slope - 4_096.0).abs() < 1.0, "slope was {slope}");
+        assert!(
+            (intercept - (base + 2 * climb) as f64).abs() < 1.0,
+            "the intercept must sit at the peak of the climb, not its mean; it was {intercept}"
+        );
+        assert_eq!(
+            fit.r_squared,
+            Some(1.0),
+            "three peaks exactly on a line describe it perfectly"
+        );
+        assert_eq!(fit.points.len(), 9, "every observation is still recorded");
+    }
+
+    #[test]
+    fn a_bend_across_batch_sizes_is_recorded_as_a_worse_fit() {
+        // The shape this machine measured: most of the growth between the small
+        // batch sizes and almost none between the large ones. The numbers are
+        // recorded; refusing to spend them is `apply`'s decision, not this
+        // module's.
+        let exact = Bytes::from_mib(500).get();
+        let fits = fit_run(&run(vec![
+            sample(64, exact, Bytes::from_mib(300).get(), 0),
+            sample(128, exact, Bytes::from_mib(302).get(), 0),
+            sample(256, exact, Bytes::from_mib(305).get(), 0),
+            sample(512, exact, Bytes::from_mib(306).get(), 0),
+        ]));
+
+        let r_squared = fits[0].r_squared.expect("a goodness of fit");
+        assert!(
+            (0.7..0.9).contains(&r_squared),
+            "a bend this shape scored {r_squared} on this machine's own data, which was 0.79"
+        );
+        assert!(r_squared < crate::apply::MIN_R_SQUARED, "and it is refused");
     }
 
     #[test]
@@ -435,6 +661,27 @@ mod tests {
         assert!(
             calibration.find(&machine(), &newer, &bucket).is_none(),
             "a fit is a fit of one engine build"
+        );
+
+        // The variant was recorded and not compared until an audit asked why.
+        // The machine fingerprint pins the ISA features it is derived from, so
+        // this is usually implied - but "usually implied" is not what the rest
+        // of this type promises, and the mapping from features to a variant
+        // belongs to the build doing the mapping.
+        let mut dispatched_elsewhere = engine();
+        dispatched_elsewhere.ggml_variant = Some("avx2".to_owned());
+        assert!(
+            calibration
+                .find(&machine(), &dispatched_elsewhere, &bucket)
+                .is_none(),
+            "a fit describes the code the engine actually dispatched to"
+        );
+
+        let mut unstated = engine();
+        unstated.ggml_variant = None;
+        assert!(
+            calibration.find(&machine(), &unstated, &bucket).is_none(),
+            "an engine that did not say which variant it ran is not a match for one that did"
         );
     }
 

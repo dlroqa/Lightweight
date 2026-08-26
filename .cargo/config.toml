@@ -9,3 +9,15 @@
 # will swap and end up slower than three:
 #
 #     CARGO_BUILD_JOBS=3 cargo build
+
+# Statically link the MSVC runtime on Windows.
+#
+# Without this, `hermes.exe` needs the Visual C++ redistributable, which a
+# person who downloaded a CLI archive has no reason to have and no obvious way
+# to be told about - the failure is a dialog naming a missing DLL. Spec section
+# 25's "normal operation needs no administrator" is hard to honour when the
+# first run demands an installer from somewhere else.
+#
+# Verified in CI with `dumpbin /dependents`, not assumed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

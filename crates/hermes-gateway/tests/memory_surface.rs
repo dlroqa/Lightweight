@@ -15,7 +15,7 @@ use hermes_core::units::Bytes;
 use hermes_gateway::manager::{ModelManager, RuntimeDefaults};
 use hermes_gateway::{GatewayConfig, GatewayState};
 use hermes_gguf::fixture::{GgufBuilder, TempDir};
-use hermes_system_info::FixedMemoryProbe;
+use hermes_system_info::{FailingMemoryProbe, FixedMemoryProbe};
 use serde_json::Value;
 
 fn ensure_provider() {
@@ -269,6 +269,64 @@ async fn a_credit_is_never_taken_when_the_probe_could_not_read_it() {
         "with no reading there is nothing to credit, so the answer must not change: {swapped}"
     );
     assert_eq!(swapped["error"]["code"], "insufficient_memory");
+}
+
+/// The remedy `MemoryError` advertises has to actually work.
+///
+/// Every variant of that error offers exactly one remedy - `ForceLoad` - and a
+/// test in `memory.rs` has asserted so since M7. On this path it was a dead
+/// end: `state.memory_snapshot()?` ran before `options.force` was ever read, so
+/// the gateway told the user to force the load and then refused the forced load
+/// for the same reason. The error was honest and the advice was unreachable.
+///
+/// Checked against the defect it exists for: restore the `?` on the probe and
+/// this fails, while the refusal test below still passes.
+#[tokio::test]
+async fn a_load_can_be_forced_past_a_probe_that_cannot_read() {
+    ensure_provider();
+
+    let (_dir, state, id) = gateway("mem-probe-fails", 64, MockBackend::default()).await;
+    let state = Arc::new(
+        Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("the gateway state is not shared yet"))
+            .with_memory_probe(Arc::new(FailingMemoryProbe)),
+    );
+    let server = Server::start(Arc::clone(&state)).await;
+
+    let forced = server.load(&id, serde_json::json!({ "force": true })).await;
+    assert_eq!(
+        forced["state"], "succeeded",
+        "the one remedy the error offers must reach the load: {forced}"
+    );
+
+    // And what was skipped is admitted rather than papered over: a load nobody
+    // judged must not report a verdict as though somebody had.
+    let (_status, resident) = server.get("/api/v1/models/resident").await;
+    assert!(
+        resident["ram_verdict"].is_null(),
+        "an unjudged load must not carry a verdict: {resident}"
+    );
+}
+
+/// Without `--force`, a probe that cannot read is still a refusal.
+///
+/// The fix above must not have turned an unreadable machine into a silently
+/// unjudged one for every caller - only for the caller who asked.
+#[tokio::test]
+async fn a_load_is_still_refused_when_the_probe_cannot_read_and_nobody_forced_it() {
+    ensure_provider();
+
+    let (_dir, state, id) = gateway("mem-probe-fails-hard", 64, MockBackend::default()).await;
+    let state = Arc::new(
+        Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("the gateway state is not shared yet"))
+            .with_memory_probe(Arc::new(FailingMemoryProbe)),
+    );
+    let server = Server::start(Arc::clone(&state)).await;
+
+    let refused = server.load(&id, serde_json::json!({})).await;
+    assert_eq!(refused["state"], "failed", "{refused}");
+    assert_eq!(refused["error"]["code"], "memory_probe_failed", "{refused}");
 }
 
 #[tokio::test]
@@ -528,4 +586,147 @@ async fn a_load_mode_the_engine_does_not_accept_is_refused_by_name() {
         "{gateway_report}"
     );
     assert!(modes.iter().any(|mode| mode == "auto"));
+}
+
+#[tokio::test]
+async fn a_measurement_of_this_machine_reaches_the_estimate_on_screen() {
+    ensure_provider();
+
+    // Every estimate this product has ever produced used the shipped
+    // coefficients: `Confidence::Measured` was unreachable, and the panel's
+    // "this is an upper bound rather than a prediction" notice was permanent.
+    // This is the whole of M10b in one assertion - a fit written for this
+    // machine, this engine and these settings changes the number on screen and
+    // says so.
+    let (dir, state, id) = gateway("mem-calibrated", 32_768, MockBackend::default()).await;
+    let server = Server::start(state.clone()).await;
+
+    let (status, before) = server.get(&format!("/api/v1/models/{id}")).await;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(
+        before["estimate"]["confidence"], "coarse",
+        "with no calibration file the shipped coefficients must still be used"
+    );
+    let coarse_compute = before["estimate"]["compute"].as_u64().expect("compute");
+    let coarse_overhead = before["estimate"]["overhead"].as_u64().expect("overhead");
+
+    // The bucket is read back out of the estimate the gateway just produced,
+    // rather than assumed here: a fit is keyed by the settings a load would
+    // actually use, and guessing them would test the guess. Built through
+    // `bucket_for`, which is the same function the load path looks up with.
+    let params: hermes_core::RuntimeParams =
+        serde_json::from_value(before["estimate"]["params"].clone()).expect("the params");
+    let n_ubatch = params.n_ubatch;
+    let file = hermes_gguf::GgufFile::open(dir.path().join("fixture.gguf")).expect("the fixture");
+    let metadata = hermes_gguf::ModelMetadata::from_file(&file).expect("its metadata");
+    let bucket = hermes_bench::apply::bucket_for(&metadata, params);
+
+    // A measurement below the shipped guesses, so that "the fit was used" and
+    // "the fit was ignored" cannot look alike - and derived from what the
+    // gateway just reported rather than picked, because the fixture is a small
+    // model and a number invented here could easily be *above* the guess.
+    //
+    // Halfway between the exactly-computed logits term, which no fit may go
+    // under, and the coarse estimate's own slope.
+    let logits_per_ubatch = metadata.vocab_size.expect("a vocabulary") as f64 * 4.0;
+    let coarse_slope = coarse_compute as f64 / f64::from(n_ubatch);
+    let slope = logits_per_ubatch + (coarse_slope - logits_per_ubatch) / 2.0;
+    // The shipped engine baseline is 64 MiB and the headless host overhead is
+    // 48 MiB. A fit sets the first and may never touch the second.
+    let intercept = Bytes::from_mib(32).get() as f64;
+    let points: Vec<hermes_bench::fit::ResidualPoint> = [n_ubatch / 2, n_ubatch, n_ubatch * 2]
+        .into_iter()
+        .map(|ubatch| hermes_bench::fit::ResidualPoint {
+            n_ubatch: ubatch,
+            residual_bytes: (slope * f64::from(ubatch) + intercept) as u64,
+            peak_rss: Bytes::ZERO,
+        })
+        .collect();
+    let mut calibration = hermes_bench::fit::Calibration::default();
+    calibration.insert(hermes_bench::fit::Fit {
+        at_unix: 1_700_000_000,
+        machine: hermes_bench::MachineFingerprint::detect(),
+        engine: hermes_bench::engine_fingerprint(&MockBackend::default()),
+        bucket,
+        compute_bytes_per_ubatch: Some(slope),
+        overhead_bytes: Some(intercept),
+        // The three points are on the line by construction, so the line
+        // accounts for all of their spread.
+        r_squared: Some(1.0),
+        max_residual_bytes: points
+            .iter()
+            .map(|point| point.residual_bytes)
+            .max()
+            .unwrap_or_default(),
+        points,
+    });
+    let paths = hermes_system_info::DataPaths::rooted_at(dir.path());
+    paths.create_all().expect("the data directories");
+    calibration
+        .save(&paths.calibration_file())
+        .expect("write the calibration");
+
+    let (status, after) = server.get(&format!("/api/v1/models/{id}")).await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        after["estimate"]["confidence"], "measured",
+        "a fit for this machine, engine and bucket must be spent: {}",
+        after["estimate"]
+    );
+    let measured_compute = after["estimate"]["compute"].as_u64().expect("compute");
+    let measured_overhead = after["estimate"]["overhead"].as_u64().expect("overhead");
+    assert!(
+        measured_compute < coarse_compute,
+        "the measurement was below the guess, so the estimate must come down: \
+         {measured_compute} vs {coarse_compute}"
+    );
+    assert!(
+        measured_overhead < coarse_overhead,
+        "{measured_overhead} vs {coarse_overhead}"
+    );
+
+    // The exact half is not a fit's business, and never moves.
+    assert_eq!(before["estimate"]["weights"], after["estimate"]["weights"]);
+    assert_eq!(
+        before["estimate"]["kv_cache"],
+        after["estimate"]["kv_cache"]
+    );
+
+    // And it is visible from outside, which is the rule every number that
+    // changes an admission decision is held to.
+    let (status, report) = server.get("/api/v1/gateway").await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["calibration"]["state"], "present");
+    assert_eq!(report["calibration"]["fits"], 1);
+    assert_eq!(
+        report["calibration"]["fits_for_this_machine"], 1,
+        "a fit taken on this machine and this engine must be counted as one: {}",
+        report["calibration"]
+    );
+}
+
+#[tokio::test]
+async fn a_damaged_calibration_file_costs_nobody_their_estimate() {
+    ensure_provider();
+
+    // A benchmark artefact must never be able to break a load. The file is
+    // read on the load path now, so "it will not parse" has to mean "the
+    // shipped coefficients stand", not "no estimate".
+    let (dir, state, id) = gateway("mem-damaged", 32_768, MockBackend::default()).await;
+    let paths = hermes_system_info::DataPaths::rooted_at(dir.path());
+    paths.create_all().expect("the data directories");
+    std::fs::write(paths.calibration_file(), b"{ this is not json").expect("write");
+
+    let server = Server::start(state).await;
+    let (status, body) = server.get(&format!("/api/v1/models/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["estimate"]["state"], "read");
+    assert_eq!(body["estimate"]["confidence"], "coarse");
+    assert!(body["estimate"]["total"].as_u64().is_some());
+
+    // Damaged is not absent, and the difference is the whole reason this is
+    // three words rather than a boolean: one of them is worth acting on.
+    let (status, report) = server.get("/api/v1/gateway").await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["calibration"]["state"], "unreadable");
 }

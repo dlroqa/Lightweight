@@ -20,7 +20,12 @@ import { after, before, describe, it } from "node:test";
 import { GatewaySupervisor, probe } from "./gateway.ts";
 
 const repoRoot = join(import.meta.dirname, "..", "..", "..");
-const binary = join(repoRoot, "target", "debug", "hermes");
+// The same name `candidatePaths` resolves. Without the suffix this test looked
+// for a file that cannot exist on Windows, found nothing, and skipped its whole
+// suite - so the one check that proves a real gateway starts and stops would
+// have reported green on Windows without ever running.
+const executable = process.platform === "win32" ? "hermes.exe" : "hermes";
+const binary = join(repoRoot, "target", "debug", executable);
 const available = existsSync(binary);
 
 /** A port unlikely to collide with anything a developer is running. */

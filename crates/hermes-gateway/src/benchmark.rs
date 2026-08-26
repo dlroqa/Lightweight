@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use hermes_bench::record::{BenchmarkRun, EngineFingerprint, MachineFingerprint, ModelFingerprint};
+use hermes_bench::record::{BenchmarkRun, MachineFingerprint, ModelFingerprint};
 use hermes_bench::{BenchError, BenchmarkStore, RunPlan, Runner};
 
 use crate::catalog::ResidentModel;
@@ -89,18 +89,12 @@ pub async fn run(
             .map(|since| since.as_secs())
             .unwrap_or_default(),
         machine: MachineFingerprint::detect(),
-        engine: EngineFingerprint {
-            backend: state.backend.id().to_string(),
-            // Stated by the backend rather than guessed here. Without it a run
-            // taken through the gateway could never be compared with one taken
-            // by `hermes bench` against the very same engine.
-            build: state.backend.capabilities().build,
-            ggml_variant: Some(
-                hermes_system_info::CpuInfo::detect()
-                    .expected_ggml_variant()
-                    .to_owned(),
-            ),
-        },
+        // Stated by the backend rather than guessed here. Without it a run
+        // taken through the gateway could never be compared with one taken by
+        // `hermes bench` against the very same engine - and a fit looked up on
+        // the load path has to agree with both, which is why this now comes
+        // from one place.
+        engine: state.engine_fingerprint(),
         model: ModelFingerprint {
             id: resident.id.to_string(),
             architecture: resident.architecture.clone(),

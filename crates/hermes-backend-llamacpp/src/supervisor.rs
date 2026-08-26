@@ -262,6 +262,37 @@ fn classify(status: std::process::ExitStatus) -> ExitClassification {
             return ExitClassification::Signalled { signal };
         }
     }
+    // Windows has no signals. A hardware exception kills the process by
+    // putting an NTSTATUS in its exit code instead, and the two that matter
+    // here mean exactly what SIGSEGV and SIGILL mean: the engine dereferenced
+    // something it should not have, or the CPU does not implement an
+    // instruction the engine's own dispatch chose.
+    //
+    // Mapped onto the same two variants rather than given their own, so that
+    // the taxonomy stays one thing and `into_error` keeps producing one error
+    // per cause on every platform. Without this an AVX-512 build on an older
+    // processor - the exact case section 10 exists for - reported
+    // "exited with status -1073741795" on Windows and the explanation only on
+    // Linux. Found by the check matrix's first Windows run.
+    #[cfg(windows)]
+    {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+        const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
+        if let Some(code) = status.code() {
+            #[allow(clippy::cast_sign_loss)]
+            let ntstatus = code as u32;
+            match ntstatus {
+                STATUS_ACCESS_VIOLATION => {
+                    return ExitClassification::Signalled { signal: SIGSEGV };
+                }
+                STATUS_ILLEGAL_INSTRUCTION | STATUS_PRIVILEGED_INSTRUCTION => {
+                    return ExitClassification::Signalled { signal: SIGILL };
+                }
+                _ => {}
+            }
+        }
+    }
     match status.code() {
         Some(0) => ExitClassification::Clean,
         Some(code) => ExitClassification::Failed { code },

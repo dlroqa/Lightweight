@@ -1,0 +1,320 @@
+# Cut a release: build every artifact on its own platform, run each one, then
+# publish a draft for a human to look at.
+#
+# Draft, always. Nothing here is code-signed, so the release notes have to say
+# what Gatekeeper and SmartScreen will actually do - and those sentences are
+# quoted from this run's own output rather than from memory. Somebody reads them
+# before anyone else does.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One macOS runner produces the universal DMG: it builds both Rust
+          # slices and `lipo`-merges them, and electron-builder merges the two
+          # app bundles. That the x86-64 half actually *runs* is proven by the
+          # `macos-intel` job below, on Intel hardware.
+          - os: macos-15
+            label: macos-universal
+            triple: aarch64-apple-darwin
+            targets: --mac
+          - os: windows-latest
+            label: windows-x64
+            triple: x86_64-pc-windows-msvc
+            targets: --win
+          # 22.04 rather than latest, deliberately: the release binary's glibc
+          # floor is whatever it was built against, and building on the newest
+          # image would refuse to run on any distribution older than it. The
+          # floor is printed by the smoke test so the number is on the record.
+          - os: ubuntu-22.04
+            label: linux-x64
+            triple: x86_64-unknown-linux-gnu
+            targets: --linux AppImage
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.label }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+
+      # Before anything is built: the installer filenames come from the desktop
+      # package's version, and a release that shipped `Hermes-0.1.0.dmg` around
+      # a `hermes 0.2.0` would be discovered by whoever tried to reproduce a bug.
+      - name: Versions agree with each other and with the tag
+        run: bash ./scripts/check-versions.sh
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+
+      - run: cargo build --release -p hermes-cli --target ${{ matrix.triple }}
+      - run: npm run build --prefix frontend
+
+      - name: The CLI archive
+        run: bash ./scripts/package-cli.sh ${{ matrix.triple }}
+
+      - name: The installer
+        run: npm --prefix apps/desktop run package -- ${{ matrix.targets }}
+        env:
+          # With no certificate in the keychain, electron-builder would
+          # otherwise go looking for one and fail the build rather than produce
+          # an unsigned artifact. These are the hooks: set the secrets and
+          # signing starts happening without a code change.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+
+      # A display for the launch check, and the user namespaces it needs.
+      # Without the second one the AppImage's sandboxed launch skips and the
+      # release goes green having never started the app: the runner images
+      # restrict unprivileged user namespaces from Ubuntu 24.04 on, exactly as
+      # a user's own 24.04 desktop does - which is why the Flatpak is the
+      # primary Linux artifact and why the refusal path is checked separately.
+      - name: A display and a user namespace for the launch check
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # Extract it, install it, run it. A file of the right name and size is
+      # not evidence that any of it works.
+      - name: Run what was built
+        env:
+          # A release must not be able to skip the one check that proves the
+          # packaged app starts at all.
+          HERMES_REQUIRE_SANDBOXED_LAUNCH: '1'
+        run: bash ./scripts/smoke-artifacts.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.label }}
+          if-no-files-found: error
+          path: |
+            dist-cli/*
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.AppImage
+
+  # The Flatpak, which is the Linux artifact that stays sandboxed on a host
+  # without unprivileged user namespaces rather than refusing there.
+  #
+  # Its own job rather than a second target on the Linux build above, for two
+  # reasons that pull the same way. It needs flatpak, flatpak-builder and three
+  # runtimes installed with sudo, none of which the AppImage build wants. And
+  # that build is pinned to ubuntu-22.04 *because* the glibc floor of the
+  # binary is whatever it was built against - while flatpak-builder has only
+  # ever been proven here on ubuntu-latest. Inside the Flatpak the runtime
+  # supplies the libraries, so its own floor is the runtime's, not the runner's.
+  flatpak:
+    name: the flatpak
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-flatpak
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+
+      # The bundle's filename carries the version too, so the same gate applies.
+      - name: Versions agree with each other and with the tag
+        run: bash ./scripts/check-versions.sh
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+
+      - name: Install flatpak and the runtimes the manifest names
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.electronjs.Electron2.BaseApp//24.08
+
+      # No `--target` here, deliberately. The build job above passes one, so
+      # between them the two branches of the staging script's binary resolution
+      # - `target/<triple>/release` and `target/release` - are both exercised by
+      # every release, rather than one of them being discovered by a release.
+      - run: cargo build --release -p hermes-cli
+      - run: npm run build --prefix frontend
+      - run: npm --prefix apps/desktop run package -- --linux flatpak
+
+      # Installs the bundle and asserts against the *installed application*:
+      # the sandbox grants that shipped, the wrapper going through zypak with no
+      # `--no-sandbox`, and whether an executable copied into the app data
+      # directory will run - which is what the downloaded engine must do.
+      - name: Run what was built
+        run: |
+          sudo apt-get install -y xvfb dbus-x11
+          xvfb-run --auto-servernum ./scripts/test-flatpak.sh
+
+      - name: What was installed
+        if: always()
+        run: flatpak list --user --app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-linux-flatpak
+          if-no-files-found: error
+          path: apps/desktop/release/*.flatpak
+
+  # The other half of the universal DMG, on the architecture it is for.
+  #
+  # `macos-15-intel` is the standard Intel runner. Its neighbour in
+  # actions/runner-images, `macos-15-large`, is the same architecture on a
+  # *larger runner*, which bills - and which stopped starting on this
+  # repository when a spending limit was reached. Without an Intel runner of
+  # some kind the x86-64 slice ships having been built and never executed, and
+  # that would have to be said in the release notes instead.
+  macos-intel:
+    name: the Intel half of the DMG, on Intel
+    needs: build
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: artifacts-macos-universal
+          path: incoming
+      - name: Mount the DMG and run its binary natively
+        run: |
+          echo "this runner is $(uname -m)"
+          test "$(uname -m)" = "x86_64" || {
+            echo "this job exists to run on Intel; it is on $(uname -m)" >&2
+            exit 1
+          }
+          dmg="$(find incoming -name '*.dmg' -print -quit)"
+          test -n "$dmg" || { echo "no DMG arrived from the build job" >&2; exit 1; }
+          mount="$(mktemp -d)"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+          app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
+          binary="$app/Contents/Resources/bin/hermes"
+          lipo -info "$binary"
+          # The real assertion: this is an Intel machine, and the binary from
+          # the universal DMG runs on it.
+          "$binary" --version
+          "$binary" sysinfo || true
+          hdiutil detach "$mount"
+
+  release:
+    name: draft the release
+    needs: [build, flatpak, macos-intel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the provenance attestation below.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -exec shasum -a 256 {} + \
+            | sed 's| \./| |' | tee SHA256SUMS
+
+      # Not a code signature, and the release notes must not let it read as one.
+      # What it does prove is which workflow, commit and repository produced
+      # these bytes - which is the one integrity guarantee available without a
+      # certificate, because it comes from GitHub's own OIDC identity.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.dmg
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.flatpak
+            dist/*.tar.gz
+            dist/*.zip
+
+      - name: Draft it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## Downloads"
+            echo
+            echo "| Platform | File |"
+            echo "|---|---|"
+            echo "| macOS (Apple Silicon and Intel) | \`Hermes-*-mac-universal.dmg\` |"
+            echo "| Windows x86-64 | \`Hermes-Setup-*.exe\` |"
+            echo "| Linux x86-64 (sandboxed) | \`Hermes-*.flatpak\` |"
+            echo "| Linux x86-64 (portable) | \`Hermes-*.AppImage\` |"
+            echo "| Command line only | \`hermes-*-<target-triple>.tar.gz\` / \`.zip\` |"
+            echo
+            echo "Two Linux builds, because the difference is real: the Flatpak"
+            echo "keeps its Chromium sandbox on a host that does not allow"
+            echo "unprivileged user namespaces, while the AppImage needs the host"
+            echo "to allow them and refuses to start rather than run unsandboxed."
+            echo "Prefer the Flatpak; the AppImage installs nothing."
+            echo
+            echo "## Nothing here is code-signed"
+            echo
+            echo "There is no Apple Developer ID and no Authenticode certificate"
+            echo "for this project, so every download will be challenged:"
+            echo
+            echo "- **macOS**: right-click the app and choose Open the first time."
+            echo "- **Windows**: SmartScreen shows *More info* → *Run anyway*."
+            echo
+            echo "\`SHA256SUMS\` and the build-provenance attestation say which"
+            echo "workflow run produced these bytes. Neither is a code signature."
+            echo
+            echo "## The inference engine is downloaded, not bundled"
+            echo
+            echo "On first use Hermes fetches the pinned llama.cpp build for your"
+            echo "platform and checks it against a SHA-256 recorded in the source."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" --draft --title "$TAG" --notes-file notes.md dist/*

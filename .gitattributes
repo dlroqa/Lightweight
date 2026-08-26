@@ -1,0 +1,19 @@
+# Line endings are normalised in the repository and checked out as LF
+# everywhere, Windows included.
+#
+# Git for Windows defaults `core.autocrlf` to true, which would check out
+# `scripts/*.sh` with CRLF. Bash then reads the carriage return as part of the
+# last token on every line and fails with `$'\r': command not found` - so the
+# single gate this project has, `scripts/check.sh`, cannot run on Windows at
+# all without this file. It is the first thing any Windows CI needs.
+* text=auto eol=lf
+
+# Binary, so no normalisation is attempted on them.
+*.png binary
+*.ico binary
+*.icns binary
+*.gguf binary
+*.gz  binary
+*.zip binary
+*.dmg binary
+*.AppImage binary

@@ -27,5 +27,9 @@ for entry in "${models[@]}"; do
   if [ -s "$out" ]; then echo "  cached  $name"; continue; fi
   curl -sSL --max-time 180 -H "Range: bytes=0-8388607" \
     -o "$out" "https://huggingface.co/$repo/resolve/main/$file"
-  printf '  fetched %-10s %s bytes\n' "$name" "$(stat -c%s "$out")"
+  # `wc -c` rather than `stat -c%s`: the latter is GNU-only, so on macOS this
+  # line failed, the script exited non-zero, and `check.sh` then reported the
+  # tier as "headers unavailable (offline?)" - a skip message naming the wrong
+  # reason, which the skip-announcement convention exists to prevent.
+  printf '  fetched %-10s %s bytes\n' "$name" "$(wc -c < "$out" | tr -d ' ')"
 done

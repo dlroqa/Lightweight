@@ -24,8 +24,8 @@
 //! | `signal:N`     | raise signal N (4 is SIGILL)                       |
 //! | `hang`         | never bind at all                                  |
 
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 fn main() {
@@ -84,6 +84,17 @@ fn main() {
             // rather than being refused outright.
             continue;
         }
+        // Read the request before answering it.
+        //
+        // Not politeness: closing a socket whose receive buffer still holds
+        // unread bytes makes Linux send RST instead of FIN, and the client
+        // then reports a transport error rather than the 200 that was already
+        // written. Answering without reading made the supervisor's readiness
+        // poll fail *after* this engine was listening - between one and
+        // twenty-four extra polls of 200 ms - which is how a stand-in engine
+        // that works turns `a_slow_engine_is_waited_for_rather_than_abandoned`
+        // into a test that fails one run in three on a busy machine.
+        drain_request(&mut stream);
         let body = "{\"status\":\"ok\"}";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -91,6 +102,29 @@ fn main() {
         );
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+    }
+}
+
+/// Read one HTTP request head, so the socket can be closed without resetting it.
+///
+/// Bounded twice - by a read timeout and by a byte count - because this must
+/// never become a way for a test to hang: a client that opens a connection and
+/// says nothing is answered anyway, exactly as before.
+fn drain_request(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut seen = Vec::new();
+    let mut buffer = [0u8; 512];
+    while seen.len() < 8192 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                seen.extend_from_slice(&buffer[..read]);
+                if seen.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -114,7 +148,22 @@ fn raise(signal: i32) {
 }
 
 #[cfg(not(unix))]
-fn raise(_signal: i32) {
-    // Windows has no equivalent; abort is close enough for what the tests need.
-    std::process::abort();
+fn raise(signal: i32) {
+    // Windows has no signals, and `abort()` here would only prove that the
+    // supervisor can see a non-zero exit. What a *real* engine does on this
+    // platform is die with an NTSTATUS in its exit code, so that is what this
+    // reproduces: the same two causes the Unix arm raises, in the spelling
+    // Windows uses for them.
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+    let status = match signal {
+        11 => STATUS_ACCESS_VIOLATION,
+        4 => STATUS_ILLEGAL_INSTRUCTION,
+        // Nothing else has a Windows equivalent worth pretending to.
+        _ => {
+            std::process::abort();
+        }
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    std::process::exit(status as i32);
 }

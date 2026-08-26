@@ -13,5 +13,11 @@ serde.workspace = true
 directories.workspace = true
 rustix.workspace = true
 
+# Only macOS and Windows need it: on Linux every number here comes from /proc or
+# from `rustix`, so a Linux build pulls in nothing new and this crate's
+# `forbid(unsafe_code)` costs nothing to keep.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+hermes-sys.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true

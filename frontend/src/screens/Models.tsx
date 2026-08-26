@@ -661,6 +661,13 @@ function EstimatePanel({ estimate }: { estimate: Estimate }) {
           from this machine, so it is an upper bound rather than a prediction.
         </div>
       )}
+      {estimate.confidence === "measured" && (
+        <div className="notice notice--info" style={{ marginTop: 12 }}>
+          The compute and overhead figures come from a benchmark of this machine,
+          this engine build and these exact settings. Weights and the KV cache
+          are computed from the file either way.
+        </div>
+      )}
       {estimate.missing.length > 0 && (
         <div className="notice notice--warn" style={{ marginTop: 8 }}>
           Incomplete: the header did not carry {estimate.missing.join(", ")}.

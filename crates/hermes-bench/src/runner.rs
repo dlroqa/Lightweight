@@ -340,6 +340,13 @@ impl<'a> Runner<'a> {
             },
             rss: after.as_ref().map(|usage| usage.rss),
             peak_rss: after.as_ref().map(|usage| usage.peak_rss),
+            // Straight from the reading, never from `cfg!`: this file is read
+            // on machines other than the one that wrote it.
+            peak_kind: after
+                .as_ref()
+                .map_or(hermes_inference::PeakKind::default(), |usage| {
+                    usage.peak_kind
+                }),
             predicted: self.prediction,
             busy_slots_per_decode: self
                 .backend

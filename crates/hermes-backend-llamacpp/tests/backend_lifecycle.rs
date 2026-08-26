@@ -25,11 +25,18 @@ struct Fixture {
 
 impl Fixture {
     fn new(tag: &str, mode: &str) -> Self {
+        // The clock alone is not unique: on a coarse timer two tests running in
+        // parallel are handed the same name. The counter and the pid settle it.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("hermes-lifecycle-{tag}-{unique}"));
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "hermes-lifecycle-{tag}-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
 
         // Planted where the installer looks, so `ensure` finds it installed and
         // never reaches the network.
@@ -301,6 +308,10 @@ async fn a_dead_engine_is_reported_as_failed_and_cleared() {
 
     let (_, _, _, _) = backend.resident().await.expect("resident");
     let usage = backend.resource_usage().await.expect("usage");
+    // One assertion on every platform again. It was split per platform in
+    // M10a.3's wake, because the engine's own resident set was a `/proc`
+    // reading and macOS and Windows had none; M10a.11 gave them one each, and
+    // this is the assertion that says so.
     assert!(usage.is_some(), "a running engine should report memory use");
 
     backend.shutdown().await.expect("shutdown");

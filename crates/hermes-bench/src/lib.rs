@@ -28,12 +28,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod error;
 pub mod fit;
 pub mod record;
 pub mod runner;
 pub mod store;
 
+pub use apply::{Calibrated, Outcome, Untrusted, engine_fingerprint, estimator_for};
 pub use error::BenchError;
 pub use record::{
     BenchmarkRun, EngineFingerprint, MachineFingerprint, ModelFingerprint, Sample, Scenario,

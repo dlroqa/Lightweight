@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for a hardened-runtime macOS build.
+
+  Inert today: no Developer ID certificate exists for this project, so nothing
+  is signed and nothing is notarised. They are committed anyway because the
+  hardened runtime is declared in `package.json`, and because adding a
+  certificate later should be a secrets change rather than a code change.
+
+  Each one is here for a reason, and there are only three:
+
+  * JIT and unsigned executable memory are what V8 needs. Electron does not
+    start under a hardened runtime without them.
+  * `disable-library-validation` is required because the app runs a *downloaded*
+    `llama-server` and its dylibs. They are fetched at first use, digest-checked
+    against a pinned manifest, and signed by nobody - so library validation
+    would refuse to load them.
+
+  Deliberately absent: camera, microphone, address book, and every network
+  server entitlement. The gateway binds loopback by itself and the sandbox
+  entitlement is not requested at all, so none of them would be doing anything.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+  </dict>
+</plist>

@@ -212,8 +212,10 @@ enum Command {
         parallel: Vec<u32>,
         /// Fit the measured residuals into `calibration.json`.
         ///
-        /// Nothing reads that file yet: the estimator keeps its shipped
-        /// defaults until a later milestone decides when a fit is trustworthy.
+        /// Every load path reads that file and spends a fit that passes the
+        /// trust rules; one that does not is ignored and the shipped defaults
+        /// stand. Sweep at least three `--ubatch` values, or the fit will not
+        /// have enough points to be believed.
         #[arg(long)]
         fit: bool,
     },
@@ -462,10 +464,33 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 ..RuntimeParams::default()
             };
 
-            let estimator = if *headless {
-                Estimator::headless()
+            let base = if *headless {
+                hermes_memory::ComputeModel::headless()
             } else {
-                Estimator::default()
+                hermes_memory::ComputeModel::default()
+            };
+            // This machine's own coefficients when `hermes bench --fit` has
+            // earned them for exactly these settings, and the shipped ones
+            // otherwise. A data directory that cannot be discovered is not a
+            // reason to refuse an estimate: it means there is nowhere a fit
+            // could have been written, which is the same answer as no fit.
+            let estimator = match hermes_system_info::DataPaths::discover() {
+                Ok(paths) => {
+                    hermes_bench::estimator_for(
+                        &paths.calibration_file(),
+                        &hermes_bench::engine_fingerprint(
+                            &hermes_backend_llamacpp::backend::ProcessBackend::new(
+                                paths.runtime_dir(),
+                            )
+                            .map_err(describe)?,
+                        ),
+                        &metadata,
+                        params,
+                        base,
+                    )
+                    .0
+                }
+                Err(_) => Estimator::new(base),
             };
             // `describe`, not `to_string`: without a reading there is no
             // verdict at all, and the remedy is the only thing that tells the
@@ -774,7 +799,10 @@ fn render_estimate(out: &mut String, metadata: &ModelMetadata, estimate: &hermes
     }
 
     let confidence = match estimate.confidence {
-        hermes_memory::Confidence::Measured => "measured for this model",
+        // Reachable for the first time in M10: a fit is keyed by the machine,
+        // the engine build *and* the settings, so saying "for this model" alone
+        // would claim less precision than the number actually has.
+        hermes_memory::Confidence::Measured => "measured on this machine, at these settings",
         hermes_memory::Confidence::Coarse => "uncalibrated; compute and overhead are estimates",
         hermes_memory::Confidence::Partial => "PARTIAL; some metadata was missing",
     };

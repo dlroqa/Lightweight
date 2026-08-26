@@ -67,6 +67,15 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
 
     let backend = ProcessBackend::new(paths.runtime_dir()).map_err(describe)?;
     let store = BenchmarkStore::new(paths.benchmarks_dir());
+    // Deliberately *not* calibrated, unlike the load paths.
+    //
+    // A run records the prediction beside the measurement so a later pass can
+    // fit the difference. Priming that prediction with this machine's previous
+    // fit would make each run a measurement of the run before it, and the
+    // residual column would shrink towards zero whether or not the estimator
+    // had got any better. The fit itself is computed from `Prediction::exact()`
+    // - weights plus KV cache - which no calibration touches, so this changes
+    // what is *reported*, never what is fitted.
     let estimator = Estimator::headless();
 
     let machine = MachineFingerprint::detect();
@@ -156,7 +165,7 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
     let path = store.save(&run).map_err(describe)?;
 
     let fitted = if options.fit {
-        let calibration_path = paths.data_dir().join("calibration.json");
+        let calibration_path = paths.calibration_file();
         let mut calibration = Calibration::load(&calibration_path).map_err(describe)?;
         let fits = fit_run(&run);
         for fit in fits.clone() {
@@ -176,7 +185,7 @@ pub async fn run(options: &BenchOptions) -> Result<String, String> {
     Ok(if options.json {
         render_json(&run, fitted.as_ref().map(|(_, fits)| fits.as_slice()))
     } else {
-        render_human(&run, &path, fitted.as_ref())
+        render_human(&run, &path, fitted.as_ref(), &metadata)
     })
 }
 
@@ -317,6 +326,7 @@ fn render_human(
     run: &BenchmarkRun,
     path: &Path,
     fitted: Option<&(PathBuf, Vec<hermes_bench::fit::Fit>)>,
+    metadata: &ModelMetadata,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -425,11 +435,15 @@ fn render_human(
                 (Some(slope), Some(intercept)) => {
                     let _ = writeln!(
                         out,
-                        "  {} {}: {:.0} bytes per ubatch token, {} fixed",
+                        "  {} {}: {:.0} bytes per ubatch token, {} fixed{}",
                         fit.bucket.architecture,
                         fit.bucket.quantization,
                         slope,
-                        hermes_core::units::Bytes(intercept.max(0.0) as u64)
+                        hermes_core::units::Bytes(intercept.max(0.0) as u64),
+                        match fit.r_squared {
+                            Some(r_squared) => format!(", R² {r_squared:.2}"),
+                            None => String::new(),
+                        }
                     );
                 }
                 _ => {
@@ -442,10 +456,35 @@ fn render_human(
                     );
                 }
             }
+            // The verdict, not a claim about it. A fit can be written and still
+            // be ignored by every load path, and this command is the only place
+            // a person would find that out before wondering why their estimate
+            // still says it is a guess.
+            match hermes_bench::apply::apply(fit, metadata, hermes_memory::ComputeModel::headless())
+            {
+                Ok(calibrated) => {
+                    let _ = writeln!(
+                        out,
+                        "    used by the next load{}",
+                        if calibrated.floor_raised_by.get() > 0 {
+                            format!(
+                                ", after raising its floor by {}",
+                                calibrated.floor_raised_by
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                Err(untrusted) => {
+                    let _ = writeln!(out, "    not used: {}", untrusted.reason());
+                }
+            }
         }
         let _ = writeln!(
             out,
-            "\nNothing reads this file yet: the estimator keeps its shipped defaults."
+            "\nEvery load path reads this file. A fit above marked \"not used\" is\n\
+             recorded but ignored, and the shipped defaults stand until one passes."
         );
     }
 

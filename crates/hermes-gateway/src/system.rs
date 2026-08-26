@@ -311,6 +311,10 @@ mod tests {
     use super::*;
     use crate::state::GatewayConfig;
     use hermes_backend_mock::MockBackend;
+    // Only the two disk tests below use it, and both are Linux-only because the
+    // disk probe is. Off Linux an unconditional import is an unused one, which
+    // `-D warnings` turns into a failed build.
+    #[cfg(target_os = "linux")]
     use hermes_system_info::DataPaths;
 
     fn state(config: GatewayConfig) -> GatewayState {
@@ -401,12 +405,23 @@ mod tests {
     /// a tag plus a unique suffix. A fixed name would be shared by two
     /// concurrent runs and by a second user on the same machine, and this test
     /// deletes what it creates.
+    ///
+    /// Behind the same `cfg` as its only two callers: dead code off Linux, and
+    /// `-D dead-code` is part of the gate.
+    #[cfg(target_os = "linux")]
     fn scratch_root(tag: &str) -> PathBuf {
+        // The clock alone is not unique: on a coarse timer two tests running in
+        // parallel are handed the same name. The counter and the pid settle it.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("hermes-system-{tag}-{unique}"))
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "hermes-system-{tag}-{}-{unique}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[cfg(target_os = "linux")]

@@ -221,6 +221,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
                     cache_type,
                     concurrency: concurrency.slots,
                     cpu,
+                    calibration: paths.calibration_file(),
                 },
             )
             .await?,
@@ -481,6 +482,11 @@ struct LoadShape {
     cache_type: GgmlType,
     concurrency: u32,
     cpu: CpuInfo,
+    /// Where `hermes bench --fit` writes this machine's coefficients.
+    ///
+    /// Carried here rather than rediscovered, so that a `--data-dir` override
+    /// reaches the estimate as well as everything else this process writes.
+    calibration: PathBuf,
 }
 
 /// Load the model named on the command line.
@@ -540,6 +546,12 @@ async fn load_at_startup(
         None => base,
     };
 
+    // Sizing runs on the shipped coefficients: the bucket a calibration is
+    // keyed by includes the context, and choosing the context is what this is
+    // about to do. The measured model judges the result below, which is the
+    // conservative order - a fit only ever lowers the compute and overhead
+    // terms, so a window sized against the defaults is never larger than one
+    // sized against a measurement of this machine.
     let estimator = Estimator::headless();
     let snapshot = SystemMemoryProbe.snapshot().map_err(describe)?;
 
@@ -559,6 +571,25 @@ async fn load_at_startup(
 
     // Admission control. Section 19: never promise a model will run just
     // because its weights fit.
+    //
+    // Judged with this machine's own coefficients when it has earned them: the
+    // context and the slot count are both settled by now, which is the first
+    // point at which this load's bucket is known.
+    let (estimator, calibration) = hermes_bench::estimator_for(
+        &shape.calibration,
+        &hermes_bench::engine_fingerprint(backend),
+        &metadata,
+        params,
+        hermes_memory::ComputeModel::headless(),
+    );
+    if let hermes_bench::Outcome::Unreadable(detail) = &calibration {
+        tracing::warn!(
+            target: targets::MEMORY,
+            detail = %detail,
+            "the calibration file could not be read; \
+             this load is estimated with the shipped coefficients"
+        );
+    }
     let estimate = estimator.estimate(&metadata, params, snapshot);
 
     // Printed below for the person watching, and logged here for the person

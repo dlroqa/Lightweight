@@ -25,7 +25,13 @@ import urllib.request
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-BINARY = REPO_ROOT / "target" / "debug" / "hermes-mock-gateway"
+# `.exe` on Windows, where cargo names the binary that way and this suite
+# otherwise fails all 32 cases with "hermes-mock-gateway is missing" against a
+# binary that was built a step earlier and is sitting right there. The desktop
+# shell's own integration test learned the same lesson in M10a.1.
+BINARY = REPO_ROOT / "target" / "debug" / (
+    "hermes-mock-gateway.exe" if sys.platform == "win32" else "hermes-mock-gateway"
+)
 
 # The gateway serves a 4096-token context under this name; several tests depend
 # on both numbers.
