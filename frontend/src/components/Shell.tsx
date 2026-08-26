@@ -70,7 +70,7 @@ export function Shell() {
           <img className="rail__mark" src="/icon.png" alt="" width={38} height={38} />
           {!collapsed && (
             <span className="rail__name">
-              <strong>Hermes</strong>
+              <strong>Lightweight</strong>
               <span>CPU Inference Gateway</span>
             </span>
           )}
