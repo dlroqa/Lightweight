@@ -1102,6 +1102,36 @@ M10a, verified by the matrix rather than by this machine:
   as the resident-set peaks they were, and `Prediction::exact_within` subtracts
   only what that kind of peak contains.
 
+The release path, proven end to end on 2026-08-26 (`release.yml` run
+`32926802994`, dispatched from master at `d434394`). Everything below was found
+by running the release, never by reading it, and each fix was only ever provable
+by the next full run — `check.yml` does not build or install anything:
+
+- **`gh release create dist/*` was handed a directory.** `upload-artifact`
+  roots each artifact at the least common ancestor of its `path:` entries, so the
+  three build jobs' artifacts arrived as *directories* and the flatpak's as flat
+  files. A flatten step (PR #5) now makes `dist` one directory of files whatever
+  shape they arrived in, and a guard counts what is actually there: on this run
+  all six filename patterns matched (`*.tar.gz` twice), `files 7` equalled
+  `SHA256SUMS 7 lines`, and the build-provenance step reported **`Attestation
+  created for 7 subjects`**. The two green-but-empty failures it replaced — an
+  empty `SHA256SUMS` and an attestation covering the flatpak alone — cannot ship
+  again; a release missing a platform stops at the guard.
+- **The Windows smoke test ran a file its install loop never waited for**
+  (PR #6). It gated readiness on the top-level `Hermes.exe` launcher, then with
+  no second wait ran `resources/bin/hermes.exe` — a file NSIS extracts
+  separately and in no guaranteed order. One release run passed and the next
+  failed on the same bytes; that was the race. The loop now waits for the file
+  the run assertion needs, and this run printed `ok the installed hermes runs`
+  where the prior one had `FAIL` in the same millisecond as the launcher
+  appearing.
+- **The draft is complete.** `dry-run-32926802994` carried **8 assets** — the
+  seven artifacts (two CLI `.tar.gz`, one CLI `.zip`, `.dmg`, `.exe`,
+  `.AppImage`, `.flatpak`) plus `SHA256SUMS` — and the whole release job was
+  green. Earlier NSIS fixes (the silent `/S` switch Git Bash rewrote, PR #4; the
+  installer that never returns because it launches the app, PR #3) are the
+  reason the Windows job reaches this point at all.
+
 M10b's three measurement questions, answered on 2026-08-25 against
 SmolLM2-135M Q4_K_M on llama.cpp `b10590`, at `--prompt-tokens 256 --repeat 2`
 (runs `18cf2bfb07298264`, `18cf2c104b6c6db3`, `18cf2c1c92bd4be4`):
