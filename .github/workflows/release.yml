@@ -276,11 +276,62 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # `upload-artifact` roots an artifact at the least common ancestor of its
+      # `path:` entries. The three build jobs upload both `dist-cli/*` and
+      # `apps/desktop/release/*`, so their artifacts contain those two
+      # *directories*; the flatpak job uploads one path, so its artifact is
+      # flat. Nothing notices until something reads `dist/*` - and three
+      # separate things did, of which only one said so:
+      #
+      #   - `gh release create ... dist/*` was handed `dist/dist-cli`, a
+      #     directory, and refused it. That was the visible failure.
+      #   - `find . -maxdepth 1 -type f` matched nothing, so `SHA256SUMS` was
+      #     written **empty** and the notes embedded an empty code block. The
+      #     step passed.
+      #   - `subject-path: dist/*.dmg` and four of its five siblings matched
+      #     nothing, so the provenance attestation covered the **flatpak alone**
+      #     - one artifact out of six. That step passed too, because the action
+      #     is satisfied when any one pattern matches.
+      #
+      # Flattened once, here, so every step below is looking at files.
+      - name: One directory of files, whatever shape they arrived in
+        run: |
+          find dist -mindepth 2 -type f -exec mv -f -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
+          ls -la dist
+
       - name: Checksums
         run: |
           cd dist
           find . -maxdepth 1 -type f ! -name SHA256SUMS -exec shasum -a 256 {} + \
             | sed 's| \./| |' | tee SHA256SUMS
+
+      # An empty `SHA256SUMS` and a one-file attestation both shipped green
+      # once. Neither can again: this counts what is actually there, and a
+      # release that is missing a platform stops here rather than being
+      # published with a gap in it.
+      - name: Every artifact is present, and the checksums cover them
+        run: |
+          missing=0
+          for pattern in '*.dmg' '*.exe' '*.AppImage' '*.flatpak' '*.tar.gz' '*.zip'; do
+            count="$(find dist -maxdepth 1 -name "$pattern" | wc -l)"
+            printf '  %-12s %s\n' "$pattern" "$count"
+            if [ "$count" -eq 0 ]; then
+              echo "  MISSING: nothing matches $pattern" >&2
+              missing=1
+            fi
+          done
+          # Counted against what is actually there rather than against a number
+          # written down here, which would be one more thing to keep in step.
+          files="$(find dist -maxdepth 1 -type f ! -name SHA256SUMS | wc -l)"
+          sums="$(grep -c . dist/SHA256SUMS || echo 0)"
+          echo "  files        $files"
+          echo "  SHA256SUMS   $sums lines"
+          if [ "$sums" -ne "$files" ]; then
+            echo "  SHA256SUMS covers $sums of $files files" >&2
+            missing=1
+          fi
+          exit "$missing"
 
       # Not a code signature, and the release notes must not let it read as one.
       # What it does prove is which workflow, commit and repository produced
