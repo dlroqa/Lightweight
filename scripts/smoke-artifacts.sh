@@ -29,7 +29,21 @@ else
   work="$(mktemp -d)"
   case "$archive" in
     *.tar.gz) tar -xzf "$archive" -C "$work" ;;
-    *.zip) unzip -q "$archive" -d "$work" ;;
+    *.zip)
+      # The separator inside the zip, asserted rather than assumed. The format
+      # specifies forward slash; Windows PowerShell's `Compress-Archive` wrote
+      # backslashes, which made every entry one file with a backslash in its
+      # name rather than a path. `unzip` only warns about it, and a warning is
+      # exit status 1, so the first symptom was this script dying with no
+      # message at all.
+      if unzip -l "$archive" | grep -q '\\'; then
+        fail "the zip uses backslash separators; it would unpack to one file"
+      else
+        pass "the zip uses the separator the format specifies"
+      fi
+      # Exit 1 is `unzip`'s warning status, not a failure; 2 and above are.
+      unzip -q "$archive" -d "$work" || [ "$?" -le 1 ]
+      ;;
   esac
   binary="$(find "$work" -name 'hermes' -o -name 'hermes.exe' | head -1)"
   if [ -n "$binary" ] && reported="$("$binary" --version 2>/dev/null)"; then
