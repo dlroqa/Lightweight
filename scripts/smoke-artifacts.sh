@@ -152,27 +152,52 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
     # `/S` is a silent install; `/D` must come last and be unquoted, which is
     # NSIS's own rule rather than a preference.
     #
-    # Started rather than waited on, because it does not come back.
-    # electron-builder's NSIS launches the application once it has finished
-    # (`runAfterFinish`, on by default), and this application is a gateway that
-    # keeps running - so the installer sits waiting on a process that has no
-    # intention of exiting. The first release run to reach this line hung here
-    # for forty minutes until the job was cancelled, and left the installer
-    # behind as an orphan process. Nothing was wrong with the installer; the
-    # test was waiting for the wrong thing.
+    # `MSYS2_ARG_CONV_EXCL='*'` is what makes those flags survive the trip.
+    # Git Bash rewrites any argument that looks like a POSIX path into a Windows
+    # one before the process sees it, so `/S` arrived as something like
+    # `C:/Program Files/Git/S` and NSIS never saw a silent switch at all: it
+    # opened its **interactive installer** and waited for a click that a headless
+    # runner is never going to produce. Both symptoms this line has shown come
+    # out of that one cause - waited on, it hung for forty minutes until the job
+    # was cancelled; started in the background, it wrote nothing and the poll
+    # below timed out. Neither was the installer's fault.
     #
-    # What actually says the install worked is the files appearing, which is
-    # what the loop below already waited for.
-    "$setup" /S "/D=$(cygpath -w "$target")" &
+    # Started rather than waited on, because it does not come back even when it
+    # works: electron-builder's NSIS launches the application once it has
+    # finished (`runAfterFinish`, on by default), and this application is a
+    # gateway that keeps running. What says the install worked is the files
+    # appearing, which is what the loop waits for.
+    MSYS2_ARG_CONV_EXCL='*' "$setup" /S "/D=$(cygpath -w "$target")" &
     installer=$!
-    for _ in $(seq 1 120); do
+    # The per-user location the installer falls back to if `/D` is not honoured.
+    # Checked as well as `$target` so that "it installed, elsewhere" is a
+    # different sentence from "it installed nothing".
+    fallback="${LOCALAPPDATA:-$HOME/AppData/Local}/Programs/Hermes"
+    for _ in $(seq 1 180); do
       [ -f "$target/Hermes.exe" ] && break
+      [ -f "$fallback/Hermes.exe" ] && break
       sleep 1
     done
     if [ -f "$target/Hermes.exe" ]; then
       pass "the installer wrote an application"
+    elif [ -f "$fallback/Hermes.exe" ]; then
+      pass "the installer wrote an application (at its default location)"
+      target="$fallback"
     else
       fail "the installer produced no Hermes.exe"
+      # Said here rather than guessed at from a bare failure next time.
+      if kill -0 "$installer" 2>/dev/null; then
+        echo "        the installer is still running; it is not installing silently"
+      else
+        status=0
+        wait "$installer" 2>/dev/null || status=$?
+        echo "        the installer exited $status"
+      fi
+      echo "        asked for: $(cygpath -w "$target")"
+      echo "        --- what it left there ---"
+      { ls -la "$target" 2>&1 || true; } | sed 's/^/        /' | head -10
+      echo "        --- and at the default location ---"
+      { ls -la "$fallback" 2>&1 || true; } | sed 's/^/        /' | head -10
     fi
     installed="$target/resources/bin/hermes.exe"
     if [ -f "$installed" ] && "$installed" --version >/dev/null 2>&1; then
