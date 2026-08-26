@@ -606,7 +606,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hermes-core",
  "hermes-inference",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-backend-llamacpp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-backend-mock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "hermes-backend-mock",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-catalog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hermes-core",
  "hermes-download",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "clap",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-download"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "hermes-core",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-gguf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hermes-core",
  "serde",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-inference"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hermes-core",
  "hermes-gguf",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-observability"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hermes-core",
  "hermes-system-info",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "getrandom 0.4.3",
  "hermes-core",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-system-info"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "hermes-core",

@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-26
+
+### Changed
+
+- Renamed the desktop shell to **Lightweight**: the sidebar brand name and the
+  window title bar now read "Lightweight" instead of "Hermes".
+
 ## [0.1.0] - 2026-08-25
 
 ### Added
@@ -22,5 +29,6 @@ All notable changes to this project are documented in this file.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/dlroqa/Lightweight/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dlroqa/Lightweight/releases/tag/v0.1.0
