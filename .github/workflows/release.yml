@@ -359,7 +359,24 @@ jobs:
           # unmistakable in the list, and safe to delete afterwards.
           TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('dry-run-{0}', github.run_id) }}
         run: |
+          # The description of what changed is taken from the CHANGELOG section
+          # for this tag, so the notes are generated from source rather than
+          # written from memory - the same discipline the signing and engine
+          # sections below already follow. Empty on a dry run, whose tag is not
+          # a version and matches no section, so the header is simply omitted.
+          version="${TAG#v}"
+          changes="$(awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md)"
           {
+            if [ -n "$changes" ]; then
+              echo "## What's new in $TAG"
+              echo
+              echo "$changes"
+              echo
+            fi
             echo "## Downloads"
             echo
             echo "| Platform | File |"
@@ -389,7 +406,7 @@ jobs:
             echo
             echo "## The inference engine is downloaded, not bundled"
             echo
-            echo "On first use Hermes fetches the pinned llama.cpp build for your"
+            echo "On first use Lightweight fetches the pinned llama.cpp build for your"
             echo "platform and checks it against a SHA-256 recorded in the source."
             echo
             echo "Calibration is intentionally deferred for pinned llama.cpp b10590:"
