@@ -25,10 +25,10 @@ Every artifact is built and then *run* on the platform it is for, by
 
 | Platform | File |
 |---|---|
-| macOS, Apple Silicon and Intel | `Hermes-*-mac-universal.dmg` |
-| Windows x86-64 | `Hermes-Setup-*.exe` |
-| Linux x86-64, sandboxed | `Hermes-*.flatpak` |
-| Linux x86-64, portable | `Hermes-*.AppImage` |
+| macOS, Apple Silicon and Intel | `Lightweight-*-mac-universal.dmg` |
+| Windows x86-64 | `Lightweight-Setup-*.exe` |
+| Linux x86-64, sandboxed | `Lightweight-*.flatpak` |
+| Linux x86-64, portable | `Lightweight-*.AppImage` |
 | Command line only | `hermes-*-<target-triple>.tar.gz` / `.zip` |
 
 Two facts worth knowing before the first launch:
@@ -208,16 +208,16 @@ turn that skip into a failure, which is what CI does.
 ## CLI
 
 ```sh
-cargo run -p hermes-cli -- sysinfo
-cargo run -p hermes-cli -- inspect model.gguf
-cargo run -p hermes-cli -- estimate model.gguf --ctx 8192 --kv-type q8_0
+cargo run -p lightweight-cli -- sysinfo
+cargo run -p lightweight-cli -- inspect model.gguf
+cargo run -p lightweight-cli -- estimate model.gguf --ctx 8192 --kv-type q8_0
 
 # Acquire the engine, admit the model, load it, and serve the OpenAI API.
 # With no --ctx, the largest context that fits this machine is chosen.
-cargo run -p hermes-cli -- serve model.gguf --port 8737
+cargo run -p lightweight-cli -- serve model.gguf --port 8737
 
 # Or start with nothing loaded and choose a model over the control API.
-cargo run -p hermes-cli -- serve --port 8737
+cargo run -p lightweight-cli -- serve --port 8737
 ```
 
 ### Benchmarks
@@ -598,21 +598,21 @@ the verdict without parsing the report. Add `--json` to any command for machine
 
 | Crate | Responsibility |
 |---|---|
-| `hermes-core` | Domain types, the actionable-error contract, privacy primitives. Pure: no I/O |
-| `hermes-gguf` | Bounded, panic-free GGUF header reader. Never reads tensor data |
-| `hermes-system-info` | CPU topology, ISA detection, memory probing, data directories |
-| `hermes-memory` | RAM estimation and admission verdicts |
-| `hermes-inference` | The backend abstraction. Contains no engine, by design |
-| `hermes-backend-llamacpp` | Acquires and supervises `llama-server`, and translates its SSE into our events |
-| `hermes-backend-mock` | A deterministic backend, so the layers above are testable without an engine |
-| `hermes-download` | Resumable, digest-verified HTTP downloads. Shared by the engine installer and the model catalog, and knows about neither |
-| `hermes-catalog` | What models this machine has and how each one arrived. Atomic writes; integrity recorded per model, never rounded up |
-| `hermes-store` | What the user accumulates: conversations and settings. Owner-only, because a model can be downloaded again and a conversation cannot |
-| `hermes-api` | OpenAI request and response types, and the SSE chunk codec |
-| `hermes-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
-| `hermes-observability` | Structured logging, rotation, privacy-mode wiring |
-| `hermes-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
-| `hermes-cli` | Command-line access to the above |
+| `lightweight-core` | Domain types, the actionable-error contract, privacy primitives. Pure: no I/O |
+| `lightweight-gguf` | Bounded, panic-free GGUF header reader. Never reads tensor data |
+| `lightweight-system-info` | CPU topology, ISA detection, memory probing, data directories |
+| `lightweight-memory` | RAM estimation and admission verdicts |
+| `lightweight-inference` | The backend abstraction. Contains no engine, by design |
+| `lightweight-backend-llamacpp` | Acquires and supervises `llama-server`, and translates its SSE into our events |
+| `lightweight-backend-mock` | A deterministic backend, so the layers above are testable without an engine |
+| `lightweight-download` | Resumable, digest-verified HTTP downloads. Shared by the engine installer and the model catalog, and knows about neither |
+| `lightweight-catalog` | What models this machine has and how each one arrived. Atomic writes; integrity recorded per model, never rounded up |
+| `lightweight-store` | What the user accumulates: conversations and settings. Owner-only, because a model can be downloaded again and a conversation cannot |
+| `lightweight-api` | OpenAI request and response types, and the SSE chunk codec |
+| `lightweight-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
+| `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
+| `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
+| `lightweight-cli` | Command-line access to the above |
 
 Two parts of the product are not crates:
 

@@ -29,7 +29,7 @@ M10a is delivered and is described in section 2 as history. M10b is the plan.
 
 | # | Where | What it did |
 |---|---|---|
-| 1 | `hermes-system-info` | `SystemMemoryProbe::snapshot()` returned `UnsupportedPlatform` off Linux, on the unconditional admission path. `serve`, `estimate`, `bench` and the gateway's load path all died on that one line: a macOS or Windows installer would have shipped a program that exits with an error. |
+| 1 | `lightweight-system-info` | `SystemMemoryProbe::snapshot()` returned `UnsupportedPlatform` off Linux, on the unconditional admission path. `serve`, `estimate`, `bench` and the gateway's load path all died on that one line: a macOS or Windows installer would have shipped a program that exits with an error. |
 | 2 | `AppImageTarget.js:25`, `appImageUtil.js:213` | The shipped AppImage disabled Chromium's sandbox in two places and said nothing. One of them is a launcher electron-builder regenerates on every build, which no configuration option reaches. |
 | 3 | `apps/desktop/package.json` | `extraResources` pointed at `target/release/hermes`, so whatever happened to be there got shipped — a binary predating `--web-root` was packaged once and the shell failed on first run for an unrelated reason. |
 | 4 | same | The same path hard-coded a Unix name while `gateway.ts:101` looks for `bin/hermes.exe`. |
@@ -51,10 +51,10 @@ Items 8 through 11 are the same defect seen from four sides: **the product measu
 
 ## 2. M10a, as delivered
 
-- **M10a.1 — the machine can be measured.** `crates/hermes-sys` is the
+- **M10a.1 — the machine can be measured.** `crates/lightweight-sys` is the
   workspace's only platform FFI: memory, CPU topology, disk and addresses on
   macOS and Windows, one `#[allow(unsafe_code)]`, one `SAFETY:` note per call,
-  and nothing contributed to a Linux build so `hermes-system-info` keeps its
+  and nothing contributed to a Linux build so `lightweight-system-info` keeps its
   `forbid(unsafe_code)`. `check.yml` runs `scripts/check.sh` — it does not
   reimplement it — on four runners.
 - **M10a.2 — the Linux artifact stops disabling its own sandbox.** Both
@@ -88,8 +88,8 @@ screen.** Each stage is shippable alone and leaves the tree green.
 
 ### M10b.1 — a fit becomes a compute model
 
-- **The policy lives in `hermes-bench`, beside the format it reads.**
-  `hermes-bench` already depends on `hermes-memory`; the reverse edge would be a
+- **The policy lives in `lightweight-bench`, beside the format it reads.**
+  `lightweight-bench` already depends on `lightweight-memory`; the reverse edge would be a
   cycle, and putting the trust rules in the estimator would make the crate that
   must stay honest depend on the crate that produces numbers. A function from
   `(&Calibration, &MachineFingerprint, &EngineFingerprint, &ModelMetadata,
@@ -219,7 +219,7 @@ gave the workspace macOS and Windows probes for the **machine**; there was no
 equivalent for a **process**, and the first macOS run of the matrix said so by
 failing `a_dead_engine_is_reported_as_failed_and_cleared`.
 
-M10a.11 closes most of it. `hermes-sys` gains one system call per platform -
+M10a.11 closes most of it. `lightweight-sys` gains one system call per platform -
 `proc_pid_rusage` on macOS, `OpenProcess` + `GetProcessMemoryInfo` +
 `GetProcessTimes` on Windows - wrapped by `hermes_system_info::process` and
 delegated to by the backend's non-Linux arm. The Linux path is untouched: its
@@ -292,5 +292,5 @@ error, which is high; existing Prometheus metric names and label sets; the
 `/health`, `/version`, `/props` and `/v1/models` bodies; the byte-exact golden
 SSE files; `ALLOWED_KV_CACHE_TYPES`; the rule that nothing in a metric or a
 benchmark record carries text; the `forbid(unsafe_code)` on every crate that has
-it, `hermes-sys` remaining the only exception; and `scripts/check.sh` as the one
+it, `lightweight-sys` remaining the only exception; and `scripts/check.sh` as the one
 definition of the gate, which CI runs rather than reimplements.

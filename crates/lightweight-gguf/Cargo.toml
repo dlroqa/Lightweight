@@ -1,0 +1,20 @@
+[package]
+name = "lightweight-gguf"
+description = "A bounded, panic-free reader for GGUF metadata. Never reads tensor data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# Exposes the GGUF writer used to build test fixtures. Enabled automatically
+# for this crate's own tests; other crates opt in to reuse the generator.
+fixtures = []

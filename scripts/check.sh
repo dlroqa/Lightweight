@@ -39,7 +39,7 @@ fi
 # they are opt-in. Point HERMES_TEST_MODEL at a .gguf to include them.
 if [ -n "${HERMES_TEST_MODEL:-}" ]; then
   echo "== test (real engine) =="
-  cargo test -p hermes-backend-llamacpp --test real_engine -- --test-threads=1
+  cargo test -p lightweight-backend-llamacpp --test real_engine -- --test-threads=1
 else
   echo "== test (real engine) == skipped: set HERMES_TEST_MODEL to a .gguf to include"
 fi
@@ -49,7 +49,7 @@ fi
 # than passing quietly.
 if [ -n "${HERMES_TEST_NETWORK:-}" ]; then
   echo "== test (model downloads) =="
-  cargo test -p hermes-catalog --test real_download -- --test-threads=1
+  cargo test -p lightweight-catalog --test real_download -- --test-threads=1
 else
   echo "== test (model downloads) == skipped: set HERMES_TEST_NETWORK=1 to include"
 fi
@@ -95,7 +95,7 @@ fi
 #
 # The workspace as a whole cannot be cross-checked on this machine: `ring` and
 # `zstd-sys` need a C toolchain for the target, and clippy never gets as far as
-# type-checking. `hermes-sys` has no C dependencies, so the one crate that
+# type-checking. `lightweight-sys` has no C dependencies, so the one crate that
 # holds every `unsafe` block *can* be checked here - and a typo in a Windows
 # arm otherwise waits for CI, which is how two platform breaks reached the
 # matrix in M10.
@@ -104,10 +104,10 @@ fi
 # a checkout with only the host target installed still passes.
 for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
   if rustup target list --installed 2>/dev/null | grep -qx "$target"; then
-    echo "== hermes-sys ($target) =="
-    cargo check -p hermes-sys --target "$target"
+    echo "== lightweight-sys ($target) =="
+    cargo check -p lightweight-sys --target "$target"
   else
-    echo "== hermes-sys ($target) == skipped: rustup target add $target to include it"
+    echo "== lightweight-sys ($target) == skipped: rustup target add $target to include it"
   fi
 done
 

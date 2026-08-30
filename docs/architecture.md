@@ -38,7 +38,7 @@ upstream JSON change breaks an adapter test instead of breaking clients.
 Every byte the RAM estimator reports traces back to two numbers per tensor type.
 They were read out of the pinned engine binary by `dlopen`-ing
 `libggml-base.so` and calling `ggml_blck_size`, `ggml_type_size` and
-`ggml_type_name`, and `crates/hermes-core/src/ggml.rs` is generated from that
+`ggml_type_name`, and `crates/lightweight-core/src/ggml.rs` is generated from that
 output.
 
 Reading them from the binary rather than transcribing the C headers caught
@@ -260,7 +260,7 @@ and the client reads `chunk.model` back and keys its context cache on it. They
 also carry `system_fingerprint`, a `timings` object shaped to llama.cpp, and
 whatever the next release adds or renames.
 
-Re-emitting means an upstream change breaks a test in `hermes-api` rather than
+Re-emitting means an upstream change breaks a test in `lightweight-api` rather than
 breaking a conversation. The translation is one file (`upstream.rs`), its
 inputs are a captured transcript from the pinned build, and the output side is
 pinned by byte-exact golden files.
@@ -538,7 +538,7 @@ that failed verification where a later run could resume from it.
 
 A model download needs exactly those properties, and the tempting move —
 copying the loop — is how two copies of an integrity check end up differing in
-the half nobody looked at. So the loop moved to `hermes-download` and the
+the half nobody looked at. So the loop moved to `lightweight-download` and the
 installer now calls it. The extraction was done first and alone, and proven by
 deleting the installed engine and re-running the real-engine tier cold.
 
@@ -547,7 +547,7 @@ deleting the installed engine and re-running the real-engine tier cold.
 The catalog records *how* each model's bytes were checked, and the four cases
 are genuinely different:
 
-- **Pinned** — checked against a digest recorded in `hermes-catalog::manifest`
+- **Pinned** — checked against a digest recorded in `lightweight-catalog::manifest`
   before the download, by `scripts/record-model-digests.sh` reading
   HuggingFace's tree API. The digest did not travel with the bytes.
 - **Published** — a pasted `huggingface.co/.../resolve/...` link, whose sha256
@@ -640,7 +640,7 @@ core could have spent over the same interval. Both counts are in the same
 unknown unit and it cancels.
 
 The alternative — a percentage computed server-side from one reading — is the
-invention `hermes-system-info::load` exists to refuse. A counter and an interval
+invention `lightweight-system-info::load` exists to refuse. A counter and an interval
 mean something exact; a single sample of a counter means nothing at all.
 
 ## Why the benchmark harness restarts the engine between buckets

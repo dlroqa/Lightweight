@@ -1,0 +1,18 @@
+[package]
+name = "lightweight-memory"
+description = "RAM estimation and load admission control."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-gguf.workspace = true
+lightweight-system-info.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+lightweight-gguf = { workspace = true, features = ["fixtures"] }

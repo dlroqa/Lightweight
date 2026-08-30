@@ -92,7 +92,7 @@ jobs:
       # real machines is worth more than one that quotes four assertions, and
       # this is where those numbers come from.
       - name: What this machine reports
-        run: cargo run -q -p hermes-cli --bin hermes -- sysinfo
+        run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
 
   linux-artifacts:
     name: linux artifacts
@@ -127,7 +127,7 @@ jobs:
       # staging it from `target/release` alone was green here every time while
       # failing in the release. The `flatpak` job below builds without a triple,
       # so the two jobs exercise one resolution branch each.
-      - run: cargo build --release -p hermes-cli --target x86_64-unknown-linux-gnu
+      - run: cargo build --release -p lightweight-cli --target x86_64-unknown-linux-gnu
       - run: npm run build --prefix frontend
 
       - name: Package the AppImage
@@ -195,7 +195,7 @@ jobs:
             org.freedesktop.Sdk//24.08 \
             org.electronjs.Electron2.BaseApp//24.08
 
-      - run: cargo build --release -p hermes-cli
+      - run: cargo build --release -p lightweight-cli
       - run: npm run build --prefix frontend
       - run: npm --prefix apps/desktop run package -- --linux flatpak
 

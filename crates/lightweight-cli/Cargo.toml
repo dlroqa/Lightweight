@@ -1,0 +1,31 @@
+[package]
+name = "lightweight-cli"
+description = "Command-line access to model inspection, RAM estimation and system facts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-gguf.workspace = true
+lightweight-memory.workspace = true
+lightweight-system-info.workspace = true
+lightweight-observability.workspace = true
+clap.workspace = true
+serde.workspace = true
+lightweight-inference.workspace = true
+lightweight-backend-llamacpp.workspace = true
+lightweight-gateway.workspace = true
+lightweight-catalog.workspace = true
+lightweight-bench.workspace = true
+lightweight-api.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+serde_json.workspace = true

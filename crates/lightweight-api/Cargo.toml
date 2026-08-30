@@ -1,0 +1,17 @@
+[package]
+name = "lightweight-api"
+description = "OpenAI-compatible request and response types, and the SSE chunk codec."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-inference.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+lightweight-observability.workspace = true

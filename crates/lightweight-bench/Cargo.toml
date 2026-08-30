@@ -1,0 +1,27 @@
+[package]
+name = "lightweight-bench"
+description = "Measures what this machine does with a model, and records it so it can be believed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-gguf.workspace = true
+lightweight-inference.workspace = true
+lightweight-memory.workspace = true
+lightweight-system-info.workspace = true
+lightweight-store.workspace = true
+lightweight-observability.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+lightweight-backend-mock.workspace = true
+lightweight-gguf = { workspace = true, features = ["fixtures"] }

@@ -18,7 +18,7 @@ codebase thought it meant.
 | 1 | `supervisor.rs:463,470` | Passed `--ctx-size C --parallel N`. The engine reads `-c` as the **total** and divides it: `n_ctx_seq = n_ctx / n_seq_max`. At four slots **every client got a quarter of the window** five surfaces advertised. |
 | 2 | `estimator.rs:204-221` | Priced KV as `C × N` against an engine allocating `C` — **over-budgeting by the slot count**, in the safe direction and wrong. |
 | 3 | `backend.rs:248-253` | `effective` was the *requested* params with the thread count patched in. **The engine's own numbers were never read back**, though `engine_props` and `with_engine_props` had both been written for it and had no callers. |
-| 4 | `backend.rs:179`, `hermes-backend-mock/src/lib.rs:232` | `max_concurrent_requests: 1`, hardcoded, served to the panel as a capability. **A lie the moment anybody passed `--concurrency 2`.** |
+| 4 | `backend.rs:179`, `lightweight-backend-mock/src/lib.rs:232` | `max_concurrent_requests: 1`, hardcoded, served to the panel as a capability. **A lie the moment anybody passed `--concurrency 2`.** |
 | 5 | `scheduler.rs:225-236` | `Waiter` carried an id, a band, a time and a channel. **No notion of a caller**, so one client's ten requests were served ahead of another client's one. |
 | 6 | `scheduler.rs:427,548` and `stream.rs:387` | A non-streamed timeout counted **both** `timed_out` and `abandoned`; a streamed one counted **only** `abandoned`. Two counters describing overlapping sets. |
 | 7 | `routes.rs:503,546` | `try_admit` then `enqueue`, two locks with a gap. A slot released **inside** the gap found an empty queue and went idle while a request was on its way into it. |

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record the sha256 and size of every pinned model in hermes-catalog::manifest.
+# Record the sha256 and size of every pinned model in lightweight-catalog::manifest.
 #
 # The digests come from HuggingFace's tree API, which reports each LFS object's
 # own sha256 (`lfs.oid`) and size. No weights are downloaded: the response is a
@@ -8,12 +8,12 @@
 # This exists for the same reason the engine digests came from the GitHub
 # release API rather than from a person's memory: a digest that was typed in is
 # a digest nobody checked. Run it, paste the literals it prints into
-# crates/hermes-catalog/src/manifest.rs, and the download path can verify a
+# crates/lightweight-catalog/src/manifest.rs, and the download path can verify a
 # model against a value recorded before the download.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-manifest=crates/hermes-catalog/src/manifest.rs
+manifest=crates/lightweight-catalog/src/manifest.rs
 
 # Read the repo/file pairs straight out of the manifest, so this script cannot
 # drift from the list it is meant to record.
@@ -35,7 +35,7 @@ if not entries:
 
 def tree(repo):
     url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
-    request = urllib.request.Request(url, headers={"User-Agent": "hermes-gateway"})
+    request = urllib.request.Request(url, headers={"User-Agent": "lightweight-gateway"})
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 

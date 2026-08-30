@@ -373,7 +373,7 @@ export class GatewaySupervisor {
    *
    * `SIGTERM` first, because the gateway shuts its engine down cleanly on it
    * and leaving an orphaned `llama-server` behind is exactly the failure the
-   * supervisor in `hermes-backend-llamacpp` exists to prevent. `SIGKILL` only
+   * supervisor in `lightweight-backend-llamacpp` exists to prevent. `SIGKILL` only
    * after a grace period, and only because a shell that cannot quit is worse
    * than one that leaves a mess.
    */

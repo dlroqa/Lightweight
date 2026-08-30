@@ -51,7 +51,7 @@ if [ ! -x "$VENV_BIN/pytest$EXE" ]; then
 fi
 
 echo "== building the mock gateway =="
-cargo build -p hermes-gateway --features mock --bin hermes-mock-gateway
+cargo build -p lightweight-gateway --features mock --bin hermes-mock-gateway
 
 echo "== contract suite =="
 exec "$VENV_BIN/pytest$EXE" tests/contract -q "$@"

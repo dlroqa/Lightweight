@@ -1,22 +1,22 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/hermes-core",
-    "crates/hermes-gguf",
-    "crates/hermes-memory",
-    "crates/hermes-inference",
-    "crates/hermes-download",
-    "crates/hermes-catalog",
-    "crates/hermes-bench",
-    "crates/hermes-store",
-    "crates/hermes-backend-llamacpp",
-    "crates/hermes-backend-mock",
-    "crates/hermes-api",
-    "crates/hermes-gateway",
-    "crates/hermes-cli",
-    "crates/hermes-system-info",
-    "crates/hermes-observability",
-    "crates/hermes-sys",
+    "crates/lightweight-core",
+    "crates/lightweight-gguf",
+    "crates/lightweight-memory",
+    "crates/lightweight-inference",
+    "crates/lightweight-download",
+    "crates/lightweight-catalog",
+    "crates/lightweight-bench",
+    "crates/lightweight-store",
+    "crates/lightweight-backend-llamacpp",
+    "crates/lightweight-backend-mock",
+    "crates/lightweight-api",
+    "crates/lightweight-gateway",
+    "crates/lightweight-cli",
+    "crates/lightweight-system-info",
+    "crates/lightweight-observability",
+    "crates/lightweight-sys",
 ]
 
 [workspace.package]
@@ -118,21 +118,21 @@ windows-sys = { version = "0.61.2", features = [
 getrandom = "0.4.3"   # OS entropy for the per-run engine API key
 
 # --- internal ---
-hermes-core = { path = "crates/hermes-core" }
-hermes-gguf = { path = "crates/hermes-gguf" }
-hermes-memory = { path = "crates/hermes-memory" }
-hermes-inference = { path = "crates/hermes-inference" }
-hermes-download = { path = "crates/hermes-download" }
-hermes-catalog = { path = "crates/hermes-catalog" }
-hermes-bench = { path = "crates/hermes-bench" }
-hermes-store = { path = "crates/hermes-store" }
-hermes-backend-llamacpp = { path = "crates/hermes-backend-llamacpp" }
-hermes-backend-mock = { path = "crates/hermes-backend-mock" }
-hermes-api = { path = "crates/hermes-api" }
-hermes-gateway = { path = "crates/hermes-gateway" }
-hermes-system-info = { path = "crates/hermes-system-info" }
-hermes-observability = { path = "crates/hermes-observability" }
-hermes-sys = { path = "crates/hermes-sys" }
+lightweight-core = { path = "crates/lightweight-core" }
+lightweight-gguf = { path = "crates/lightweight-gguf" }
+lightweight-memory = { path = "crates/lightweight-memory" }
+lightweight-inference = { path = "crates/lightweight-inference" }
+lightweight-download = { path = "crates/lightweight-download" }
+lightweight-catalog = { path = "crates/lightweight-catalog" }
+lightweight-bench = { path = "crates/lightweight-bench" }
+lightweight-store = { path = "crates/lightweight-store" }
+lightweight-backend-llamacpp = { path = "crates/lightweight-backend-llamacpp" }
+lightweight-backend-mock = { path = "crates/lightweight-backend-mock" }
+lightweight-api = { path = "crates/lightweight-api" }
+lightweight-gateway = { path = "crates/lightweight-gateway" }
+lightweight-system-info = { path = "crates/lightweight-system-info" }
+lightweight-observability = { path = "crates/lightweight-observability" }
+lightweight-sys = { path = "crates/lightweight-sys" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.
