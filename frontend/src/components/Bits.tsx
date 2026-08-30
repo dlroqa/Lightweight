@@ -109,8 +109,16 @@ export function Row({ label, children }: { label: string; children: ReactNode })
         fontSize: 13,
       }}
     >
-      <span style={{ color: "var(--text-muted)" }}>{label}</span>
-      <span className="tnum" style={{ fontWeight: 500, textAlign: "right" }}>
+      <span style={{ color: "var(--text-muted)", flexShrink: 0 }}>{label}</span>
+      <span
+        className="tnum"
+        style={{
+          fontWeight: 500,
+          textAlign: "right",
+          minWidth: 0,
+          overflowWrap: "anywhere",
+        }}
+      >
         {children}
       </span>
     </div>
