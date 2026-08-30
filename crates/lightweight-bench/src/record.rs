@@ -65,10 +65,11 @@ impl MachineFingerprint {
     /// and a zero total is visibly not a reading.
     pub fn detect() -> Self {
         let cpu = lightweight_system_info::CpuInfo::detect();
-        let total =
-            lightweight_system_info::MemoryProbe::snapshot(&lightweight_system_info::SystemMemoryProbe)
-                .map(|snapshot| snapshot.total)
-                .unwrap_or(Bytes::ZERO);
+        let total = lightweight_system_info::MemoryProbe::snapshot(
+            &lightweight_system_info::SystemMemoryProbe,
+        )
+        .map(|snapshot| snapshot.total)
+        .unwrap_or(Bytes::ZERO);
         Self {
             cpu_model: cpu.model.clone(),
             physical_cores: cpu.physical_cores,

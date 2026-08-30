@@ -45,8 +45,9 @@ impl RuntimeInstaller {
     /// directory: a verified, re-downloadable artifact, so losing it costs a
     /// download and nothing else.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, BackendError> {
-        let client = lightweight_download::client(concat!("hermes-gateway/", env!("CARGO_PKG_VERSION")))
-            .map_err(as_backend_error)?;
+        let client =
+            lightweight_download::client(concat!("hermes-gateway/", env!("CARGO_PKG_VERSION")))
+                .map_err(as_backend_error)?;
         Ok(Self {
             root: root.into(),
             client,

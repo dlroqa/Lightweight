@@ -1075,7 +1075,10 @@ mod tests {
         assert_eq!(err.code(), "memory_probe_unsupported");
         let remedies = err.remedies();
         assert_eq!(remedies.len(), 1);
-        assert_eq!(remedies[0].action, lightweight_core::RemedyAction::ForceLoad);
+        assert_eq!(
+            remedies[0].action,
+            lightweight_core::RemedyAction::ForceLoad
+        );
     }
 
     #[test]

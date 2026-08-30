@@ -88,7 +88,10 @@ impl Installer {
         downloads_dir: impl Into<PathBuf>,
     ) -> Result<Self, CatalogError> {
         Ok(Self {
-            client: lightweight_download::client(concat!("hermes-gateway/", env!("CARGO_PKG_VERSION")))?,
+            client: lightweight_download::client(concat!(
+                "hermes-gateway/",
+                env!("CARGO_PKG_VERSION")
+            ))?,
             models_dir: models_dir.into(),
             downloads_dir: downloads_dir.into(),
         })

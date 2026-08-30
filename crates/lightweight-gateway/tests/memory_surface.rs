@@ -617,7 +617,8 @@ async fn a_measurement_of_this_machine_reaches_the_estimate_on_screen() {
     let params: lightweight_core::RuntimeParams =
         serde_json::from_value(before["estimate"]["params"].clone()).expect("the params");
     let n_ubatch = params.n_ubatch;
-    let file = lightweight_gguf::GgufFile::open(dir.path().join("fixture.gguf")).expect("the fixture");
+    let file =
+        lightweight_gguf::GgufFile::open(dir.path().join("fixture.gguf")).expect("the fixture");
     let metadata = lightweight_gguf::ModelMetadata::from_file(&file).expect("its metadata");
     let bucket = lightweight_bench::apply::bucket_for(&metadata, params);
 

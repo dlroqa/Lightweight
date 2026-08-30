@@ -460,8 +460,11 @@ fn render_human(
             // be ignored by every load path, and this command is the only place
             // a person would find that out before wondering why their estimate
             // still says it is a guess.
-            match lightweight_bench::apply::apply(fit, metadata, lightweight_memory::ComputeModel::headless())
-            {
+            match lightweight_bench::apply::apply(
+                fit,
+                metadata,
+                lightweight_memory::ComputeModel::headless(),
+            ) {
                 Ok(calibrated) => {
                     let _ = writeln!(
                         out,

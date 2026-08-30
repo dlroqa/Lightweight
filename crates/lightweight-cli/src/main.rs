@@ -747,7 +747,11 @@ fn render_inspect(out: &mut String, metadata: &ModelMetadata) {
     }
 }
 
-fn render_estimate(out: &mut String, metadata: &ModelMetadata, estimate: &lightweight_memory::Estimate) {
+fn render_estimate(
+    out: &mut String,
+    metadata: &ModelMetadata,
+    estimate: &lightweight_memory::Estimate,
+) {
     line!(
         out,
         "{} at {} context, {} KV cache",
@@ -803,7 +807,9 @@ fn render_estimate(out: &mut String, metadata: &ModelMetadata, estimate: &lightw
         // the engine build *and* the settings, so saying "for this model" alone
         // would claim less precision than the number actually has.
         lightweight_memory::Confidence::Measured => "measured on this machine, at these settings",
-        lightweight_memory::Confidence::Coarse => "uncalibrated; compute and overhead are estimates",
+        lightweight_memory::Confidence::Coarse => {
+            "uncalibrated; compute and overhead are estimates"
+        }
         lightweight_memory::Confidence::Partial => "PARTIAL; some metadata was missing",
     };
     line!(

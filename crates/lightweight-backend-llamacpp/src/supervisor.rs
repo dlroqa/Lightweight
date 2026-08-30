@@ -106,9 +106,9 @@ impl ExitClassification {
                 // Distinguish an OOM kill from a deliberate one by asking how
                 // much memory was left. A probe failure is not evidence of an
                 // OOM, so it falls through to the generic case.
-                let starved = SystemMemoryProbe
-                    .snapshot()
-                    .is_ok_and(|snapshot| snapshot.available < lightweight_core::Bytes::from_mib(256));
+                let starved = SystemMemoryProbe.snapshot().is_ok_and(|snapshot| {
+                    snapshot.available < lightweight_core::Bytes::from_mib(256)
+                });
                 if starved {
                     BackendError::EngineOom { tail }
                 } else {

@@ -306,7 +306,9 @@ pub fn apply(
 /// because a fit is looked up by exactly the key a run was recorded with, and
 /// two spellings of "the same engine" would mean a machine could never find its
 /// own measurement.
-pub fn engine_fingerprint(backend: &dyn lightweight_inference::InferenceBackend) -> EngineFingerprint {
+pub fn engine_fingerprint(
+    backend: &dyn lightweight_inference::InferenceBackend,
+) -> EngineFingerprint {
     EngineFingerprint {
         backend: backend.id().to_string(),
         // Stated by the backend rather than guessed by the caller.

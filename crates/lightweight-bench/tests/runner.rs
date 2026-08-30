@@ -140,7 +140,10 @@ async fn what_is_recorded_is_what_the_engine_reported() {
     assert!(sample.wall_ms > 0 || sample.time_to_first_token_ms.is_some());
     // The mock's engine reading is fixed, so this proves the reading travelled
     // rather than that any particular number is right.
-    assert_eq!(sample.rss, Some(lightweight_core::units::Bytes::from_mib(512)));
+    assert_eq!(
+        sample.rss,
+        Some(lightweight_core::units::Bytes::from_mib(512))
+    );
     assert_eq!(
         sample.peak_rss,
         Some(lightweight_core::units::Bytes::from_mib(600))
