@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture the headers of real models for the hermes-gguf integration tests.
+# Capture the headers of real models for the lightweight-gguf integration tests.
 #
 # Only the first few megabytes of each file are fetched, with an HTTP range
 # request, because everything we parse lives in the header. The full models run

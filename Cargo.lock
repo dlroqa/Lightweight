@@ -605,262 +605,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hermes-api"
-version = "0.1.1"
-dependencies = [
- "hermes-core",
- "hermes-inference",
- "hermes-observability",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "hermes-backend-llamacpp"
-version = "0.1.1"
-dependencies = [
- "async-trait",
- "bytes",
- "flate2",
- "futures-util",
- "getrandom 0.4.3",
- "hermes-core",
- "hermes-download",
- "hermes-gguf",
- "hermes-inference",
- "hermes-memory",
- "hermes-observability",
- "hermes-system-info",
- "hex",
- "libc",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "zip",
-]
-
-[[package]]
-name = "hermes-backend-mock"
-version = "0.1.1"
-dependencies = [
- "async-trait",
- "futures-util",
- "hermes-core",
- "hermes-gguf",
- "hermes-inference",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "hermes-bench"
-version = "0.1.1"
-dependencies = [
- "futures-util",
- "hermes-backend-mock",
- "hermes-core",
- "hermes-gguf",
- "hermes-inference",
- "hermes-memory",
- "hermes-observability",
- "hermes-store",
- "hermes-system-info",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "hermes-catalog"
-version = "0.1.1"
-dependencies = [
- "hermes-core",
- "hermes-download",
- "hermes-gguf",
- "hermes-observability",
- "hex",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "hermes-cli"
-version = "0.1.1"
-dependencies = [
- "axum",
- "clap",
- "hermes-api",
- "hermes-backend-llamacpp",
- "hermes-bench",
- "hermes-catalog",
- "hermes-core",
- "hermes-gateway",
- "hermes-gguf",
- "hermes-inference",
- "hermes-memory",
- "hermes-observability",
- "hermes-system-info",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "hermes-core"
-version = "0.1.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "hermes-download"
-version = "0.1.1"
-dependencies = [
- "futures-util",
- "hermes-core",
- "hex",
- "reqwest",
- "rustls",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "hermes-gateway"
-version = "0.1.1"
-dependencies = [
- "axum",
- "futures-util",
- "getrandom 0.4.3",
- "hermes-api",
- "hermes-backend-mock",
- "hermes-bench",
- "hermes-catalog",
- "hermes-core",
- "hermes-gguf",
- "hermes-inference",
- "hermes-memory",
- "hermes-observability",
- "hermes-store",
- "hermes-system-info",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "hermes-gguf"
-version = "0.1.1"
-dependencies = [
- "hermes-core",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "hermes-inference"
-version = "0.1.1"
-dependencies = [
- "async-trait",
- "futures-util",
- "hermes-core",
- "hermes-gguf",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "hermes-memory"
-version = "0.1.1"
-dependencies = [
- "hermes-core",
- "hermes-gguf",
- "hermes-system-info",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "hermes-observability"
-version = "0.1.1"
-dependencies = [
- "hermes-core",
- "hermes-system-info",
- "serde",
- "thiserror",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hermes-store"
-version = "0.1.1"
-dependencies = [
- "getrandom 0.4.3",
- "hermes-core",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "hermes-sys"
-version = "0.1.1"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hermes-system-info"
-version = "0.1.1"
-dependencies = [
- "directories",
- "hermes-core",
- "hermes-sys",
- "rustix",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1225,6 +969,262 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d0a00925a9f930d679b6789b721e3a7f9ed110f41b86d2497caa780c3a070a"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lightweight-api"
+version = "0.1.1"
+dependencies = [
+ "lightweight-core",
+ "lightweight-inference",
+ "lightweight-observability",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "lightweight-backend-llamacpp"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "lightweight-core",
+ "lightweight-download",
+ "lightweight-gguf",
+ "lightweight-inference",
+ "lightweight-memory",
+ "lightweight-observability",
+ "lightweight-system-info",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zip",
+]
+
+[[package]]
+name = "lightweight-backend-mock"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lightweight-core",
+ "lightweight-gguf",
+ "lightweight-inference",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightweight-bench"
+version = "0.1.1"
+dependencies = [
+ "futures-util",
+ "lightweight-backend-mock",
+ "lightweight-core",
+ "lightweight-gguf",
+ "lightweight-inference",
+ "lightweight-memory",
+ "lightweight-observability",
+ "lightweight-store",
+ "lightweight-system-info",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "lightweight-catalog"
+version = "0.1.1"
+dependencies = [
+ "hex",
+ "lightweight-core",
+ "lightweight-download",
+ "lightweight-gguf",
+ "lightweight-observability",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "lightweight-cli"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "clap",
+ "lightweight-api",
+ "lightweight-backend-llamacpp",
+ "lightweight-bench",
+ "lightweight-catalog",
+ "lightweight-core",
+ "lightweight-gateway",
+ "lightweight-gguf",
+ "lightweight-inference",
+ "lightweight-memory",
+ "lightweight-observability",
+ "lightweight-system-info",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "lightweight-core"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "lightweight-download"
+version = "0.1.1"
+dependencies = [
+ "futures-util",
+ "hex",
+ "lightweight-core",
+ "reqwest",
+ "rustls",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightweight-gateway"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "futures-util",
+ "getrandom 0.4.3",
+ "lightweight-api",
+ "lightweight-backend-mock",
+ "lightweight-bench",
+ "lightweight-catalog",
+ "lightweight-core",
+ "lightweight-gguf",
+ "lightweight-inference",
+ "lightweight-memory",
+ "lightweight-observability",
+ "lightweight-store",
+ "lightweight-system-info",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "lightweight-gguf"
+version = "0.1.1"
+dependencies = [
+ "lightweight-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "lightweight-inference"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lightweight-core",
+ "lightweight-gguf",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightweight-memory"
+version = "0.1.1"
+dependencies = [
+ "lightweight-core",
+ "lightweight-gguf",
+ "lightweight-system-info",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "lightweight-observability"
+version = "0.1.1"
+dependencies = [
+ "lightweight-core",
+ "lightweight-system-info",
+ "serde",
+ "thiserror",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "lightweight-store"
+version = "0.1.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "lightweight-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "lightweight-sys"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "lightweight-system-info"
+version = "0.1.1"
+dependencies = [
+ "directories",
+ "lightweight-core",
+ "lightweight-sys",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

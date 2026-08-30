@@ -70,7 +70,7 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
 
-      - run: cargo build --release -p hermes-cli --target ${{ matrix.triple }}
+      - run: cargo build --release -p lightweight-cli --target ${{ matrix.triple }}
       - run: npm run build --prefix frontend
 
       - name: The CLI archive
@@ -195,7 +195,7 @@ jobs:
       # between them the two branches of the staging script's binary resolution
       # - `target/<triple>/release` and `target/release` - are both exercised by
       # every release, rather than one of them being discovered by a release.
-      - run: cargo build --release -p hermes-cli
+      - run: cargo build --release -p lightweight-cli
       - run: npm run build --prefix frontend
       - run: npm --prefix apps/desktop run package -- --linux flatpak
 
@@ -364,10 +364,10 @@ jobs:
             echo
             echo "| Platform | File |"
             echo "|---|---|"
-            echo "| macOS (Apple Silicon and Intel) | \`Hermes-*-mac-universal.dmg\` |"
-            echo "| Windows x86-64 | \`Hermes-Setup-*.exe\` |"
-            echo "| Linux x86-64 (sandboxed) | \`Hermes-*.flatpak\` |"
-            echo "| Linux x86-64 (portable) | \`Hermes-*.AppImage\` |"
+            echo "| macOS (Apple Silicon and Intel) | \`Lightweight-*-mac-universal.dmg\` |"
+            echo "| Windows x86-64 | \`Lightweight-Setup-*.exe\` |"
+            echo "| Linux x86-64 (sandboxed) | \`Lightweight-*.flatpak\` |"
+            echo "| Linux x86-64 (portable) | \`Lightweight-*.AppImage\` |"
             echo "| Command line only | \`hermes-*-<target-triple>.tar.gz\` / \`.zip\` |"
             echo
             echo "Two Linux builds, because the difference is real: the Flatpak"

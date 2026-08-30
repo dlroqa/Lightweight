@@ -59,7 +59,7 @@ function verify(binary) {
   if (found !== version) {
     die(
       `${binary} reports ${found}, but this package is ${version}.\n` +
-        "       Rebuild it: cargo build --release -p hermes-cli",
+        "       Rebuild it: cargo build --release -p lightweight-cli",
     );
   }
   console.log(`stage: ${binary} is ${reported}`);
@@ -69,7 +69,7 @@ function stageMacUniversal() {
   const slices = [];
   for (const target of MAC_TARGETS) {
     console.log(`stage: building ${target}`);
-    run("cargo", ["build", "--release", "-p", "hermes-cli", "--target", target], {
+    run("cargo", ["build", "--release", "-p", "lightweight-cli", "--target", target], {
       cwd: repoRoot,
       stdio: "inherit",
     });
@@ -124,7 +124,7 @@ function stageHost() {
   if (!found) {
     die(
       `no binary at ${candidates.join(" or ")}\n` +
-        "       Build it first: cargo build --release -p hermes-cli",
+        "       Build it first: cargo build --release -p lightweight-cli",
     );
   }
   try {

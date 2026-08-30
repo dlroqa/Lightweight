@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.1",
   "type": "module",
-  "description": "The Hermes desktop shell: a window onto a gateway, and a supervisor for one.",
+  "description": "The Lightweight desktop shell: a window onto a gateway, and a supervisor for one.",
   "main": "dist/main.js",
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -23,7 +23,7 @@
     "toolsets": {
       "appimage": "1.0.3"
     },
-    "productName": "Hermes",
+    "productName": "Lightweight",
     "icon": "build/icons",
     "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "files": [
@@ -92,7 +92,7 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "artifactName": "${productName}-Setup-${version}-${arch}.${ext}",
-      "shortcutName": "Hermes"
+      "shortcutName": "Lightweight"
     },
     "directories": {
       "output": "release",
@@ -101,5 +101,5 @@
     "publish": null
   },
   "desktopName": "hermes.desktop",
-  "author": "Hermes"
+  "author": "Lightweight"
 }

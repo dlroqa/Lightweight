@@ -18,16 +18,16 @@ Read against the source, not against the roadmap.
 
 | # | Where | What it did |
 |---|---|---|
-| 1 | `hermes-memory/src/estimator.rs:166-205` | A KV cache type this build cannot size was billed at **zero bytes** with an empty `missing` list, so the estimate reported `Coarse` — a confident zero. The per-token half of the same function separately assumed 16 bits, so the two halves disagreed. |
-| 2 | `hermes-system-info/src/memory.rs:58-64` | All three probe failures offered one remedy: "Set the available-memory override in settings". **No such setting has ever existed.** |
-| 3 | `hermes-gateway/src/control.rs:578-582` | A memory probe failure returned a header with no estimate and **no reason**. `manager.rs:484-486` wrapped the same failure in a generic I/O error, discarding both the code and the remedies. `hermes-cli/src/main.rs:363` printed `to_string()` rather than `describe`, dropping the remedies at the last layer. |
-| 4 | `hermes-observability/src/targets.rs:21` | `targets::MEMORY` — "RAM estimation, admission verdicts and memory pressure warnings" — had **no call sites anywhere**. |
-| 5 | `frontend/src/api/client.ts:81` | Read `remedy.message`. The wire field is `label` (`hermes-core/src/error.rs:143`). Every remedy the gateway has ever sent rendered as a bullet list of `undefined`. |
-| 6 | `hermes-gateway/src/manager.rs:484-501` | A swap estimated memory **while the outgoing model was still resident**, though `backend.rs:186-199` stops the old engine before starting the new one. A swap was refused by roughly the outgoing model's footprint. |
+| 1 | `lightweight-memory/src/estimator.rs:166-205` | A KV cache type this build cannot size was billed at **zero bytes** with an empty `missing` list, so the estimate reported `Coarse` — a confident zero. The per-token half of the same function separately assumed 16 bits, so the two halves disagreed. |
+| 2 | `lightweight-system-info/src/memory.rs:58-64` | All three probe failures offered one remedy: "Set the available-memory override in settings". **No such setting has ever existed.** |
+| 3 | `lightweight-gateway/src/control.rs:578-582` | A memory probe failure returned a header with no estimate and **no reason**. `manager.rs:484-486` wrapped the same failure in a generic I/O error, discarding both the code and the remedies. `lightweight-cli/src/main.rs:363` printed `to_string()` rather than `describe`, dropping the remedies at the last layer. |
+| 4 | `lightweight-observability/src/targets.rs:21` | `targets::MEMORY` — "RAM estimation, admission verdicts and memory pressure warnings" — had **no call sites anywhere**. |
+| 5 | `frontend/src/api/client.ts:81` | Read `remedy.message`. The wire field is `label` (`lightweight-core/src/error.rs:143`). Every remedy the gateway has ever sent rendered as a bullet list of `undefined`. |
+| 6 | `lightweight-gateway/src/manager.rs:484-501` | A swap estimated memory **while the outgoing model was still resident**, though `backend.rs:186-199` stops the old engine before starting the new one. A swap was refused by roughly the outgoing model's footprint. |
 | 7 | `manager.rs:487-500` vs `control.rs:601-606` | Two rules for which context a load gets, and they disagreed: the load path reads the stored default and never `last_n_ctx`; the detail endpoint reads `last_n_ctx` and never the stored default. The estimate on screen could be for a context no button produces. |
 
 Two more, of the same family: `BackendCapabilities.kv_cache_types` is populated
-(`hermes-inference/src/backend.rs:77-83`) and serialized by no route, while
+(`lightweight-inference/src/backend.rs:77-83`) and serialized by no route, while
 `control.rs:290` tells the user "/health lists what this engine accepts"; and
 `resource_usage()` — the engine's own RSS, the one number that makes a `Coarse`
 estimate checkable — has exactly one caller in the tree, in the CLI.
@@ -90,7 +90,7 @@ stage is shippable alone and leaves the tree green.
   for a model they asked to add.
 - **Engine RSS published as a reading, not a rate**, through `metrics_snapshot`.
   A pull reads `/proc` once and answers — no sampler, no interval, no retained
-  state, per the argument in `hermes-system-info/src/load.rs:10-21`. `cpu_percent`
+  state, per the argument in `lightweight-system-info/src/load.rs:10-21`. `cpu_percent`
   is deliberately not serialized: nothing produces it, and a percentage from one
   sample is the invention that module exists to refuse.
 - **`Verdict::Tight` is surfaced, not gated.** `largest_safe_context` only ever

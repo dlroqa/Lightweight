@@ -1,0 +1,20 @@
+[package]
+name = "lightweight-backend-mock"
+description = "A deterministic in-process backend, so the layers above can be tested without an engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-gguf.workspace = true
+lightweight-inference.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

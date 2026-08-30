@@ -1,0 +1,25 @@
+[package]
+name = "lightweight-catalog"
+description = "The persistent model catalog: what is installed, where it came from, and how much can be promised about its bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-gguf.workspace = true
+lightweight-download.workspace = true
+lightweight-observability.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

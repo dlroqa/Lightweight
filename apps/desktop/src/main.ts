@@ -91,7 +91,7 @@ async function createWindow(): Promise<void> {
     minWidth: 960,
     minHeight: 640,
     show: false,
-    title: "Hermes",
+    title: "Lightweight",
     // Linux and Windows read the window's icon from the process; macOS uses the
     // bundle's and ignores this.
     icon: icon("window.png"),
@@ -145,7 +145,7 @@ function showStartupFailure(reason: string): void {
   console.error(`hermes-desktop: the gateway did not start.\n${reason}`);
   void dialog.showMessageBox({
     type: "error",
-    title: "Hermes could not start",
+    title: "Lightweight could not start",
     message: "The gateway did not start.",
     detail: reason,
     buttons: ["Quit"],
@@ -167,7 +167,7 @@ function updateTray(state: GatewayState): void {
             : "Stopped";
 
   const menu = Menu.buildFromTemplate([
-    { label: `Hermes — ${label}`, enabled: false },
+    { label: `Lightweight — ${label}`, enabled: false },
     { type: "separator" },
     {
       label: "Open panel",
@@ -193,7 +193,9 @@ function updateTray(state: GatewayState): void {
       },
     },
     {
-      label: supervisor.ownsProcess() ? "Quit Hermes and stop the gateway" : "Quit Hermes",
+      label: supervisor.ownsProcess()
+        ? "Quit Lightweight and stop the gateway"
+        : "Quit Lightweight",
       click: () => {
         quitting = true;
         app.quit();
@@ -201,7 +203,7 @@ function updateTray(state: GatewayState): void {
     },
   ]);
 
-  tray.setToolTip(`Hermes — ${label}`);
+  tray.setToolTip(`Lightweight — ${label}`);
   tray.setContextMenu(menu);
 }
 
@@ -270,7 +272,7 @@ if (!sandbox.sandboxed) {
   // only the dialog. `showErrorBox` is one of the few dialogs that works
   // before `whenReady`.
   process.stderr.write(`${message}\n`);
-  dialog.showErrorBox("Hermes cannot start unsandboxed", message);
+  dialog.showErrorBox("Lightweight cannot start unsandboxed", message);
   // Non-zero: a wrapper or a service manager must be able to tell that this
   // was a refusal rather than a normal quit.
   app.exit(1);

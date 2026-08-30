@@ -31,7 +31,7 @@ BINARY="target/$TRIPLE/release/hermes$EXE"
 [ -f "$BINARY" ] || BINARY="target/release/hermes$EXE"
 [ -f "$BINARY" ] || {
   echo "no binary at target/$TRIPLE/release/hermes$EXE or target/release/hermes$EXE" >&2
-  echo "build it first: cargo build --release -p hermes-cli" >&2
+  echo "build it first: cargo build --release -p lightweight-cli" >&2
   exit 1
 }
 
@@ -47,7 +47,7 @@ cp LICENSE "$STAGE/LICENSE"
 # What someone who unpacked only this archive needs to know. Deliberately short:
 # the engine not being in here is the one genuinely surprising fact.
 ENGINE_BUILD="$(sed -n 's/.*PINNED_BUILD: &str = "\([^"]*\)".*/\1/p' \
-  crates/hermes-backend-llamacpp/src/manifest.rs | head -1)"
+  crates/lightweight-backend-llamacpp/src/manifest.rs | head -1)"
 cat > "$STAGE/README.md" <<EOF
 # Hermes $VERSION — $TRIPLE
 

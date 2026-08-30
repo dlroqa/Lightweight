@@ -22,7 +22,7 @@ Two things answer that, and the second is why this directory exists:
 1. The shell refuses to start when it sees `--no-sandbox`
    (`apps/desktop/src/sandbox.ts`), naming what was detected and what to do.
    Verified by execution: on a machine that genuinely cannot create user
-   namespaces, launching `Hermes-0.1.0.AppImage` prints the diagnostic and exits
+   namespaces, launching `Lightweight-0.1.0.AppImage` prints the diagnostic and exits
    non-zero rather than starting.
 2. Flatpak sandboxes through bubblewrap and portals instead, needing no SUID
    helper and no unprivileged user namespace of its own. It is the build that
@@ -43,7 +43,7 @@ flatpak install --user -y flathub org.freedesktop.Platform//24.08 \
                                   org.electronjs.Electron2.BaseApp//24.08
 
 # then, from the repository root
-cargo build --release -p hermes-cli
+cargo build --release -p lightweight-cli
 (cd frontend && npm run build)
 (cd apps/desktop && npm run package -- --linux flatpak)
 ```

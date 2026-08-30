@@ -14,27 +14,27 @@ suite and the dependency gate — before a checkpoint is committed.
 | **M0** Foundations | **done** | workspace, pinned toolchain, dependency policy + gate, error taxonomy, privacy primitives, structured logging, platform data dirs |
 | **M1** Metadata, system info, RAM estimation | **done** | GGUF reader, ggml type table, architecture table, CPU/ISA + memory probes, RAM estimator with admission verdicts, `hermes inspect \| estimate \| sysinfo` |
 | **M2** Engine acquisition and supervision | **done** | pinned runtime manifest with per-platform digests, download with resume + streamed sha256, archive extraction, `InferenceBackend` trait, supervised `llama-server` child process, crash classification, `hermes serve` |
-| **M3** Vertical slice: the gateway | **done** | SSE codec, generation events, upstream HTTP/SSE adapter, `MockBackend`, `hermes-api` DTOs, `hermes-gateway` serving `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/props`, `/version`, permissive auth, `Semaphore(1)`, cancellation, openai-SDK contract suite |
+| **M3** Vertical slice: the gateway | **done** | SSE codec, generation events, upstream HTTP/SSE adapter, `MockBackend`, `lightweight-api` DTOs, `lightweight-gateway` serving `/v1/chat/completions` (streamed and not), `/v1/models`, `/health`, `/props`, `/version`, permissive auth, `Semaphore(1)`, cancellation, openai-SDK contract suite |
 | **M3.5** Remote access | **done** | serving any non-loopback address (LAN or overlay), repeatable name-resolving `--host`, key from the environment, metadata redaction for unauthenticated callers, engine key out of `argv`, secrets/address gate |
 | **M3.55** The remote leg | **done** | `hermes sysinfo` reports every bindable address; a `--host` name that resolves only to loopback is diagnosed instead of served silently |
 | **M3.6** Thinking models | **done** | `reasoning_effort` and `chat_template_kwargs` acted on rather than dropped, engine-neutral `ReasoningControl`, coverage at every layer and against both a reasoning and a non-reasoning model; a real agent harness ran a full session against the gateway |
 | **M4** Tool calls, taxonomy, completions | **done** | `tools`/`tool_choice`/`parallel_tool_calls` acted on and counted, a real agent loop closed against a real model, the full section 27 taxonomy as OpenAI bodies *with* their statuses, `/v1/completions` streamed and not |
 | **M5** Scheduler, metrics, per-token timings | **done** | priority bands classified from measured cost, starvation-bounded fairness, queue position reported to streamed clients, `/metrics` and `/api/v1/metrics`, per-token timings from the engine, `--concurrency` |
-| **M6a** Model manager | **done** | `hermes-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
+| **M6a** Model manager | **done** | `lightweight-download` shared by engine and models, persistent catalog with atomic writes, import + pinned downloads + pasted links with per-model integrity, `hermes models`, scheduler pause/drain, hot swap over `/api/v1`, jobs with SSE progress, `serve` with no model |
 | **M6b.1** Backend seams | **done** | `/api/v1/system`, `/api/v1/gateway`, `/api/v1/events`, `/api/v1/logs`, `GET /api/v1/models/{id}`; disk via `rustix` and processor time from `/proc/stat` as probes that say when they could not read; an in-flight gauge that spans the response body; the panel served from the gateway, so no CORS layer exists |
-| **M6b.2** Persistence | **done** | `hermes-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
+| **M6b.2** Persistence | **done** | `lightweight-store`: conversations and settings under the two M0 directories that had never been written to, owner-only, atomic; `/api/v1/conversations` and `/api/v1/settings` |
 | **M6b.3** The panel | **done** | React + TypeScript + Vite in `frontend/`, eight screens on the seams M6b.1 and M6b.2 opened, served same-origin by the gateway; no CORS layer exists anywhere |
 | **M6b.4** The desktop shell | **done** | `apps/desktop`: attaches to a gateway already serving or starts one, stops only what it started, tray, key handling, packaging config |
 | **M7.1** Say the true number | **done** | the KV arithmetic as one fallible pass, so its two halves cannot disagree about a type this build cannot size; per-variant memory remedies naming `--force` instead of a setting that never existed; `Probed<Estimate>` and `ManagerError::MemoryProbe` so a probe failure says why; `targets::MEMORY` given its call sites; the panel reading `label` rather than a field that does not exist |
 | **M7.2** Spend the right budget | **done** | an injectable `MemoryProbe` on `GatewayState`; `Budget` crediting a swap with the `RssAnon` the outgoing engine is about to release; engine RSS and peak in `/api/v1/metrics` and two new Prometheus gauges, read per pull with no sampler; `Verdict::Tight` warned in the log and said on screen, gating nothing |
 | **M7.3** Controls that change something | **done** | one `choose_context` for the load path and the detail that disagreed; `last_n_ctx` demoted to history; engine capabilities and load defaults on `/api/v1/gateway`; `?ctx=`/`?kv_type=` pricing on the model detail; context and KV type pickers in the panel, which now follows the load job and shows the refusal it had been hiding |
 | **M8.1** Make the CPU visible | **done** | `cpu_percent` retired for `cpu_ticks` read from `/proc/<pid>/stat` and published unconverted; the panel differences them into cores; latency histograms with real Prometheus buckets, existing names and values unchanged; per-band generation and wait counters; the engine's own `/metrics` scraped once per pull, which `--metrics` had promised since M2 |
-| **M8.2** The harness that measures | **done** | `hermes-bench`: three deterministic scenarios over the `InferenceBackend` trait, prompts sized by the engine's own tokenizer, runs saved owner-only to the `benchmarks_dir()` M0 chose and nothing had written to; `hermes bench` with its own engine and a per-bucket reload, `POST /api/v1/benchmarks` against what is resident, Run Benchmark wired in the panel; `--fit` writes a slope and an intercept because peak RSS cannot separate two collinear coefficients |
+| **M8.2** The harness that measures | **done** | `lightweight-bench`: three deterministic scenarios over the `InferenceBackend` trait, prompts sized by the engine's own tokenizer, runs saved owner-only to the `benchmarks_dir()` M0 chose and nothing had written to; `hermes bench` with its own engine and a per-bucket reload, `POST /api/v1/benchmarks` against what is resident, Run Benchmark wired in the panel; `--fit` writes a slope and an intercept because peak RSS cannot separate two collinear coefficients |
 | **M8.3** The knobs | **done** | `n_ubatch` and `n_batch` reachable and `?ubatch=` priced; `--threads-batch`, `--poll`, `--cache-reuse`, `--load-mode` and CPU affinity reachable and absent by default; a locked-memory pre-flight from `/proc/self/limits`, `VmLck` credited on a swap, and `Tight` refused for a locking load; the panel reads the `thread_choices` served since M6b.1 |
 | **M9.1** Engine truth | **done** | `--ctx-size` multiplied by the slot count at the one boundary that knows the engine's convention, so each client gets the window every surface advertises; `--no-kv-unified` and `--cont-batching` stated; the engine's own `/props` read back once it is ready and the recorded parameters reconciled with it; three hardcoded `max_concurrent_requests: 1` capabilities retired |
 | **M9.2** Clients, not only requests | **done** | `PeerKey` from the connection — observed, never claimed, never logged or labelled; a fair-queuing round in the sort key that degenerates to today's order for one caller; `Ticket::position` an `Option`; `timed_out` and `abandoned` made to mean what they say; admission one locked decision; the benchmark's discarded permit |
 | **M9.3** The number, and the clients | **done** | `--concurrency auto` derived from cores and memory, with the divisor set by a sweep rather than chosen; the scheduler's capacity re-derived per load; `/api/v1/requests` and a Running Now card, because a running request was a bare `usize`; `hermes bench --parallel` with a concurrent scenario; two genuinely concurrent clients in the contract suite |
-| **M10a** Cross-platform | **done** | `hermes-sys`, the workspace's only platform FFI, with one `SAFETY:` note per call and nothing contributed to a Linux build, so `hermes-system-info` keeps its `forbid(unsafe_code)`; `check.yml` running `scripts/check.sh` itself on four runners; the Linux artifact no longer disabling its own Chromium sandbox; one artifact per platform and a Flatpak that builds; per-process memory on the two platforms without `/proc`, and `PeakKind` so a macOS footprint is not mistaken for a resident-set peak |
+| **M10a** Cross-platform | **done** | `lightweight-sys`, the workspace's only platform FFI, with one `SAFETY:` note per call and nothing contributed to a Linux build, so `lightweight-system-info` keeps its `forbid(unsafe_code)`; `check.yml` running `scripts/check.sh` itself on four runners; the Linux artifact no longer disabling its own Chromium sandbox; one artifact per platform and a Flatpak that builds; per-process memory on the two platforms without `/proc`, and `PeakKind` so a macOS footprint is not mistaken for a resident-set peak |
 | **M10b** Calibration | **done** | `HermesPaths::calibration_file()`; the six estimator sites taking a calibrated model when a trustworthy fit describes the load and the shipped defaults when not; `Confidence::Measured` reachable, said by `hermes estimate` and shown in the panel; `/api/v1/gateway` reporting the calibration outcome; trust rules informed by measurement — three distinct batch sizes, and a line accounting for 95% of the spread — and the finding that on this machine no fit earns them, because the shipped compute shape is wrong for this engine rather than merely mis-set |
 
 ## Verified by execution, not only by unit tests
@@ -98,7 +98,7 @@ Remote access, against the same engine serving a real model
   `openai` SDK with the key: 142 and 141 completion tokens, `finish_reason`
   `stop` both times, `cached_tokens` 0 → 23 across the turns, and a wrong key
   refused with 401 on the same socket.
-- **The log file exists at last.** `hermes-observability` has been complete
+- **The log file exists at last.** `lightweight-observability` has been complete
   since M0 and nothing had ever called `init()`, so every `tracing` line in the
   workspace went nowhere; `serve` now installs it. What a session records:
   privacy mode, engine lifecycle, model loaded, `gateway listening` with the
@@ -145,7 +145,7 @@ Thinking models, now covered deliberately rather than by accident:
 
 - `reasoning_effort` and `chat_template_kwargs` are typed request fields, carried
   through as an engine-neutral `ReasoningControl` plus untouched template
-  options, and asserted at every layer — parsed in `hermes-api`, sent by the
+  options, and asserted at every layer — parsed in `lightweight-api`, sent by the
   llama.cpp adapter, seen by the backend in the gateway suite, and sent by the
   genuine `openai` SDK in the contract suite.
 - Against a real thinking model, `reasoning_effort: "none"` produces content and
@@ -192,7 +192,7 @@ M4, the half of tool calling that was missing:
   400 naming the parameter. So is a tool declaration with no function name, and
   a `tool_choice` naming a function `tools` does not declare — the shape a
   half-finished rename takes.
-- **Section 27 now has statuses, not just bodies.** `hermes-api` already proved
+- **Section 27 now has statuses, not just bodies.** `lightweight-api` already proved
   every variant renders a well-formed body; the gateway now pins the status a
   client branches on *before* it reads the body, for all 20 variants, with a
   second test that fails if a new variant is added and not listed.
@@ -734,8 +734,8 @@ M6b.2, against a real gateway on this machine:
 
 - **The two M0 directories are finally written to.** `conversations_dir()` and
   `settings_file()` were chosen in the first milestone and nothing had ever
-  called them. `hermes-store` is a crate of its own rather than part of
-  `hermes-catalog`: the two look alike — a directory, atomic writes, a JSON
+  called them. `lightweight-store` is a crate of its own rather than part of
+  `lightweight-catalog`: the two look alike — a directory, atomic writes, a JSON
   document — and differ in the way that matters, which is that a model can be
   downloaded again and a conversation cannot.
 - **What the user typed is owner-only.** Conversation files come out `0600` and
@@ -1007,7 +1007,7 @@ the real-engine work above by hand.
 
 **One flake observed and not papered over.**
 `a_slow_engine_is_waited_for_rather_than_abandoned`
-(`hermes-backend-llamacpp/tests/supervision.rs`) failed once under a full
+(`lightweight-backend-llamacpp/tests/supervision.rs`) failed once under a full
 `cargo test --workspace` and passed on every isolated and repeated run. It
 asserts a wall-clock uptime of at least 400 ms against a fake engine, which is
 timing-sensitive on four contended cores. The assertion is not weakened to make
@@ -1089,7 +1089,7 @@ M10a, verified by the matrix rather than by this machine:
   — `linux-x64`, `macos-arm64`, `macos-x64`, `windows-x64`, `linux artifacts`
   and `flatpak` — pass on the branch head.
 - **Two platform breaks were found by the matrix and not by review**, which is
-  why `check.sh` now cross-checks `hermes-sys` for the three non-host targets on
+  why `check.sh` now cross-checks `lightweight-sys` for the three non-host targets on
   any machine that has them installed: the crate holds every `unsafe` block in
   the workspace and has no C dependencies, so a typo in a Windows arm need not
   wait for CI.

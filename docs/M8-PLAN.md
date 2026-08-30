@@ -12,14 +12,14 @@ M7 left a gateway that is honest about memory. It was not yet honest about
 
 | # | Where | What it did |
 |---|---|---|
-| 1 | `hermes-backend-llamacpp/src/backend.rs:421` | `ResourceSnapshot.cpu_percent` was set to `None` by the only code that produced it and serialized by nothing. On a product whose premise is CPU inference, **no surface reported how much processor the engine used.** |
-| 2 | `hermes-gateway/src/metrics.rs:121-143` | `Tally` kept count, sum and max. No p95 of anything was recoverable, on a gateway where one slow request in fifty is the entire complaint. |
-| 3 | `hermes-backend-llamacpp/src/supervisor.rs:482-484` | `--metrics` was passed to the engine under a comment saying it was "for the metrics provider to scrape". **Nothing had ever scraped it.** |
-| 4 | `hermes-gateway/src/scheduler.rs:184-211` | `QueueSnapshot.wait_ms_total` and `wait_ms_max` were carried in JSON and rendered to Prometheus nowhere. |
-| 5 | `hermes-system-info/src/paths.rs:147` | `benchmarks_dir()` was chosen in M0 and created at every startup. **Nothing had ever written to it.** |
-| 6 | `hermes-memory/src/estimate.rs:96-108` | `ComputeModel`'s doc comment said "the benchmark harness fits them from observed peak RSS". There was no harness. |
-| 7 | `hermes-core/src/runtime.rs` | `n_batch` and `n_ubatch` were passed to the engine and varied by no load path. `--threads-batch`, `--poll`, `--cache-reuse`, `--load-mode` and CPU affinity appeared nowhere in `crates/`. |
-| 8 | `hermes-gateway/src/system.rs:82` | `CpuReport.thread_choices` was served and read by no screen, so the panel could not set a thread count the HTTP API already accepted. |
+| 1 | `lightweight-backend-llamacpp/src/backend.rs:421` | `ResourceSnapshot.cpu_percent` was set to `None` by the only code that produced it and serialized by nothing. On a product whose premise is CPU inference, **no surface reported how much processor the engine used.** |
+| 2 | `lightweight-gateway/src/metrics.rs:121-143` | `Tally` kept count, sum and max. No p95 of anything was recoverable, on a gateway where one slow request in fifty is the entire complaint. |
+| 3 | `lightweight-backend-llamacpp/src/supervisor.rs:482-484` | `--metrics` was passed to the engine under a comment saying it was "for the metrics provider to scrape". **Nothing had ever scraped it.** |
+| 4 | `lightweight-gateway/src/scheduler.rs:184-211` | `QueueSnapshot.wait_ms_total` and `wait_ms_max` were carried in JSON and rendered to Prometheus nowhere. |
+| 5 | `lightweight-system-info/src/paths.rs:147` | `benchmarks_dir()` was chosen in M0 and created at every startup. **Nothing had ever written to it.** |
+| 6 | `lightweight-memory/src/estimate.rs:96-108` | `ComputeModel`'s doc comment said "the benchmark harness fits them from observed peak RSS". There was no harness. |
+| 7 | `lightweight-core/src/runtime.rs` | `n_batch` and `n_ubatch` were passed to the engine and varied by no load path. `--threads-batch`, `--poll`, `--cache-reuse`, `--load-mode` and CPU affinity appeared nowhere in `crates/`. |
+| 8 | `lightweight-gateway/src/system.rs:82` | `CpuReport.thread_choices` was served and read by no screen, so the panel could not set a thread count the HTTP API already accepted. |
 
 Three of those are the product claiming something it does not do. That settles
 the shape of the milestone: **instruments, then measurements, then the knobs the
@@ -48,7 +48,7 @@ measurements justify.**
 
 ### M8.2 — the harness that measures
 
-- **`hermes-bench`**, a runner over the `InferenceBackend` trait and nothing
+- **`lightweight-bench`**, a runner over the `InferenceBackend` trait and nothing
   else, so one implementation serves a CLI sweep and a gateway quick run and is
   testable against the mock with no engine.
 - **Three scenarios**, deterministic, with prompts sized by asking the engine's

@@ -1,0 +1,16 @@
+[package]
+name = "lightweight-observability"
+description = "Structured logging, log rotation and privacy-mode wiring."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-system-info.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true

@@ -1,0 +1,48 @@
+[package]
+name = "lightweight-gateway"
+description = "The OpenAI-compatible HTTP surface: routes, auth, streaming."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The mock gateway binary, used by the contract suite. Off by default so the
+# shipped gateway carries no test scaffolding.
+mock = ["dep:lightweight-backend-mock"]
+
+[dependencies]
+lightweight-core.workspace = true
+lightweight-api.workspace = true
+lightweight-inference.workspace = true
+lightweight-catalog.workspace = true
+lightweight-store.workspace = true
+lightweight-bench.workspace = true
+lightweight-memory.workspace = true
+lightweight-system-info.workspace = true
+lightweight-gguf.workspace = true
+lightweight-observability.workspace = true
+lightweight-backend-mock = { workspace = true, optional = true }
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+lightweight-backend-mock.workspace = true
+# The GGUF writer, so the detail endpoint can be tested against a real header
+# rather than a hand-rolled byte array. A dev-dependency only: nothing shipped
+# builds the fixtures feature.
+lightweight-gguf = { workspace = true, features = ["fixtures"] }
+reqwest.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+
+[[bin]]
+name = "hermes-mock-gateway"
+required-features = ["mock"]

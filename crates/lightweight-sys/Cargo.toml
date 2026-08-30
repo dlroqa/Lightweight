@@ -1,0 +1,18 @@
+[package]
+name = "lightweight-sys"
+description = "The workspace's only platform FFI: memory, CPU topology, disk and addresses on macOS and Windows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Nothing here is needed on Linux: `lightweight-system-info` reads /proc directly and
+# `rustix` wraps statvfs safely, so this crate contributes no code and no
+# dependency to a Linux build. It exists because macOS and Windows publish these
+# numbers only through C APIs, and `lightweight-system-info` is `forbid(unsafe_code)`.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
