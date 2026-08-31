@@ -65,9 +65,10 @@ pub struct ServeOptions {
     /// Whether `--host` was typed rather than defaulted. When false, a
     /// persisted `config/api.json` may supply the hosts instead.
     pub hosts_explicit: bool,
-    /// Port to bind. `0` picks a free one.
-    pub port: u16,
-    /// Whether `--port` was typed rather than defaulted.
+    /// Port to bind, or `auto` for a kernel-assigned free one.
+    pub port: Port,
+    /// Whether `--port` was typed rather than defaulted. When false, a persisted
+    /// `config/api.json` may supply the port instead.
     pub port_explicit: bool,
     /// Key required on every request. Mandatory as soon as any bind is
     /// reachable from another machine.
@@ -145,6 +146,65 @@ impl std::fmt::Display for Concurrency {
     }
 }
 
+/// Which port to bind, as the operator asked for it.
+///
+/// A type rather than a bare number for the same reason as `Concurrency`: "pick
+/// any free one" is a value the operator can name, not a magic zero they have to
+/// know maps to a kernel-assigned port. The default stays a fixed port, so a
+/// port only moves when it is asked to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port {
+    /// Exactly this port; a taken one is an error, not a nudge elsewhere.
+    Fixed(u16),
+    /// Let the kernel assign a free port, read back and reported at startup.
+    Auto,
+}
+
+impl Port {
+    /// The port to request when binding: `Auto` asks the kernel for 0, which it
+    /// answers with a real free port that `local_addr()` then reads back.
+    pub const fn for_bind(self) -> u16 {
+        match self {
+            Self::Fixed(port) => port,
+            Self::Auto => 0,
+        }
+    }
+}
+
+impl Default for Port {
+    fn default() -> Self {
+        Self::Fixed(lightweight_gateway::DEFAULT_PORT)
+    }
+}
+
+impl std::str::FromStr for Port {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // `auto` and its literal spelling `0` are the same request: hand the
+        // choice to the kernel. Every other value is a specific port to hold.
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        match value.parse::<u16>() {
+            Ok(0) => Ok(Self::Auto),
+            Ok(port) => Ok(Self::Fixed(port)),
+            Err(_) => Err(format!(
+                "`{value}` is not a port; pass `auto`, `0`, or a number from 1 to 65535"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Port {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(port) => write!(f, "{port}"),
+            Self::Auto => f.write_str("auto"),
+        }
+    }
+}
+
 /// The environment variable holding the API key.
 ///
 /// Preferred over the flag: an argument is visible in `ps` and readable from
@@ -186,13 +246,20 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     let api_config_store = lightweight_store::ApiConfigStore::new(paths.api_config_file());
     let api_config = api_config_store.load().map_err(describe)?;
     let effective_hosts = effective_hosts(&options, &api_config);
-    let port = if options.port_explicit {
+    // A typed `--port` wins outright; otherwise the file's numeric port speaks,
+    // and only if it is silent does the built-in default apply. `Port::Auto` is
+    // a runtime request, never persisted, so the file can only ever supply a
+    // fixed port — a saved "pick a random port each start" would make the
+    // panel's own URL unstable, the opposite of the goal.
+    let port: Port = if options.port_explicit {
         options.port
     } else {
-        api_config.port.unwrap_or(options.port)
+        api_config.port.map_or(options.port, Port::Fixed)
     };
 
-    let resolved = resolve_each(&effective_hosts, port)?;
+    // `Auto` resolves to port 0 for binding; the real port is read back from the
+    // first listener below and shared across the rest.
+    let resolved = resolve_each(&effective_hosts, port.for_bind())?;
     let addresses = bind_addresses(&resolved);
     let bind_ips: Vec<IpAddr> = addresses.iter().map(SocketAddr::ip).collect();
 
@@ -212,9 +279,27 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     let auth = AuthPolicy::build(&bind_ips, static_key, named_keys)
         .map_err(|_| exposed_without_key(&bind_ips))?;
 
+    // With a fixed port every listener binds its own address unchanged. With
+    // `auto`, the first bind asks the kernel for a free port (0) and the rest
+    // are pinned to whatever it answered, so "serve LAN + mesh on one auto port"
+    // shares a single port rather than handing each host a different random one.
     let mut listeners = Vec::with_capacity(addresses.len());
+    let mut chosen_port: Option<u16> = None;
     for address in &addresses {
-        listeners.push(bind(*address).await?);
+        let target = match chosen_port {
+            Some(port) => SocketAddr::new(address.ip(), port),
+            None => *address,
+        };
+        let listener = bind(target).await?;
+        if matches!(port, Port::Auto) && chosen_port.is_none() {
+            chosen_port = Some(
+                listener
+                    .local_addr()
+                    .map_err(|err| format!("could not read the bound address: {err}"))?
+                    .port(),
+            );
+        }
+        listeners.push(listener);
     }
 
     // Asked of the sockets rather than taken from `addresses`: a request for
@@ -376,7 +461,9 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     );
     tracing::info!(
         target: lightweight_observability::targets::STARTUP,
-        port = options.port,
+        // The real bound port, read back from the socket: with `--port auto` the
+        // requested port was 0, and the kernel-assigned one is what was served.
+        port = bound.first().map_or(0, SocketAddr::port),
         listeners = listeners.len(),
         auth = state.config.auth.is_enabled(),
         "gateway listening"
@@ -1067,18 +1154,38 @@ async fn bind(address: SocketAddr) -> Result<tokio::net::TcpListener, String> {
                 " — this machine does not currently hold that address. \
                  Check the interface is up, or bind by name instead so the \
                  current address is looked up at startup."
+                    .to_owned()
             }
-            std::io::ErrorKind::AddrInUse => {
-                " — something else is already listening there. Choose another \
-                 port, or stop the other process."
-            }
+            std::io::ErrorKind::AddrInUse => addr_in_use_advice(address.port()),
             std::io::ErrorKind::PermissionDenied => {
-                " — ports below 1024 need privileges this process does not have."
+                " — ports below 1024 need privileges this process does not have.".to_owned()
             }
-            _ => "",
+            _ => String::new(),
         };
         format!("could not bind {address}: {err}{explanation}")
     })
+}
+
+/// The "something is already there" advice, tuned to the likely cause.
+///
+/// Split from `bind` so the message is unit-testable, and so the default port
+/// gets a pointed explanation: 11434 is also Ollama's port, so a stranger there
+/// is usually another local-LLM server rather than a leftover Hermes. Naming
+/// that, and pointing at `--port auto`, turns a bare "address in use" — which
+/// reads as a bug — into a conflict the operator can resolve in one step.
+fn addr_in_use_advice(port: u16) -> String {
+    if port == lightweight_gateway::DEFAULT_PORT {
+        format!(
+            " — something else is already listening on port {port}. That is also \
+             Ollama's default port, so another local-LLM server may be holding it. \
+             Pass `--port auto` for a free port, `--port <n>` for a specific one, \
+             or stop the other process."
+        )
+    } else {
+        " — something else is already listening there. Pass `--port auto` for a \
+         free port, `--port <n>` for another, or stop the other process."
+            .to_owned()
+    }
 }
 
 /// Read the API key from the environment.
@@ -1126,7 +1233,7 @@ mod tests {
     fn options(
         hosts: &[&str],
         hosts_explicit: bool,
-        port: u16,
+        port: Port,
         port_explicit: bool,
     ) -> ServeOptions {
         ServeOptions {
@@ -1154,7 +1261,7 @@ mod tests {
             hosts: vec!["mesh-name".to_owned()],
             port: Some(9999),
         };
-        let opts = options(&["127.0.0.1"], true, 11434, true);
+        let opts = options(&["127.0.0.1"], true, Port::Fixed(11434), true);
         assert_eq!(
             effective_hosts(&opts, &config),
             vec!["127.0.0.1".to_owned()]
@@ -1168,7 +1275,7 @@ mod tests {
             port: Some(9999),
         };
         // --host not typed, so the file speaks.
-        let opts = options(&["127.0.0.1"], false, 11434, false);
+        let opts = options(&["127.0.0.1"], false, Port::Fixed(11434), false);
         assert_eq!(
             effective_hosts(&opts, &config),
             vec!["mesh-name".to_owned()]
@@ -1178,7 +1285,7 @@ mod tests {
     #[test]
     fn an_empty_config_leaves_the_default_host_alone() {
         let config = lightweight_store::ApiConfig::default();
-        let opts = options(&["127.0.0.1"], false, 11434, false);
+        let opts = options(&["127.0.0.1"], false, Port::Fixed(11434), false);
         assert_eq!(
             effective_hosts(&opts, &config),
             vec!["127.0.0.1".to_owned()]
@@ -1375,5 +1482,81 @@ mod tests {
         assert!(refusal.contains("auto"), "{refusal}");
         assert!(Concurrency::from_str("two").is_err());
         assert!(Concurrency::from_str("-1").is_err());
+    }
+
+    #[test]
+    fn a_port_of_auto_or_zero_is_a_value_rather_than_a_magic_number() {
+        use std::str::FromStr as _;
+
+        // `auto` and `0` are the same request: hand the choice to the kernel.
+        assert_eq!(Port::from_str("auto"), Ok(Port::Auto));
+        assert_eq!(Port::from_str("AUTO"), Ok(Port::Auto));
+        assert_eq!(Port::from_str("0"), Ok(Port::Auto));
+        assert_eq!(Port::from_str("11434"), Ok(Port::Fixed(11434)));
+        // What each resolves to at bind time: `Auto` asks for 0.
+        assert_eq!(Port::Auto.for_bind(), 0);
+        assert_eq!(Port::Fixed(11434).for_bind(), 11434);
+        // Junk is refused, not silently treated as the default.
+        assert!(Port::from_str("http").is_err());
+        assert!(Port::from_str("-1").is_err());
+        assert!(Port::from_str("70000").is_err());
+        // Round-trips through Display, the way clap renders and re-parses the
+        // default value.
+        assert_eq!(
+            Port::from_str(&Port::default().to_string()),
+            Ok(Port::Fixed(lightweight_gateway::DEFAULT_PORT))
+        );
+    }
+
+    #[tokio::test]
+    async fn two_hosts_with_auto_share_one_kernel_assigned_port() {
+        // The "serve LAN + mesh on one auto port" case: each `--host` must land
+        // on the *same* free port, not a different random one per listener. This
+        // mirrors the loop in `run` — bind the first at 0, read it back, pin the
+        // rest — over two loopback addresses so no real interface is needed.
+        let addresses = [
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0),
+        ];
+        let mut listeners = Vec::new();
+        let mut chosen_port: Option<u16> = None;
+        for address in &addresses {
+            let target = match chosen_port {
+                Some(port) => SocketAddr::new(address.ip(), port),
+                None => *address,
+            };
+            let listener = bind(target).await.expect("bind loopback");
+            if chosen_port.is_none() {
+                chosen_port = Some(listener.local_addr().expect("addr").port());
+            }
+            listeners.push(listener);
+        }
+
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().expect("addr").port())
+            .collect();
+        assert_eq!(ports.len(), 2);
+        assert_ne!(ports[0], 0, "the kernel must have assigned a real port");
+        assert_eq!(
+            ports[0], ports[1],
+            "both hosts must share the one auto port"
+        );
+    }
+
+    #[test]
+    fn the_in_use_message_signposts_the_default_port() {
+        // On 11434 — the default, and also Ollama's — the message names the
+        // likely culprit and points at the explicit escape hatch.
+        let on_default = addr_in_use_advice(lightweight_gateway::DEFAULT_PORT);
+        assert!(on_default.contains("11434"), "{on_default}");
+        assert!(on_default.contains("Ollama"), "{on_default}");
+        assert!(on_default.contains("--port auto"), "{on_default}");
+
+        // On any other port there is no Ollama story to tell, but the escape
+        // hatch is still offered rather than a bare "in use".
+        let elsewhere = addr_in_use_advice(9999);
+        assert!(!elsewhere.contains("Ollama"), "{elsewhere}");
+        assert!(elsewhere.contains("--port auto"), "{elsewhere}");
     }
 }

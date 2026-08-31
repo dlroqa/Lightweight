@@ -493,6 +493,21 @@ Prefer the name: an overlay network can reissue an address, and a name usually
 survives it. The default port is **11434** — the common local-LLM port — so a
 client that assumes it finds the gateway without being told.
 
+Because 11434 is also Ollama's default, a machine already running Ollama holds
+it, and `hermes serve` then fails with `address in use` rather than moving the
+port on its own — a remote agent's URL must not shift underneath it. The failure
+names the likely culprit and offers the fix. When you do want any free port, ask
+for one explicitly:
+
+```sh
+hermes serve model.gguf --port auto        # or --port 0; the chosen port is printed
+```
+
+`--port auto` reports the kernel-assigned port on the startup line and in the
+panel's connection block, and when several `--host` values are served it binds
+them all to the one shared port. It is an explicit, per-run choice and is never
+persisted — `api.json` keeps a fixed port so the panel's own URL stays stable.
+
 ### Keys, and where the configuration lives
 
 Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,

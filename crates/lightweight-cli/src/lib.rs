@@ -137,9 +137,15 @@ enum Command {
         /// the one engine.
         #[arg(long, default_value = "127.0.0.1")]
         host: Vec<String>,
-        /// Port to bind. `0` picks a free one and prints it.
-        #[arg(long, default_value_t = lightweight_gateway::DEFAULT_PORT)]
-        port: u16,
+        /// Port to bind, or `auto` (equivalently `0`) for a free one.
+        ///
+        /// The default is a fixed port, and a taken one is an error with a
+        /// suggestion rather than a silent move — a remote agent's URL must not
+        /// shift under it. `auto` is the explicit opt-in: the kernel assigns a
+        /// free port, printed on the startup line and shown in the panel's
+        /// *Connect an agent* block.
+        #[arg(long, default_value = "11434")]
+        port: serve::Port,
         /// Requests to run at once, or `auto`.
         ///
         /// `auto` derives it from this machine and says where the number came

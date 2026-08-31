@@ -25,8 +25,18 @@ All notable changes to this project are documented in this file.
   `LIGHTWEIGHT_NO_BANNER` are honoured; `--json` and pipes are never decorated.
 - `hermes sysinfo` reports an address's reserved-range scope, in the human output
   and as an `addresses` array under `--json`.
+- **`hermes serve --port auto`** (equivalently `--port 0`) binds a kernel-assigned
+  free port and prints it — the explicit way past a taken 11434 without moving the
+  default. With several `--host` values it binds them all to the one shared port.
+  It is a per-run choice and is never written to `api.json`.
 
 ### Changed
+
+- **The `address in use` message on the default port is now a signpost.** Because
+  11434 is also Ollama's default, `hermes serve` names that likely cause and
+  suggests `--port auto`, a different `--port`, or stopping the other process,
+  rather than failing with a bare "in use". The desktop shell inherits the same
+  guidance and points at its own levers (`HERMES_PORT` or the *Serve on* control).
 
 - **The default port is now 11434** (was 8737), so the CLI, the desktop shell and
   the dev proxy agree and a client assuming the common local-LLM port finds the

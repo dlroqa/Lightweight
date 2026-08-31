@@ -136,17 +136,42 @@ async function createWindow(): Promise<void> {
   await window.loadURL(`http://127.0.0.1:${port}/`);
 }
 
+/**
+ * Turn a port-conflict failure into the two levers the desktop actually has.
+ *
+ * The gateway's own stderr already explains the conflict and suggests
+ * `--port auto`, but that is a CLI flag: the shell does not pass it, and a
+ * persisted "random port each start" would make the panel's own URL unstable.
+ * So on a taken port the desktop points at the two explicit, stable levers it
+ * *does* have — the `HERMES_PORT` environment variable, and the panel's
+ * **Serve on** control, which writes the port into `config/api.json`. Detection
+ * is on the gateway's own wording so no separate error taxonomy is needed.
+ */
+function portConflictGuidance(reason: string): string {
+  const looksLikePortConflict =
+    /already listening/i.test(reason) || /address (already )?in use/i.test(reason);
+  if (!looksLikePortConflict) return "";
+  return (
+    `\n\nThe port is already taken — often by another local-LLM server, since ` +
+    `${DEFAULT_PORT} is also Ollama's default. To move Lightweight off it, set ` +
+    `HERMES_PORT to a free port before launching, or change the port in the ` +
+    `panel's “Serve on” control (it is saved and reused). Or stop whatever is ` +
+    `holding the port.`
+  );
+}
+
 function showStartupFailure(reason: string): void {
+  const detail = `${reason}${portConflictGuidance(reason)}`;
   // To stderr as well as to a dialog. A dialog needs a working display and a
   // running message loop; when the shell dies before either exists — or under a
   // virtual display, or in CI — the dialog is never seen and the process exits
   // silently, which is the least serviceable failure a supervisor can have.
-  console.error(`hermes-desktop: the gateway did not start.\n${reason}`);
+  console.error(`hermes-desktop: the gateway did not start.\n${detail}`);
   void dialog.showMessageBox({
     type: "error",
     title: "Lightweight could not start",
     message: "The gateway did not start.",
-    detail: reason,
+    detail,
     buttons: ["Quit"],
   });
 }
