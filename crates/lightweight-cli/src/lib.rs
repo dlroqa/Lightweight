@@ -17,6 +17,7 @@ use std::io::Write as _;
 
 use clap::{Parser, Subcommand};
 
+mod banner;
 mod bench;
 mod models;
 mod serve;
@@ -26,6 +27,27 @@ use lightweight_memory::{Estimator, RuntimeParams, Verdict};
 use lightweight_system_info::{
     CpuInfo, MemoryProbe, SystemMemoryProbe, classified_addresses, reachable_addresses,
 };
+
+/// Which name the program was invoked as.
+///
+/// The binary was `hermes` and stays `hermes`, byte for byte — the 0.1.2 rename
+/// kept the command deliberately. `lightweight` is a second, additive entry
+/// point over the very same command tree, distinguished only by a welcome mark
+/// it prints and by the name that appears in its own `--help`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Personality {
+    Hermes,
+    Lightweight,
+}
+
+impl Personality {
+    const fn binary_name(self) -> &'static str {
+        match self {
+            Self::Hermes => "hermes",
+            Self::Lightweight => "lightweight",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -500,15 +522,39 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 /// pipe - `hermes sysinfo | head` would crash, because Rust ignores SIGPIPE at
 /// startup and turns it into a write error - and a rendered `String` is
 /// something tests can assert against.
-fn main() -> ExitCode {
-    // `get_matches` rather than `parse` so the raw `ArgMatches` is in hand: it
-    // is the only thing that can tell a flag the user typed from a default clap
-    // supplied, which is what lets `config/api.json` sit *under* the flags
-    // without changing a byte of `--help`. `FromArgMatches` then produces the
-    // same `Cli` `parse` would have.
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+/// Run the CLI under a given name.
+///
+/// The single entry point both binaries call. `hermes` behaves exactly as it
+/// always has; `lightweight` adds the welcome mark and its own program name in
+/// help, and nothing else.
+pub fn run_cli(personality: Personality) -> ExitCode {
+    let mut command = <Cli as clap::CommandFactory>::command().name(personality.binary_name());
+
+    // Bare `lightweight`, with no subcommand: greet and show what it can do,
+    // exiting cleanly. `hermes` keeps clap's usage error, unchanged.
+    if personality == Personality::Lightweight && std::env::args_os().count() == 1 {
+        if banner::should_show(false) {
+            banner::print(env!("CARGO_PKG_VERSION"));
+        }
+        let _ = command.print_help();
+        println!();
+        return ExitCode::SUCCESS;
+    }
+
+    // `get_matches_mut` rather than `parse` so the raw `ArgMatches` is in hand:
+    // it is the only thing that can tell a flag the user typed from a default
+    // clap supplied, which is what lets `config/api.json` sit *under* the flags
+    // without changing a byte of `--help`. `--help` and `--version` exit inside
+    // here, before any banner, so neither is ever decorated.
+    let matches = command.get_matches_mut();
     let cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    // The welcome mark, once the run is known not to be machine-readable.
+    if personality == Personality::Lightweight && banner::should_show(cli.json) {
+        banner::print(env!("CARGO_PKG_VERSION"));
+    }
+
     let mut out = String::new();
 
     let outcome = run(&cli, &matches, &mut out);
