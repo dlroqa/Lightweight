@@ -18,6 +18,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod api_config;
+pub mod api_keys;
 /// Atomic, owner-only writes.
 ///
 /// Public because a third copy of it was the alternative. `lightweight-catalog` has
@@ -30,6 +32,8 @@ pub mod conversations;
 pub mod error;
 pub mod settings;
 
+pub use api_config::{ApiConfig, ApiConfigStore};
+pub use api_keys::{ApiKeyRecord, ApiKeyStore, RateLimit, generate_secret, verify_against};
 pub use conversations::{Conversation, ConversationStore, ConversationSummary, StoredMessage};
 pub use error::StoreError;
 pub use settings::{GatewaySettings, Settings, SettingsStore};

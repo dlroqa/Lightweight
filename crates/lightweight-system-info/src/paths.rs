@@ -180,6 +180,16 @@ impl DataPaths {
         self.config.join("api.json")
     }
 
+    /// The API keys file: hashed keys and their per-key limits.
+    ///
+    /// Separate from [`Self::api_config_file`] for the same reason the config is
+    /// separate from settings: even hashed, this is the credential store, and a
+    /// file that holds credentials should not be the file a user is told to
+    /// paste when reporting a bind problem.
+    pub fn api_keys_file(&self) -> PathBuf {
+        self.config.join("api-keys.json")
+    }
+
     /// The model catalog: what is installed, its metadata and its digests.
     pub fn catalog_file(&self) -> PathBuf {
         self.data.join("catalog.json")

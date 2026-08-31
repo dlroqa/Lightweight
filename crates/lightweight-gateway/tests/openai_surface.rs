@@ -431,9 +431,7 @@ async fn a_configured_key_is_enforced() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "shared-secret".into(),
-            },
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
             ..GatewayConfig::default()
         },
     )
@@ -786,9 +784,7 @@ async fn an_unauthenticated_caller_is_told_the_context_but_not_the_path() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "shared-secret".into(),
-            },
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
             ..GatewayConfig::default()
         },
     )
@@ -827,9 +823,7 @@ async fn the_engines_own_properties_reach_an_authorized_caller_and_no_one_else()
             ..MockConfig::default()
         },
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "shared-secret".into(),
-            },
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
             ..GatewayConfig::default()
         },
     )
@@ -867,9 +861,7 @@ async fn an_authenticated_caller_sees_everything() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "shared-secret".into(),
-            },
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
             ..GatewayConfig::default()
         },
     )
@@ -907,9 +899,7 @@ async fn the_api_key_cannot_be_printed_by_accident() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "a-key-that-must-not-be-logged".into(),
-            },
+            auth: AuthPolicy::with_static_key("a-key-that-must-not-be-logged".into()),
             ..GatewayConfig::default()
         },
     )
@@ -1829,9 +1819,7 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "secret-key".into(),
-            },
+            auth: AuthPolicy::with_static_key("secret-key".into()),
             ..GatewayConfig::default()
         },
     )
@@ -1988,9 +1976,7 @@ async fn describing_the_machine_and_the_service_needs_the_key() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "secret-key".into(),
-            },
+            auth: AuthPolicy::with_static_key("secret-key".into()),
             ..GatewayConfig::default()
         },
     )
@@ -2019,9 +2005,7 @@ async fn the_gateway_description_never_carries_the_key() {
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
-            auth: AuthPolicy::Required {
-                key: "secret-key".into(),
-            },
+            auth: AuthPolicy::with_static_key("secret-key".into()),
             ..GatewayConfig::default()
         },
     )

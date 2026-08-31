@@ -23,7 +23,9 @@ mod serve;
 use lightweight_core::{Actionable, GgmlType, units::Bytes};
 use lightweight_gguf::{GgufFile, ModelMetadata};
 use lightweight_memory::{Estimator, RuntimeParams, Verdict};
-use lightweight_system_info::{CpuInfo, MemoryProbe, SystemMemoryProbe, reachable_addresses};
+use lightweight_system_info::{
+    CpuInfo, MemoryProbe, SystemMemoryProbe, classified_addresses, reachable_addresses,
+};
 
 #[derive(Parser)]
 #[command(
@@ -227,6 +229,45 @@ enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// Manage the API keys remote agents authenticate with.
+    ///
+    /// Keys are stored hashed: one is shown once, when it is created, and never
+    /// again. A key that is lost is replaced, not recovered.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+    /// Show the persisted gateway configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Mint a new key and print it once.
+    Create {
+        /// A label for the key, e.g. the agent it is for.
+        #[arg(long)]
+        name: Option<String>,
+        /// Cap requests per minute for this key.
+        #[arg(long)]
+        per_minute: Option<u32>,
+        /// Cap requests per day for this key.
+        #[arg(long)]
+        per_day: Option<u32>,
+    },
+    /// List the keys, by prefix. Secrets are never shown.
+    List,
+    /// Revoke a key by its id (from `key list`).
+    Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the persisted bind configuration.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -274,6 +315,17 @@ enum ModelsAction {
 /// The read-only actions need no async runtime; import and add do, because they
 /// hash and download. Built here rather than around every command, the same way
 /// `serve` does it.
+macro_rules! line {
+    ($out:expr) => {{
+        // Writing to a `String` is infallible; the result exists only to
+        // satisfy the `fmt::Write` signature.
+        let _ = writeln!($out);
+    }};
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
 fn models_command(cli: &Cli, out: &mut String, action: &ModelsAction) -> Result<ExitCode, String> {
     let paths = lightweight_system_info::DataPaths::discover().map_err(serve::describe)?;
     let mut store = models::open(&paths)?;
@@ -307,6 +359,132 @@ fn models_command(cli: &Cli, out: &mut String, action: &ModelsAction) -> Result<
     Ok(ExitCode::SUCCESS)
 }
 
+fn key_command(cli: &Cli, out: &mut String, action: &KeyAction) -> Result<ExitCode, String> {
+    let paths = lightweight_system_info::DataPaths::discover().map_err(serve::describe)?;
+    let store = lightweight_store::ApiKeyStore::new(paths.api_keys_file());
+
+    match action {
+        KeyAction::Create {
+            name,
+            per_minute,
+            per_day,
+        } => {
+            let limit = lightweight_store::RateLimit {
+                per_minute: *per_minute,
+                per_day: *per_day,
+            };
+            let (record, full) = store
+                .create(name.as_deref().unwrap_or(""), limit)
+                .map_err(serve::describe)?;
+            if cli.json {
+                render_json(
+                    out,
+                    &serde_json::json!({
+                        "id": record.id,
+                        "name": record.name,
+                        "prefix": record.prefix,
+                        "created_at": record.created_at,
+                        "key": full,
+                    }),
+                );
+            } else {
+                line!(out, "{full}");
+                line!(out);
+                line!(
+                    out,
+                    "This is the only time the key is shown. Copy it now — it"
+                );
+                line!(
+                    out,
+                    "is stored hashed and cannot be recovered, only replaced."
+                );
+                line!(out);
+                line!(out, "  id     {}", record.id);
+                if !record.name.is_empty() {
+                    line!(out, "  name   {}", record.name);
+                }
+                line!(
+                    out,
+                    "Set HERMES_API_KEY on the agent, or pass it as the OpenAI api_key."
+                );
+            }
+        }
+        KeyAction::List => {
+            let keys = store.list().map_err(serve::describe)?;
+            if cli.json {
+                render_json(out, &keys);
+            } else if keys.is_empty() {
+                line!(
+                    out,
+                    "No API keys. Create one with `hermes key create --name <label>`."
+                );
+            } else {
+                for record in &keys {
+                    let limit = describe_limit(record.limit);
+                    let label = if record.name.is_empty() {
+                        "(unnamed)"
+                    } else {
+                        &record.name
+                    };
+                    line!(out, "{}  {}  {label}  {limit}", record.id, record.prefix);
+                }
+            }
+        }
+        KeyAction::Revoke { id } => {
+            let removed = store.revoke(id).map_err(serve::describe)?;
+            if cli.json {
+                render_json(out, &serde_json::json!({ "revoked": removed, "id": id }));
+            } else if removed {
+                line!(
+                    out,
+                    "Revoked {id}. A gateway already running keeps it until restarted."
+                );
+            } else {
+                line!(out, "No key with id {id}.");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn describe_limit(limit: lightweight_store::RateLimit) -> String {
+    match (limit.per_minute, limit.per_day) {
+        (None, None) => "unlimited".to_owned(),
+        (Some(m), None) => format!("{m}/min"),
+        (None, Some(d)) => format!("{d}/day"),
+        (Some(m), Some(d)) => format!("{m}/min, {d}/day"),
+    }
+}
+
+fn config_command(cli: &Cli, out: &mut String, action: &ConfigAction) -> Result<ExitCode, String> {
+    let paths = lightweight_system_info::DataPaths::discover().map_err(serve::describe)?;
+    let store = lightweight_store::ApiConfigStore::new(paths.api_config_file());
+    let config = store.load().map_err(serve::describe)?;
+
+    match action {
+        ConfigAction::Show => {
+            if cli.json {
+                render_json(out, &config);
+            } else {
+                line!(out, "config file  {}", store.path().display());
+                if config.hosts.is_empty() {
+                    line!(
+                        out,
+                        "hosts        (none set — binds loopback unless --host is given)"
+                    );
+                } else {
+                    line!(out, "hosts        {}", config.hosts.join(", "));
+                }
+                match config.port {
+                    Some(port) => line!(out, "port         {port}"),
+                    None => line!(out, "port         (none set — default applies)"),
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// A multi-threaded runtime for the commands that do I/O.
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
@@ -322,22 +500,18 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 /// pipe - `hermes sysinfo | head` would crash, because Rust ignores SIGPIPE at
 /// startup and turns it into a write error - and a rendered `String` is
 /// something tests can assert against.
-macro_rules! line {
-    ($out:expr) => {{
-        // Writing to a `String` is infallible; the result exists only to
-        // satisfy the `fmt::Write` signature.
-        let _ = writeln!($out);
-    }};
-    ($out:expr, $($arg:tt)*) => {{
-        let _ = writeln!($out, $($arg)*);
-    }};
-}
-
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // `get_matches` rather than `parse` so the raw `ArgMatches` is in hand: it
+    // is the only thing that can tell a flag the user typed from a default clap
+    // supplied, which is what lets `config/api.json` sit *under* the flags
+    // without changing a byte of `--help`. `FromArgMatches` then produces the
+    // same `Cli` `parse` would have.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let mut out = String::new();
 
-    let outcome = run(&cli, &mut out);
+    let outcome = run(&cli, &matches, &mut out);
 
     // A closed pipe is not an error: it is what `| head` does. Exit as the
     // default SIGPIPE disposition would, rather than panicking or reporting a
@@ -358,7 +532,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
+fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCode, String> {
     match &cli.command {
         Command::Serve {
             model,
@@ -381,6 +555,14 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 .enable_all()
                 .build()
                 .map_err(|err| format!("could not start the async runtime: {err}"))?;
+            // Whether the user actually typed these, as opposed to clap
+            // filling in the documented default. A default means the persisted
+            // config, if any, may speak; a typed flag always wins.
+            let serve_matches = matches.subcommand_matches("serve");
+            let from_cli = |name: &str| {
+                serve_matches.and_then(|m| m.value_source(name))
+                    == Some(clap::parser::ValueSource::CommandLine)
+            };
             runtime.block_on(serve::run(serve::ServeOptions {
                 model: model.clone(),
                 n_ctx: *ctx,
@@ -391,7 +573,9 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
                 load_mode: load_mode.clone(),
                 force: *force,
                 hosts: host.clone(),
+                hosts_explicit: from_cli("host"),
                 port: *port,
+                port_explicit: from_cli("port"),
                 api_key: api_key.clone(),
                 concurrency: *concurrency,
                 web_root: web_root.clone(),
@@ -432,6 +616,8 @@ fn run(cli: &Cli, out: &mut String) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Models { action } => models_command(cli, out, action),
+        Command::Key { action } => key_command(cli, out, action),
+        Command::Config { action } => config_command(cli, out, action),
         Command::Inspect { model, header_only } => {
             let metadata = load_metadata(model, *header_only)?;
             if cli.json {
@@ -553,6 +739,7 @@ fn sysinfo(out: &mut String, json: bool) {
     let cpu = CpuInfo::detect();
     let memory = SystemMemoryProbe.snapshot();
     let addresses = reachable_addresses();
+    let classified = classified_addresses();
 
     if json {
         let value = serde_json::json!({
@@ -568,6 +755,14 @@ fn sysinfo(out: &mut String, json: bool) {
                 found.iter().map(ToString::to_string).collect::<Vec<_>>()
             }),
             "reachable_addresses_error": addresses.as_ref().err().map(ToString::to_string),
+            // Same addresses, each tagged with the reserved range it falls in,
+            // so a script can prefer an overlay address without guessing.
+            "addresses": classified.as_ref().ok().map(|found| {
+                found.iter().map(|entry| serde_json::json!({
+                    "address": entry.address.to_string(),
+                    "scope": entry.scope,
+                })).collect::<Vec<_>>()
+            }),
         });
         render_json(out, &value);
         return;
@@ -631,13 +826,15 @@ fn sysinfo(out: &mut String, json: bool) {
     // it wrong is silent: a name that resolves to loopback binds successfully
     // and serves nobody.
     line!(out, "\nNetwork");
-    match &addresses {
+    match &classified {
         Ok(found) if !found.is_empty() => {
-            for (index, address) in found.iter().enumerate() {
+            for (index, entry) in found.iter().enumerate() {
                 line!(
                     out,
-                    "  {:<17}{address}",
-                    if index == 0 { "Reachable at" } else { "" }
+                    "  {:<17}{:<39}  {}",
+                    if index == 0 { "Reachable at" } else { "" },
+                    entry.address.to_string(),
+                    entry.scope.label()
                 );
             }
             line!(

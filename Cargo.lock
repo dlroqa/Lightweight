@@ -1084,6 +1084,7 @@ dependencies = [
  "lightweight-inference",
  "lightweight-memory",
  "lightweight-observability",
+ "lightweight-store",
  "lightweight-system-info",
  "serde",
  "serde_json",
@@ -1202,6 +1203,7 @@ dependencies = [
  "lightweight-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
 ]

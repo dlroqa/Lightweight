@@ -23,6 +23,8 @@ pub use memory::{
     FailingMemoryProbe, FixedMemoryProbe, MemoryError, MemoryProbe, MemorySnapshot,
     SystemMemoryProbe,
 };
-pub use network::{NetworkError, reachable_addresses};
+pub use network::{
+    AddressScope, ClassifiedAddress, NetworkError, classified_addresses, reachable_addresses,
+};
 pub use paths::{DataPaths, PathsError};
 pub use process::{ProcessError, ProcessUsage};

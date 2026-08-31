@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     let auth = match api_key {
-        Some(key) => AuthPolicy::Required { key },
+        Some(key) => AuthPolicy::with_static_key(key),
         None => AuthPolicy::Disabled,
     };
     let state = Arc::new(GatewayState::new(

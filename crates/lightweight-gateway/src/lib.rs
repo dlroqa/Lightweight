@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod completions;
 pub mod control;
 pub mod jobs;
+pub mod limits;
 pub mod logs;
 pub mod manager;
 pub mod metrics;
@@ -118,6 +119,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         // Wrapped around every route rather than written into each handler:
         // there are a dozen of them, and a gauge that a new endpoint can forget
         // to join is a gauge that quietly stops being true.
+        .layer(axum::middleware::from_fn(guard_control_writes))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             count_in_flight,
@@ -160,6 +162,39 @@ async fn count_in_flight(
         |(mut stream, guard)| async move { Some((stream.next().await?, (stream, guard))) },
     );
     axum::response::Response::from_parts(parts, axum::body::Body::from_stream(counted))
+}
+
+/// Refuse a state-changing request to the control surface that a foreign page
+/// forged. See [`routes::forbid_cross_origin`] for why this is separate from
+/// authentication and why it cannot be.
+///
+/// Scoped to `/api/v1` and to the methods that change state: a `GET` is safe to
+/// serve to anyone the auth layer admits, and the OpenAI surface under `/v1` is
+/// the API's front door, guarded by its key rather than by the browser's
+/// same-origin rule. Written as a layer, not a line in each handler, for the
+/// same reason `count_in_flight` is: a guard a new endpoint can forget to join
+/// is a guard that quietly stops being true.
+async fn guard_control_writes(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+
+    let method = request.method();
+    let is_write = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let is_control = request.uri().path().starts_with("/api/v1/");
+
+    if is_write
+        && is_control
+        && let Some(refusal) = routes::forbid_cross_origin(request.headers())
+    {
+        return refusal;
+    }
+
+    next.run(request).await
 }
 
 /// Whether a path is the gateway describing itself rather than doing work.

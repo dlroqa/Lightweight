@@ -14,6 +14,7 @@
 //! exactly that: LAN exposure is opt-in and authenticated, and it is not
 //! something a user can end up with by accident.
 
+use lightweight_store::ApiKeyRecord;
 use std::net::IpAddr;
 
 /// How requests are authenticated.
@@ -27,20 +28,41 @@ use std::net::IpAddr;
 pub enum AuthPolicy {
     /// Any bearer value is accepted, and so is none at all. Never 401.
     Disabled,
-    /// A key is required and compared in constant time.
-    Required { key: String },
+    /// A key is required. A request is admitted if it presents the static key
+    /// (from `--api-key` or the environment), if there is one, or any of the
+    /// named keys from the store. All comparisons are constant time.
+    Required {
+        /// The single static key, if one was configured out of band.
+        static_key: Option<String>,
+        /// The named keys from the store, each carrying its own limit. Only the
+        /// hash of each travels here; the plaintext never does.
+        named: Vec<ApiKeyRecord>,
+    },
 }
 
 impl std::fmt::Debug for AuthPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Disabled => f.write_str("Disabled"),
-            // Not even the length: that is a hint about the key, and nothing
-            // above this line has any use for it.
-            Self::Required { .. } => f.write_str("Required { key: <redacted> }"),
+            // Neither the static key nor even its length: both are hints about
+            // the secret, and nothing above this line has any use for them. The
+            // named records hold only hashes, but their count is said so a log
+            // is not silent about whether keys exist at all.
+            Self::Required { named, .. } => f
+                .debug_struct("Required")
+                .field("static_key", &"<redacted>")
+                .field("named_keys", &named.len())
+                .finish(),
         }
     }
 }
+
+/// Who a request turned out to be, once its credentials checked out.
+///
+/// `None` for the anonymous cases — auth disabled on loopback, or the static
+/// key — which carry no per-key identity. `Some` names the store key that
+/// matched, so the caller can attribute the request and apply that key's limit.
+pub type Caller = Option<ApiKeyRecord>;
 
 /// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,20 +106,55 @@ impl AuthPolicy {
         addresses: &[IpAddr],
         configured_key: Option<String>,
     ) -> Result<Self, NeedsKey> {
+        Self::build(addresses, configured_key, Vec::new())
+    }
+
+    /// Choose a policy from the bind set, a static key and the stored keys.
+    ///
+    /// A credential is present when the static key is set and non-empty, or when
+    /// at least one named key is stored. An exposed bind with no credential of
+    /// either kind is the refusal case, unchanged from when there was only ever
+    /// one key.
+    pub fn build(
+        addresses: &[IpAddr],
+        static_key: Option<String>,
+        named: Vec<ApiKeyRecord>,
+    ) -> Result<Self, NeedsKey> {
         let exposed = addresses.iter().any(|address| !address.is_loopback());
-        match configured_key {
-            Some(key) if !key.is_empty() => Ok(Self::Required { key }),
-            _ if exposed => Err(NeedsKey),
-            _ => Ok(Self::Disabled),
+        let static_key = static_key.filter(|key| !key.is_empty());
+        let has_credential = static_key.is_some() || !named.is_empty();
+        match (has_credential, exposed) {
+            (true, _) => Ok(Self::Required { static_key, named }),
+            (false, true) => Err(NeedsKey),
+            (false, false) => Ok(Self::Disabled),
+        }
+    }
+
+    /// A policy requiring exactly one static key and no named keys. The shape a
+    /// bare `--api-key` produces, and what the tests build.
+    pub fn with_static_key(key: String) -> Self {
+        Self::Required {
+            static_key: Some(key),
+            named: Vec::new(),
         }
     }
 
     /// Check one request's `Authorization` header value.
     pub fn check(&self, header: Option<&str>) -> Result<(), AuthFailure> {
-        let Self::Required { key } = self else {
+        self.identify(header).map(|_| ())
+    }
+
+    /// Check the header and report which key admitted the request.
+    ///
+    /// The static key is tried first — it is the one a loopback deployment most
+    /// often uses — and only then the named keys. A named match returns that
+    /// key's record so the caller can attribute the request and meter it; every
+    /// other admitted case is anonymous.
+    pub fn identify(&self, header: Option<&str>) -> Result<Caller, AuthFailure> {
+        let Self::Required { static_key, named } = self else {
             // Disabled accepts everything, including a missing header. This is
             // the branch `Bearer no-key-required` lands in.
-            return Ok(());
+            return Ok(None);
         };
 
         let presented = header
@@ -111,11 +168,15 @@ impl AuthPolicy {
             })
             .ok_or(AuthFailure::Missing)?;
 
-        if constant_time_eq(presented.as_bytes(), key.as_bytes()) {
-            Ok(())
-        } else {
-            Err(AuthFailure::Invalid)
+        if let Some(key) = static_key
+            && constant_time_eq(presented.as_bytes(), key.as_bytes())
+        {
+            return Ok(None);
         }
+
+        lightweight_store::verify_against(named, presented)
+            .map(Some)
+            .ok_or(AuthFailure::Invalid)
     }
 
     pub const fn is_enabled(&self) -> bool {
@@ -149,11 +210,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// 24 bytes from the operating system's entropy source, hex encoded. Used when
 /// a user turns on network access and has not chosen a key themselves.
-pub fn generate_key() -> Result<String, std::io::Error> {
-    let mut bytes = [0_u8; 24];
-    getrandom::fill(&mut bytes).map_err(|err| std::io::Error::other(err.to_string()))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
+///
+/// The generator itself now lives in `lightweight-store` beside the key store
+/// that is its main caller; this re-export keeps the one existing caller here
+/// — [`exposed_without_key`](crate) — unchanged.
+pub use lightweight_store::generate_secret as generate_key;
 
 #[cfg(test)]
 mod tests {
@@ -190,9 +251,7 @@ mod tests {
 
     #[test]
     fn a_required_key_must_match_exactly() {
-        let policy = AuthPolicy::Required {
-            key: "secret".into(),
-        };
+        let policy = AuthPolicy::with_static_key("secret".into());
         assert!(policy.check(Some("Bearer secret")).is_ok());
         assert_eq!(
             policy.check(Some("Bearer wrong")),
@@ -207,10 +266,52 @@ mod tests {
     }
 
     #[test]
-    fn the_bearer_scheme_is_matched_case_insensitively() {
+    fn a_named_key_admits_and_identifies_its_caller() {
+        // A store-minted key must verify through the policy and hand back its
+        // own record, which is what lets the request be attributed and metered.
+        let dir = std::env::temp_dir().join(format!(
+            "hermes-auth-named-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let store = lightweight_store::ApiKeyStore::new(dir.join("api-keys.json"));
+        let (record, full) = store
+            .create("harness", lightweight_store::RateLimit::default())
+            .expect("create");
+
+        let policy = AuthPolicy::build(
+            std::slice::from_ref(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None,
+            store.list().expect("list"),
+        )
+        .expect("build");
+
+        let header = format!("Bearer {full}");
+        let caller = policy.identify(Some(&header)).expect("identify");
+        assert_eq!(caller.map(|r| r.id), Some(record.id));
+        assert_eq!(
+            policy.identify(Some("Bearer sk-lw-wrong")),
+            Err(AuthFailure::Invalid)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_static_key_and_named_keys_coexist() {
+        // A deployment can keep its old --api-key while adding named ones; both
+        // admit, and the static one stays anonymous.
         let policy = AuthPolicy::Required {
-            key: "secret".into(),
+            static_key: Some("legacy".into()),
+            named: Vec::new(),
         };
+        assert_eq!(policy.identify(Some("Bearer legacy")).expect("ok"), None);
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_matched_case_insensitively() {
+        let policy = AuthPolicy::with_static_key("secret".into());
         assert!(policy.check(Some("bearer secret")).is_ok());
         assert!(policy.check(Some("BEARER secret")).is_ok());
     }
@@ -284,9 +385,7 @@ mod tests {
     fn the_key_never_appears_in_debug_output() {
         // `GatewayState`'s Debug prints its config, which holds this policy, so
         // a derived Debug here would write the key into any `?state` log line.
-        let policy = AuthPolicy::Required {
-            key: "super-secret-key-value".into(),
-        };
+        let policy = AuthPolicy::with_static_key("super-secret-key-value".into());
         let rendered = format!("{policy:?}");
         assert!(!rendered.contains("super-secret-key-value"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");

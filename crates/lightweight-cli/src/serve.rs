@@ -62,8 +62,13 @@ pub struct ServeOptions {
     /// serving on two of them should not require opening the wildcard. Empty
     /// means loopback.
     pub hosts: Vec<String>,
+    /// Whether `--host` was typed rather than defaulted. When false, a
+    /// persisted `config/api.json` may supply the hosts instead.
+    pub hosts_explicit: bool,
     /// Port to bind. `0` picks a free one.
     pub port: u16,
+    /// Whether `--port` was typed rather than defaulted.
+    pub port_explicit: bool,
     /// Key required on every request. Mandatory as soon as any bind is
     /// reachable from another machine.
     pub api_key: Option<String>,
@@ -173,11 +178,39 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     // an address this machine no longer holds costs a multi-gigabyte load and
     // several seconds before failing - which is exactly what happened the first
     // time this was run against a real model.
-    let resolved = resolve_each(&options.hosts, options.port)?;
+    // The persisted config sits beneath the flags: a typed `--host`/`--port`
+    // wins, and only when one was defaulted does the file get to speak. A file
+    // that will not parse is a hard error here rather than a silent fall back to
+    // loopback, which would un-expose a gateway the user had configured to be
+    // reachable without saying a word about it.
+    let api_config_store = lightweight_store::ApiConfigStore::new(paths.api_config_file());
+    let api_config = api_config_store.load().map_err(describe)?;
+    let effective_hosts = effective_hosts(&options, &api_config);
+    let port = if options.port_explicit {
+        options.port
+    } else {
+        api_config.port.unwrap_or(options.port)
+    };
+
+    let resolved = resolve_each(&effective_hosts, port)?;
     let addresses = bind_addresses(&resolved);
-    let key = options.api_key.clone().or_else(read_key_from_environment);
     let bind_ips: Vec<IpAddr> = addresses.iter().map(SocketAddr::ip).collect();
-    let auth = AuthPolicy::for_binds(&bind_ips, key).map_err(|_| exposed_without_key(&bind_ips))?;
+
+    // Key precedence: an explicit `--api-key`, then `HERMES_API_KEY`, then the
+    // named keys in the store. The store is only consulted when a bind is
+    // exposed — a loopback gateway that had once been given remote keys must not
+    // start silently demanding one from the local clients that never needed it.
+    let static_key = options.api_key.clone().or_else(read_key_from_environment);
+    let exposed = bind_ips.iter().any(|ip| !ip.is_loopback());
+    let named_keys = if exposed {
+        lightweight_store::ApiKeyStore::new(paths.api_keys_file())
+            .list()
+            .map_err(describe)?
+    } else {
+        Vec::new()
+    };
+    let auth = AuthPolicy::build(&bind_ips, static_key, named_keys)
+        .map_err(|_| exposed_without_key(&bind_ips))?;
 
     let mut listeners = Vec::with_capacity(addresses.len());
     for address in &addresses {
@@ -787,6 +820,21 @@ pub(crate) fn describe<E: Actionable>(err: E) -> String {
     out
 }
 
+/// The hosts to bind, after the persisted config has had its say.
+///
+/// A typed `--host` wins outright. Otherwise a non-empty `hosts` list in
+/// `config/api.json` is used, and only if that is empty too does the built-in
+/// loopback default (an empty list, which `resolve_each` maps to loopback)
+/// apply. Kept apart from the port so the two can be defaulted independently:
+/// a user may pin a port in the file and still pass `--host` on the day.
+fn effective_hosts(options: &ServeOptions, config: &lightweight_store::ApiConfig) -> Vec<String> {
+    if options.hosts_explicit || config.hosts.is_empty() {
+        options.hosts.clone()
+    } else {
+        config.hosts.clone()
+    }
+}
+
 /// Turn `--host` values into addresses to bind.
 ///
 /// Each value may be a literal address in either family, or a name. Accepting
@@ -1074,6 +1122,68 @@ fn exposed_without_key(addresses: &[IpAddr]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options(
+        hosts: &[&str],
+        hosts_explicit: bool,
+        port: u16,
+        port_explicit: bool,
+    ) -> ServeOptions {
+        ServeOptions {
+            model: None,
+            n_ctx: None,
+            threads: None,
+            kv_type: "f16".to_owned(),
+            ubatch: None,
+            threads_batch: None,
+            load_mode: None,
+            force: false,
+            hosts: hosts.iter().map(|h| (*h).to_owned()).collect(),
+            hosts_explicit,
+            port,
+            port_explicit,
+            api_key: None,
+            concurrency: Concurrency::Auto,
+            web_root: None,
+        }
+    }
+
+    #[test]
+    fn a_typed_host_flag_beats_the_config_file() {
+        let config = lightweight_store::ApiConfig {
+            hosts: vec!["mesh-name".to_owned()],
+            port: Some(9999),
+        };
+        let opts = options(&["127.0.0.1"], true, 11434, true);
+        assert_eq!(
+            effective_hosts(&opts, &config),
+            vec!["127.0.0.1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_config_file_fills_in_a_defaulted_host() {
+        let config = lightweight_store::ApiConfig {
+            hosts: vec!["mesh-name".to_owned()],
+            port: Some(9999),
+        };
+        // --host not typed, so the file speaks.
+        let opts = options(&["127.0.0.1"], false, 11434, false);
+        assert_eq!(
+            effective_hosts(&opts, &config),
+            vec!["mesh-name".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_config_leaves_the_default_host_alone() {
+        let config = lightweight_store::ApiConfig::default();
+        let opts = options(&["127.0.0.1"], false, 11434, false);
+        assert_eq!(
+            effective_hosts(&opts, &config),
+            vec!["127.0.0.1".to_owned()]
+        );
+    }
 
     #[test]
     fn no_host_means_loopback() {
