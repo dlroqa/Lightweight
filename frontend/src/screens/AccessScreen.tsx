@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Check,
@@ -327,6 +327,14 @@ function KeysCard({
 
 function RevealOnce({ created, onDismiss }: { created: CreatedKey; onDismiss: () => void }) {
   const [copied, setCopied] = useState(false);
+  // Move focus to the reveal the moment it appears: it carries a secret shown
+  // only once, and a keyboard or screen-reader user must be taken to it rather
+  // than left to discover it. `tabIndex={-1}` makes the container focusable
+  // without adding it to the tab order afterwards.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    ref.current?.focus();
+  }, []);
   async function copy() {
     try {
       await navigator.clipboard.writeText(created.key);
@@ -338,6 +346,8 @@ function RevealOnce({ created, onDismiss }: { created: CreatedKey; onDismiss: ()
   }
   return (
     <div
+      ref={ref}
+      tabIndex={-1}
       className="notice notice--warn"
       role="status"
       aria-live="polite"
@@ -473,9 +483,12 @@ function BindCard({
   const network = system.data?.network ?? null;
   const reachableAddrs: AddressReport[] = network?.addresses ?? [];
 
-  // Seed the form from the persisted config the first time it loads.
+  // Seed the form from the persisted config the first time it loads. An effect,
+  // not a memo: this is a state write in response to data arriving, not a
+  // derived value, and doing it during render misbehaves under StrictMode's
+  // double-invoke.
   const configData = config.data;
-  useMemo(() => {
+  useEffect(() => {
     if (configData && selected === null) {
       setSelected(new Set(configData.hosts));
       setPort(configData.port != null ? String(configData.port) : "");
