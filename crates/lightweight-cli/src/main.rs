@@ -116,7 +116,7 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: Vec<String>,
         /// Port to bind. `0` picks a free one and prints it.
-        #[arg(long, default_value_t = 8737)]
+        #[arg(long, default_value_t = lightweight_gateway::DEFAULT_PORT)]
         port: u16,
         /// Requests to run at once, or `auto`.
         ///

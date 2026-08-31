@@ -64,6 +64,15 @@ pub fn service(
 /// for them. Our own UI control API lives under `/api/v1` and is deliberately
 /// never mixed in with the OpenAI routes — a client enumerating `/v1` must find
 /// only what OpenAI defines there.
+/// The port the gateway binds when nothing says otherwise.
+///
+/// 11434 rather than a bespoke number so the desktop shell, the dev proxy and
+/// the CLI all agree, and so a client that assumes the common local-LLM port
+/// finds the gateway where it expects to. The collision with that ecosystem is
+/// the reason the desktop supervisor probes `/health` before attaching to a
+/// port it did not open.
+pub const DEFAULT_PORT: u16 = 11434;
+
 pub fn app(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/health", get(routes::health))
@@ -112,6 +121,22 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/settings",
             get(store_api::settings).put(store_api::save_settings),
+        )
+        .route(
+            "/api/v1/gateway/config",
+            get(store_api::get_config).put(store_api::save_config),
+        )
+        .route(
+            "/api/v1/gateway/keys",
+            get(store_api::list_keys).post(store_api::create_key),
+        )
+        .route(
+            "/api/v1/gateway/keys/{id}",
+            axum::routing::delete(store_api::revoke_key),
+        )
+        .route(
+            "/api/v1/gateway/keys/{id}/limit",
+            axum::routing::put(store_api::set_key_limit),
         )
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.

@@ -4,6 +4,7 @@ import {
   Cpu,
   FileText,
   Gauge,
+  KeyRound,
   LayoutDashboard,
   MessageSquare,
   Moon,
@@ -29,6 +30,7 @@ const NAV = [
   { to: "/inference", label: "Inference", icon: Sliders },
   { to: "/performance", label: "Performance", icon: Gauge },
   { to: "/gateway", label: "API Gateway", icon: Network },
+  { to: "/access", label: "Access & Keys", icon: KeyRound },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
   { to: "/logs", label: "Logs", icon: FileText },
 ];

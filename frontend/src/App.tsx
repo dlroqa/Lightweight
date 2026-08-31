@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { Shell } from "./components/Shell";
 import { Chat } from "./screens/Chat";
 import { Dashboard } from "./screens/Dashboard";
+import { AccessScreen } from "./screens/AccessScreen";
 import { GatewayScreen } from "./screens/GatewayScreen";
 import { Inference } from "./screens/Inference";
 import { Logs } from "./screens/Logs";
@@ -20,6 +21,7 @@ export function App() {
         <Route path="inference" element={<Inference />} />
         <Route path="performance" element={<Performance />} />
         <Route path="gateway" element={<GatewayScreen />} />
+        <Route path="access" element={<AccessScreen />} />
         <Route path="settings" element={<SettingsScreen />} />
         <Route path="logs" element={<Logs />} />
         <Route path="*" element={<Navigate to="/" replace />} />

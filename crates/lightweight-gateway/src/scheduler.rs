@@ -78,6 +78,17 @@ impl PeerKey {
     pub fn from_socket(address: SocketAddr) -> Self {
         Self(Some(address.ip().to_canonical()))
     }
+
+    /// Whether the peer is this machine: loopback, or a transport with no peer
+    /// at all (a test's `oneshot`), which is only ever local.
+    ///
+    /// This is the one question the control surface asks — whether a
+    /// state-changing request came from the machine running the gateway — and
+    /// it is answered without exposing the address the rest of this type
+    /// deliberately keeps to itself.
+    pub fn is_local(&self) -> bool {
+        self.0.is_none_or(|ip| ip.is_loopback())
+    }
 }
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerKey {
@@ -1115,6 +1126,23 @@ impl Drop for SlotPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_is_local_only_when_loopback_or_absent() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // No socket at all (a test oneshot, a peerless transport): local.
+        assert!(PeerKey::default().is_local());
+        // A loopback socket, including a second loopback address: local.
+        assert!(PeerKey::from_socket(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9)).is_local());
+        assert!(
+            PeerKey::from_socket(SocketAddr::new(Ipv4Addr::new(127, 0, 0, 2).into(), 9)).is_local()
+        );
+        // A documentation-range address stands in for a real remote peer.
+        assert!(
+            !PeerKey::from_socket(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 10).into(), 9))
+                .is_local()
+        );
+    }
     use futures_util::FutureExt;
 
     fn scheduler(capacity: u32) -> Arc<Scheduler> {

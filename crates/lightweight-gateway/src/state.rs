@@ -277,6 +277,20 @@ impl GatewayState {
             .map(|paths| lightweight_store::SettingsStore::new(paths.settings_file()))
     }
 
+    pub fn api_config_store(&self) -> Option<lightweight_store::ApiConfigStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| lightweight_store::ApiConfigStore::new(paths.api_config_file()))
+    }
+
+    pub fn api_keys_store(&self) -> Option<lightweight_store::ApiKeyStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| lightweight_store::ApiKeyStore::new(paths.api_keys_file()))
+    }
+
     pub fn jobs(&self) -> &Arc<crate::jobs::Jobs> {
         &self.jobs
     }
