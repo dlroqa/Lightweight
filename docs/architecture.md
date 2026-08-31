@@ -501,6 +501,67 @@ single `tracing::debug!(?state)` would have written the key into a log file.
 the same structural approach `hermes_core::Private` takes for prompts: the
 guarantee holds whether or not the next person writing a log line remembers it.
 
+## Why keys are hashed, and stored apart from the configuration
+
+A key handed to another machine has to survive this one restarting — the desktop
+shell used to mint a fresh one on every launch, which meant a key shared on
+Monday was dead by Tuesday. So keys are persisted. Persisted keys, though, are a
+credential store, and a credential store is a liability: the file is one `cat`
+from disaster. So only a **hash** of each key is kept, with a short prefix for
+display. A key is shown once, when it is created, and cannot be read back —
+losing one means revoking and reissuing, never recovering. The cost is real and
+is stated at the point of creation; the gain is that the file is worthless to
+anyone who reads it.
+
+The keys live in `config/api-keys.json`, deliberately *not* in `config/api.json`
+beside the bind hosts. Both files are owner-only, so the split is not about
+permissions. It is about **write authority and pasteability**: `api.json` is
+edited by a control endpoint and is the file a user will paste into a bug report,
+while the key store is a credential the same endpoint must never be able to touch
+and no user should ever paste. Merging them would make every configuration write
+path a credential write path.
+
+## Why the bind configuration is a file under the flags, not over them
+
+`config/api.json` records the hosts and the port, and it is read *beneath* the
+command-line flags: a typed `--host` or `--port` always wins, and the file speaks
+only when clap supplied the default. The alternative — a file that overrides the
+flags — would make `hermes serve --host localhost` do something other than what
+it plainly says on a machine whose file disagreed, which is the kind of silent
+surprise the whole address-probe warning exists to prevent.
+
+Telling "the user typed this" from "clap defaulted it" is what `ArgMatches::`
+`value_source` is for, and using it rather than switching the flags to `Option`
+is deliberate: it keeps `--help` byte-identical, and `hermes serve --help` is
+quoted in the README and depended on by the desktop shell's version check.
+
+## Why classification is by RFC range, and never by product
+
+The panel helps an operator pick which address to serve on by labelling each one
+— *private network*, *shared range*, *unique-local*, *public* — so a Tailscale or
+Headscale address is recognisably the overlay's and a routable address is
+recognisably exposed. That labelling is drawn from the reserved range an address
+falls in (`100.64/10` is RFC 6598, `fd00::/8` is RFC 4193) and from nothing else:
+never an interface name, never a product's name. The reasons are the same ones
+[Why the gateway knows nothing about the network it is on](#why-the-gateway-knows-nothing-about-the-network-it-is-on)
+gives — a product name in the code is a build fitted to one machine's network —
+with one addition: the classification is **display-only**. `AuthPolicy` still
+draws its single distinction, loopback or not, and never consults a scope. A
+product name appears only in prose, in the README's timeout table, where it is
+hedged as a "typical source" of a range rather than asserted as a detection.
+
+## Why widening exposure takes local access
+
+Listing keys and reading the configuration are open to any authenticated caller,
+but creating a key, revoking one, or changing the bind set are refused unless the
+request came from a loopback peer. The reasoning is that a key exists to let a
+remote agent *use* the gateway, not to let it reshape it: if a leaked key could
+mint three more, revoking it would be pointless, and if it could add a listener,
+using the gateway would be a way to widen the gateway. The peer address the
+kernel already put on the connection answers "is this local?" without the control
+layer ever seeing or storing the address — the same restraint the scheduler's
+`PeerKey` keeps.
+
 ## The gateway is a provider; the harness is a client
 
 Worth stating because the code could be misread as being built *for* one

@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Named, hashed API keys.** A gateway can now issue a key per consumer, each
+  nameable and revocable on its own. Keys are stored as SHA-256 hashes and a
+  display prefix in `config/api-keys.json`; the plaintext is shown once, at
+  creation, and never again. Create, list and revoke them with `hermes key`, or
+  on the panel's new **Access & Keys** screen. The existing `--api-key` /
+  `HERMES_API_KEY` static key still works alongside them.
+- **Per-key rate limits.** Each key can carry a per-minute and a per-day
+  ceiling, enforced live: a key over its limit gets a `429` with a `Retry-After`.
+  Loopback and anonymous callers (the panel, a local script) are never metered.
+- **Persisted bind configuration** in `config/api.json` — the hosts and port the
+  gateway serves on, read beneath the command-line flags so a typed `--host` or
+  `--port` always wins. Edit it with `hermes config`, or the panel's *Serve on*
+  control, which lists the machine's reachable addresses tagged with the reserved
+  range each falls in (a Tailscale/CGNAT address reads *shared range*).
+- **The `lightweight` command**, a second entry point identical to `hermes` that
+  prints a feather welcome mark on an interactive terminal. `NO_COLOR` and
+  `LIGHTWEIGHT_NO_BANNER` are honoured; `--json` and pipes are never decorated.
+- `hermes sysinfo` reports an address's reserved-range scope, in the human output
+  and as an `addresses` array under `--json`.
+
+### Changed
+
+- **The default port is now 11434** (was 8737), so the CLI, the desktop shell and
+  the dev proxy agree and a client assuming the common local-LLM port finds the
+  gateway. Anyone who relied on the old default must now pass `--port 8737`.
+- The desktop shell no longer mints a fresh API key on every launch — the bug
+  that broke a key shared with a remote agent. Keys are the gateway's own, and the
+  tray's "Copy API key" is now "Manage API keys…", which opens the panel.
+- State-changing control endpoints under `/api/v1` now refuse a request from a
+  foreign origin, and creating keys or widening the bind set is refused from a
+  non-loopback peer: those take access to the machine running the gateway.
+
 ## [0.1.2] - 2026-08-30
 
 ### Added

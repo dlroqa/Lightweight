@@ -83,9 +83,10 @@ anywhere. A browser on another machine reaches it over the exposed bind for
 free.
 
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
-serving or starts one of its own, stops only what it started, keeps serving
-after its window is closed, and generates an API key only when the bind is
-reachable from another machine — passed in the environment, never in `argv`.
+serving or starts one of its own, stops only what it started, and keeps serving
+after its window is closed. Keys are the gateway's own — hashed on disk, created
+in the panel or with `hermes key create`, and shown once — so a key shared with a
+remote agent survives a restart of the shell.
 `npm run package` builds this platform's installers — a Flatpak and an AppImage
 on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
 the release binary and the built panel.
@@ -214,10 +215,10 @@ cargo run -p lightweight-cli -- estimate model.gguf --ctx 8192 --kv-type q8_0
 
 # Acquire the engine, admit the model, load it, and serve the OpenAI API.
 # With no --ctx, the largest context that fits this machine is chosen.
-cargo run -p lightweight-cli -- serve model.gguf --port 8737
+cargo run -p lightweight-cli -- serve model.gguf
 
 # Or start with nothing loaded and choose a model over the control API.
-cargo run -p lightweight-cli -- serve --port 8737
+cargo run -p lightweight-cli -- serve
 ```
 
 ### Benchmarks
@@ -472,17 +473,61 @@ Headscale, Netmaker, ZeroTier, Nebula and a hand-rolled WireGuard are all the
 same case:
 
 ```sh
-export HERMES_API_KEY=$(openssl rand -hex 24)   # required off loopback; no default, ever
-hermes serve model.gguf --host <address-or-name> --port 8737
+hermes key create --name my-agent          # printed once; stored hashed
+hermes serve model.gguf --host <address-or-name>
 
 # A machine holding several addresses can serve on each of them, with one
 # engine and one queue behind them all:
-hermes serve model.gguf --host <lan-name> --host <mesh-name> --port 8737
+hermes serve model.gguf --host <lan-name> --host <mesh-name>
+```
+
+A remote agent then authenticates with the key it was given:
+
+```sh
+export OPENAI_BASE_URL=http://<address-or-name>:11434/v1
+export OPENAI_API_KEY=sk-lw-…               # the key hermes key create printed
 ```
 
 `--host` takes an address in either family or a **name**, resolved at startup.
 Prefer the name: an overlay network can reissue an address, and a name usually
-survives it.
+survives it. The default port is **11434** — the common local-LLM port — so a
+client that assumes it finds the gateway without being told.
+
+### Keys, and where the configuration lives
+
+Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,
+or wherever `HERMES_GATEWAY_HOME` points), both owner-only:
+
+* **`api.json`** — the bind hosts and port. Written by `hermes config` or by the
+  panel's *Serve on* control, and read beneath the command-line flags: a typed
+  `--host`/`--port` always wins, and the file speaks only when one was not given.
+* **`api-keys.json`** — the API keys, stored as SHA-256 hashes and a display
+  prefix. A key is shown once, when it is created, and never again; a lost key is
+  revoked and replaced, not recovered. `--api-key` and `HERMES_API_KEY` still
+  work as a single static key alongside the named ones.
+
+```sh
+hermes key create --name ci --per-minute 60 --per-day 2000
+hermes key list                # names, prefixes and limits — never the secret
+hermes key revoke <id>
+hermes config show             # what api.json currently holds
+```
+
+Per-key limits are enforced live: a key over its ceiling gets a `429` with a
+`Retry-After`, while the machine's own loopback callers (the panel, a local
+script) are never metered.
+
+The panel's **Access & Keys** screen does all of this with a copy-paste
+connection block, and lists the machine's reachable addresses with the reserved
+range each falls in — a Tailscale/CGNAT address reads *shared range*, a
+unique-local IPv6 address *unique-local* — so choosing which to serve on is a
+click rather than a reading of `ip addr`. Creating and revoking keys, and
+widening the bind set, are refused from a remote session: those take access to
+the machine itself.
+
+Every command above is also available as `lightweight` — the same tool, which
+prints a small feather on an interactive terminal to confirm you are in.
+`hermes` is unchanged.
 
 Ask the machine what it can be reached at rather than guessing:
 
@@ -514,7 +559,7 @@ warning: --host "hermes" resolved only to 127.0.1.1, which is loopback.
     --host 192.0.2.10
     --host 198.51.100.4
 
-  Bind one of those, or a name that resolves to one, and set HERMES_API_KEY.
+  Bind one of those, or a name that resolves to one, and create a key with `hermes key create`.
 ```
 
 It warns rather than refuses: a name that resolves to loopback is unusual but
@@ -587,8 +632,9 @@ gateway is not serving would trade a clear refusal for silent truncation.
 `hermes serve` in the foreground needs nothing from any platform and is the
 portable answer. For a machine that should serve after logout,
 `packaging/systemd/` holds a Linux `systemd --user` example whose every value —
-model, addresses, key — comes from a file outside the repository. macOS and
-Windows service wrappers arrive with cross-platform packaging in M10.
+model, addresses, key — comes from a file outside the repository. M10 shipped the
+per-platform installers; a macOS launchd and a Windows service wrapper are still
+left to a later pass.
 
 `estimate` exits non-zero when a model would not fit, so scripts can branch on
 the verdict without parsing the report. Add `--json` to any command for machine
