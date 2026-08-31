@@ -62,12 +62,32 @@ export interface DiskReport {
   same_filesystem: boolean | null;
 }
 
+export type AddressScope =
+  | "loopback"
+  | "link_local"
+  | "private"
+  | "shared_range"
+  | "unique_local"
+  | "global_unicast";
+
+export interface AddressReport {
+  address: string;
+  scope: AddressScope;
+  label: string;
+}
+
+export interface NetworkReport {
+  addresses: AddressReport[];
+  error?: string;
+}
+
 export interface SystemReport {
   os: { name: string; family: string; architecture: string };
   cpu: CpuReport;
   cpu_times: Probed<CpuTimes>;
   memory: Probed<MemoryReport>;
   disk: Probed<DiskReport>;
+  network: NetworkReport;
 }
 
 export interface Tally {

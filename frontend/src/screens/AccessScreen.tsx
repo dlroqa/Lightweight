@@ -3,15 +3,23 @@ import { useMemo, useState } from "react";
 import {
   Check,
   Copy,
+  Globe,
   KeyRound,
   Plus,
+  RotateCw,
   ShieldCheck,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
 
 import { api, ApiError } from "../api/client";
-import type { ApiKeyLimit, ApiKeyView, CreatedKey } from "../api/types";
+import type {
+  AddressReport,
+  ApiKeyLimit,
+  ApiKeyView,
+  CreatedKey,
+  GatewayBindConfig,
+} from "../api/types";
 import { Card } from "../components/Card";
 import { Empty, ErrorState, Loading, Pill } from "../components/Bits";
 import { TopBar } from "../components/Shell";
@@ -27,6 +35,23 @@ function viewingLocally(): boolean {
     host === "[::1]" ||
     host.startsWith("127.")
   );
+}
+
+/** The desktop shell bridge, present only inside Electron. */
+interface HermesShell {
+  present: boolean;
+  restart?: () => Promise<unknown>;
+}
+function shell(): HermesShell | undefined {
+  return (window as unknown as { hermesShell?: HermesShell }).hermesShell;
+}
+
+/** A tone for the scope pill: overlay/private are friendly, public is a warning. */
+function scopeTone(scope: string): "ok" | "accent" | "warn" | "neutral" {
+  if (scope === "shared_range" || scope === "unique_local") return "accent";
+  if (scope === "private") return "ok";
+  if (scope === "global_unicast") return "warn";
+  return "neutral";
 }
 
 function relativeTime(unixSeconds: number | null): string {
@@ -75,6 +100,8 @@ export function AccessScreen() {
         )}
 
         <ConnectCard baseUrl={baseUrl} exposed={Boolean(reachable && !reachable.loopback)} />
+
+        <BindCard local={local} hasKeys={Boolean((keys.data ?? []).length)} onSaved={gateway.refresh} />
 
         <KeysCard keys={keys.data} error={keys.error} loading={keys.loading} local={local} onChange={keys.refresh} />
       </div>
@@ -422,3 +449,204 @@ function KeyRow({
     </div>
   );
 }
+
+
+function BindCard({
+  local,
+  hasKeys,
+  onSaved,
+}: {
+  local: boolean;
+  hasKeys: boolean;
+  onSaved: () => void;
+}) {
+  const system = usePoll(api.system, 8000);
+  const config = usePoll(api.gatewayConfig, 8000);
+
+  const [selected, setSelected] = useState<Set<string> | null>(null);
+  const [port, setPort] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saved, setSaved] = useState<GatewayBindConfig | null>(null);
+  const [restarting, setRestarting] = useState(false);
+
+  const network = system.data?.network ?? null;
+  const reachableAddrs: AddressReport[] = network?.addresses ?? [];
+
+  // Seed the form from the persisted config the first time it loads.
+  const configData = config.data;
+  useMemo(() => {
+    if (configData && selected === null) {
+      setSelected(new Set(configData.hosts));
+      setPort(configData.port != null ? String(configData.port) : "");
+    }
+  }, [configData, selected]);
+
+  const chosen = selected ?? new Set<string>();
+
+  function toggle(address: string) {
+    const next = new Set(chosen);
+    if (next.has(address)) next.delete(address);
+    else next.add(address);
+    setSelected(next);
+  }
+
+  async function save() {
+    setSaving(true);
+    setSaveError(null);
+    setSaved(null);
+    try {
+      // Loopback is always served; it is not offered as a toggle and is added
+      // here so the machine (and this panel) can always reach the gateway.
+      const hosts = ["127.0.0.1", ...[...chosen].filter((h) => h !== "127.0.0.1")];
+      const result = await api.saveGatewayConfig({
+        hosts,
+        port: port.trim() ? Number(port) : null,
+      });
+      setSaved(result as unknown as GatewayBindConfig);
+      onSaved();
+      config.refresh();
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function restart() {
+    const bridge = shell();
+    if (!bridge?.restart) return;
+    setRestarting(true);
+    try {
+      await bridge.restart();
+      window.setTimeout(() => window.location.reload(), 1500);
+    } finally {
+      setRestarting(false);
+    }
+  }
+
+  const exposedChosen = [...chosen].some((h) => h !== "127.0.0.1");
+
+  return (
+    <Card
+      title="Serve on"
+      action={
+        config.data && !config.data.matches_running ? (
+          <Pill tone="warn">restart to apply</Pill>
+        ) : undefined
+      }
+    >
+      <p className="card__note" style={{ marginTop: 0 }}>
+        Choose which addresses the gateway answers on. Loopback is always served;
+        add a reachable address to let other machines — over Tailscale, a LAN, or
+        any overlay — connect.
+      </p>
+
+      <div style={{ display: "grid", gap: 8, margin: "12px 0" }}>
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: "10px 12px",
+            border: "1px solid var(--rule)",
+            borderRadius: "var(--radius)",
+            opacity: 0.7,
+          }}
+        >
+          <input type="checkbox" checked disabled />
+          <span style={{ flex: 1 }}>127.0.0.1</span>
+          <Pill tone="neutral">loopback · always on</Pill>
+        </label>
+
+        {reachableAddrs.map((addr) => (
+          <label
+            key={addr.address}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 12px",
+              border: "1px solid var(--rule)",
+              borderRadius: "var(--radius)",
+              cursor: local ? "pointer" : "default",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={chosen.has(addr.address)}
+              disabled={!local}
+              onChange={() => toggle(addr.address)}
+            />
+            <Globe size={15} style={{ color: "var(--text-faint)" }} />
+            <code className="tnum" style={{ flex: 1, overflowWrap: "anywhere" }}>
+              {addr.address}
+            </code>
+            <Pill tone={scopeTone(addr.scope)}>{addr.label}</Pill>
+          </label>
+        ))}
+        {reachableAddrs.length === 0 && (
+          <div className="card__note">
+            No addresses beyond loopback are up on this machine right now.
+          </div>
+        )}
+      </div>
+
+      {exposedChosen && !hasKeys && (
+        <div className="notice notice--warn" style={{ marginBottom: 12 }}>
+          Serving a reachable address needs at least one API key. Create one below
+          first — the gateway refuses to start exposed without a key.
+        </div>
+      )}
+
+      {local && (
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <label className="field" style={{ flex: "0 0 120px" }}>
+            <span className="field__label">Port</span>
+            <input
+              className="input tnum"
+              inputMode="numeric"
+              placeholder="11434"
+              value={port}
+              onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+            />
+          </label>
+          <button type="button" className="btn btn--primary" disabled={saving} onClick={save}>
+            Save binding
+          </button>
+        </div>
+      )}
+
+      {saveError && (
+        <div className="notice notice--danger" style={{ marginTop: 12 }}>
+          {saveError}
+        </div>
+      )}
+      {saved && (
+        <div className="notice notice--info" style={{ marginTop: 12, display: "grid", gap: 8 }}>
+          <span>
+            Saved. The change takes effect when the gateway restarts — listeners
+            are fixed for the life of a run.
+          </span>
+          {shell()?.restart && (
+            <button
+              type="button"
+              className="btn"
+              disabled={restarting}
+              onClick={restart}
+              style={{ justifySelf: "start" }}
+            >
+              <RotateCw size={14} /> {restarting ? "Restarting…" : "Restart gateway now"}
+            </button>
+          )}
+          {!shell()?.restart && (
+            <span className="card__note">
+              Restart <code>hermes serve</code> to apply.
+            </span>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+

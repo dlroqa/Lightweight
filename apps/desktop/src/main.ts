@@ -17,7 +17,6 @@ import {
   Menu,
   Tray,
   app,
-  clipboard,
   dialog,
   ipcMain,
   nativeImage,
@@ -181,14 +180,17 @@ function updateTray(state: GatewayState): void {
       },
     },
     {
-      label: "Copy API key",
-      // Only ever present when this shell generated one, which happens only for
-      // a bind reachable from another machine. There is no key to copy for a
-      // loopback gateway, and none is invented.
-      visible: state.kind === "running" && Boolean(state.apiKey),
+      // The shell no longer holds a key to copy: keys are the gateway's own,
+      // hashed, and are created and shown once in the panel (or with
+      // `hermes key create`). The tray points there rather than pretending to
+      // have a credential it deliberately never sees.
+      label: "Manage API keys\u2026",
       click: () => {
-        if (state.kind === "running" && state.apiKey) {
-          clipboard.writeText(state.apiKey);
+        if (window) {
+          window.show();
+          window.focus();
+        } else {
+          void createWindow();
         }
       },
     },
@@ -256,6 +258,7 @@ async function start(): Promise<void> {
 
 // The panel asks for this once, to show what it is attached to.
 ipcMain.handle("gateway:current", () => supervisor.current());
+ipcMain.handle("gateway:restart", () => supervisor.restart());
 
 // Refuse before anything else, including before the app is ready.
 //

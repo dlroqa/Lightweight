@@ -27,7 +27,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lightweight_core::{Actionable, Bytes};
 use lightweight_system_info::{
-    CpuInfo, CpuTimes, DiskSpace, MemoryProbe, MemorySnapshot, SystemMemoryProbe,
+    AddressScope, CpuInfo, CpuTimes, DiskSpace, MemoryProbe, MemorySnapshot, SystemMemoryProbe,
+    classified_addresses,
 };
 use serde::Serialize;
 
@@ -198,6 +199,29 @@ pub struct SystemReport {
     cpu_times: Probed<CpuTimes>,
     memory: Probed<MemoryReport>,
     disk: Probed<DiskReport>,
+    /// The addresses another machine could reach this one at, each tagged with
+    /// the reserved range it falls in, so the panel can offer a bind choice
+    /// without the operator reading `ip addr` by hand.
+    network: NetworkReport,
+}
+
+/// The reachable addresses, classified. Advisory only — the same list
+/// `hermes sysinfo` prints, and never load-bearing on any gateway decision.
+#[derive(Debug, Serialize)]
+pub struct NetworkReport {
+    addresses: Vec<AddressReport>,
+    /// Present only when the probe itself failed; the address list is then
+    /// empty rather than wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressReport {
+    address: String,
+    scope: AddressScope,
+    /// A short human label for the scope, so the panel need not map the enum.
+    label: &'static str,
 }
 
 /// `GET /api/v1/system`.
@@ -245,6 +269,28 @@ pub fn report(state: &GatewayState) -> SystemReport {
         cpu_times: Probed::from_probe(lightweight_system_info::cpu_times()),
         memory: Probed::from_probe(SystemMemoryProbe.snapshot().map(MemoryReport::from)),
         disk: disk_report(state),
+        network: network_report(),
+    }
+}
+
+/// Classify the reachable addresses for the panel's bind picker.
+fn network_report() -> NetworkReport {
+    match classified_addresses() {
+        Ok(found) => NetworkReport {
+            addresses: found
+                .into_iter()
+                .map(|entry| AddressReport {
+                    address: entry.address.to_string(),
+                    scope: entry.scope,
+                    label: entry.scope.label(),
+                })
+                .collect(),
+            error: None,
+        },
+        Err(err) => NetworkReport {
+            addresses: Vec::new(),
+            error: Some(err.to_string()),
+        },
     }
 }
 
