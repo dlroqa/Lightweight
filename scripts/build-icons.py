@@ -181,25 +181,32 @@ def macos_masked(icon: Image.Image, size: int) -> Image.Image:
 
 
 def tray_icon(fallback: Image.Image) -> Image.Image:
-    """The menu-bar icon: the feather on transparency, keyed off its white field.
+    """The menu-bar icon: the feather on transparency.
 
-    Alpha is the distance from white — `255 - min(r, g, b)` per pixel — so the
-    white field goes fully transparent, the saturated feather stays opaque, and
-    its soft wisps keep a soft edge rather than a cut-out one. The mark is then
-    centred in a square with a little transparent padding and returned at 48px
-    RGBA, the size the shell loads.
+    Two source shapes are accepted. A source that already carries an alpha
+    channel — a feather drawn on transparency — is used as it is. A fully opaque
+    source (the feather on a white field) is keyed by distance from white:
+    `255 - min(r, g, b)` per pixel, so the white goes transparent, the saturated
+    feather stays opaque, and its soft wisps keep a soft edge. Either way the
+    mark is cropped, centred in a square with a little padding, and returned at
+    48px RGBA — the size the shell loads.
 
     When `icon/tray-source.png` is absent the plated brand mark is used instead,
-    so the build still produces a tray icon; drop the violet feather in and
-    re-run to get the intended one.
+    so the build still produces a tray icon; drop the feather in and re-run to
+    get the intended one.
     """
     if not TRAY_SOURCE.is_file():
         print(f"note: {TRAY_SOURCE.relative_to(ROOT)} is absent; tray uses the plated brand mark")
         return fallback.resize((48, 48), Image.LANCZOS)
     art = Image.open(TRAY_SOURCE).convert("RGBA")
-    red, green, blue = art.convert("RGB").split()
-    lowest = ImageChops.darker(ImageChops.darker(red, green), blue)
-    art.putalpha(ImageChops.invert(lowest))
+    lowest_alpha, _ = art.getchannel("A").getextrema()
+    if lowest_alpha == 255:
+        # Opaque source: the background is a white field to key out. (A source
+        # that already has transparency keeps the alpha it came with; keying it
+        # from white would paint its transparent, RGB-zero background solid.)
+        red, green, blue = art.convert("RGB").split()
+        lowest = ImageChops.darker(ImageChops.darker(red, green), blue)
+        art.putalpha(ImageChops.invert(lowest))
     box = art.getchannel("A").getbbox()
     if box is None:
         print("note: the tray source keyed to nothing; tray uses the plated brand mark")

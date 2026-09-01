@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-01
+
+Public reach and multi-model serving. The gateway can now sit behind a trusted
+reverse proxy or Cloudflare Tunnel with `--behind-proxy` — reachable at a real
+domain, key-required, and no longer fooled into treating a remote caller as
+local — and `hermes fleet` runs up to four models at once as isolated
+per-tenant gateways. Per-user API keys and their rate limits now take effect the
+moment they change instead of at the next restart, and the desktop icons are
+rounded to the macOS squircle with a new violet-feather menu-bar mark.
+
 ### Added
 
 - **`--behind-proxy` mode** for putting the gateway behind a trusted reverse

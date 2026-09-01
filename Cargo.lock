@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lightweight-core",
  "lightweight-inference",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-backend-llamacpp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-backend-mock"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-util",
  "lightweight-backend-mock",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-catalog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hex",
  "lightweight-core",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "clap",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-download"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures-util",
  "hex",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-gguf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lightweight-core",
  "serde",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-inference"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-memory"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lightweight-core",
  "lightweight-gguf",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-observability"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "lightweight-core",
  "lightweight-system-info",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.4.3",
  "lightweight-core",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-sys"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-system-info"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "directories",
  "lightweight-core",
