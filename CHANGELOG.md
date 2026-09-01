@@ -43,6 +43,15 @@ rounded to the macOS squircle with a new violet-feather menu-bar mark.
   transparent margin, so the app sits on the dock like a native one instead of a
   hard-edged square. Generated for every packaged size by `scripts/build-icons.py`.
 
+### Fixed
+
+- **An engine launch that loses the ephemeral-port race is retried.** The
+  supervisor hands the engine a loopback port it proved free a moment earlier;
+  on a busy machine another process can take it in the gap before the engine
+  binds. Such a launch is now retried with a fresh port instead of surfacing the
+  crash, as the design always intended. Only that transient case is retried — a
+  signal, a timeout, or a genuinely unstartable engine is still reported at once.
+
 ## [0.2.0] - 2026-08-31
 
 Remote access: the gateway can now be reached from another machine over any
