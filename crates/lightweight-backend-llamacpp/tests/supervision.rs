@@ -111,6 +111,9 @@ impl FakeModel {
 impl Drop for FakeModel {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        // The `bind_fail_once` mode keeps its attempt count in a sidecar; clean
+        // it up too so a rerun starts fresh and nothing is left in temp.
+        let _ = std::fs::remove_file(format!("{}.attempts", self.0.display()));
     }
 }
 
@@ -271,6 +274,28 @@ async fn cancelling_a_start_leaves_no_engine_running() {
     let result = handle.await.expect("the task should finish");
     let err = result.expect_err("a cancelled start must not report success");
     assert_eq!(err.code(), "cancelled");
+}
+
+#[tokio::test]
+async fn a_launch_that_loses_the_port_race_is_retried_until_it_binds() {
+    // The reserved port can be taken between the probe closing and the child
+    // binding it, on a busy machine — the failure that flaked this suite on a
+    // loaded CI runner. The first launch here exits as if it lost that race; the
+    // supervisor must try again with a fresh port and serve, rather than
+    // surfacing the crash. This is the retry `reserve_port` documents.
+    let engine = supervisor::start(
+        &config(&FakeModel::new("bind_fail_once")),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("a lost port race must be retried, not reported as a crash");
+
+    assert!(
+        engine.port() > 0,
+        "the engine that finally bound has a port"
+    );
+    assert!(engine.base_url().starts_with("http://127.0.0.1:"));
+    let _ = engine.shutdown().await;
 }
 
 #[tokio::test]

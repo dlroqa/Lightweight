@@ -46,6 +46,15 @@ const STDERR_TAIL_LINES: usize = 64;
 /// How often readiness is polled while the engine loads.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How many times a launch is attempted before giving up.
+///
+/// Each attempt reserves a fresh loopback port, so this is how many chances a
+/// launch has to win the ephemeral-port race [`reserve_port`] describes. Three
+/// is enough that losing it three times running is itself a signal that
+/// something other than luck is wrong, while keeping a genuinely unstartable
+/// engine's failure prompt rather than dragging it out.
+const MAX_START_ATTEMPTS: u32 = 3;
+
 /// KV cache element types the pinned engine accepts.
 ///
 /// Read from `llama-server --help` at build b10590: "allowed values: f32, f16,
@@ -300,8 +309,60 @@ fn classify(status: std::process::ExitStatus) -> ExitClassification {
     }
 }
 
-/// Launch the engine and wait until it is ready to serve.
+/// Launch the engine, retrying a launch that lost the ephemeral-port race.
+///
+/// [`reserve_port`] hands the child a port proven free a moment earlier, and on
+/// a busy machine another process can take it in the gap between the probe
+/// closing and the child binding — the child then exits non-zero without ever
+/// serving. The design anticipates exactly this (see [`reserve_port`]), so such
+/// a launch is retried a bounded number of times, each with a fresh port.
+///
+/// Only that transient shape is retried. A signal (an illegal instruction, a
+/// segfault, an OOM kill), a start timeout and a cancellation are not transient
+/// and are reported at once; and a deterministic non-zero exit — a genuinely
+/// unstartable engine — simply reproduces across the attempts and is then
+/// reported unchanged, so retrying can recover a race but never hide a failure.
 pub async fn start(
+    config: &EngineConfig,
+    cancel: &CancellationToken,
+) -> Result<Engine, BackendError> {
+    let mut attempt = 1;
+    loop {
+        match start_attempt(config, cancel).await {
+            Ok(engine) => return Ok(engine),
+            Err(err) if attempt < MAX_START_ATTEMPTS && is_retryable_startup(&err) => {
+                tracing::warn!(
+                    target: targets::BACKEND,
+                    attempt,
+                    error = %err,
+                    "the engine exited during startup; retrying with a fresh port"
+                );
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether a startup failure is the transient port race worth another attempt.
+///
+/// A non-signalled, non-zero exit before the engine ever served is the shape a
+/// lost port-bind race takes. Everything else — a signal, a timeout, a
+/// cancellation, or the "never even ran" placeholder — is left to the caller.
+fn is_retryable_startup(err: &BackendError) -> bool {
+    matches!(
+        err,
+        BackendError::EngineCrashed {
+            exit_code: Some(_),
+            signal: None,
+            ..
+        }
+    )
+}
+
+/// One launch attempt: reserve a port, spawn the child, and wait until it is
+/// ready to serve. [`start`] wraps this in the port-race retry.
+async fn start_attempt(
     config: &EngineConfig,
     cancel: &CancellationToken,
 ) -> Result<Engine, BackendError> {
