@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`--behind-proxy` mode** for putting the gateway behind a trusted reverse
+  proxy or Cloudflare Tunnel while it stays bound to loopback. It turns on
+  API-key auth (refusing to start without a credential) and trusts the proxy's
+  `CF-Connecting-IP` header — only from a loopback peer — so a remote caller is
+  identified by its real address rather than passing as local. Set it with the
+  flag or `HERMES_BEHIND_PROXY`. A plain loopback gateway is unchanged.
+- **`hermes fleet`** runs up to four models at once, one isolated gateway per
+  model. Each entry in a small JSON manifest gets its own data root, port and
+  keys, so one tenant's traffic can never evict or disturb another's. The
+  four-model cap and the manifest checks (duplicate ports/names, missing model
+  files, a profile with no key) are enforced before anything launches.
+- **A public-domain recipe** in the README: reaching the gateway at
+  `https://…/v1` over a Cloudflare Tunnel with `--behind-proxy`, and serving
+  several models behind per-hostname routing with `hermes fleet`.
+
+### Changed
+
+- **Per-user API keys and limits now take effect live.** Creating a key,
+  changing its rate limit, or revoking it through the control API is honoured on
+  the next request instead of at the next restart — the gateway reloads its key
+  set from the store on each change. A revoked key stops working immediately.
+- **The menu-bar (tray) icon** is now its own transparent mark, keyed from a
+  dedicated `icon/tray-source.png`, rather than the plated brand icon.
+- **The desktop app icons are rounded** to the macOS "squircle" with a
+  transparent margin, so the app sits on the dock like a native one instead of a
+  hard-edged square. Generated for every packaged size by `scripts/build-icons.py`.
+
 ## [0.2.0] - 2026-08-31
 
 Remote access: the gateway can now be reached from another machine over any

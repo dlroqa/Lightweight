@@ -798,7 +798,7 @@ fn is_authorized(state: &GatewayState, headers: &HeaderMap) -> bool {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    state.config.auth.check(presented).is_ok()
+    state.auth_policy().check(presented).is_ok()
 }
 
 /// Check the request's credentials, if any are required.
@@ -808,7 +808,7 @@ pub(crate) fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Res
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    state.config.auth.check(presented).err().map(unauthorized)
+    state.auth_policy().check(presented).err().map(unauthorized)
 }
 
 /// Refuse a state-changing control request that a foreign page forged.
@@ -871,7 +871,7 @@ pub(crate) fn admit_request(state: &GatewayState, headers: &HeaderMap) -> Option
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
 
-    let caller = match state.config.auth.identify(presented) {
+    let caller = match state.auth_policy().identify(presented) {
         Ok(caller) => caller,
         Err(failure) => return Some(unauthorized(failure)),
     };

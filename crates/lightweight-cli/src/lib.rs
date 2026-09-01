@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 mod banner;
 mod bench;
+mod fleet;
 mod models;
 mod serve;
 use lightweight_core::{Actionable, GgmlType, units::Bytes};
@@ -179,6 +180,15 @@ enum Command {
         /// from `/proc`, and kept in shell history.
         #[arg(long)]
         api_key: Option<String>,
+        /// A trusted proxy (e.g. a Cloudflare Tunnel) fronts this loopback bind.
+        ///
+        /// Turns on API-key auth even though the bind is loopback — the gateway
+        /// refuses to start without a key — and trusts the proxy's
+        /// `CF-Connecting-IP` so a remote caller cannot pass as local and reach
+        /// the machine-only controls. Set `HERMES_BEHIND_PROXY` for the same
+        /// effect. Without it a loopback gateway is unchanged.
+        #[arg(long)]
+        behind_proxy: bool,
     },
     /// Estimate what a model would cost to load, and whether it fits.
     Estimate {
@@ -269,6 +279,19 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Serve several models at once, one isolated gateway per model.
+    ///
+    /// Reads a JSON manifest listing up to four models — each with its own port,
+    /// data directory and keys — and launches each as a `hermes serve …
+    /// --behind-proxy` child. One tenant's traffic can never evict or disturb
+    /// another's, because each model is its own process. Point a reverse proxy
+    /// or Cloudflare Tunnel at the per-model ports to publish them.
+    Fleet {
+        /// The manifest to read. Defaults to `fleet.json` in the config
+        /// directory.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 }
 
@@ -475,6 +498,22 @@ fn key_command(cli: &Cli, out: &mut String, action: &KeyAction) -> Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
+/// Whether an environment variable is set to a truthy value.
+///
+/// A boolean flag has no value to parse, so its environment twin is read as a
+/// switch: present and meaningful is on, absent or an explicit `0`/`false`/empty
+/// is off — so `HERMES_BEHIND_PROXY=0` in a service file reads as off rather
+/// than as the surprising on that "any value is true" would give.
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name),
+        Ok(value)
+            if !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+    )
+}
+
 fn describe_limit(limit: lightweight_store::RateLimit) -> String {
     match (limit.per_minute, limit.per_day) {
         (None, None) => "unlimited".to_owned(),
@@ -600,6 +639,7 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
             api_key,
             concurrency,
             web_root,
+            behind_proxy,
         } => {
             // Only this command needs an async runtime, so it is built here
             // rather than wrapping every command in one.
@@ -629,6 +669,10 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
                 port: *port,
                 port_explicit: from_cli("port"),
                 api_key: api_key.clone(),
+                // The flag, or the environment variable for a service file that
+                // would rather not carry it on the command line. Any non-empty
+                // value other than `0`/`false` counts as set.
+                behind_proxy: *behind_proxy || env_flag("HERMES_BEHIND_PROXY"),
                 concurrency: *concurrency,
                 web_root: web_root.clone(),
             }))?;
@@ -670,6 +714,7 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
         Command::Models { action } => models_command(cli, out, action),
         Command::Key { action } => key_command(cli, out, action),
         Command::Config { action } => config_command(cli, out, action),
+        Command::Fleet { config } => fleet::run(config.clone()),
         Command::Inspect { model, header_only } => {
             let metadata = load_metadata(model, *header_only)?;
             if cli.json {

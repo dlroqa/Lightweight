@@ -459,20 +459,25 @@ pub async fn create_key(
     };
 
     match blocking(move || store.create(&request.name, request.limit)).await {
-        Ok((record, plaintext)) => (
-            StatusCode::CREATED,
-            // The one place a plaintext key leaves the gateway, and only ever to
-            // a loopback caller: this is the moment it is shown, once.
-            axum::Json(json!({
-                "id": record.id,
-                "name": record.name,
-                "prefix": record.prefix,
-                "created_at": record.created_at,
-                "limit": record.limit,
-                "key": plaintext,
-            })),
-        )
-            .into_response(),
+        Ok((record, plaintext)) => {
+            // The store now has the key; make the running gateway honour it on
+            // the very next request rather than at the next restart.
+            state.refresh_keys();
+            (
+                StatusCode::CREATED,
+                // The one place a plaintext key leaves the gateway, and only ever to
+                // a loopback caller: this is the moment it is shown, once.
+                axum::Json(json!({
+                    "id": record.id,
+                    "name": record.name,
+                    "prefix": record.prefix,
+                    "created_at": record.created_at,
+                    "limit": record.limit,
+                    "key": plaintext,
+                })),
+            )
+                .into_response()
+        }
         Err(failure) => failure.into_response(),
     }
 }
@@ -499,6 +504,9 @@ pub async fn revoke_key(
             if removed {
                 // Free the live counters so a future id cannot inherit them.
                 state.limiter().forget(&id);
+                // Drop the key from the live policy so it stops authenticating
+                // now, not at the next restart.
+                state.refresh_keys();
                 (
                     StatusCode::OK,
                     axum::Json(json!({ "revoked": true, "id": id })),
@@ -544,7 +552,11 @@ pub async fn set_key_limit(
         Err(err) => return bad_request("body", &err.to_string()),
     };
     match blocking(move || store.set_limit(&id, limit)).await {
-        Ok(true) => (StatusCode::OK, axum::Json(json!({ "updated": true }))).into_response(),
+        Ok(true) => {
+            // Enforce the new ceiling from the next request, not the next restart.
+            state.refresh_keys();
+            (StatusCode::OK, axum::Json(json!({ "updated": true }))).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({
@@ -605,7 +617,7 @@ pub async fn save_config(
     };
 
     let port = incoming.port.unwrap_or(crate::DEFAULT_PORT);
-    let has_credential = state.config.auth.is_enabled()
+    let has_credential = state.auth_policy().is_enabled()
         || state
             .api_keys_store()
             .and_then(|keys| keys.any().ok())

@@ -508,6 +508,79 @@ panel's connection block, and when several `--host` values are served it binds
 them all to the one shared port. It is an explicit, per-run choice and is never
 persisted — `api.json` keeps a fixed port so the panel's own URL stays stable.
 
+### A public domain, over Cloudflare Tunnel
+
+To reach the gateway at a real hostname — `https://api.example.com/v1` — without
+opening an inbound port, keep it on **loopback** and put a
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+in front of it. `cloudflared` dials *out* to Cloudflare, which terminates TLS at
+its edge and routes your hostname down the tunnel to `127.0.0.1`.
+
+Because the bind stays loopback, the gateway would not normally demand a key —
+loopback is its trust boundary. Pass **`--behind-proxy`** to tell it a trusted
+proxy now fronts it: it then requires an API key (refusing to start without one),
+meters named keys as usual, and trusts the proxy's `CF-Connecting-IP` header so a
+remote caller is seen as remote — a caller reaching the tunnel can *use* the
+gateway with a key but can never mint keys or change the bind, which stay
+machine-local. The header is trusted only from a loopback peer, so it cannot be
+spoofed from off the machine.
+
+```sh
+hermes key create --name my-agent            # printed once
+hermes serve model.gguf --behind-proxy       # still on 127.0.0.1:11434, now key-required
+
+cloudflared tunnel login                     # pick your Cloudflare zone
+cloudflared tunnel create lightweight
+# ~/.cloudflared/config.yml:
+#   tunnel: <UUID>
+#   credentials-file: /home/<you>/.cloudflared/<UUID>.json
+#   ingress:
+#     - hostname: api.example.com
+#       service: http://localhost:11434
+#     - service: http_status:404
+cloudflared tunnel route dns lightweight api.example.com
+cloudflared tunnel run lightweight           # or: sudo cloudflared service install
+```
+
+`HERMES_BEHIND_PROXY=1` does the same as the flag, for a service file that would
+rather not carry it on the command line. One edge to know: Cloudflare's edge
+drops a request whose first byte takes longer than ~100 s, so for a cold load or
+a long generation prefer `stream: true` — the gateway keeps the connection alive
+with SSE keep-alives while it works.
+
+### Several models, isolated per tenant (`hermes fleet`)
+
+The engine is single-resident by design, so serving several models — and keeping
+one tenant's traffic from evicting another's — means **one gateway per model**,
+each with its own data root (`HERMES_GATEWAY_HOME`) and therefore its own keys,
+rate limits and catalog. `hermes fleet` reads a manifest, caps it at **four
+models**, and launches each as its own `hermes serve … --behind-proxy`:
+
+```json
+// ~/.config/CpuInferenceGateway/fleet.json  (or pass --config <path>)
+{
+  "models": [
+    { "name": "qwen",  "path": "/models/qwen.gguf",  "port": 11434, "host": "qwen.api.example.com",  "profile": "/srv/lw/qwen"  },
+    { "name": "llama", "path": "/models/llama.gguf", "port": 11435, "host": "llama.api.example.com", "profile": "/srv/lw/llama" }
+  ]
+}
+```
+
+```sh
+HERMES_GATEWAY_HOME=/srv/lw/qwen  hermes key create --name tenant-a   # per-profile keys
+HERMES_GATEWAY_HOME=/srv/lw/llama hermes key create --name tenant-b
+hermes fleet                                                          # launches both; Ctrl-C stops all
+```
+
+Point one tunnel `ingress` rule at each model's port (`qwen.api.example.com` →
+`localhost:11434`, and so on). A key authenticates only on its own model's
+gateway, so a leaked hostname is useless without that profile's key, and a
+request to one model can never disturb another. `fleet` refuses before launching
+anything if the manifest exceeds four models, reuses a port or name, points at a
+missing model file, or names a profile with no key. It is the interactive/
+foreground way to run several at once; for an always-on server, run each model as
+its own service unit instead.
+
 ### Keys, and where the configuration lives
 
 Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,

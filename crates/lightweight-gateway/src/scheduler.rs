@@ -89,6 +89,37 @@ impl PeerKey {
     pub fn is_local(&self) -> bool {
         self.0.is_none_or(|ip| ip.is_loopback())
     }
+
+    /// The key for a request, resolving a trusted proxy's forwarded client IP.
+    ///
+    /// When a trusted proxy (a Cloudflare Tunnel, say) fronts a loopback bind,
+    /// every request arrives from `127.0.0.1` and its real origin is in
+    /// `CF-Connecting-IP`. Honouring that header is what lets the scheduler tell
+    /// remote clients apart again and, more importantly, what stops a remote
+    /// caller from looking `is_local()` and reaching the control surface.
+    ///
+    /// The header is trusted **only** when `trust` is on *and* the socket peer
+    /// is loopback. A remote peer can never present a loopback socket address,
+    /// and Cloudflare overwrites any `CF-Connecting-IP` a client tries to send,
+    /// so this cannot be spoofed from off the machine. With trust off, or from a
+    /// non-loopback peer, the header is ignored and the socket address stands —
+    /// exactly as before this existed.
+    pub fn resolve(
+        socket: Option<SocketAddr>,
+        cf_connecting_ip: Option<&str>,
+        trust: bool,
+    ) -> Self {
+        if trust
+            && socket.is_some_and(|address| address.ip().is_loopback())
+            && let Some(ip) = cf_connecting_ip.and_then(|value| value.trim().parse::<IpAddr>().ok())
+        {
+            return Self(Some(ip.to_canonical()));
+        }
+        match socket {
+            Some(address) => Self::from_socket(address),
+            None => Self::default(),
+        }
+    }
 }
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerKey {
@@ -106,12 +137,22 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerKey {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(parts
+        let socket = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map_or_else(Self::default, |ConnectInfo(address)| {
-                Self::from_socket(*address)
-            }))
+            .map(|ConnectInfo(address)| *address);
+        // Present, and true, only when the gateway was started behind a trusted
+        // proxy; `app` inserts it, so a router assembled without it (a test's
+        // `oneshot`) simply never trusts the header.
+        let trust = parts
+            .extensions
+            .get::<crate::TrustForwarded>()
+            .is_some_and(|forwarded| forwarded.0);
+        let forwarded = parts
+            .headers
+            .get("cf-connecting-ip")
+            .and_then(|value| value.to_str().ok());
+        Ok(Self::resolve(socket, forwarded, trust))
     }
 }
 
@@ -1143,6 +1184,55 @@ mod tests {
                 .is_local()
         );
     }
+
+    #[test]
+    fn a_trusted_loopback_peer_takes_its_ip_from_the_forwarded_header() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // Behind a tunnel every request arrives from loopback and the real
+        // client is in CF-Connecting-IP. Honouring it is what makes the request
+        // non-local, so the control surface stays out of a remote caller's reach.
+        // RFC 5737 documentation address stands in for a real client.
+        let socket = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9));
+        let peer = PeerKey::resolve(socket, Some("192.0.2.10"), true);
+        assert!(
+            !peer.is_local(),
+            "a forwarded public IP must not read as local"
+        );
+        assert_eq!(
+            peer,
+            PeerKey(Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))))
+        );
+    }
+
+    #[test]
+    fn a_forwarded_header_is_ignored_without_trust() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // A gateway not started behind a proxy never trusts the header, so the
+        // socket address stands and a loopback peer stays local.
+        let socket = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9));
+        assert!(PeerKey::resolve(socket, Some("192.0.2.10"), false).is_local());
+    }
+
+    #[test]
+    fn a_forwarded_header_from_a_non_loopback_peer_is_ignored() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        // The spoof guard: only the proxy on this machine, reaching us over
+        // loopback, may set the client IP. A LAN peer sending the header cannot
+        // forge an identity — the socket address it really came from wins.
+        let lan = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 9);
+        assert_eq!(
+            PeerKey::resolve(Some(lan), Some("192.0.2.10"), true),
+            PeerKey::from_socket(lan)
+        );
+    }
+
+    #[test]
+    fn a_garbage_forwarded_header_falls_back_to_the_socket() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let socket = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9));
+        assert!(PeerKey::resolve(socket, Some("not-an-ip"), true).is_local());
+    }
+
     use futures_util::FutureExt;
 
     fn scheduler(capacity: u32) -> Arc<Scheduler> {

@@ -94,6 +94,45 @@ jobs:
       - name: What this machine reports
         run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
 
+  # Rendering: prove the icon pipeline runs and produces the right shape.
+  #
+  # Separate from the gate because it needs Pillow, a tool-time dependency the
+  # product itself does not carry. It renders every icon from the committed
+  # artwork and asserts *properties* — the packaged app icons are rounded
+  # squircles with transparent corners, the tray icon is the size the shell
+  # loads — rather than a byte-for-byte match, which would be a flaky gate the
+  # moment a runner's libpng differs from a contributor's. The rendered icons
+  # are uploaded so a human can eyeball them on a pull request.
+  icons:
+    name: render icons
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Pinned so the render is reproducible run to run; the shape checks below
+      # do not depend on the pin, but a moving Pillow is one less thing to wonder
+      # about when an icon looks wrong.
+      - run: pip install "Pillow==10.2.0"
+      - name: Render the icons
+        run: python3 scripts/build-icons.py
+      - name: Verify their shape
+        run: python3 scripts/verify-icons.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rendered-icons
+          path: |
+            apps/desktop/build/icons/
+            apps/desktop/build/tray.png
+            apps/desktop/build/window.png
+            apps/desktop/build/icon.icns
+            apps/desktop/build/icon.ico
+
   linux-artifacts:
     name: linux artifacts
     runs-on: ubuntu-latest
