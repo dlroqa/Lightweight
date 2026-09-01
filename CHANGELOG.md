@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-31
+
+Remote access: the gateway can now be reached from another machine over any
+overlay network, authenticated with named API keys that survive a restart and
+can be rate-limited per key. A new **Access & Keys** panel and the `hermes key`
+/ `hermes config` commands manage it, and the bind hosts and port persist in
+`config/api.json`. The default port moves to **11434** to agree with the desktop
+app and the common local-LLM clients — a behaviour change for anyone who relied
+on the old `8737`.
+
 ### Added
 
 - **Named, hashed API keys.** A gateway can now issue a key per consumer, each

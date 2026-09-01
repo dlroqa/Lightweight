@@ -1,7 +1,7 @@
 {
   "name": "hermes-desktop",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "description": "The Lightweight desktop shell: a window onto a gateway, and a supervisor for one.",
   "main": "dist/main.js",
