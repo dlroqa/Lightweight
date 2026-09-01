@@ -23,6 +23,7 @@
 //! | `exit:N`       | exit with status N without serving                 |
 //! | `signal:N`     | raise signal N (4 is SIGILL)                       |
 //! | `hang`         | never bind at all                                  |
+//! | `bind_fail_once` | first launch exits as if the port was taken, then serves |
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,10 +40,13 @@ fn main() {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(0);
 
-    let mode = args
+    let model_path = args
         .iter()
         .position(|arg| arg == "--model")
         .and_then(|index| args.get(index + 1))
+        .cloned();
+    let mode = model_path
+        .as_deref()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|contents| contents.trim().to_owned())
         .unwrap_or_else(|| "ready".to_owned());
@@ -50,6 +54,27 @@ fn main() {
     // Written to stderr so the supervisor's log pump and crash tail can be
     // tested against something realistic.
     eprintln!("fake-engine: starting on port {port} in mode {mode}");
+
+    if mode == "bind_fail_once" {
+        // Stand in for losing the ephemeral-port race: the first launch fails to
+        // bind and exits, and a later one — handed a fresh port by the
+        // supervisor's retry — serves. The attempt count lives in a sidecar
+        // beside the model, because each retry is a brand-new process with no
+        // memory of the last.
+        if let Some(path) = &model_path {
+            let counter = format!("{path}.attempts");
+            let seen: u32 = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            let _ = std::fs::write(&counter, (seen + 1).to_string());
+            if seen == 0 {
+                eprintln!("fake-engine: error: could not bind port {port}");
+                std::process::exit(98);
+            }
+        }
+        // A later attempt falls through and serves like `ready`.
+    }
 
     if let Some(code) = mode.strip_prefix("exit:") {
         eprintln!("fake-engine: error: unable to load model");
