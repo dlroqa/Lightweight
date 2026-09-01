@@ -972,6 +972,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightagent-core"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "directories",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-provider-lightweight"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "lightagent-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lightweight-api"
 version = "0.2.1"
 dependencies = [
