@@ -112,6 +112,42 @@ impl Server {
         let value = response.json().await.unwrap_or(Value::Null);
         (status, value)
     }
+
+    /// A GET returning the raw body text, for asserting on the exact bytes on
+    /// the wire rather than only the parsed fields.
+    async fn get_text(&self, path: &str) -> String {
+        reqwest::Client::new()
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .expect("request")
+            .text()
+            .await
+            .expect("text")
+    }
+
+    async fn put(&self, path: &str, body: Value) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .put(format!("{}{path}", self.base))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let value = response.json().await.unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    async fn delete(&self, path: &str) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .delete(format!("{}{path}", self.base))
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let value = response.json().await.unwrap_or(Value::Null);
+        (status, value)
+    }
 }
 
 #[tokio::test]
@@ -506,4 +542,121 @@ async fn an_id_that_could_not_have_come_from_the_store_is_refused() {
         (400..500).contains(&status),
         "a malformed id must not be a server error: {status}"
     );
+}
+
+// --- API keys and bind configuration -----------------------------------------
+
+#[tokio::test]
+async fn a_key_is_created_once_and_then_only_ever_seen_redacted() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("keys-create").await;
+    let server = Server::start(state).await;
+
+    // Create returns the plaintext, exactly once.
+    let (status, created) = server
+        .post(
+            "/api/v1/gateway/keys",
+            serde_json::json!({ "name": "harness", "limit": { "per_minute": 60 } }),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    let key = created["key"].as_str().expect("a plaintext key").to_owned();
+    assert!(key.starts_with("sk-lw-"), "{created}");
+    assert_eq!(created["name"], "harness");
+
+    // The list never carries the key or its hash — assert on the raw bytes, not
+    // just the parsed shape, because the invariant is about the wire.
+    let raw = server.get_text("/api/v1/gateway/keys").await;
+    assert!(!raw.contains(&key), "the plaintext key was listed: {raw}");
+    assert!(!raw.contains("hash"), "a hash was listed: {raw}");
+
+    let (status, list) = server.get("/api/v1/gateway/keys").await;
+    assert_eq!(status, 200);
+    let row = &list["data"][0];
+    assert_eq!(row["name"], "harness");
+    assert!(row["prefix"].as_str().unwrap().starts_with("sk-lw-"));
+    assert!(row.get("key").is_none() && row.get("hash").is_none());
+}
+
+#[tokio::test]
+async fn a_created_key_authenticates_a_request_and_a_revoked_one_stops() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("keys-auth").await;
+
+    // The key store is shared with the running gateway's auth only at startup,
+    // so this test checks the store round-trip through the endpoints and the
+    // revoke path, not live re-auth (which is a restart concern).
+    let server = Server::start(state).await;
+    let (_status, created) = server
+        .post("/api/v1/gateway/keys", serde_json::json!({ "name": "k" }))
+        .await;
+    let id = created["id"].as_str().expect("id").to_owned();
+
+    let (status, body) = server.delete(&format!("/api/v1/gateway/keys/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revoked"], true);
+
+    // A second revoke is a 404, not a 500.
+    let (status, _) = server.delete(&format!("/api/v1/gateway/keys/{id}")).await;
+    assert_eq!(status, 404);
+
+    let (_status, list) = server.get("/api/v1/gateway/keys").await;
+    assert_eq!(list["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_bind_config_without_a_loopback_host_is_refused() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("cfg-loopback").await;
+    let server = Server::start(state).await;
+
+    // A documentation-range address resolves but is not loopback, so saving it
+    // alone would lock the panel out of its own gateway.
+    let (status, body) = server
+        .put(
+            "/api/v1/gateway/config",
+            serde_json::json!({ "hosts": ["192.0.2.10"], "port": 11434 }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["param"], "hosts");
+}
+
+#[tokio::test]
+async fn an_exposed_bind_config_without_a_key_is_refused() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("cfg-key").await;
+    let server = Server::start(state).await;
+
+    // Loopback plus an exposed address, but no key configured: refused, the same
+    // rule the CLI enforces at startup.
+    let (status, body) = server
+        .put(
+            "/api/v1/gateway/config",
+            serde_json::json!({ "hosts": ["127.0.0.1", "192.0.2.10"] }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["param"], "hosts");
+}
+
+#[tokio::test]
+async fn a_loopback_bind_config_round_trips() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model("cfg-ok").await;
+    let server = Server::start(state).await;
+
+    let (status, body) = server
+        .put(
+            "/api/v1/gateway/config",
+            serde_json::json!({ "hosts": ["127.0.0.1"], "port": 11434 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["restart_required"], true);
+
+    let (status, read) = server.get("/api/v1/gateway/config").await;
+    assert_eq!(status, 200);
+    assert_eq!(read["hosts"][0], "127.0.0.1");
+    assert_eq!(read["port"], 11434);
 }

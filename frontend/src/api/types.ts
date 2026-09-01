@@ -62,12 +62,32 @@ export interface DiskReport {
   same_filesystem: boolean | null;
 }
 
+export type AddressScope =
+  | "loopback"
+  | "link_local"
+  | "private"
+  | "shared_range"
+  | "unique_local"
+  | "global_unicast";
+
+export interface AddressReport {
+  address: string;
+  scope: AddressScope;
+  label: string;
+}
+
+export interface NetworkReport {
+  addresses: AddressReport[];
+  error?: string;
+}
+
 export interface SystemReport {
   os: { name: string; family: string; architecture: string };
   cpu: CpuReport;
   cpu_times: Probed<CpuTimes>;
   memory: Probed<MemoryReport>;
   disk: Probed<DiskReport>;
+  network: NetworkReport;
 }
 
 export interface Tally {
@@ -237,6 +257,42 @@ export interface GatewayReport {
     /** The load modes this engine accepts, in its own spelling. */
     load_modes: string[];
   };
+}
+
+/** A per-key usage ceiling. `null` on either axis means unlimited. */
+export interface ApiKeyLimit {
+  per_minute: number | null;
+  per_day: number | null;
+}
+
+/** One API key, as the panel sees it — never the secret, never its hash. */
+export interface ApiKeyView {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: number;
+  limit: ApiKeyLimit;
+  total: number;
+  last_used: number | null;
+  in_last_minute: number;
+  today: number;
+}
+
+/** The response to creating a key: the one time the plaintext is returned. */
+export interface CreatedKey {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: number;
+  limit: ApiKeyLimit;
+  key: string;
+}
+
+/** The persisted bind configuration, and whether it matches what is bound now. */
+export interface GatewayBindConfig {
+  hosts: string[];
+  port: number | null;
+  matches_running: boolean;
 }
 
 /** A row of `GET /api/v1/models`. */

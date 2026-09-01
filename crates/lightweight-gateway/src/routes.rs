@@ -211,7 +211,7 @@ pub async fn chat_completions(
     peer: PeerKey,
     body: Bytes,
 ) -> Response {
-    if let Some(refusal) = authorize(&state, &headers) {
+    if let Some(refusal) = admit_request(&state, &headers) {
         return refusal;
     }
 
@@ -254,7 +254,7 @@ pub async fn completions(
     peer: PeerKey,
     body: Bytes,
 ) -> Response {
-    if let Some(refusal) = authorize(&state, &headers) {
+    if let Some(refusal) = admit_request(&state, &headers) {
         return refusal;
     }
 
@@ -808,25 +808,134 @@ pub(crate) fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Res
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    state.config.auth.check(presented).err().map(|failure| {
-        let code = match failure {
-            AuthFailure::Missing => "missing_api_key",
-            AuthFailure::Invalid => "invalid_api_key",
-        };
+    state.config.auth.check(presented).err().map(unauthorized)
+}
+
+/// Refuse a state-changing control request that a foreign page forged.
+///
+/// The control surface under `/api/v1` is the panel's own, and on a loopback
+/// gateway [`authorize`] is a no-op there — which means any page a browser has
+/// open can `fetch` these endpoints. A `text/plain` POST is not preflighted, so
+/// nothing but this stops a page on another origin from rewriting the bind list
+/// or minting a key while the user is merely looking at it.
+///
+/// The check is the standard one: a browser attaches an `Origin` to every
+/// cross-site state-changing request and a page cannot spoof it, so an `Origin`
+/// whose authority is not this gateway's own is a forgery. A request with no
+/// `Origin` is not from a browser at all — curl, a harness, the CLI — and is
+/// left to [`authorize`], which is the only guard those callers can satisfy.
+///
+/// The OpenAI surface under `/v1` is deliberately *not* guarded: a remote
+/// harness calls it from another origin as a matter of course, and its guard is
+/// the API key, not the browser's same-origin rule.
+pub(crate) fn forbid_cross_origin(headers: &HeaderMap) -> Option<Response> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())?;
+
+    // The request's own notion of where it was sent. `Host` is the authority a
+    // same-origin fetch echoes back in `Origin`, so the two agree exactly when
+    // the request came from a page this gateway served.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+
+    if origin_authority(origin) == host {
+        return None;
+    }
+
+    Some(
         ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            ErrorEnvelope {
-                error: lightweight_api::error::ErrorBody {
-                    message: failure.message().to_owned(),
-                    r#type: "authentication_error".to_owned(),
-                    param: None,
-                    code: code.to_owned(),
-                    hermes: None,
-                },
-            },
+            StatusCode::FORBIDDEN,
+            ErrorEnvelope::invalid_request(
+                "This request came from another origin and was refused. Change                  the gateway's configuration from the machine running it, or                  from the panel it serves.",
+                "cross_origin_refused",
+            ),
         )
-        .into_response()
-    })
+        .into_response(),
+    )
+}
+
+/// Authorize a generation request and meter it against its key's limit.
+///
+/// One call rather than an `authorize` followed by a separate meter, so the
+/// header is parsed once and the matched key flows straight into the limiter.
+/// Returns the refusal to send, or `None` to proceed.
+///
+/// Only a named key is metered. A loopback anonymous caller (the panel, the
+/// desktop shell, a local script) and a static-key caller carry no per-key
+/// budget and are never throttled — the limit exists to cap one *remote*
+/// consumer, not the machine's own use of its own engine.
+pub(crate) fn admit_request(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+
+    let caller = match state.config.auth.identify(presented) {
+        Ok(caller) => caller,
+        Err(failure) => return Some(unauthorized(failure)),
+    };
+
+    let record = caller?;
+    if record.limit.is_unlimited() {
+        return None;
+    }
+
+    match state.limiter().admit(&record.id, record.limit) {
+        Ok(()) => None,
+        Err(throttled) => Some(too_many_requests(throttled)),
+    }
+}
+
+/// The 401 an auth failure becomes, shared by [`authorize`] and
+/// [`admit_request`] so the body is identical whichever path rejected.
+fn unauthorized(failure: AuthFailure) -> Response {
+    let code = match failure {
+        AuthFailure::Missing => "missing_api_key",
+        AuthFailure::Invalid => "invalid_api_key",
+    };
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        ErrorEnvelope {
+            error: lightweight_api::error::ErrorBody {
+                message: failure.message().to_owned(),
+                r#type: "authentication_error".to_owned(),
+                param: None,
+                code: code.to_owned(),
+                hermes: None,
+            },
+        },
+    )
+    .into_response()
+}
+
+/// The 429 a throttled request becomes, carrying `Retry-After`.
+fn too_many_requests(throttled: crate::limits::Throttled) -> Response {
+    let which = match throttled.which {
+        crate::limits::Ceiling::PerMinute => "per-minute",
+        crate::limits::Ceiling::PerDay => "per-day",
+    };
+    let message = format!(
+        "this key has reached its {which} request limit; retry in {} seconds",
+        throttled.retry_after
+    );
+    let mut response = ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        ErrorEnvelope::invalid_request(message, "rate_limited"),
+    )
+    .into_response();
+    if let Ok(value) = header::HeaderValue::from_str(&throttled.retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The `host:port` an `Origin` header names, or `None` for the opaque `null`.
+///
+/// `Origin` is a serialized URL (`http://127.0.0.1:11434`); `Host` is a bare
+/// authority (`127.0.0.1:11434`). Comparing them means stripping the scheme.
+fn origin_authority(origin: &str) -> Option<&str> {
+    origin.split_once("://").map(|(_, authority)| authority)
 }
 
 impl ApiError {
@@ -859,6 +968,52 @@ fn completion_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_request_without_an_origin_is_left_to_the_auth_layer() {
+        // curl, a harness, the CLI: no Origin means not a browser, and the only
+        // guard those callers can satisfy is the key.
+        assert!(forbid_cross_origin(&headers(&[("host", "127.0.0.1:11434")])).is_none());
+        assert!(forbid_cross_origin(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn a_same_origin_request_is_allowed() {
+        let map = headers(&[
+            ("host", "127.0.0.1:11434"),
+            ("origin", "http://127.0.0.1:11434"),
+        ]);
+        assert!(forbid_cross_origin(&map).is_none());
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused() {
+        let map = headers(&[
+            ("host", "127.0.0.1:11434"),
+            ("origin", "http://example.test"),
+        ]);
+        let refusal = forbid_cross_origin(&map).expect("a foreign origin is refused");
+        assert_eq!(refusal.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn an_opaque_origin_is_refused() {
+        // A sandboxed iframe or a file:// page sends `Origin: null`, which names
+        // no authority and so cannot be this gateway's own.
+        let map = headers(&[("host", "127.0.0.1:11434"), ("origin", "null")]);
+        assert!(forbid_cross_origin(&map).is_some());
+    }
 
     #[test]
     fn an_oversized_max_tokens_is_clamped_rather_than_refused() {

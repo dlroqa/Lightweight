@@ -118,6 +118,9 @@ pub struct GatewayState {
     /// admission verdict over HTTP depend on how much RAM the machine running
     /// the test happened to have free.
     memory: Arc<dyn lightweight_system_info::MemoryProbe + Send + Sync>,
+    /// Per-key request limits, tracked live. Empty and idle until a named key
+    /// with a ceiling is used; loopback and anonymous callers never touch it.
+    limiter: Arc<crate::limits::RateLimiter>,
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -149,6 +152,7 @@ impl GatewayState {
             jobs: Arc::new(crate::jobs::Jobs::new()),
             shutdown: CancellationToken::new(),
             memory: Arc::new(lightweight_system_info::SystemMemoryProbe),
+            limiter: Arc::new(crate::limits::RateLimiter::new()),
         }
     }
 
@@ -273,6 +277,20 @@ impl GatewayState {
             .map(|paths| lightweight_store::SettingsStore::new(paths.settings_file()))
     }
 
+    pub fn api_config_store(&self) -> Option<lightweight_store::ApiConfigStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| lightweight_store::ApiConfigStore::new(paths.api_config_file()))
+    }
+
+    pub fn api_keys_store(&self) -> Option<lightweight_store::ApiKeyStore> {
+        self.config
+            .paths
+            .as_ref()
+            .map(|paths| lightweight_store::ApiKeyStore::new(paths.api_keys_file()))
+    }
+
     pub fn jobs(&self) -> &Arc<crate::jobs::Jobs> {
         &self.jobs
     }
@@ -280,6 +298,10 @@ impl GatewayState {
     /// The counters, for the handlers that record into them.
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    pub fn limiter(&self) -> &Arc<crate::limits::RateLimiter> {
+        &self.limiter
     }
 
     pub fn scheduler(&self) -> &Arc<Scheduler> {

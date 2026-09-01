@@ -20,6 +20,7 @@ pub mod catalog;
 pub mod completions;
 pub mod control;
 pub mod jobs;
+pub mod limits;
 pub mod logs;
 pub mod manager;
 pub mod metrics;
@@ -63,6 +64,15 @@ pub fn service(
 /// for them. Our own UI control API lives under `/api/v1` and is deliberately
 /// never mixed in with the OpenAI routes — a client enumerating `/v1` must find
 /// only what OpenAI defines there.
+/// The port the gateway binds when nothing says otherwise.
+///
+/// 11434 rather than a bespoke number so the desktop shell, the dev proxy and
+/// the CLI all agree, and so a client that assumes the common local-LLM port
+/// finds the gateway where it expects to. The collision with that ecosystem is
+/// the reason the desktop supervisor probes `/health` before attaching to a
+/// port it did not open.
+pub const DEFAULT_PORT: u16 = 11434;
+
 pub fn app(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/health", get(routes::health))
@@ -112,12 +122,29 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             "/api/v1/settings",
             get(store_api::settings).put(store_api::save_settings),
         )
+        .route(
+            "/api/v1/gateway/config",
+            get(store_api::get_config).put(store_api::save_config),
+        )
+        .route(
+            "/api/v1/gateway/keys",
+            get(store_api::list_keys).post(store_api::create_key),
+        )
+        .route(
+            "/api/v1/gateway/keys/{id}",
+            axum::routing::delete(store_api::revoke_key),
+        )
+        .route(
+            "/api/v1/gateway/keys/{id}/limit",
+            axum::routing::put(store_api::set_key_limit),
+        )
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.
         .fallback(web::serve)
         // Wrapped around every route rather than written into each handler:
         // there are a dozen of them, and a gauge that a new endpoint can forget
         // to join is a gauge that quietly stops being true.
+        .layer(axum::middleware::from_fn(guard_control_writes))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             count_in_flight,
@@ -160,6 +187,39 @@ async fn count_in_flight(
         |(mut stream, guard)| async move { Some((stream.next().await?, (stream, guard))) },
     );
     axum::response::Response::from_parts(parts, axum::body::Body::from_stream(counted))
+}
+
+/// Refuse a state-changing request to the control surface that a foreign page
+/// forged. See [`routes::forbid_cross_origin`] for why this is separate from
+/// authentication and why it cannot be.
+///
+/// Scoped to `/api/v1` and to the methods that change state: a `GET` is safe to
+/// serve to anyone the auth layer admits, and the OpenAI surface under `/v1` is
+/// the API's front door, guarded by its key rather than by the browser's
+/// same-origin rule. Written as a layer, not a line in each handler, for the
+/// same reason `count_in_flight` is: a guard a new endpoint can forget to join
+/// is a guard that quietly stops being true.
+async fn guard_control_writes(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+
+    let method = request.method();
+    let is_write = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let is_control = request.uri().path().starts_with("/api/v1/");
+
+    if is_write
+        && is_control
+        && let Some(refusal) = routes::forbid_cross_origin(request.headers())
+    {
+        return refusal;
+    }
+
+    next.run(request).await
 }
 
 /// Whether a path is the gateway describing itself rather than doing work.

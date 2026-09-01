@@ -166,42 +166,33 @@ describe("deciding whether a bind needs a key", () => {
 });
 
 describe("planning a launch", () => {
-  it("gives a loopback gateway no key at all", () => {
-    // The gateway only requires one when a bind is reachable from elsewhere.
-    // Inventing a credential for a purely local socket would mean the panel has
-    // to carry one for no gain.
-    const launch = planLaunch({ binary: "hermes", port: 11434 });
-    assert.equal(launch.apiKey, undefined);
-    assert.equal(launch.env.HERMES_API_KEY, undefined);
+  it("never mints a key, on any host list", () => {
+    // The shell used to invent a fresh key every launch, which is exactly why a
+    // key shared with a remote agent broke on the next restart. Keys are now the
+    // gateway's own, hashed and persisted; the shell carries none.
+    for (const hosts of [undefined, ["127.0.0.1"], ["127.0.0.1", "192.0.2.10"]]) {
+      const launch = planLaunch({ binary: "hermes", port: 11434, hosts });
+      assert.equal(
+        (launch as { apiKey?: string }).apiKey,
+        undefined,
+        "planLaunch must not return a key",
+      );
+      assert.equal(
+        launch.env.HERMES_API_KEY,
+        undefined,
+        "planLaunch must not put a key in the environment",
+      );
+    }
   });
 
-  it("generates a key as soon as a bind is reachable from elsewhere", () => {
+  it("never puts a credential in the command line", () => {
+    // /proc/<pid>/cmdline is world-readable; --api-key must never appear there.
     const launch = planLaunch({
       binary: "hermes",
       port: 11434,
-      hosts: ["127.0.0.1", "192.0.2.10"],
+      hosts: ["192.0.2.10"],
     });
-    assert.ok(launch.apiKey, "a reachable bind must have a key");
-    assert.equal(launch.env.HERMES_API_KEY, launch.apiKey);
-    assert.ok(launch.apiKey.length >= 32);
-  });
-
-  it("never puts the key in the command line", () => {
-    // /proc/<pid>/cmdline is world-readable. M3.5 moved the engine's own key
-    // out of its arguments for this reason; the same applies to ours.
-    const launch = planLaunch({
-      binary: "hermes",
-      port: 11434,
-      hosts: ["0.0.0.0"],
-    });
-    const line = launch.argv.join(" ");
-    assert.ok(launch.apiKey);
-    assert.equal(
-      line.includes(launch.apiKey),
-      false,
-      `the key leaked into argv: ${line}`,
-    );
-    assert.equal(line.includes("--api-key"), false);
+    assert.equal(launch.argv.join(" ").includes("--api-key"), false);
   });
 
   it("passes the port, the hosts and the panel through", () => {
@@ -224,12 +215,6 @@ describe("planning a launch", () => {
       "/panel/dist",
     ]);
     assert.equal(launch.env.HERMES_GATEWAY_HOME, "/data");
-  });
-
-  it("two launches do not share a key", () => {
-    const first = planLaunch({ binary: "h", port: 1, hosts: ["0.0.0.0"] });
-    const second = planLaunch({ binary: "h", port: 2, hosts: ["0.0.0.0"] });
-    assert.notEqual(first.apiKey, second.apiKey);
   });
 });
 

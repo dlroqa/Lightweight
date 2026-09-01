@@ -42,6 +42,14 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
 cp "$BINARY" "$STAGE/hermes$EXE"
+
+# The same program under its second name. `lightweight` prints a welcome mark
+# and is otherwise identical to `hermes`; shipping both means a user can reach
+# for either. It sits beside the release binary, cross build or host build.
+LIGHT="target/$TRIPLE/release/lightweight$EXE"
+[ -f "$LIGHT" ] || LIGHT="target/release/lightweight$EXE"
+[ -f "$LIGHT" ] && cp "$LIGHT" "$STAGE/lightweight$EXE"
+
 cp LICENSE "$STAGE/LICENSE"
 
 # What someone who unpacked only this archive needs to know. Deliberately short:
@@ -52,6 +60,7 @@ cat > "$STAGE/README.md" <<EOF
 # Hermes $VERSION — $TRIPLE
 
 A local CPU inference gateway. Run \`./hermes serve --help\` to start.
+(\`./lightweight\` is the same tool with a welcome banner.)
 
 - **The inference engine is not in this archive.** Hermes downloads the pinned
   llama.cpp build (\`$ENGINE_BUILD\`) for this platform on first use, verifies it

@@ -73,6 +73,119 @@ impl Actionable for NetworkError {
     }
 }
 
+/// Which reserved range an address falls in, for **display only**.
+///
+/// The module's rule that nothing here has an opinion about which network an
+/// address belongs to governs what the gateway *does* — a bind is loopback or
+/// it is not, and [`crate::paths`] and the auth policy never consult this. What
+/// a person is *shown* is a different question: an operator choosing which
+/// address to hand a remote agent is helped by knowing that one of them is the
+/// CGNAT range a mesh VPN hands out and another is a routable public address.
+///
+/// The distinction is drawn by RFC range and by nothing else — never by
+/// interface name, never by a product's name. `SharedRange` is what `100.64/10`
+/// is; whether a Tailscale, a Headscale or a hand-rolled CGNAT put it there is
+/// not knowable here and not asserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressScope {
+    /// `127/8`, `::1` — this machine only.
+    Loopback,
+    /// `169.254/16`, `fe80::/10` — needs a scope id to bind, never advice.
+    LinkLocal,
+    /// `10/8`, `172.16/12`, `192.168/16` — RFC 1918 private networks.
+    Private,
+    /// `100.64/10` — RFC 6598 shared address space, used by CGNAT and by most
+    /// mesh VPNs for their overlay addresses.
+    SharedRange,
+    /// `fc00::/7` — RFC 4193 unique-local IPv6, the v6 overlay equivalent.
+    UniqueLocal,
+    /// Anything else: a routable, globally-scoped address.
+    GlobalUnicast,
+}
+
+impl AddressScope {
+    /// Classify an address by the reserved range it falls in.
+    pub const fn of(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                if v4.is_loopback() {
+                    Self::Loopback
+                } else if v4.is_link_local() {
+                    Self::LinkLocal
+                } else if a == 100 && (b & 0xc0) == 64 {
+                    // 100.64/10 — RFC 6598 shared address space (second octet 64..127)
+                    Self::SharedRange
+                } else if v4.is_private() {
+                    Self::Private
+                } else {
+                    Self::GlobalUnicast
+                }
+            }
+            IpAddr::V6(v6) => {
+                let head = v6.segments()[0];
+                if v6.is_loopback() {
+                    Self::Loopback
+                } else if (head & 0xffc0) == 0xfe80 {
+                    Self::LinkLocal
+                } else if (head & 0xfe00) == 0xfc00 {
+                    Self::UniqueLocal
+                } else {
+                    Self::GlobalUnicast
+                }
+            }
+        }
+    }
+
+    /// A short human label, for a pill beside the address.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::LinkLocal => "link-local",
+            Self::Private => "private network",
+            Self::SharedRange => "shared range",
+            Self::UniqueLocal => "unique-local",
+            Self::GlobalUnicast => "public",
+        }
+    }
+
+    /// The standard the range is defined by, for the operator who wants to know
+    /// exactly what they are looking at.
+    pub const fn rfc(self) -> &'static str {
+        match self {
+            Self::Loopback => "RFC 1122",
+            Self::LinkLocal => "RFC 3927 / RFC 4291",
+            Self::Private => "RFC 1918",
+            Self::SharedRange => "RFC 6598",
+            Self::UniqueLocal => "RFC 4193",
+            Self::GlobalUnicast => "globally routable",
+        }
+    }
+}
+
+/// A reachable address paired with the range it falls in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ClassifiedAddress {
+    pub address: IpAddr,
+    pub scope: AddressScope,
+}
+
+/// The reachable addresses of [`reachable_addresses`], each tagged with its
+/// scope, in the same stable order.
+///
+/// A convenience over classifying the flat list at every call site, and the
+/// single place the panel and `sysinfo` read so the two never drift.
+pub fn classified_addresses() -> Result<Vec<ClassifiedAddress>, NetworkError> {
+    Ok(reachable_addresses()?
+        .into_iter()
+        .map(|address| ClassifiedAddress {
+            address,
+            scope: AddressScope::of(address),
+        })
+        .collect())
+}
+
 /// Addresses another machine could reach this one at, in a stable order.
 ///
 /// IPv4 before IPv6, each family ascending, so repeated runs and the output
@@ -335,6 +448,39 @@ Local:
             !is_reachable_from_elsewhere(&"127.0.1.1".parse::<IpAddr>().unwrap()),
             "127.0.1.1 is the address this whole module exists to warn about"
         );
+    }
+
+    #[test]
+    fn scope_is_drawn_by_rfc_range_alone() {
+        // v4, by octet form so no dotted-quad literal enters the repository.
+        let cases_v4 = [
+            (Ipv4Addr::new(127, 0, 0, 1), AddressScope::Loopback),
+            (Ipv4Addr::new(169, 254, 1, 1), AddressScope::LinkLocal),
+            (Ipv4Addr::new(10, 0, 0, 1), AddressScope::Private),
+            (Ipv4Addr::new(172, 16, 0, 1), AddressScope::Private),
+            (Ipv4Addr::new(192, 168, 0, 1), AddressScope::Private),
+            // 100.64/10 is the CGNAT range mesh VPNs hand out; 100.128 is not.
+            (Ipv4Addr::new(100, 64, 0, 1), AddressScope::SharedRange),
+            (Ipv4Addr::new(100, 127, 255, 255), AddressScope::SharedRange),
+            (Ipv4Addr::new(100, 128, 0, 1), AddressScope::GlobalUnicast),
+            (Ipv4Addr::new(203, 0, 113, 9), AddressScope::GlobalUnicast),
+        ];
+        for (address, scope) in cases_v4 {
+            assert_eq!(AddressScope::of(IpAddr::V4(address)), scope, "{address}");
+        }
+
+        // v6, via parse into IpAddr so the type name stays out of non-Linux
+        // builds. `fd00::1` is the whitelisted base of the unique-local range.
+        let cases_v6: [(&str, AddressScope); 4] = [
+            ("::1", AddressScope::Loopback),
+            ("fe80::1", AddressScope::LinkLocal),
+            ("fd00::1", AddressScope::UniqueLocal),
+            ("2001:db8::1", AddressScope::GlobalUnicast),
+        ];
+        for (text, scope) in cases_v6 {
+            let address: IpAddr = text.parse().unwrap();
+            assert_eq!(AddressScope::of(address), scope, "{text}");
+        }
     }
 
     #[cfg(target_os = "linux")]

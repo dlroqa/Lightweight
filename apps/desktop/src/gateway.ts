@@ -12,7 +12,6 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -152,8 +151,6 @@ export interface LaunchOptions {
 export interface Launch {
   argv: string[];
   env: Record<string, string>;
-  /** Present only when a key was required, so the shell can show it once. */
-  apiKey?: string;
 }
 
 /**
@@ -180,12 +177,13 @@ export function planLaunch(options: LaunchOptions): Launch {
   const env: Record<string, string> = {};
   if (options.home) env.HERMES_GATEWAY_HOME = options.home;
 
-  const exposed = (options.hosts ?? []).some(isNonLoopback);
-  if (!exposed) return { argv, env };
-
-  const apiKey = randomBytes(32).toString("base64url");
-  env.HERMES_API_KEY = apiKey;
-  return { argv, env, apiKey };
+  // No key is minted here any more, and that is the point. The gateway keeps
+  // its own keys, hashed, and a key shared with a remote agent must survive a
+  // restart of this shell — a fresh `randomBytes` every launch is exactly the
+  // bug that broke. An exposed bind now needs a key created first (in the panel
+  // or with `hermes key create`); the gateway refuses to start otherwise and
+  // says so, which the panel's bind-config flow steers the user through.
+  return { argv, env };
 }
 
 /**
@@ -209,7 +207,7 @@ export type GatewayState =
   | { kind: "stopped" }
   | { kind: "attached"; port: number; health: HealthReport }
   | { kind: "starting"; port: number }
-  | { kind: "running"; port: number; pid: number; apiKey?: string }
+  | { kind: "running"; port: number; pid: number }
   | { kind: "failed"; reason: string };
 
 /**
@@ -226,6 +224,8 @@ export class GatewaySupervisor {
    * killing a gateway that was already serving before the shell opened.
    */
   private owned = false;
+  /** The options the running gateway was started with, for a restart. */
+  private lastOptions: LaunchOptions | null = null;
   /**
    * The last thing the gateway said before it stopped.
    *
@@ -267,6 +267,7 @@ export class GatewaySupervisor {
     options: LaunchOptions,
     fetchImpl: typeof fetch = fetch,
   ): Promise<GatewayState> {
+    this.lastOptions = options;
     const existing = await probe(options.port, fetchImpl);
     if (existing) {
       this.owned = false;
@@ -323,7 +324,6 @@ export class GatewaySupervisor {
         kind: "running",
         port: options.port,
         pid: child.pid ?? -1,
-        ...(launch.apiKey ? { apiKey: launch.apiKey } : {}),
       });
     } catch (cause) {
       this.set({
@@ -394,6 +394,24 @@ export class GatewaySupervisor {
     if (!exited) child.kill("SIGKILL");
     this.child = null;
     this.owned = false;
+  }
+
+  /**
+   * Stop this shell's gateway and start it again with the same options.
+   *
+   * Only ever restarts a gateway this shell owns — an attached one belongs to
+   * someone else, the same rule `stop` keeps. This is how a bind-configuration
+   * change written from the panel takes effect: the listeners are fixed for the
+   * life of a run, so applying a new set means a new run, and the supervisor is
+   * the only thing that knows whether the gateway is ours to cycle.
+   */
+  async restart(): Promise<GatewayState> {
+    if (!this.owned || !this.lastOptions) {
+      throw new Error("this gateway was not started by this app, so it cannot be restarted here");
+    }
+    const options = this.lastOptions;
+    await this.stop();
+    return this.attachOrStart(options);
   }
 }
 

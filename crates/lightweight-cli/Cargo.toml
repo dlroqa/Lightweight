@@ -6,9 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "lightweight_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hermes"
-path = "src/main.rs"
+path = "src/bin/hermes.rs"
+
+[[bin]]
+name = "lightweight"
+path = "src/bin/lightweight.rs"
 
 [dependencies]
 lightweight-core.workspace = true
@@ -21,6 +29,7 @@ serde.workspace = true
 lightweight-inference.workspace = true
 lightweight-backend-llamacpp.workspace = true
 lightweight-gateway.workspace = true
+lightweight-store.workspace = true
 lightweight-catalog.workspace = true
 lightweight-bench.workspace = true
 lightweight-api.workspace = true

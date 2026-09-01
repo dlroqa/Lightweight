@@ -15,6 +15,10 @@ import type {
   Job,
   LogsBody,
   Metrics,
+  ApiKeyView,
+  CreatedKey,
+  GatewayBindConfig,
+  ApiKeyLimit,
   ModelDetail,
   PinnedModel,
   CatalogRow,
@@ -248,6 +252,30 @@ export const api = {
     request<{ deleted: string }>(
       `/api/v1/conversations/${encodeURIComponent(id)}`,
       { method: "DELETE" },
+    ),
+
+  keys: () =>
+    request<ListBody<ApiKeyView>>("/api/v1/gateway/keys").then((body) => body.data),
+  createKey: (body: { name?: string; limit?: ApiKeyLimit }) =>
+    request<CreatedKey>("/api/v1/gateway/keys", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  revokeKey: (id: string) =>
+    request<{ revoked: boolean; id: string }>(
+      `/api/v1/gateway/keys/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  setKeyLimit: (id: string, limit: ApiKeyLimit) =>
+    request<{ updated: boolean }>(
+      `/api/v1/gateway/keys/${encodeURIComponent(id)}/limit`,
+      { method: "PUT", body: JSON.stringify(limit) },
+    ),
+  gatewayConfig: () => request<GatewayBindConfig>("/api/v1/gateway/config"),
+  saveGatewayConfig: (body: { hosts: string[]; port: number | null }) =>
+    request<{ hosts: string[]; port: number | null; restart_required: boolean }>(
+      "/api/v1/gateway/config",
+      { method: "PUT", body: JSON.stringify(body) },
     ),
 
   settings: () => request<Settings>("/api/v1/settings"),
