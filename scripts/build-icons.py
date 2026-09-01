@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageChops, ImageFilter
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter
 except ModuleNotFoundError:  # pragma: no cover - a tool, not a test
     sys.exit("Pillow is needed to rebuild the icons: pip install --user Pillow")
 
@@ -113,6 +113,105 @@ def plate_icon(image: Image.Image, plate: tuple[int, int, int]) -> Image.Image:
 # itself rather than a recolourable glyph.
 
 
+# The tray artwork, kept apart from the brand plate above.
+#
+# A menu-bar icon wants the mark on transparency, not on a plate, and the reason
+# the plate icons ship *with* their plate — that keying the old teal feather out
+# of navy deleted half the mark — does not apply to this one: it is a saturated
+# feather on pure white, which keys cleanly. So the tray gets its own source and
+# its own path through this script.
+TRAY_SOURCE = ROOT / "icon" / "tray-source.png"
+
+# How much of the macOS app-icon canvas the rounded body fills. Apple's grid
+# puts an 824px body in a 1024px canvas — a hair over 80% — with the rest a
+# transparent margin the dock and Launchpad expect to see.
+MACOS_BODY = 0.805
+
+# The superellipse exponent that matches the macOS "squircle". Two gives an
+# ellipse and infinity a square; the platform corner sits around five.
+SQUIRCLE_N = 5.0
+
+
+def superellipse_mask(side: int, n: float = SQUIRCLE_N, supersample: int = 4) -> Image.Image:
+    """An anti-aliased squircle alpha mask, `side` x `side`.
+
+    The macOS corner is a superellipse, not a circular round-rect, and matching
+    it is what makes the icon sit on the dock exactly like every other app
+    rather than almost like them. Pillow has no superellipse primitive, so the
+    boundary is sampled parametrically, filled as a polygon at `supersample`x,
+    and box-averaged down — which is where the smooth edge comes from.
+    """
+    import math
+
+    high = side * supersample
+    half = high / 2.0
+    steps = 720
+    points = []
+    for index in range(steps):
+        angle = 2.0 * math.pi * index / steps
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        # |cos|^(2/n)·sign(cos), scaled from the centre to the half-extent.
+        x = half + math.copysign(abs(cos_a) ** (2.0 / n), cos_a) * half
+        y = half + math.copysign(abs(sin_a) ** (2.0 / n), sin_a) * half
+        points.append((x, y))
+    big = Image.new("L", (high, high), 0)
+    ImageDraw.Draw(big).polygon(points, fill=255)
+    return big.resize((side, side), Image.LANCZOS)
+
+
+def macos_masked(icon: Image.Image, size: int) -> Image.Image:
+    """`icon` re-cut to the macOS app-icon shape at `size` x `size`.
+
+    The plate is scaled to Apple's content square, centred on a transparent
+    canvas, and its corners taken off by the squircle mask — so the packaged
+    icon carries its own rounded corners and margin. macOS, unlike iOS, does not
+    add them for an app, which is why a full-bleed square reads as a hard-edged
+    tile next to everything else on the dock.
+    """
+    body = round(size * MACOS_BODY)
+    plate = icon.resize((body, body), Image.LANCZOS).convert("RGBA")
+    # Fold the squircle into the plate's own alpha rather than overwriting it,
+    # so a plate that ever carried transparency of its own keeps it.
+    combined = ImageChops.multiply(plate.getchannel("A"), superellipse_mask(body))
+    plate.putalpha(combined)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    edge = (size - body) // 2
+    canvas.alpha_composite(plate, (edge, edge))
+    return canvas
+
+
+def tray_icon(fallback: Image.Image) -> Image.Image:
+    """The menu-bar icon: the feather on transparency, keyed off its white field.
+
+    Alpha is the distance from white — `255 - min(r, g, b)` per pixel — so the
+    white field goes fully transparent, the saturated feather stays opaque, and
+    its soft wisps keep a soft edge rather than a cut-out one. The mark is then
+    centred in a square with a little transparent padding and returned at 48px
+    RGBA, the size the shell loads.
+
+    When `icon/tray-source.png` is absent the plated brand mark is used instead,
+    so the build still produces a tray icon; drop the violet feather in and
+    re-run to get the intended one.
+    """
+    if not TRAY_SOURCE.is_file():
+        print(f"note: {TRAY_SOURCE.relative_to(ROOT)} is absent; tray uses the plated brand mark")
+        return fallback.resize((48, 48), Image.LANCZOS)
+    art = Image.open(TRAY_SOURCE).convert("RGBA")
+    red, green, blue = art.convert("RGB").split()
+    lowest = ImageChops.darker(ImageChops.darker(red, green), blue)
+    art.putalpha(ImageChops.invert(lowest))
+    box = art.getchannel("A").getbbox()
+    if box is None:
+        print("note: the tray source keyed to nothing; tray uses the plated brand mark")
+        return fallback.resize((48, 48), Image.LANCZOS)
+    mark = art.crop(box)
+    # A little air around the feather so it is not wall-to-wall in the bar.
+    side = round(max(mark.size) / 0.82)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.alpha_composite(mark, ((side - mark.width) // 2, (side - mark.height) // 2))
+    return square.resize((48, 48), Image.LANCZOS)
+
+
 def save(image: Image.Image, path: Path, size: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     out = image if size is None else image.resize((size, size), Image.LANCZOS)
@@ -127,6 +226,11 @@ def main() -> None:
     source = Image.open(SOURCE).convert("RGB")
     plate = background(source)
     icon = plate_icon(source, plate)
+    # The packaging icons carry the rounded macOS squircle and its transparent
+    # margin; built once at full size and resized down, so every size shares one
+    # shape. The web assets below stay full-bleed on `icon`, because a browser
+    # favicon and the iOS home-screen icon are masked by their own host.
+    masked = macos_masked(icon, 1024)
 
     # The desktop shell's packaged icon, as a *set* rather than one large PNG.
     # electron-builder reads a directory of `<n>x<n>.png` files as an icon set
@@ -136,32 +240,32 @@ def main() -> None:
     # here and nothing is ever upscaled.
     icons = ROOT / "apps/desktop/build/icons"
     for size in (16, 24, 32, 48, 64, 128, 256, 512, 1024):
-        save(icon, icons / f"{size}x{size}.png", size)
+        save(masked, icons / f"{size}x{size}.png", size)
     # The two the shell loads at run time. `scripts-build.mjs` copies them into
     # `dist/`, which is the directory electron-builder packages - `build/` is
     # electron-builder's own resources directory and is not shipped inside the
     # app, so an icon read from there would be present in a checkout and
     # missing from the AppImage.
     #
-    # The tray is drawn at 16-24px on Linux and Windows; at 2x so a HiDPI
-    # display has real pixels to use.
-    save(icon, ROOT / "apps/desktop/build/tray.png", 48)
+    # The tray gets the mark on transparency from its own source; the menu bar
+    # wants a glyph, not a plated tile.
+    save(tray_icon(icon), ROOT / "apps/desktop/build/tray.png")
     # The window, which is also what a Linux taskbar and an alt-tab switcher
     # show. 256 is the largest either asks for.
-    save(icon, ROOT / "apps/desktop/build/window.png", 256)
+    save(masked, ROOT / "apps/desktop/build/window.png", 256)
 
     # macOS and Windows want a single multi-resolution file rather than the
     # directory of PNGs the Linux target reads. They are generated here and
     # committed like every other icon, so no build step needs Pillow - the
     # dependency policy keeps tool-time requirements out of the build.
     desktop_build = ROOT / "apps/desktop/build"
-    icon.save(
+    masked.save(
         desktop_build / "icon.icns",
         sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256), (512, 512), (1024, 1024)],
     )
     print("apps/desktop/build/icon.icns  16-1024")
     # `.ico` tops out at 256; Windows scales that for anything larger.
-    icon.resize((256, 256), Image.LANCZOS).save(
+    masked.resize((256, 256), Image.LANCZOS).save(
         desktop_build / "icon.ico",
         sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
     )

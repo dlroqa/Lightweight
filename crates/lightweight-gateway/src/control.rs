@@ -894,7 +894,7 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
             .collect(),
         restart_required: vec!["listeners", "auth", "concurrency"],
         auth: AuthReport {
-            required: config.auth.is_enabled(),
+            required: state.auth_policy().is_enabled(),
         },
         concurrency: ConcurrencyReport {
             // What is being handed out right now, which follows the loaded

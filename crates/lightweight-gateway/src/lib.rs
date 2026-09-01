@@ -73,7 +73,22 @@ pub fn service(
 /// port it did not open.
 pub const DEFAULT_PORT: u16 = 11434;
 
+/// Whether this gateway trusts a fronting proxy's forwarded client IP.
+///
+/// Inserted as a request extension by [`app`] and read by the [`PeerKey`]
+/// extractor. A newtype rather than a bare `bool` so it cannot be confused with
+/// any other boolean an extractor might reach for, and `Copy` so the layer can
+/// hand each request its own.
+///
+/// [`PeerKey`]: crate::scheduler::PeerKey
+#[derive(Clone, Copy)]
+pub struct TrustForwarded(pub bool);
+
 pub fn app(state: Arc<GatewayState>) -> Router {
+    // Read before `state` is moved into `with_state`: the extractor learns
+    // whether to honour `CF-Connecting-IP` from this, and only a gateway started
+    // behind a trusted proxy sets it.
+    let trust_forwarded = TrustForwarded(state.config.trust_forwarded);
     Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
@@ -149,6 +164,10 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             Arc::clone(&state),
             count_in_flight,
         ))
+        // Carried on every request so the `PeerKey` extractor knows whether a
+        // `CF-Connecting-IP` header may be trusted. Off unless the gateway was
+        // started behind a trusted proxy.
+        .layer(axum::Extension(trust_forwarded))
         .with_state(state)
 }
 

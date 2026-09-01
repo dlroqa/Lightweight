@@ -182,6 +182,32 @@ impl AuthPolicy {
     pub const fn is_enabled(&self) -> bool {
         matches!(self, Self::Required { .. })
     }
+
+    /// The same policy with its named keys replaced by a fresh reading.
+    ///
+    /// Used to make a runtime key change take effect without a restart: the
+    /// store is the source of truth, and after a create, a limit change or a
+    /// revocation the gateway rebuilds the named set from it. The static key —
+    /// the out-of-band credential a bind was started with — is preserved
+    /// untouched, because it does not live in the store and is not the thing
+    /// that changed.
+    ///
+    /// A `Disabled` policy is returned unchanged. Refreshing is only ever asked
+    /// of a gateway that manages keys, which is always `Required` (an exposed or
+    /// proxied bind refuses to start without a credential), so this arm never
+    /// runs in practice; keeping it a no-op means a stray call can never
+    /// silently start demanding keys from the local clients a loopback gateway
+    /// serves without one.
+    #[must_use]
+    pub fn reloaded(&self, named: Vec<ApiKeyRecord>) -> Self {
+        match self {
+            Self::Required { static_key, .. } => Self::Required {
+                static_key: static_key.clone(),
+                named,
+            },
+            Self::Disabled => Self::Disabled,
+        }
+    }
 }
 
 /// A non-loopback bind was requested with no key configured.

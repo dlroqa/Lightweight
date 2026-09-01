@@ -16,6 +16,15 @@ use lightweight_core::Actionable as _;
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub auth: AuthPolicy,
+    /// Whether a fronting proxy's forwarded client IP (`CF-Connecting-IP`) is
+    /// trusted. On only when the gateway was started with `--behind-proxy`; see
+    /// [`crate::TrustForwarded`] and [`crate::scheduler::PeerKey::resolve`].
+    pub trust_forwarded: bool,
+    /// Whether this gateway enforces named API keys, and so reloads them from
+    /// the store when they change at runtime. True for an exposed or proxied
+    /// bind; false for a plain loopback bind, which serves its local clients
+    /// without a key and must keep doing so.
+    pub manages_keys: bool,
     /// Requests that may run at once.
     ///
     /// One, because the engine serves one and because a second concurrent
@@ -70,6 +79,8 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             auth: AuthPolicy::Disabled,
+            trust_forwarded: false,
+            manages_keys: false,
             max_concurrent_requests: 1,
             queue_timeout: std::time::Duration::from_secs(600),
             queue_notice_interval: crate::stream::KEEP_ALIVE_INTERVAL,
@@ -86,6 +97,17 @@ pub struct GatewayState {
     pub backend: Arc<dyn InferenceBackend>,
     pub catalog: Arc<Catalog>,
     pub config: GatewayConfig,
+    /// The live authentication policy.
+    ///
+    /// Seeded from `config.auth` at startup and swapped by [`refresh_keys`] when
+    /// a key is created, re-limited or revoked at runtime, so what a request is
+    /// checked against is always what is currently stored — `config.auth` is the
+    /// snapshot the process began with and must not be read on the request path.
+    /// An `Arc` inside the lock so a reader clones a handle under a moment's lock
+    /// and then checks credentials without holding it.
+    ///
+    /// [`refresh_keys`]: GatewayState::refresh_keys
+    auth: std::sync::RwLock<Arc<AuthPolicy>>,
     /// Admission control: one permit per concurrent request, and the order in
     /// which waiting requests get one.
     scheduler: Arc<Scheduler>,
@@ -142,9 +164,11 @@ impl GatewayState {
         config: GatewayConfig,
     ) -> Self {
         let scheduler = Scheduler::new(config.max_concurrent_requests, config.scheduler);
+        let auth = std::sync::RwLock::new(Arc::new(config.auth.clone()));
         Self {
             backend,
             catalog,
+            auth,
             config,
             scheduler,
             metrics: Arc::new(Metrics::new()),
@@ -289,6 +313,52 @@ impl GatewayState {
             .paths
             .as_ref()
             .map(|paths| lightweight_store::ApiKeyStore::new(paths.api_keys_file()))
+    }
+
+    /// The authentication policy to check this request against.
+    ///
+    /// The live one, not the startup snapshot in `config.auth`: a key created,
+    /// re-limited or revoked at runtime is reflected here on the next request.
+    /// A read clones the `Arc` under a brief lock and releases it, so the
+    /// constant-time credential comparison runs without the lock held.
+    pub fn auth_policy(&self) -> Arc<AuthPolicy> {
+        Arc::clone(
+            &self
+                .auth
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Rebuild the named-key set from the store so a runtime change takes hold.
+    ///
+    /// Called after a successful create, limit change or revocation. A no-op on
+    /// a gateway that does not manage keys — a plain loopback bind serves local
+    /// clients without one and must keep doing so — and on a gateway with no
+    /// data directory, which has no store to read. The static key is preserved;
+    /// only the store-backed named set is replaced. See [`AuthPolicy::reloaded`].
+    ///
+    /// The read is a small JSON file and this runs only on an administrative
+    /// request, never the generation path, so it is done inline rather than
+    /// behind a blocking task.
+    pub fn refresh_keys(&self) {
+        if !self.config.manages_keys {
+            return;
+        }
+        let Some(store) = self.api_keys_store() else {
+            return;
+        };
+        let Ok(named) = store.list() else {
+            // A store that could not be read leaves the current policy in place:
+            // the live keys stay valid rather than every request suddenly
+            // failing because one reload hit a transient error.
+            return;
+        };
+        let refreshed = Arc::new(self.auth_policy().reloaded(named));
+        *self
+            .auth
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = refreshed;
     }
 
     pub fn jobs(&self) -> &Arc<crate::jobs::Jobs> {
@@ -603,6 +673,107 @@ mod tests {
             );
         }
         assert_eq!(state.scheduler().snapshot().running, 4);
+    }
+
+    #[test]
+    fn refreshing_keys_tracks_the_store_so_the_limit_enforced_is_the_limit_set() {
+        // The bug this closes: auth was a startup snapshot, so a key created,
+        // re-limited or revoked on a running gateway had no effect until
+        // restart. After each store change the gateway rebuilds its named set,
+        // so what a request is checked against is always what is stored now.
+        use lightweight_store::RateLimit;
+
+        let root = std::env::temp_dir().join(format!(
+            "hermes-state-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let paths = lightweight_system_info::DataPaths::rooted_at(&root);
+        paths.create_all().expect("create data dirs");
+
+        // Starts Required via a static key (so it is enabled), managing keys,
+        // with no named keys yet.
+        let state = state(GatewayConfig {
+            auth: AuthPolicy::with_static_key("static".to_owned()),
+            manages_keys: true,
+            paths: Some(paths.clone()),
+            ..GatewayConfig::default()
+        });
+
+        let store = state.api_keys_store().expect("a store");
+        let (record, full) = store
+            .create(
+                "alice",
+                RateLimit {
+                    per_minute: Some(2),
+                    per_day: None,
+                },
+            )
+            .expect("create");
+        let bearer = format!("Bearer {full}");
+
+        // Before a refresh the live policy is the startup snapshot: it has never
+        // heard of this key.
+        assert!(
+            state.auth_policy().identify(Some(&bearer)).is_err(),
+            "a key created after startup must not be honoured until the reload"
+        );
+
+        // After the reload the key authenticates and carries the limit it was
+        // created with.
+        state.refresh_keys();
+        let caller = state
+            .auth_policy()
+            .identify(Some(&bearer))
+            .expect("the reloaded key is valid");
+        let identified = caller.expect("a named key identifies its record");
+        assert_eq!(identified.id, record.id);
+        assert_eq!(identified.limit.per_minute, Some(2));
+
+        // A limit changed at runtime is the limit enforced from the next reload.
+        store
+            .set_limit(
+                &record.id,
+                RateLimit {
+                    per_minute: Some(9),
+                    per_day: None,
+                },
+            )
+            .expect("set_limit");
+        state.refresh_keys();
+        let updated = state
+            .auth_policy()
+            .identify(Some(&bearer))
+            .expect("still valid")
+            .expect("still a named key");
+        assert_eq!(
+            updated.limit.per_minute,
+            Some(9),
+            "the new ceiling must be live"
+        );
+
+        // A revoked key stops authenticating at once, not at the next restart.
+        store.revoke(&record.id).expect("revoke");
+        state.refresh_keys();
+        assert!(
+            state.auth_policy().identify(Some(&bearer)).is_err(),
+            "a revoked key must be rejected after the reload"
+        );
+        // The static key it was started with is untouched by any of this.
+        assert!(state.auth_policy().check(Some("Bearer static")).is_ok());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_gateway_that_does_not_manage_keys_ignores_a_refresh() {
+        // A plain loopback gateway serves local clients with no key; a stray
+        // refresh must not start demanding one.
+        let state = state(GatewayConfig::default());
+        state.refresh_keys();
+        assert!(!state.auth_policy().is_enabled());
     }
 
     #[tokio::test]

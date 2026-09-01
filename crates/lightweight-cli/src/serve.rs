@@ -73,6 +73,12 @@ pub struct ServeOptions {
     /// Key required on every request. Mandatory as soon as any bind is
     /// reachable from another machine.
     pub api_key: Option<String>,
+    /// A trusted reverse proxy (a Cloudflare Tunnel, say) fronts this loopback
+    /// bind. Turns on API-key auth even though the bind is loopback — loading
+    /// the named-key store and refusing to start without a credential — and
+    /// trusts the proxy's `CF-Connecting-IP` so a remote caller is not treated
+    /// as local. Off by default; a plain loopback gateway is unchanged.
+    pub behind_proxy: bool,
     /// Requests the gateway may run at once, or `auto`.
     ///
     /// One number, not two: it sizes the engine's slots *and* the gateway's
@@ -269,15 +275,20 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     // start silently demanding one from the local clients that never needed it.
     let static_key = options.api_key.clone().or_else(read_key_from_environment);
     let exposed = bind_ips.iter().any(|ip| !ip.is_loopback());
-    let named_keys = if exposed {
+    // A bind that is reachable from another machine enforces keys, and so does a
+    // loopback bind that a trusted proxy fronts — `--behind-proxy` is the user
+    // saying "this is exposed, through the tunnel." Both load the named-key
+    // store; a plain loopback bind loads nothing, so its local clients keep
+    // needing no key.
+    let expose_auth = exposed || options.behind_proxy;
+    let named_keys = if expose_auth {
         lightweight_store::ApiKeyStore::new(paths.api_keys_file())
             .list()
             .map_err(describe)?
     } else {
         Vec::new()
     };
-    let auth = AuthPolicy::build(&bind_ips, static_key, named_keys)
-        .map_err(|_| exposed_without_key(&bind_ips))?;
+    let auth = finalize_auth(&bind_ips, static_key, named_keys, options.behind_proxy)?;
 
     // With a fixed port every listener binds its own address unchanged. With
     // `auto`, the first bind asks the kernel for a free port (0) and the rest
@@ -375,6 +386,10 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             catalog,
             GatewayConfig {
                 auth,
+                // A trusted proxy fronts a loopback bind: honour its forwarded
+                // client IP, and reload named keys when they change at runtime.
+                trust_forwarded: options.behind_proxy,
+                manages_keys: expose_auth,
                 // What the engine confirmed it is running, where one was
                 // loaded, rather than what was asked for. The two agree unless
                 // the engine opened fewer slots than it was told to - and
@@ -454,7 +469,11 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     println!(
         "  auth     {}",
         if state.config.auth.is_enabled() {
-            "api key required"
+            if options.behind_proxy {
+                "api key required (behind a trusted proxy)"
+            } else {
+                "api key required"
+            }
         } else {
             "disabled (loopback only)"
         }
@@ -1226,6 +1245,49 @@ fn exposed_without_key(addresses: &[IpAddr]) -> String {
     message
 }
 
+/// Decide the auth policy from the bind set, a static key and the named keys.
+///
+/// Split from [`run`] so the two refusals are testable without a runtime or a
+/// store: `AuthPolicy::build` refuses an *exposed* bind with no credential, and
+/// this adds the `--behind-proxy` case — a loopback bind that a proxy will
+/// publish, which `build` sees as unexposed and would leave `Disabled`. Running
+/// behind a tunnel with no key would put an open engine on the internet, so it
+/// is refused here with a message that names the flag rather than an address.
+fn finalize_auth(
+    bind_ips: &[IpAddr],
+    static_key: Option<String>,
+    named: Vec<lightweight_store::ApiKeyRecord>,
+    behind_proxy: bool,
+) -> Result<AuthPolicy, String> {
+    let auth = AuthPolicy::build(bind_ips, static_key, named)
+        .map_err(|_| exposed_without_key(bind_ips))?;
+    if behind_proxy && !auth.is_enabled() {
+        return Err(behind_proxy_without_key());
+    }
+    Ok(auth)
+}
+
+/// Explain a refusal to run behind a proxy without a key.
+///
+/// `--behind-proxy` says a tunnel or reverse proxy will publish this loopback
+/// bind to other machines, so it demands a credential for the same reason an
+/// off-loopback bind does — the difference is only that the bind itself stays
+/// loopback, so the generic "binding to X" refusal would name no address. This
+/// one names the flag instead, and offers both ways to satisfy it: a named key
+/// for a metered tenant, or a static key for the whole gateway.
+fn behind_proxy_without_key() -> String {
+    let mut message = String::from(
+        "--behind-proxy publishes this gateway through a proxy, so an API key is required.\n\n  \
+         Mint one for a tenant:\n\n    hermes key create --name <label>\n",
+    );
+    if let Ok(suggestion) = lightweight_gateway::auth::generate_key() {
+        message.push_str(&format!(
+            "\n  or set a static key for the whole gateway:\n\n    export {API_KEY_ENV}={suggestion}\n"
+        ));
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1250,6 +1312,7 @@ mod tests {
             port,
             port_explicit,
             api_key: None,
+            behind_proxy: false,
             concurrency: Concurrency::Auto,
             web_root: None,
         }
@@ -1558,5 +1621,35 @@ mod tests {
         let elsewhere = addr_in_use_advice(9999);
         assert!(!elsewhere.contains("Ollama"), "{elsewhere}");
         assert!(elsewhere.contains("--port auto"), "{elsewhere}");
+    }
+
+    #[test]
+    fn behind_proxy_on_loopback_without_a_key_is_refused() {
+        // The whole point of the flag: a loopback bind a tunnel will publish
+        // must not come up open. `build` would call this `Disabled`; the flag
+        // turns that into a refusal that names itself.
+        let loopback = [IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        let err = finalize_auth(&loopback, None, Vec::new(), true)
+            .expect_err("a proxied bind with no key must be refused");
+        assert!(err.contains("--behind-proxy"), "{err}");
+        assert!(err.contains("hermes key create"), "{err}");
+    }
+
+    #[test]
+    fn behind_proxy_with_a_static_key_enables_auth_on_a_loopback_bind() {
+        let loopback = [IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        let auth = finalize_auth(&loopback, Some("k".to_owned()), Vec::new(), true)
+            .expect("a key satisfies the requirement");
+        assert!(auth.is_enabled(), "the key must turn auth on");
+    }
+
+    #[test]
+    fn a_plain_loopback_bind_stays_open_without_a_key() {
+        // Unchanged behaviour for everyone not behind a proxy: local clients
+        // need no key, so nothing is demanded of them.
+        let loopback = [IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        let auth = finalize_auth(&loopback, None, Vec::new(), false)
+            .expect("a plain loopback bind needs no key");
+        assert!(!auth.is_enabled());
     }
 }
