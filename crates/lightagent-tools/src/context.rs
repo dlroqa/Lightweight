@@ -55,6 +55,45 @@ pub struct Delegation {
     pub worker_max_output_bytes: usize,
 }
 
+/// The effective web-access settings a web tool enforces.
+///
+/// A plain, resolved view — the caller translates the persisted `WebConfig` into
+/// this once (resolving the search key's [`SecretRef`](lightagent_core::SecretRef)
+/// to a value held only in memory), so this crate never learns the config format
+/// and never re-reads a secret. `allow_domains`, when non-empty, is both a fetch
+/// allow-list and the set of hosts exempt from the private-address guard.
+#[derive(Clone, Debug)]
+pub struct WebPolicy {
+    /// When non-empty, a fetch host must match one of these (exactly or as a
+    /// subdomain); such a host is also exempt from `block_private_addresses`.
+    pub allow_domains: Vec<String>,
+    /// Refuse a fetch whose host resolves to a non-global address.
+    pub block_private_addresses: bool,
+    /// The most bytes a single fetch reads before truncating.
+    pub max_fetch_bytes: usize,
+    /// The per-request timeout.
+    pub timeout: Duration,
+    /// The `web.search` endpoint; `None` means no backend is configured.
+    pub search_endpoint: Option<String>,
+    /// The query-string parameter the search endpoint reads the query from.
+    pub search_query_param: String,
+    /// The resolved search bearer key, held only in memory; never logged.
+    pub search_api_key: Option<String>,
+    /// The most results a single search returns.
+    pub search_max_results: usize,
+}
+
+/// Everything the web tools need to run, injected by the caller so this crate
+/// never builds an HTTP client or reads the config format itself.
+#[derive(Clone)]
+pub struct WebContext {
+    /// The HTTP client the caller built (with the rustls provider installed and
+    /// automatic redirects disabled, so the tool follows them under its guard).
+    pub client: reqwest::Client,
+    /// The effective web policy.
+    pub policy: Arc<WebPolicy>,
+}
+
 /// The context handed to a [`Tool`](crate::Tool) when it runs.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -67,16 +106,19 @@ pub struct ToolCtx {
     pub clock: Clock,
     /// Present only when delegation is enabled for this run.
     pub delegation: Option<Delegation>,
+    /// Present only when web access is enabled for this run.
+    pub web: Option<WebContext>,
 }
 
 impl ToolCtx {
-    /// A context with no delegation and the system clock.
+    /// A context with no delegation, no web access and the system clock.
     pub fn new(cancel: CancellationToken) -> Self {
         Self {
             cancel,
             run: None,
             clock: Clock::System,
             delegation: None,
+            web: None,
         }
     }
 
@@ -95,6 +137,12 @@ impl ToolCtx {
     /// Enable delegation with the given bundle.
     pub fn with_delegation(mut self, delegation: Delegation) -> Self {
         self.delegation = Some(delegation);
+        self
+    }
+
+    /// Enable web access with the given context.
+    pub fn with_web(mut self, web: WebContext) -> Self {
+        self.web = Some(web);
         self
     }
 }

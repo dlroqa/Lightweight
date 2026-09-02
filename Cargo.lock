@@ -984,6 +984,7 @@ dependencies = [
  "lightagent-provider-lightweight",
  "lightagent-store",
  "lightagent-tools",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1054,6 +1055,7 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "lightagent-core",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

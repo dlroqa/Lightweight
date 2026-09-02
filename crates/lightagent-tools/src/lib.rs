@@ -9,14 +9,18 @@
 //!   model's arguments before a tool ever runs;
 //! * [`BoundedExecutor`] — the concrete invoker the loop drives, enforcing the
 //!   policy, a per-call timeout, cancellation and an output ceiling;
-//! * the built-ins [`builtins::DateTimeNow`] and [`builtins::AgentDelegate`],
-//!   the latter starting a fresh bounded child run under a worker profile
-//!   through the *same* core loop — never a second one.
+//! * the built-ins [`builtins::DateTimeNow`], [`builtins::AgentDelegate`] (which
+//!   starts a fresh bounded child run under a worker profile through the *same*
+//!   core loop — never a second one), and [`builtins::WebFetch`] /
+//!   [`builtins::WebSearch`] (read-only network access under a guard).
 //!
-//! It depends on `lightagent-core` and nothing that reaches a network: a tool
-//! that needs the wire (the delegate's worker provider) receives it through a
-//! [`ProviderFactory`](lightagent_core::ProviderFactory) injected by the caller,
-//! so this crate never grows a transport dependency.
+//! What a tool needs from the outside is always injected, never built here: the
+//! delegate's worker provider arrives as a
+//! [`ProviderFactory`](lightagent_core::ProviderFactory), and the web tools' HTTP
+//! client and resolved policy arrive as a [`WebContext`] — the caller builds the
+//! `reqwest::Client` (having installed the TLS provider) and resolves any secret,
+//! so this crate makes requests but owns neither client construction nor the
+//! config format.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -30,7 +34,7 @@ pub mod output;
 pub mod registry;
 pub mod schema;
 
-pub use context::{Clock, Delegation, ToolCtx};
+pub use context::{Clock, Delegation, ToolCtx, WebContext, WebPolicy};
 pub use definition::{Tool, ToolDefinition};
 pub use executor::BoundedExecutor;
 pub use output::clamp;

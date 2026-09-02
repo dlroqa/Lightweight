@@ -138,12 +138,75 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Web access configuration (Phase 9; a placeholder shape this pass).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A search backend for `web.search`.
+///
+/// `web.search` sends the query to `endpoint` (adding `query_param=<query>`) and
+/// parses a JSON response with a `results` array of objects carrying a `title`,
+/// a `url`, and a snippet under `content`, `snippet` or `description` — SearXNG's
+/// `format=json` shape, and a common minimal one. No backend ships by default, so
+/// the tool reports that none is configured until an operator sets `endpoint`.
+/// A key, when the endpoint needs one, is held by reference and sent as
+/// `Authorization: Bearer <key>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSearchConfig {
+    /// The JSON search endpoint, e.g. `https://searx.example/search?format=json`.
+    pub endpoint: Option<String>,
+    /// The query-string parameter the endpoint reads the query from.
+    pub query_param: String,
+    /// A bearer key for the endpoint, by reference. Never stored in the clear.
+    pub api_key: Option<SecretRef>,
+    /// The most results a single search returns.
+    pub max_results: usize,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            query_param: "q".to_owned(),
+            api_key: None,
+            max_results: 5,
+        }
+    }
+}
+
+/// Web access configuration.
+///
+/// Off by default: `web.fetch` and `web.search` are declared to the model but
+/// refuse to run until `enabled` is set, so a fresh install reaches no network.
+/// `allow_domains`, when non-empty, is an allow-list a fetch host must match
+/// (exactly or as a subdomain); it also opts a host past the private-address
+/// guard, so an operator can reach a named internal service without opening the
+/// guard for everything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     pub enabled: bool,
     pub allow_domains: Vec<String>,
+    /// The most bytes a single fetch reads before truncating.
+    pub max_fetch_bytes: usize,
+    /// The per-request timeout, in seconds.
+    pub timeout_secs: u64,
+    /// Refuse a fetch whose host resolves to a loopback, private, link-local or
+    /// otherwise non-global address (an SSRF guard), unless the host is named in
+    /// `allow_domains`.
+    pub block_private_addresses: bool,
+    /// The `web.search` backend.
+    pub search: WebSearchConfig,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_domains: Vec::new(),
+            max_fetch_bytes: 1_000_000,
+            timeout_secs: 20,
+            block_private_addresses: true,
+            search: WebSearchConfig::default(),
+        }
+    }
 }
 
 /// The whole typed configuration.
@@ -202,6 +265,32 @@ impl Config {
                 "agent.max_tool_calls must be at least 1".to_owned(),
             ));
         }
+        if self.web.enabled {
+            if self.web.max_fetch_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "web.max_fetch_bytes must be at least 1".to_owned(),
+                ));
+            }
+            if self.web.timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "web.timeout_secs must be at least 1".to_owned(),
+                ));
+            }
+            if self.web.search.query_param.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "web.search.query_param must not be empty".to_owned(),
+                ));
+            }
+            if let Some(endpoint) = &self.web.search.endpoint {
+                let endpoint = endpoint.trim();
+                if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                    return Err(ConfigError::Invalid(format!(
+                        "web.search.endpoint must be an http(s) URL, got {:?}",
+                        self.web.search.endpoint
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -217,6 +306,17 @@ impl Config {
             && let Some(object) = inference.as_object_mut()
         {
             object.insert(
+                "api_key".to_owned(),
+                serde_json::Value::String(api_key.redacted()),
+            );
+        }
+        if let Some(api_key) = &self.web.search.api_key
+            && let Some(search) = value
+                .get_mut("web")
+                .and_then(|web| web.get_mut("search"))
+                .and_then(|search| search.as_object_mut())
+        {
+            search.insert(
                 "api_key".to_owned(),
                 serde_json::Value::String(api_key.redacted()),
             );
@@ -347,6 +447,44 @@ mod tests {
         config.inference.base_url = "http://127.0.0.1:11434".to_owned();
         config.agent.max_turns = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn web_validation_only_bites_when_enabled() {
+        let mut config = Config::default();
+        // A disabled web section is never validated, however odd its fields.
+        config.web.timeout_secs = 0;
+        config.web.search.endpoint = Some("not-a-url".to_owned());
+        config
+            .validate()
+            .expect("a disabled web section is not validated");
+
+        config.web.enabled = true;
+        assert!(config.validate().is_err(), "timeout_secs 0 is rejected");
+        config.web.timeout_secs = 20;
+        assert!(
+            config.validate().is_err(),
+            "a non-http endpoint is rejected"
+        );
+        config.web.search.endpoint = Some("https://searx.example/search".to_owned());
+        config
+            .validate()
+            .expect("a valid enabled web section validates");
+    }
+
+    #[test]
+    fn a_search_key_is_redacted_and_round_trips() {
+        let mut config = Config::default();
+        config.web.enabled = true;
+        config.web.search.endpoint = Some("https://searx.example/search".to_owned());
+        config.web.search.api_key = Some(SecretRef::env("SEARCH_TOKEN"));
+
+        let redacted = config.redacted_json().to_string();
+        assert!(redacted.contains("${env:SEARCH_TOKEN}"));
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, config);
     }
 
     #[test]

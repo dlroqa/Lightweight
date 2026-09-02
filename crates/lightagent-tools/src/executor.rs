@@ -19,7 +19,7 @@ use lightagent_core::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::{Clock, Delegation, ToolCtx};
+use crate::context::{Clock, Delegation, ToolCtx, WebContext};
 use crate::output::clamp;
 use crate::registry::ToolRegistry;
 use crate::schema;
@@ -37,6 +37,7 @@ pub struct BoundedExecutor {
     run: Option<RunId>,
     clock: Clock,
     delegation: Option<Delegation>,
+    web: Option<WebContext>,
 }
 
 impl BoundedExecutor {
@@ -55,6 +56,7 @@ impl BoundedExecutor {
             run: None,
             clock: Clock::System,
             delegation: None,
+            web: None,
         }
     }
 
@@ -73,6 +75,12 @@ impl BoundedExecutor {
     /// Enable `agent.delegate` by supplying what a worker run needs.
     pub fn with_delegation(mut self, delegation: Delegation) -> Self {
         self.delegation = Some(delegation);
+        self
+    }
+
+    /// Enable `web.fetch`/`web.search` by supplying the HTTP client and policy.
+    pub fn with_web(mut self, web: WebContext) -> Self {
+        self.web = Some(web);
         self
     }
 
@@ -95,6 +103,9 @@ impl BoundedExecutor {
         }
         if let Some(delegation) = &self.delegation {
             ctx = ctx.with_delegation(delegation.clone());
+        }
+        if let Some(web) = &self.web {
+            ctx = ctx.with_web(web.clone());
         }
         ctx
     }

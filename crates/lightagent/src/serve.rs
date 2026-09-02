@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{LightweightFactory, resolve_profile};
+use crate::chat::{LightweightFactory, resolve_profile, web_context};
 
 /// Builds and drives a real run with the Lightweight provider per request.
 struct LightweightRunFactory {
@@ -89,7 +89,7 @@ impl RunFactory for LightweightRunFactory {
             worker_per_call: Duration::from_secs(60),
             worker_max_output_bytes: 262_144,
         };
-        let executor = BoundedExecutor::new(
+        let mut executor = BoundedExecutor::new(
             ToolRegistry::builtin(),
             PolicyEngine::new(profile.approval_policy.into()),
             Duration::from_secs(60),
@@ -97,6 +97,9 @@ impl RunFactory for LightweightRunFactory {
         )
         .with_run(RunId::new())
         .with_delegation(delegation);
+        if let Some(web) = web_context(&self.config) {
+            executor = executor.with_web(web);
+        }
 
         let agent = AgentLoop::from_profile(provider, executor, &profile);
         manager::drive(agent, request.message, sink, cancel, decisions).await

@@ -17,10 +17,49 @@ use lightagent_core::{
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
-use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry};
+use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry, WebContext, WebPolicy};
 use tokio_util::sync::CancellationToken;
 
 use crate::slash::{self, Slash};
+
+/// Build the web context for a run when web access is enabled, else `None`.
+///
+/// Shared by `chat` and `serve`. The client disables automatic redirects so
+/// `web.fetch` follows them under its own per-hop SSRF guard, and carries the
+/// configured per-request timeout. The search key is resolved here and held only
+/// in memory. `None` when web is disabled or the client cannot be built.
+pub(crate) fn web_context(config: &Config) -> Option<WebContext> {
+    if !config.web.enabled {
+        return None;
+    }
+    lightagent_provider_lightweight::ensure_provider();
+    let timeout = Duration::from_secs(config.web.timeout_secs.max(1));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("lightagent/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    let policy = WebPolicy {
+        allow_domains: config.web.allow_domains.clone(),
+        block_private_addresses: config.web.block_private_addresses,
+        max_fetch_bytes: config.web.max_fetch_bytes,
+        timeout,
+        search_endpoint: config.web.search.endpoint.clone(),
+        search_query_param: config.web.search.query_param.clone(),
+        search_api_key: config
+            .web
+            .search
+            .api_key
+            .as_ref()
+            .and_then(|key| key.resolve()),
+        search_max_results: config.web.search.max_results,
+    };
+    Some(WebContext {
+        client,
+        policy: Arc::new(policy),
+    })
+}
 
 /// Builds Lightweight providers for delegated worker runs.
 pub(crate) struct LightweightFactory {
@@ -87,7 +126,7 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         worker_per_call: Duration::from_secs(60),
         worker_max_output_bytes: 262_144,
     };
-    let executor = BoundedExecutor::new(
+    let mut executor = BoundedExecutor::new(
         ToolRegistry::builtin(),
         PolicyEngine::new(profile.approval_policy.into()),
         Duration::from_secs(60),
@@ -95,6 +134,9 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     )
     .with_run(RunId::new())
     .with_delegation(delegation);
+    if let Some(web) = web_context(&config) {
+        executor = executor.with_web(web);
+    }
 
     let agent = AgentLoop::from_profile(provider, executor, &profile);
 

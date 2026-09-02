@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use lightagent_core::ToolSchema;
 
-use crate::builtins::{AgentDelegate, DateTimeNow};
+use crate::builtins::{AgentDelegate, DateTimeNow, WebFetch, WebSearch};
 use crate::definition::Tool;
 
 /// A named, immutable-once-built set of tools.
@@ -38,11 +38,15 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
-    /// The standard built-in set: `datetime.now` and `agent.delegate`.
+    /// The standard built-in set: `datetime.now`, `agent.delegate`, and the web
+    /// tools `web.fetch` and `web.search` (which run only when the executor is
+    /// given a web context; otherwise they return a controlled error).
     pub fn builtin() -> Self {
         Self::new()
             .with(Arc::new(DateTimeNow::new()))
             .with(Arc::new(AgentDelegate::new()))
+            .with(Arc::new(WebFetch::new()))
+            .with(Arc::new(WebSearch::new()))
     }
 
     /// The built-in set a worker is given: everything except `agent.delegate`,
@@ -98,17 +102,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_lists_datetime_and_delegate() {
+    fn builtin_lists_the_standard_tools() {
         let registry = ToolRegistry::builtin();
         assert!(registry.contains("datetime.now"));
         assert!(registry.contains("agent.delegate"));
-        assert_eq!(registry.schemas().len(), 2);
+        assert!(registry.contains("web.fetch"));
+        assert!(registry.contains("web.search"));
+        assert_eq!(registry.schemas().len(), 4);
     }
 
     #[test]
     fn worker_default_excludes_delegate() {
         let registry = ToolRegistry::worker_default();
         assert!(registry.contains("datetime.now"));
+        assert!(registry.contains("web.fetch"));
         assert!(!registry.contains("agent.delegate"));
     }
 
