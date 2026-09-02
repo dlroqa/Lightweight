@@ -76,6 +76,7 @@ fn app_state(auth: AuthConfig) -> AppState {
         manager: RunManager::new(Arc::new(MockFactory)),
         auth,
         sessions: SessionStore::new(dir),
+        web_root: None,
     }
 }
 

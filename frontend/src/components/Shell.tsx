@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import {
+  Bot,
   ChevronLeft,
   Cpu,
   FileText,
@@ -14,6 +15,7 @@ import {
   Settings as SettingsIcon,
   Sliders,
   Sun,
+  Wrench,
 } from "lucide-react";
 
 import { api } from "../api/client";
@@ -25,6 +27,8 @@ import { wasRead } from "../api/types";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
+  { to: "/agent", label: "Agent", icon: Bot },
+  { to: "/agent/tools", label: "Agent Tools", icon: Wrench },
   { to: "/chat", label: "Chat", icon: MessageSquare },
   { to: "/models", label: "Models", icon: Package },
   { to: "/inference", label: "Inference", icon: Sliders },

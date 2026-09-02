@@ -16,10 +16,11 @@ pub mod sse;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -43,6 +44,9 @@ pub struct AppState {
     pub auth: AuthConfig,
     /// The session store for the active profile.
     pub sessions: SessionStore,
+    /// When set, the panel is served from this directory (same-origin), so the
+    /// WebUI and the API it calls share one origin and need no CORS.
+    pub web_root: Option<PathBuf>,
 }
 
 /// Build the API router over `state`.
@@ -61,7 +65,66 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/lightagent/v1/approvals", get(list_approvals))
         .route("/api/lightagent/v1/approvals/{run}", post(respond_approval))
+        .fallback(serve_static)
         .with_state(Arc::new(state))
+}
+
+/// Serve the WebUI from `web_root`, if configured.
+///
+/// Every API route is matched before this fallback. Path resolution is a
+/// whitelist — each component must be an ordinary name, so `..` is refused
+/// rather than resolved — and a path with no file extension that does not exist
+/// is answered with `index.html`, so a client-side route deep-links, while a
+/// missing asset is a 404 rather than the document.
+async fn serve_static(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let Some(root) = &state.web_root else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let relative = uri.path().trim_start_matches('/');
+    let mut full = root.clone();
+    let mut looks_like_asset = false;
+    if relative.is_empty() {
+        full.push("index.html");
+    } else {
+        for component in relative.split('/') {
+            let ordinary = !component.is_empty()
+                && component != "."
+                && component != ".."
+                && component
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+            if !ordinary {
+                return (StatusCode::NOT_FOUND, "not found").into_response();
+            }
+            full.push(component);
+        }
+        looks_like_asset = std::path::Path::new(relative).extension().is_some();
+    }
+
+    match tokio::fs::read(&full).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type(&full))], bytes).into_response(),
+        Err(_) if looks_like_asset => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(_) => match tokio::fs::read(root.join("index.html")).await {
+            Ok(bytes) => {
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+    }
+}
+
+fn content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") | Some("map") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Reject a request that failed authorization, else `None`.

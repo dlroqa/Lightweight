@@ -99,6 +99,9 @@ enum Command {
         /// Environment variable holding the API key (required off loopback).
         #[arg(long)]
         key_env: Option<String>,
+        /// Serve the built WebUI panel from this directory (e.g. frontend/dist).
+        #[arg(long)]
+        web_root: Option<std::path::PathBuf>,
     },
     /// Report the environment, home, profile and provider.
     Doctor,
@@ -221,7 +224,8 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             host,
             port,
             key_env,
-        }) => serve::run(host, port, key_env).await,
+            web_root,
+        }) => serve::run(host, port, key_env, web_root).await,
         Some(Command::Doctor) => doctor(cli.json),
         Some(Command::Banner { preview }) => {
             if preview {

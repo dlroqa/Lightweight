@@ -113,7 +113,12 @@ fn fail(sink: &AgentEventSink, message: &str) {
 }
 
 /// Bind and serve the API until interrupted.
-pub async fn run(host: String, port: u16, key_env: Option<String>) -> Result<(), String> {
+pub async fn run(
+    host: String,
+    port: u16,
+    key_env: Option<String>,
+    web_root: Option<PathBuf>,
+) -> Result<(), String> {
     let paths = LightagentPaths::resolve().map_err(|error| error.to_string())?;
     let config = ConfigStore::at(&paths)
         .load()
@@ -147,6 +152,7 @@ pub async fn run(host: String, port: u16, key_env: Option<String>) -> Result<(),
         manager: RunManager::new(factory),
         auth,
         sessions,
+        web_root: web_root.clone(),
     };
 
     let addr = format!("{host}:{port}");
@@ -163,6 +169,12 @@ pub async fn run(host: String, port: u16, key_env: Option<String>) -> Result<(),
     );
     if is_loopback {
         println!("Loopback bind: no API key required.");
+    }
+    if let Some(root) = &web_root {
+        println!(
+            "Serving the panel from {} at http://{bound}/",
+            root.display()
+        );
     }
     axum::serve(listener, router(state).into_make_service())
         .await

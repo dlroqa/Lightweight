@@ -20,14 +20,20 @@ export default defineConfig(({ mode }) => {
   // browser-facing type world this project compiles against.
   const env = loadEnv(mode, process.cwd(), "HERMES_");
   const gateway = env.HERMES_DEV_ORIGIN ?? "http://127.0.0.1:11434";
+  // The Lightagent API is a separate server (`lightagent serve`, default 8735).
+  // Its prefix is listed first so it wins over the gateway's `/api`.
+  const agent = env.HERMES_AGENT_ORIGIN ?? "http://127.0.0.1:8735";
 
   return {
   plugins: [react()],
   server: {
     port: 5173,
-    proxy: Object.fromEntries(
-      PROXIED.map((path) => [path, { target: gateway, changeOrigin: true }]),
-    ),
+    proxy: {
+      "/api/lightagent": { target: agent, changeOrigin: true },
+      ...Object.fromEntries(
+        PROXIED.map((path) => [path, { target: gateway, changeOrigin: true }]),
+      ),
+    },
   },
   build: {
     outDir: "dist",
