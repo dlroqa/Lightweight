@@ -12,6 +12,7 @@
 
 mod banner;
 mod chat;
+mod serve;
 mod slash;
 
 use std::io::IsTerminal as _;
@@ -86,6 +87,18 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         action: Option<SessionsAction>,
+    },
+    /// Serve the Lightagent HTTP API (runs, sessions, tools, approvals + SSE).
+    Serve {
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind.
+        #[arg(long, default_value_t = 8735)]
+        port: u16,
+        /// Environment variable holding the API key (required off loopback).
+        #[arg(long)]
+        key_env: Option<String>,
     },
     /// Report the environment, home, profile and provider.
     Doctor,
@@ -204,6 +217,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Sessions { action }) => {
             sessions_cmd(action.unwrap_or(SessionsAction::List), cli.json)
         }
+        Some(Command::Serve {
+            host,
+            port,
+            key_env,
+        }) => serve::run(host, port, key_env).await,
         Some(Command::Doctor) => doctor(cli.json),
         Some(Command::Banner { preview }) => {
             if preview {

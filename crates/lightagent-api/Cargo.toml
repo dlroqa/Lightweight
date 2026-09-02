@@ -1,29 +1,22 @@
 [package]
-name = "lightagent"
-description = "The Lightagent CLI: an interactive agent harness over the Lightweight inference gateway."
+name = "lightagent-api"
+description = "The Lightagent HTTP API: runs, sessions, tools and approvals over axum with SSE streaming."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "lightagent"
-path = "src/bin/lightagent.rs"
-
-[lib]
-name = "lightagent"
-path = "src/lib.rs"
-
 [dependencies]
 lightagent-core.workspace = true
 lightagent-tools.workspace = true
 lightagent-store.workspace = true
-lightagent-api.workspace = true
-lightagent-provider-lightweight.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
-clap.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
 futures-util.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

@@ -31,6 +31,9 @@ use crate::provider::{
 };
 use crate::tool_stream::ToolCallAccumulator;
 
+/// A channel a streaming run sends each [`AgentEvent`] to as it happens.
+pub type AgentEventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
+
 /// What a run needs beyond its provider and invoker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunConfig {
@@ -146,6 +149,21 @@ struct Driver {
     call_counts: BTreeMap<String, u32>,
     /// The tool batch in progress, if the last turn asked for tools.
     pending: Option<Batch>,
+    /// When set, each emitted event is also sent here live, for a streaming
+    /// caller. Persisted across a suspend so a resume keeps streaming.
+    sink: Option<AgentEventSink>,
+}
+
+impl Driver {
+    /// Record an event: append it to the run's log, and — when a live sink is
+    /// attached — send a copy to it. A send to a closed receiver is ignored, so
+    /// a client that walked away never affects the run.
+    fn emit(&mut self, event: AgentEvent) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.send(event.clone());
+        }
+        self.events.push(event);
+    }
 }
 
 /// What one model turn produced.
@@ -214,6 +232,27 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         user_input: impl Into<String>,
         cancel: CancellationToken,
     ) -> Result<RunOutcome, AgentError> {
+        let driver = self.new_driver(user_input, None);
+        self.drive(driver, cancel).await
+    }
+
+    /// Like [`run`](Self::run), but also emit each [`AgentEvent`] to `sink` as it
+    /// happens, for a caller streaming the run live (the HTTP API's SSE). The
+    /// sink rides along through a suspend, so a [`resume`](Self::resume) of the
+    /// paused run keeps streaming to it. A closed receiver is ignored — the run
+    /// is unaffected by nobody listening.
+    pub async fn run_streaming(
+        &self,
+        user_input: impl Into<String>,
+        cancel: CancellationToken,
+        sink: AgentEventSink,
+    ) -> Result<RunOutcome, AgentError> {
+        let driver = self.new_driver(user_input, Some(sink));
+        self.drive(driver, cancel).await
+    }
+
+    /// Build the initial driver, emitting the opening `RunStarted`.
+    fn new_driver(&self, user_input: impl Into<String>, sink: Option<AgentEventSink>) -> Driver {
         let run = RunId::new();
         let mut messages = Vec::new();
         if let Some(system) = &self.config.system {
@@ -221,22 +260,23 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         }
         messages.push(ProviderMessage::user(user_input));
 
-        let driver = Driver {
+        let mut driver = Driver {
             started: Instant::now(),
             limits: self.config.limits,
             model: self.config.model.clone(),
             messages,
-            events: vec![AgentEvent::RunStarted {
-                run,
-                parent: self.config.parent.clone(),
-            }],
+            events: Vec::new(),
             turn: 0,
             tool_calls_made: 0,
             call_counts: BTreeMap::new(),
             pending: None,
+            sink,
         };
-
-        self.drive(driver, cancel).await
+        driver.emit(AgentEvent::RunStarted {
+            run,
+            parent: self.config.parent.clone(),
+        });
+        driver
     }
 
     /// Resume a paused run with a human's decision.
@@ -272,7 +312,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                     call.id.clone(),
                     outcome.content.clone(),
                 ));
-                driver.events.push(AgentEvent::ToolCallCompleted {
+                driver.emit(AgentEvent::ToolCallCompleted {
                     id: call.id.clone(),
                     outcome,
                 });
@@ -306,7 +346,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                 BatchResult::Done => {
                     driver.pending = None;
                     if driver.turn >= driver.limits.max_turns {
-                        driver.events.push(AgentEvent::RunCompleted {
+                        driver.emit(AgentEvent::RunCompleted {
                             reason: StopReason::MaxTurns,
                         });
                         return Ok(RunOutcome::Completed {
@@ -342,7 +382,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         if let Some(budget) = driver.limits.wall_clock()
             && driver.started.elapsed() >= budget
         {
-            driver.events.push(AgentEvent::RunCompleted {
+            driver.emit(AgentEvent::RunCompleted {
                 reason: StopReason::WallClockExceeded,
             });
             return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
@@ -367,7 +407,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    driver.events.push(AgentEvent::RunCompleted { reason: StopReason::Cancelled });
+                    driver.emit(AgentEvent::RunCompleted { reason: StopReason::Cancelled });
                     return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
                         events: std::mem::take(&mut driver.events),
                     })));
@@ -378,11 +418,11 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             match item {
                 Ok(ProviderEvent::RoleStarted) => {}
                 Ok(ProviderEvent::Reasoning(text)) => {
-                    driver.events.push(AgentEvent::Reasoning { text });
+                    driver.emit(AgentEvent::Reasoning { text });
                 }
                 Ok(ProviderEvent::Content(text)) => {
                     assistant_text.push_str(&text);
-                    driver.events.push(AgentEvent::Content { text });
+                    driver.emit(AgentEvent::Content { text });
                 }
                 Ok(ProviderEvent::ToolCallDelta {
                     index,
@@ -396,10 +436,10 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                     finish = Some((reason, usage));
                 }
                 Err(err) => {
-                    driver.events.push(AgentEvent::Error {
+                    driver.emit(AgentEvent::Error {
                         message: err.to_string(),
                     });
-                    driver.events.push(AgentEvent::RunCompleted {
+                    driver.emit(AgentEvent::RunCompleted {
                         reason: StopReason::Error,
                     });
                     return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
@@ -410,11 +450,11 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         }
 
         let (reason, usage) = finish.unwrap_or((FinishReason::Stop, None));
-        driver.events.push(AgentEvent::TurnCompleted { usage });
+        driver.emit(AgentEvent::TurnCompleted { usage });
 
         match reason {
             FinishReason::Stop | FinishReason::Length => {
-                driver.events.push(AgentEvent::RunCompleted {
+                driver.emit(AgentEvent::RunCompleted {
                     reason: StopReason::EndTurn,
                 });
                 Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
@@ -422,10 +462,10 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                 })))
             }
             FinishReason::Error => {
-                driver.events.push(AgentEvent::Error {
+                driver.emit(AgentEvent::Error {
                     message: "the provider ended the turn with an error".to_owned(),
                 });
-                driver.events.push(AgentEvent::RunCompleted {
+                driver.emit(AgentEvent::RunCompleted {
                     reason: StopReason::Error,
                 });
                 Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
@@ -471,7 +511,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
 
             driver.tool_calls_made += 1;
             if driver.tool_calls_made > driver.limits.max_tool_calls {
-                driver.events.push(AgentEvent::RunCompleted {
+                driver.emit(AgentEvent::RunCompleted {
                     reason: StopReason::MaxToolCalls,
                 });
                 return BatchResult::Completed;
@@ -481,7 +521,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             let count = driver.call_counts.entry(key).or_insert(0);
             *count += 1;
             if *count > driver.limits.max_repeated_identical_calls {
-                driver.events.push(AgentEvent::RunCompleted {
+                driver.emit(AgentEvent::RunCompleted {
                     reason: StopReason::RepeatedToolCalls,
                 });
                 return BatchResult::Completed;
@@ -497,13 +537,13 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                         call.id.clone(),
                         outcome.content.clone(),
                     ));
-                    driver.events.push(AgentEvent::ToolCallCompleted {
+                    driver.emit(AgentEvent::ToolCallCompleted {
                         id: call.id.clone(),
                         outcome,
                     });
                 }
                 ApprovalNeed::Require(request) => {
-                    driver.events.push(AgentEvent::AwaitingApproval {
+                    driver.emit(AgentEvent::AwaitingApproval {
                         id: call.id.clone(),
                         name: call.name.clone(),
                     });
@@ -520,7 +560,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
 
     /// Run one approved call: start, invoke, append its result, complete.
     async fn run_call(&self, driver: &mut Driver, call: &ToolCall, cancel: &CancellationToken) {
-        driver.events.push(AgentEvent::ToolCallStarted {
+        driver.emit(AgentEvent::ToolCallStarted {
             id: call.id.clone(),
             name: call.name.clone(),
         });
@@ -529,7 +569,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             call.id.clone(),
             outcome.content.clone(),
         ));
-        driver.events.push(AgentEvent::ToolCallCompleted {
+        driver.emit(AgentEvent::ToolCallCompleted {
             id: call.id.clone(),
             outcome,
         });
@@ -545,6 +585,28 @@ mod tests {
     use crate::profile::{AgentProfile, ProfileId};
     use crate::provider::{ProviderEvent, Role, Usage};
     use async_trait::async_trait;
+
+    #[tokio::test]
+    async fn run_streaming_emits_each_event_live() {
+        let mock = MockProvider::new(vec![stop_turn("hi")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent = AgentLoop::new(mock, NullInvoker, RunConfig::new("m"));
+        let outcome = agent
+            .run_streaming("go", CancellationToken::new(), tx)
+            .await
+            .unwrap();
+
+        let mut streamed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            streamed.push(event);
+        }
+        assert!(matches!(
+            streamed.first(),
+            Some(AgentEvent::RunStarted { .. })
+        ));
+        // The live stream and the recorded log are the same events, in order.
+        assert_eq!(streamed, outcome.into_events());
+    }
 
     fn stop_turn(content: &str) -> Vec<ProviderEvent> {
         vec![

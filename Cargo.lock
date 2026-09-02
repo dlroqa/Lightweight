@@ -975,12 +975,31 @@ dependencies = [
 name = "lightagent"
 version = "0.2.1"
 dependencies = [
+ "async-trait",
+ "axum",
  "clap",
  "futures-util",
+ "lightagent-api",
  "lightagent-core",
  "lightagent-provider-lightweight",
  "lightagent-store",
  "lightagent-tools",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-api"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "lightagent-core",
+ "lightagent-store",
+ "lightagent-tools",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

@@ -23,9 +23,9 @@ use tokio_util::sync::CancellationToken;
 use crate::slash::{self, Slash};
 
 /// Builds Lightweight providers for delegated worker runs.
-struct LightweightFactory {
-    base_url: String,
-    api_key: Option<String>,
+pub(crate) struct LightweightFactory {
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<String>,
 }
 
 impl ProviderFactory for LightweightFactory {
@@ -294,7 +294,7 @@ fn render(events: &[AgentEvent]) {
 
 /// Resolve the profile to run: the named one, else the active one, else a
 /// built-in default that needs no prior `init`.
-fn resolve_profile(
+pub(crate) fn resolve_profile(
     store: &ProfileStore,
     config: &Config,
     name: Option<String>,
