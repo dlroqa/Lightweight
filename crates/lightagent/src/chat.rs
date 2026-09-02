@@ -5,9 +5,10 @@
 //! returned, tool activity is shown on stderr, and a tool call that needs
 //! approval pauses for a yes/no at the prompt before the run resumes.
 
+use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lightagent_core::{
     AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config, ConfigStore,
@@ -15,6 +16,7 @@ use lightagent_core::{
     ProviderFactory, RunId, RunOutcome, StopReason,
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
+use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
 use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
@@ -48,6 +50,9 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let store = ProfileStore::new(paths.root());
     let profile = resolve_profile(&store, &config, profile)?;
+
+    let session_store = SessionStore::at_profile(&store.handle(&profile.id));
+    let mut session = Session::new(profile.id.as_str(), "chat session");
 
     let base_url = profile
         .routing
@@ -123,13 +128,74 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
             }
             continue;
         }
+        session.push_message(StoredMessage::new("user", &line));
         let outcome = agent
             .run(line, CancellationToken::new())
             .await
             .map_err(|error| error.to_string())?;
-        drive(&agent, outcome, &stdin).await?;
+        let events = drive(&agent, outcome, &stdin).await?;
+        record_turn(&mut session, &events);
+        if let Err(error) = session_store.save(&session) {
+            eprintln!("· could not save session: {error}");
+        }
+    }
+    if !session.runs.is_empty() {
+        println!("\nSession saved as {}.", session.id.as_str());
     }
     Ok(())
+}
+
+/// Fold one completed run's events into the session: the assistant's answer as a
+/// message, and a run record with its tool history.
+fn record_turn(session: &mut Session, events: &[AgentEvent]) {
+    let mut run_id = String::new();
+    let mut content = String::new();
+    let mut stop_reason = None;
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut arguments: HashMap<String, String> = HashMap::new();
+    let mut tools = Vec::new();
+
+    for event in events {
+        match event {
+            AgentEvent::RunStarted { run, .. } => run_id = run.as_str().to_string(),
+            AgentEvent::Content { text } => content.push_str(text),
+            AgentEvent::ToolCallRequested { call } => {
+                arguments.insert(call.id.clone(), call.arguments.clone());
+            }
+            AgentEvent::ToolCallStarted { id, name } => {
+                names.insert(id.clone(), name.clone());
+            }
+            AgentEvent::ToolCallCompleted { id, outcome } => tools.push(ToolHistoryEntry {
+                tool: names.get(id).cloned().unwrap_or_else(|| id.clone()),
+                arguments_preview: preview(arguments.get(id).map(String::as_str).unwrap_or("")),
+                outcome: if outcome.is_error { "error" } else { "ok" }.to_string(),
+                duration_ms: None,
+            }),
+            AgentEvent::RunCompleted { reason } => stop_reason = Some(format!("{reason:?}")),
+            _ => {}
+        }
+    }
+
+    if !content.is_empty() {
+        session.push_message(StoredMessage::new("assistant", content));
+    }
+    let now = SystemTime::now();
+    session.push_run(RunRecord {
+        run_id,
+        started_at: now,
+        ended_at: Some(now),
+        stop_reason,
+        tools,
+    });
+}
+
+fn preview(text: &str) -> String {
+    const MAX: usize = 120;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        text.chars().take(MAX).collect()
+    }
 }
 
 /// Handle a slash command; returns true when the session should end.
@@ -159,12 +225,12 @@ async fn drive(
     agent: &AgentLoop<LightweightProvider, BoundedExecutor>,
     mut outcome: RunOutcome,
     stdin: &std::io::Stdin,
-) -> Result<(), String> {
+) -> Result<Vec<AgentEvent>, String> {
     loop {
         match outcome {
             RunOutcome::Completed { events } => {
                 render(&events);
-                return Ok(());
+                return Ok(events);
             }
             RunOutcome::AwaitingApproval {
                 events,

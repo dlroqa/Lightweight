@@ -20,6 +20,7 @@ members = [
     "crates/lightagent-core",
     "crates/lightagent-provider-lightweight",
     "crates/lightagent-tools",
+    "crates/lightagent-store",
     "crates/lightagent",
 ]
 
@@ -142,6 +143,7 @@ lightweight-sys = { path = "crates/lightweight-sys" }
 lightagent-core = { path = "crates/lightagent-core" }
 lightagent-provider-lightweight = { path = "crates/lightagent-provider-lightweight" }
 lightagent-tools = { path = "crates/lightagent-tools" }
+lightagent-store = { path = "crates/lightagent-store" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.

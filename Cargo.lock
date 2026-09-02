@@ -979,6 +979,7 @@ dependencies = [
  "futures-util",
  "lightagent-core",
  "lightagent-provider-lightweight",
+ "lightagent-store",
  "lightagent-tools",
  "serde_json",
  "tokio",
@@ -1015,6 +1016,17 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "lightagent-store"
+version = "0.2.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "lightagent-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

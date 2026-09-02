@@ -17,6 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 lightagent-core.workspace = true
 lightagent-tools.workspace = true
+lightagent-store.workspace = true
 lightagent-provider-lightweight.workspace = true
 clap.workspace = true
 tokio = { workspace = true }

@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use lightagent_core::{
     AgentProfile, Config, ConfigStore, LightagentPaths, ProfileId, ProfileStore,
 };
+use lightagent_store::{SessionId, SessionStore};
 use lightagent_tools::ToolRegistry;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,6 +82,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<ProfilesAction>,
     },
+    /// List and inspect saved sessions for the active profile.
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
     /// Report the environment, home, profile and provider.
     Doctor,
     /// Print the welcome mark and exit.
@@ -127,6 +133,16 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List saved sessions, newest first.
+    List,
+    /// Show one session's transcript and run history.
+    Show { id: String },
+    /// Delete one session.
+    Delete { id: String },
 }
 
 /// Entry point: parse, dispatch, and turn an error into a message and exit code.
@@ -184,6 +200,9 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Profiles { action }) => {
             profiles_cmd(action.unwrap_or(ProfilesAction::List), cli.json)
+        }
+        Some(Command::Sessions { action }) => {
+            sessions_cmd(action.unwrap_or(SessionsAction::List), cli.json)
         }
         Some(Command::Doctor) => doctor(cli.json),
         Some(Command::Banner { preview }) => {
@@ -400,6 +419,91 @@ fn profiles_cmd(action: ProfilesAction, json: bool) -> Result<(), String> {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
+}
+
+// --- sessions ---------------------------------------------------------------
+
+fn sessions_cmd(action: SessionsAction, json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let store = ProfileStore::new(paths.root());
+    let active = active_profile_id(&store)?
+        .ok_or_else(|| "no active profile — run `lightagent init` first".to_string())?;
+    let handle = store.handle(&active);
+    let sessions = SessionStore::at_profile(&handle);
+
+    match action {
+        SessionsAction::List => {
+            let list = sessions.list().map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&list).map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
+            if list.is_empty() {
+                println!("No saved sessions for profile '{}'.", active.as_str());
+                return Ok(());
+            }
+            for summary in list {
+                println!(
+                    "{}  {:<24}  {} msgs, {} runs",
+                    summary.id.as_str(),
+                    truncate(&summary.title, 24),
+                    summary.message_count,
+                    summary.run_count
+                );
+            }
+            Ok(())
+        }
+        SessionsAction::Show { id } => {
+            let id = SessionId::parse(&id).map_err(|error| error.to_string())?;
+            let session = sessions.load(&id).map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&session).map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
+            println!(
+                "session {}  (profile {})",
+                session.id.as_str(),
+                session.profile
+            );
+            println!("title: {}", session.title);
+            for message in &session.messages {
+                println!("  [{}] {}", message.role, first_line(&message.content));
+            }
+            for run in &session.runs {
+                println!(
+                    "  run {} — {} ({} tool calls)",
+                    run.run_id,
+                    run.stop_reason.as_deref().unwrap_or("?"),
+                    run.tools.len()
+                );
+            }
+            Ok(())
+        }
+        SessionsAction::Delete { id } => {
+            let id = SessionId::parse(&id).map_err(|error| error.to_string())?;
+            if sessions.delete(&id).map_err(|error| error.to_string())? {
+                println!("Deleted session {}.", id.as_str());
+            } else {
+                println!("No session {} to delete.", id.as_str());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
 }
 
 // --- config -----------------------------------------------------------------
