@@ -19,6 +19,8 @@ pub enum StopReason {
     MaxTurns,
     /// The run hit its tool-call budget.
     MaxToolCalls,
+    /// The run repeated one identical tool call past its budget — a loop.
+    RepeatedToolCalls,
     /// The run exceeded its wall-clock budget.
     WallClockExceeded,
     /// The run was cancelled.

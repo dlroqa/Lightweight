@@ -1,0 +1,16 @@
+[package]
+name = "lightagent-tools"
+description = "Tool registry, argument validation, bounded execution and built-in tools for the Lightagent runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightagent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true

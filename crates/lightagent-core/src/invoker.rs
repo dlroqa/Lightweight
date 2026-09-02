@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::permissions::{ApprovalDecision, ApprovalNeed};
+
 /// One tool call the model asked for, reconstructed from the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
@@ -82,8 +84,27 @@ pub trait ToolInvoker: Send + Sync {
     /// The tools available this run, declared to the model in the request.
     fn schemas(&self) -> Vec<ToolSchema>;
 
+    /// Decide whether `call` may run now, needs a human decision, or is denied.
+    ///
+    /// The loop consults this before invoking, so a call that requires approval
+    /// pauses the run rather than running unasked. The default auto-approves
+    /// everything, which is what the [`NullInvoker`] and any tool-free run want;
+    /// a real invoker (Slice 4's `BoundedExecutor`) delegates to a policy
+    /// engine.
+    fn approval_for(&self, _call: &ToolCall) -> ApprovalNeed {
+        ApprovalNeed::AutoApprove
+    }
+
     /// Run one tool call to a result.
     async fn invoke(&self, call: &ToolCall, cancel: CancellationToken) -> ToolOutcome;
+
+    /// Persist a remembered grant for `call`.
+    ///
+    /// Called by the loop when a human grants a call and asks to remember it, so
+    /// a matching call does not ask again until the grant expires. The default
+    /// is a no-op — nothing is remembered — which suits an invoker with no
+    /// policy of its own.
+    fn remember(&self, _decision: &ApprovalDecision, _call: &ToolCall) {}
 }
 
 /// An invoker that declares no tools and declines every call.

@@ -38,15 +38,18 @@ pub use event::{AgentEvent, StopReason};
 pub use ids::RunId;
 pub use invoker::{NullInvoker, ToolCall, ToolInvoker, ToolOutcome, ToolSchema};
 pub use limits::RunLimits;
-pub use loop_::{AgentError, AgentLoop, RunConfig};
+pub use loop_::{AgentError, AgentLoop, RunConfig, RunOutcome, Suspended};
 pub use mock::MockProvider;
 pub use paths::{LightagentPaths, PathsError};
-pub use permissions::{RiskClass, Scope};
+pub use permissions::{
+    ApprovalDecision, ApprovalId, ApprovalNeed, ApprovalRecord, ApprovalRequest, ApprovalStore,
+    ApprovalStoreError, PolicyEngine, RiskClass, Scope,
+};
 pub use profile::{
     AgentProfile, ModelRouting, ProfileError, ProfileHandle, ProfileId, ProfileStore, ProviderKind,
 };
 pub use provider::{
-    AgentProvider, FinishReason, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
-    ProviderStream, ProviderToolCall, Role, Usage,
+    AgentProvider, FinishReason, ProviderError, ProviderEvent, ProviderFactory, ProviderMessage,
+    ProviderRequest, ProviderStream, ProviderToolCall, Role, Usage,
 };
 pub use tool_stream::ToolCallAccumulator;

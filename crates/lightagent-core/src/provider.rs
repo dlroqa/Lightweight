@@ -8,12 +8,15 @@
 //! gateway speaks and the one Slice 2's adapter reproduces. The types here name
 //! no HTTP, no SSE and no JSON: the adapter owns all of that.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::invoker::ToolSchema;
+use crate::profile::ModelRouting;
 
 /// A message in the conversation sent to the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,4 +219,29 @@ pub trait AgentProvider: Send + Sync {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError>;
+}
+
+/// A shared provider is itself a provider, so a child run built from an
+/// `Arc<dyn AgentProvider>` (as delegation does) drives the same loop as a
+/// concrete one, with no second implementation.
+#[async_trait]
+impl AgentProvider for Arc<dyn AgentProvider> {
+    async fn stream(
+        &self,
+        request: ProviderRequest,
+        cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        (**self).stream(request, cancel).await
+    }
+}
+
+/// Builds a provider for a profile's [`ModelRouting`].
+///
+/// Delegation needs a worker's provider without `lightagent-core` depending on
+/// any transport, so a factory is injected: a caller that *does* know how to
+/// reach a model (a provider adapter, or a test's mock) maps a routing to a
+/// shared [`AgentProvider`]. The loop and the delegate tool stay transport-free.
+pub trait ProviderFactory: Send + Sync {
+    /// The provider that serves `routing`.
+    fn provider(&self, routing: &ModelRouting) -> Result<Arc<dyn AgentProvider>, ProviderError>;
 }

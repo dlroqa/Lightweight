@@ -19,6 +19,7 @@ members = [
     "crates/lightweight-sys",
     "crates/lightagent-core",
     "crates/lightagent-provider-lightweight",
+    "crates/lightagent-tools",
 ]
 
 [workspace.package]
@@ -139,6 +140,7 @@ lightweight-sys = { path = "crates/lightweight-sys" }
 # --- lightagent (agent harness; strictly additive, no edge into lightweight-*) ---
 lightagent-core = { path = "crates/lightagent-core" }
 lightagent-provider-lightweight = { path = "crates/lightagent-provider-lightweight" }
+lightagent-tools = { path = "crates/lightagent-tools" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.

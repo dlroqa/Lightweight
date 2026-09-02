@@ -1004,6 +1004,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightagent-tools"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lightweight-api"
 version = "0.2.1"
 dependencies = [
