@@ -46,8 +46,10 @@ pub enum AgentEvent {
     ToolCallStarted { id: String, name: String },
     /// A tool finished, with its result.
     ToolCallCompleted { id: String, outcome: ToolOutcome },
-    /// A tool call is waiting on a human approval decision. Reserved for
-    /// Slice 4; never emitted yet.
+    /// A tool call is waiting on a human approval decision. `id` is the tool
+    /// call's id, so a later same-id [`ToolCallStarted`](Self::ToolCallStarted)
+    /// (on approve) or [`ToolCallCompleted`](Self::ToolCallCompleted) (on deny)
+    /// resolves it.
     AwaitingApproval { id: String, name: String },
     /// One model turn completed, with its token accounting when known.
     TurnCompleted { usage: Option<Usage> },

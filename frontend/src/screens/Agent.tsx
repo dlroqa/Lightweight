@@ -63,10 +63,42 @@ export function Agent() {
   );
   const tools = useMemo(() => foldTools(events), [events]);
   const pending = useMemo(() => {
-    // The last unresolved approval request, if any.
-    const request = [...events].reverse().find((event) => event.type === "approval.required");
-    return !done && request ? { tool: str(request.data.name) } : null;
+    if (done) return null;
+    // An approval stays pending only until the same tool call reports back: on
+    // approve the call emits tool.started/output, on reject a tool.failed — both
+    // carry the approval's tool-call id, so a later same-id event resolves it.
+    // Without this the request card would linger until the whole run ended.
+    let openId: string | null = null;
+    let openName = "";
+    for (const event of events) {
+      const id = str(event.data.id);
+      if (event.type === "approval.required") {
+        openId = id;
+        openName = str(event.data.name);
+      } else if (
+        openId &&
+        id === openId &&
+        (event.type === "tool.started" ||
+          event.type === "tool.output" ||
+          event.type === "tool.failed")
+      ) {
+        openId = null;
+      }
+    }
+    return openId ? { tool: openName } : null;
   }, [events, done]);
+  const failure = useMemo(() => {
+    // The server sends an `error` event (with the message) then a terminal
+    // `run.failed`. Prefer the message; fall back if only the terminal arrived.
+    const failed = events.some((event) => event.type === "run.failed");
+    const errored = [...events].reverse().find((event) => event.type === "error");
+    if (!failed && !errored) return null;
+    return (errored && str(errored.data.message)) || "The run failed.";
+  }, [events]);
+  const cancelled = useMemo(
+    () => events.some((event) => event.type === "run.cancelled"),
+    [events],
+  );
   const running = runId !== null && !done;
 
   async function send() {
@@ -118,8 +150,29 @@ export function Agent() {
         <Card
           title="Ask the agent"
           action={
-            <Pill tone={running ? "accent" : done ? "ok" : "neutral"} dot>
-              {running ? "running" : done ? "done" : "idle"}
+            <Pill
+              tone={
+                running
+                  ? "accent"
+                  : failure
+                    ? "danger"
+                    : cancelled
+                      ? "warn"
+                      : done
+                        ? "ok"
+                        : "neutral"
+              }
+              dot
+            >
+              {running
+                ? "running"
+                : failure
+                  ? "failed"
+                  : cancelled
+                    ? "stopped"
+                    : done
+                      ? "done"
+                      : "idle"}
             </Pill>
           }
         >
@@ -184,10 +237,19 @@ export function Agent() {
         ) : (
           <>
             <Card title="Answer">
-              {answer ? (
-                <p style={{ whiteSpace: "pre-wrap", margin: 0 }}>{answer}</p>
+              {answer && <p style={{ whiteSpace: "pre-wrap", margin: 0 }}>{answer}</p>}
+              {failure ? (
+                <p
+                  style={{
+                    margin: answer ? "10px 0 0" : 0,
+                    whiteSpace: "pre-wrap",
+                    color: "var(--danger)",
+                  }}
+                >
+                  {failure}
+                </p>
               ) : (
-                <span className="muted">{running ? "Thinking…" : "No answer."}</span>
+                !answer && <span className="muted">{running ? "Thinking…" : "No answer."}</span>
               )}
             </Card>
 
