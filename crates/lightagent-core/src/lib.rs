@@ -31,8 +31,8 @@ pub mod provider;
 pub mod tool_stream;
 
 pub use config::{
-    AgentConfig, ApprovalPolicy, Config, ConfigError, ConfigStore, InferenceConfig, SecretRef,
-    SecurityConfig, ToolsConfig, WebConfig, WebSearchConfig,
+    AgentConfig, ApprovalPolicy, Config, ConfigError, ConfigStore, InferenceConfig, McpConfig,
+    McpServerEntry, SecretRef, SecurityConfig, ToolsConfig, WebConfig, WebSearchConfig,
 };
 pub use event::{AgentEvent, StopReason};
 pub use ids::RunId;

@@ -10,6 +10,7 @@
 //! `config show` and a prompt all carry only the variable's name — the value is
 //! resolved at the point of use and nowhere else.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -209,6 +210,66 @@ impl Default for WebConfig {
     }
 }
 
+/// One MCP server the agent connects to as a client.
+///
+/// `stdio` spawns a subprocess; `http` reaches a streamable-HTTP endpoint. An
+/// `http` server's `auth`, when set, is a [`SecretRef`] resolved to a bearer key
+/// at connect time — never stored in the clear.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum McpServerEntry {
+    Stdio {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        #[serde(default)]
+        auth: Option<SecretRef>,
+    },
+}
+
+impl McpServerEntry {
+    /// The server's name (its tool namespace).
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Stdio { name, .. } | Self::Http { name, .. } => name,
+        }
+    }
+}
+
+/// Model Context Protocol client configuration.
+///
+/// Off by default, like `web`: no server is contacted until `enabled` is set.
+/// Each server's tools are offered to the model namespaced as `mcp.<server>.<tool>`
+/// and gated by the same policy as any tool.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub enabled: bool,
+    /// The per-request (and connect) timeout, in seconds.
+    pub timeout_secs: u64,
+    /// The servers to connect.
+    pub servers: Vec<McpServerEntry>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 30,
+            servers: Vec::new(),
+        }
+    }
+}
+
 /// Filesystem and terminal tool configuration.
 ///
 /// Off by default, like `web`: `fs.*` and `terminal.run` are declared to the
@@ -258,6 +319,8 @@ pub struct Config {
     pub web: WebConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -339,6 +402,37 @@ impl Config {
                 return Err(ConfigError::Invalid(
                     "tools.terminal_timeout_secs must be at least 1".to_owned(),
                 ));
+            }
+        }
+        if self.mcp.enabled {
+            if self.mcp.timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "mcp.timeout_secs must be at least 1".to_owned(),
+                ));
+            }
+            for server in &self.mcp.servers {
+                if server.name().trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "an mcp server has an empty name".to_owned(),
+                    ));
+                }
+                match server {
+                    McpServerEntry::Stdio { command, name, .. } => {
+                        if command.trim().is_empty() {
+                            return Err(ConfigError::Invalid(format!(
+                                "mcp server {name:?} has an empty command"
+                            )));
+                        }
+                    }
+                    McpServerEntry::Http { url, name, .. } => {
+                        let url = url.trim();
+                        if !(url.starts_with("http://") || url.starts_with("https://")) {
+                            return Err(ConfigError::Invalid(format!(
+                                "mcp server {name:?} url must be an http(s) URL"
+                            )));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -520,6 +614,32 @@ mod tests {
         config
             .validate()
             .expect("a valid enabled web section validates");
+    }
+
+    #[test]
+    fn mcp_validation_checks_servers_when_enabled() {
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerEntry::Http {
+            name: "bad".to_owned(),
+            url: "not-a-url".to_owned(),
+            headers: BTreeMap::new(),
+            auth: None,
+        });
+        config
+            .validate()
+            .expect("a disabled mcp section is not validated");
+
+        config.mcp.enabled = true;
+        assert!(config.validate().is_err(), "a non-http url is rejected");
+
+        config.mcp.servers.clear();
+        config.mcp.servers.push(McpServerEntry::Stdio {
+            name: "git".to_owned(),
+            command: "mcp-git".to_owned(),
+            args: vec!["--stdio".to_owned()],
+            env: BTreeMap::new(),
+        });
+        config.validate().expect("a valid stdio server validates");
     }
 
     #[test]

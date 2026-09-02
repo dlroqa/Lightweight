@@ -18,17 +18,18 @@ use lightagent_core::{
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::SessionStore;
-use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry};
+use lightagent_tools::{BoundedExecutor, Delegation, Tool, ToolRegistry};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{LightweightFactory, resolve_profile, web_context, workspace_context};
+use crate::chat::{LightweightFactory, mcp_tools, resolve_profile, web_context, workspace_context};
 
 /// Builds and drives a real run with the Lightweight provider per request.
 struct LightweightRunFactory {
     root: PathBuf,
     config: Config,
+    mcp_tools: Vec<Arc<dyn Tool>>,
 }
 
 #[async_trait]
@@ -90,8 +91,12 @@ impl RunFactory for LightweightRunFactory {
             worker_per_call: Duration::from_secs(60),
             worker_max_output_bytes: 262_144,
         };
+        let mut registry = ToolRegistry::builtin();
+        for tool in &self.mcp_tools {
+            registry.insert(Arc::clone(tool));
+        }
         let mut executor = BoundedExecutor::new(
-            ToolRegistry::builtin(),
+            registry,
             PolicyEngine::new(profile.approval_policy.into()),
             Duration::from_secs(60),
             262_144,
@@ -151,9 +156,11 @@ pub async fn run(
         }
     };
 
+    let mcp = mcp_tools(&config).await;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
         config,
+        mcp_tools: mcp,
     });
     let state = AppState {
         manager: RunManager::new(factory),

@@ -981,6 +981,7 @@ dependencies = [
  "futures-util",
  "lightagent-api",
  "lightagent-core",
+ "lightagent-mcp",
  "lightagent-provider-lightweight",
  "lightagent-store",
  "lightagent-tools",
@@ -1014,6 +1015,22 @@ dependencies = [
  "directories",
  "futures-util",
  "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-mcp"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "lightagent-provider-lightweight",
+ "lightagent-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

@@ -13,14 +13,15 @@ use std::time::{Duration, SystemTime};
 
 use lightagent_core::{
     AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config, ConfigStore,
-    LightagentPaths, ModelRouting, PolicyEngine, ProfileId, ProfileStore, ProviderError,
-    ProviderFactory, RunId, RunOutcome, StopReason,
+    LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine, ProfileId, ProfileStore,
+    ProviderError, ProviderFactory, RunId, RunOutcome, StopReason,
 };
+use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
 use lightagent_tools::{
-    BoundedExecutor, Delegation, ToolRegistry, WebContext, WebPolicy, Workspace, WorkspaceContext,
-    WorkspacePolicy,
+    BoundedExecutor, Delegation, Tool, ToolRegistry, WebContext, WebPolicy, Workspace,
+    WorkspaceContext, WorkspacePolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -105,6 +106,69 @@ pub(crate) fn workspace_context(config: &Config, default_dir: PathBuf) -> Option
     })
 }
 
+/// Connect the configured MCP servers and return their tools, or an empty list.
+///
+/// Shared by `chat` and `serve`. A server that cannot be reached is logged and
+/// skipped, never fatal. The returned tools each hold their server's client, so
+/// the connections live exactly as long as the tools are kept (in the registry).
+pub(crate) async fn mcp_tools(config: &Config) -> Vec<Arc<dyn Tool>> {
+    if !config.mcp.enabled || config.mcp.servers.is_empty() {
+        return Vec::new();
+    }
+    let specs: Vec<McpServerSpec> = config.mcp.servers.iter().map(to_mcp_spec).collect();
+    let timeout = Duration::from_secs(config.mcp.timeout_secs.max(1));
+    lightagent_provider_lightweight::ensure_provider();
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("· could not build the MCP HTTP client: {error}");
+            return Vec::new();
+        }
+    };
+    let hub = McpHub::connect(specs, timeout, client).await;
+    for (name, error) in &hub.errors {
+        eprintln!("· MCP server '{name}' unavailable: {error}");
+    }
+    if !hub.connected.is_empty() {
+        eprintln!("· MCP connected: {}", hub.connected.join(", "));
+    }
+    hub.tools
+}
+
+fn to_mcp_spec(entry: &McpServerEntry) -> McpServerSpec {
+    match entry {
+        McpServerEntry::Stdio {
+            name,
+            command,
+            args,
+            env,
+        } => McpServerSpec {
+            name: name.clone(),
+            transport: McpTransportSpec::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            },
+        },
+        McpServerEntry::Http {
+            name,
+            url,
+            headers,
+            auth,
+        } => McpServerSpec {
+            name: name.clone(),
+            transport: McpTransportSpec::Http {
+                url: url.clone(),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                bearer: auth.as_ref().and_then(|secret| secret.resolve()),
+            },
+        },
+    }
+}
+
 /// Builds Lightweight providers for delegated worker runs.
 pub(crate) struct LightweightFactory {
     pub(crate) base_url: String,
@@ -171,8 +235,12 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         worker_per_call: Duration::from_secs(60),
         worker_max_output_bytes: 262_144,
     };
+    let mut registry = ToolRegistry::builtin();
+    for tool in mcp_tools(&config).await {
+        registry.insert(tool);
+    }
     let mut executor = BoundedExecutor::new(
-        ToolRegistry::builtin(),
+        registry,
         PolicyEngine::new(profile.approval_policy.into()),
         Duration::from_secs(60),
         262_144,
