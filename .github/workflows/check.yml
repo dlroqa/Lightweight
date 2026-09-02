@@ -94,6 +94,18 @@ jobs:
       - name: What this machine reports
         run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
 
+      # The Lightagent welcome mark, rendered on a real (stronger) runner and
+      # through a non-TTY pipe, proving the preview path is TTY-independent.
+      # Property-asserted (half-block present in colour; no escapes under
+      # NO_COLOR), never byte-matched, so a runner's terminal cannot flake it.
+      # One leg only: the mark is platform-independent.
+      - name: Lightagent welcome mark renders
+        if: matrix.label == 'linux-x64'
+        run: |
+          cargo run -q -p lightagent --bin lightagent -- banner --preview | grep -q $'▀'
+          NO_COLOR=1 cargo run -q -p lightagent --bin lightagent -- banner --preview | { ! grep -q $'\x1b'; }
+          cargo run -q -p lightagent --bin lightagent -- tools list --json | grep -q datetime.now
+
   # Rendering: prove the icon pipeline runs and produces the right shape.
   #
   # Separate from the gate because it needs Pillow, a tool-time dependency the

@@ -20,6 +20,7 @@ members = [
     "crates/lightagent-core",
     "crates/lightagent-provider-lightweight",
     "crates/lightagent-tools",
+    "crates/lightagent",
 ]
 
 [workspace.package]

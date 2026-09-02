@@ -972,6 +972,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightagent"
+version = "0.2.1"
+dependencies = [
+ "clap",
+ "futures-util",
+ "lightagent-core",
+ "lightagent-provider-lightweight",
+ "lightagent-tools",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lightagent-core"
 version = "0.2.1"
 dependencies = [
