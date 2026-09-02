@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -17,7 +18,10 @@ use lightagent_core::{
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
-use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry, WebContext, WebPolicy};
+use lightagent_tools::{
+    BoundedExecutor, Delegation, ToolRegistry, WebContext, WebPolicy, Workspace, WorkspaceContext,
+    WorkspacePolicy,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::slash::{self, Slash};
@@ -61,6 +65,46 @@ pub(crate) fn web_context(config: &Config) -> Option<WebContext> {
     })
 }
 
+/// Build the workspace context for a run when the filesystem/terminal tools are
+/// enabled, else `None`.
+///
+/// `default_dir` is the per-profile `workspace/` used when config sets no
+/// override. The directory is created if missing, then canonicalized into a
+/// confined [`Workspace`]. `None` when tools are disabled or the root is
+/// unavailable.
+pub(crate) fn workspace_context(config: &Config, default_dir: PathBuf) -> Option<WorkspaceContext> {
+    if !config.tools.enabled {
+        return None;
+    }
+    let root = config
+        .tools
+        .workspace
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or(default_dir);
+    if let Err(error) = std::fs::create_dir_all(&root) {
+        eprintln!("· could not create workspace {}: {error}", root.display());
+        return None;
+    }
+    let workspace = match Workspace::new(&root) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            eprintln!("· workspace unavailable: {error}");
+            return None;
+        }
+    };
+    let policy = WorkspacePolicy {
+        max_file_bytes: config.tools.max_file_bytes,
+        allow_terminal: config.tools.allow_terminal,
+        terminal_timeout: Duration::from_secs(config.tools.terminal_timeout_secs.max(1)),
+        terminal_allowlist: config.tools.terminal_allowlist.clone(),
+    };
+    Some(WorkspaceContext {
+        workspace: Arc::new(workspace),
+        policy: Arc::new(policy),
+    })
+}
+
 /// Builds Lightweight providers for delegated worker runs.
 pub(crate) struct LightweightFactory {
     pub(crate) base_url: String,
@@ -92,6 +136,7 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
 
     let session_store = SessionStore::at_profile(&store.handle(&profile.id));
     let mut session = Session::new(profile.id.as_str(), "chat session");
+    let workspace_dir = store.handle(&profile.id).workspace_dir();
 
     let base_url = profile
         .routing
@@ -136,6 +181,9 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     .with_delegation(delegation);
     if let Some(web) = web_context(&config) {
         executor = executor.with_web(web);
+    }
+    if let Some(workspace) = workspace_context(&config, workspace_dir) {
+        executor = executor.with_workspace(workspace);
     }
 
     let agent = AgentLoop::from_profile(provider, executor, &profile);

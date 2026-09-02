@@ -33,10 +33,14 @@ pub mod executor;
 pub mod output;
 pub mod registry;
 pub mod schema;
+pub mod workspace;
 
-pub use context::{Clock, Delegation, ToolCtx, WebContext, WebPolicy};
+pub use context::{
+    Clock, Delegation, ToolCtx, WebContext, WebPolicy, WorkspaceContext, WorkspacePolicy,
+};
 pub use definition::{Tool, ToolDefinition};
 pub use executor::BoundedExecutor;
 pub use output::clamp;
 pub use registry::ToolRegistry;
 pub use schema::{SchemaError, validate};
+pub use workspace::Workspace;

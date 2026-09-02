@@ -209,6 +209,42 @@ impl Default for WebConfig {
     }
 }
 
+/// Filesystem and terminal tool configuration.
+///
+/// Off by default, like `web`: `fs.*` and `terminal.run` are declared to the
+/// model but refuse to run until `enabled` is set. The tools are confined to a
+/// single `workspace` directory (the per-profile `workspace/` when unset), and
+/// `terminal.run` needs `allow_terminal` on top of `enabled` — running a program
+/// is a strictly larger grant than reading files, so it is opted into separately.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    pub enabled: bool,
+    /// The confinement root; the per-profile `workspace/` directory when unset.
+    pub workspace: Option<String>,
+    /// The most bytes a single `fs.read`/`fs.write` may move.
+    pub max_file_bytes: usize,
+    /// Allow `terminal.run` (requires `enabled` too).
+    pub allow_terminal: bool,
+    /// The wall-clock timeout for one `terminal.run`, in seconds.
+    pub terminal_timeout_secs: u64,
+    /// When non-empty, only these program names may be run by `terminal.run`.
+    pub terminal_allowlist: Vec<String>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            workspace: None,
+            max_file_bytes: 1_000_000,
+            allow_terminal: false,
+            terminal_timeout_secs: 30,
+            terminal_allowlist: Vec::new(),
+        }
+    }
+}
+
 /// The whole typed configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -220,6 +256,8 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub web: WebConfig,
+    #[serde(default)]
+    pub tools: ToolsConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -289,6 +327,18 @@ impl Config {
                         self.web.search.endpoint
                     )));
                 }
+            }
+        }
+        if self.tools.enabled {
+            if self.tools.max_file_bytes == 0 {
+                return Err(ConfigError::Invalid(
+                    "tools.max_file_bytes must be at least 1".to_owned(),
+                ));
+            }
+            if self.tools.terminal_timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "tools.terminal_timeout_secs must be at least 1".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -470,6 +520,28 @@ mod tests {
         config
             .validate()
             .expect("a valid enabled web section validates");
+    }
+
+    #[test]
+    fn tools_validation_only_bites_when_enabled() {
+        let mut config = Config::default();
+        config.tools.max_file_bytes = 0;
+        config
+            .validate()
+            .expect("a disabled tools section is not validated");
+
+        config.tools.enabled = true;
+        assert!(config.validate().is_err(), "max_file_bytes 0 is rejected");
+        config.tools.max_file_bytes = 1_000;
+        config.tools.terminal_timeout_secs = 0;
+        assert!(
+            config.validate().is_err(),
+            "terminal_timeout_secs 0 is rejected"
+        );
+        config.tools.terminal_timeout_secs = 30;
+        config
+            .validate()
+            .expect("a valid enabled tools section validates");
     }
 
     #[test]

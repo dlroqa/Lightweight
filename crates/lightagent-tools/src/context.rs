@@ -14,6 +14,7 @@ use lightagent_core::{ProfileStore, ProviderFactory, RunId};
 use tokio_util::sync::CancellationToken;
 
 use crate::registry::ToolRegistry;
+use crate::workspace::Workspace;
 
 /// The time source a tool reads.
 ///
@@ -94,6 +95,33 @@ pub struct WebContext {
     pub policy: Arc<WebPolicy>,
 }
 
+/// The effective filesystem/terminal settings the workspace tools enforce.
+///
+/// A resolved view the caller builds once from the persisted `ToolsConfig`, so
+/// this crate never learns the config format. `allow_terminal` gates
+/// `terminal.run` on top of the workspace being present at all.
+#[derive(Clone, Debug)]
+pub struct WorkspacePolicy {
+    /// The most bytes a single `fs.read`/`fs.write` may move.
+    pub max_file_bytes: usize,
+    /// Whether `terminal.run` may run at all.
+    pub allow_terminal: bool,
+    /// The wall-clock timeout for one `terminal.run`.
+    pub terminal_timeout: Duration,
+    /// When non-empty, the only program names `terminal.run` may launch.
+    pub terminal_allowlist: Vec<String>,
+}
+
+/// Everything the filesystem and terminal tools need, injected by the caller so
+/// this crate never resolves the workspace path or reads the config itself.
+#[derive(Clone)]
+pub struct WorkspaceContext {
+    /// The confined root every path is resolved through.
+    pub workspace: Arc<Workspace>,
+    /// The effective policy.
+    pub policy: Arc<WorkspacePolicy>,
+}
+
 /// The context handed to a [`Tool`](crate::Tool) when it runs.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -108,6 +136,8 @@ pub struct ToolCtx {
     pub delegation: Option<Delegation>,
     /// Present only when web access is enabled for this run.
     pub web: Option<WebContext>,
+    /// Present only when filesystem/terminal access is enabled for this run.
+    pub workspace: Option<WorkspaceContext>,
 }
 
 impl ToolCtx {
@@ -119,6 +149,7 @@ impl ToolCtx {
             clock: Clock::System,
             delegation: None,
             web: None,
+            workspace: None,
         }
     }
 
@@ -143,6 +174,12 @@ impl ToolCtx {
     /// Enable web access with the given context.
     pub fn with_web(mut self, web: WebContext) -> Self {
         self.web = Some(web);
+        self
+    }
+
+    /// Enable filesystem/terminal access with the given context.
+    pub fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 }

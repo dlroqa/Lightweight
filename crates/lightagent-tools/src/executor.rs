@@ -19,7 +19,7 @@ use lightagent_core::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::{Clock, Delegation, ToolCtx, WebContext};
+use crate::context::{Clock, Delegation, ToolCtx, WebContext, WorkspaceContext};
 use crate::output::clamp;
 use crate::registry::ToolRegistry;
 use crate::schema;
@@ -38,6 +38,7 @@ pub struct BoundedExecutor {
     clock: Clock,
     delegation: Option<Delegation>,
     web: Option<WebContext>,
+    workspace: Option<WorkspaceContext>,
 }
 
 impl BoundedExecutor {
@@ -57,6 +58,7 @@ impl BoundedExecutor {
             clock: Clock::System,
             delegation: None,
             web: None,
+            workspace: None,
         }
     }
 
@@ -84,6 +86,12 @@ impl BoundedExecutor {
         self
     }
 
+    /// Enable the `fs.*`/`terminal.run` tools by supplying the confined workspace.
+    pub fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     /// The risk and scopes a call would carry, from its tool's definition.
     fn classify(&self, call: &ToolCall) -> Option<(RiskClass, Vec<Scope>)> {
         self.registry
@@ -106,6 +114,9 @@ impl BoundedExecutor {
         }
         if let Some(web) = &self.web {
             ctx = ctx.with_web(web.clone());
+        }
+        if let Some(workspace) = &self.workspace {
+            ctx = ctx.with_workspace(workspace.clone());
         }
         ctx
     }

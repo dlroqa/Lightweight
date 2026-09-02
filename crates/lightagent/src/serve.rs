@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{LightweightFactory, resolve_profile, web_context};
+use crate::chat::{LightweightFactory, resolve_profile, web_context, workspace_context};
 
 /// Builds and drives a real run with the Lightweight provider per request.
 struct LightweightRunFactory {
@@ -82,6 +82,7 @@ impl RunFactory for LightweightRunFactory {
             }
         };
 
+        let workspace_dir = store.handle(&profile.id).workspace_dir();
         let delegation = Delegation {
             profiles: Arc::new(store),
             factory: Arc::new(LightweightFactory { base_url, api_key }),
@@ -99,6 +100,9 @@ impl RunFactory for LightweightRunFactory {
         .with_delegation(delegation);
         if let Some(web) = web_context(&self.config) {
             executor = executor.with_web(web);
+        }
+        if let Some(workspace) = workspace_context(&self.config, workspace_dir) {
+            executor = executor.with_workspace(workspace);
         }
 
         let agent = AgentLoop::from_profile(provider, executor, &profile);

@@ -204,6 +204,11 @@ impl ProfileHandle {
         self.dir.join("memory")
     }
 
+    /// The confined scratch workspace for the filesystem and terminal tools.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.dir.join("workspace")
+    }
+
     pub fn approvals_file(&self) -> PathBuf {
         self.dir.join("approvals.jsonl")
     }
