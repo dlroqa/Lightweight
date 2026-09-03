@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -16,6 +16,7 @@ use lightagent_core::{
     LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine, ProfileId, ProfileStore,
     ProviderError, ProviderFactory, RunId, RunOutcome, SkillStore, StopReason,
 };
+use lightagent_extensions::ExtensionStore;
 use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
@@ -111,11 +112,24 @@ pub(crate) fn workspace_context(config: &Config, default_dir: PathBuf) -> Option
 /// Shared by `chat` and `serve`. A server that cannot be reached is logged and
 /// skipped, never fatal. The returned tools each hold their server's client, so
 /// the connections live exactly as long as the tools are kept (in the registry).
-pub(crate) async fn mcp_tools(config: &Config) -> Vec<Arc<dyn Tool>> {
-    if !config.mcp.enabled || config.mcp.servers.is_empty() {
+/// `extra_servers` are MCP servers contributed by active extensions; they are
+/// merged with the configured servers but, like them, are only contacted when the
+/// MCP subsystem is enabled — an extension widens what is available, not what is
+/// permitted.
+pub(crate) async fn mcp_tools(
+    config: &Config,
+    extra_servers: &[McpServerEntry],
+) -> Vec<Arc<dyn Tool>> {
+    if !config.mcp.enabled || (config.mcp.servers.is_empty() && extra_servers.is_empty()) {
         return Vec::new();
     }
-    let specs: Vec<McpServerSpec> = config.mcp.servers.iter().map(to_mcp_spec).collect();
+    let specs: Vec<McpServerSpec> = config
+        .mcp
+        .servers
+        .iter()
+        .chain(extra_servers.iter())
+        .map(to_mcp_spec)
+        .collect();
     let timeout = Duration::from_secs(config.mcp.timeout_secs.max(1));
     lightagent_provider_lightweight::ensure_provider();
     let client = match reqwest::Client::builder().timeout(timeout).build() {
@@ -169,15 +183,33 @@ fn to_mcp_spec(entry: &McpServerEntry) -> McpServerSpec {
     }
 }
 
-/// Load the skills for a run: the global set plus the profile's own.
+/// Load the extensions for a run: the global set plus the profile's own.
+pub(crate) fn load_extensions(home: &Path, profile_dir: &Path) -> ExtensionStore {
+    ExtensionStore::load(&lightagent_extensions::extension_dirs(home, profile_dir))
+}
+
+/// Load only the global extensions. `serve` shares one set of MCP connections
+/// across every profile, built once at startup before any profile is chosen, so
+/// only the global extensions' MCP servers can join that shared set; a profile's
+/// own extension skills and instructions are still applied per run.
+pub(crate) fn load_global_extensions(home: &Path) -> ExtensionStore {
+    ExtensionStore::load(&[home.join("extensions")])
+}
+
+/// Load the skills for a run: the global set, then the active extensions' skills,
+/// then the profile's own. Ordering makes precedence follow ownership — an
+/// extension's skill overrides a global default, and a profile's overrides an
+/// extension's.
 pub(crate) fn load_skills(
-    home: &std::path::Path,
-    profile_dir: &std::path::Path,
+    home: &Path,
+    profile_dir: &Path,
+    extensions: &ExtensionStore,
+    config: &Config,
 ) -> Arc<SkillStore> {
-    Arc::new(SkillStore::load(&lightagent_core::skill_dirs(
-        home,
-        profile_dir,
-    )))
+    let mut dirs = vec![home.join("skills")];
+    dirs.extend(extensions.skill_dirs(&config.extensions));
+    dirs.push(profile_dir.join("skills"));
+    Arc::new(SkillStore::load(&dirs))
 }
 
 /// Builds Lightweight providers for delegated worker runs.
@@ -213,7 +245,8 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     let mut session = Session::new(profile.id.as_str(), "chat session");
     let workspace_dir = store.handle(&profile.id).workspace_dir();
     let profile_dir = store.handle(&profile.id).dir().to_path_buf();
-    let skills = load_skills(paths.root(), &profile_dir);
+    let extensions = load_extensions(paths.root(), &profile_dir);
+    let skills = load_skills(paths.root(), &profile_dir, &extensions, &config);
 
     let base_url = profile
         .routing
@@ -249,7 +282,7 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         worker_max_output_bytes: 262_144,
     };
     let mut registry = ToolRegistry::builtin();
-    for tool in mcp_tools(&config).await {
+    for tool in mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await {
         registry.insert(tool);
     }
     if let Some(tool) = crate::rag::rag_tool(&profile_dir, &config) {
@@ -277,6 +310,13 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
             .persona
             .push_str(&format!("\n\n{}", skills.catalog()));
         executor = executor.with_skills(SkillContext { skills });
+    }
+
+    let extension_instructions = extensions.instructions(&config.extensions);
+    if !extension_instructions.is_empty() {
+        profile
+            .persona
+            .push_str(&format!("\n\n{extension_instructions}"));
     }
 
     let memory_catalog = crate::memory::recent_catalog(&profile_dir, &config);

@@ -375,6 +375,34 @@ impl Default for ToolsConfig {
     }
 }
 
+/// Extension (installable capability bundle) configuration.
+///
+/// An extension is a directory that packages skills, MCP-server declarations and
+/// persona instructions into one installable unit, discovered under the global
+/// `extensions/` directory and a profile's own. Installing one is dropping its
+/// directory in place; these settings only gate what is already installed.
+///
+/// `enabled` is the master switch (on by default — an extension composes inert
+/// primitives, and any MCP server it contributes still needs `mcp.enabled` to be
+/// contacted). `disabled` names extensions that stay installed but contribute
+/// nothing to a run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsConfig {
+    pub enabled: bool,
+    /// Names of installed extensions to leave inactive.
+    pub disabled: Vec<String>,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+        }
+    }
+}
+
 /// The whole typed configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -394,6 +422,8 @@ pub struct Config {
     pub rag: RagConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,

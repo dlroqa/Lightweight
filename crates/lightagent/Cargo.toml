@@ -24,6 +24,7 @@ lightagent-mcp.workspace = true
 lightagent-rag.workspace = true
 lightagent-memory.workspace = true
 lightagent-acp.workspace = true
+lightagent-extensions.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
 clap.workspace = true

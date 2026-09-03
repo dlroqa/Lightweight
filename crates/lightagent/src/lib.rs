@@ -13,6 +13,7 @@
 mod acp;
 mod banner;
 mod chat;
+mod extensions;
 mod import;
 mod memory;
 mod rag;
@@ -86,6 +87,11 @@ enum Command {
     Profiles {
         #[command(subcommand)]
         action: Option<ProfilesAction>,
+    },
+    /// List and toggle installed extensions (capability bundles).
+    Extensions {
+        #[command(subcommand)]
+        action: Option<ExtensionsAction>,
     },
     /// List and inspect saved sessions for the active profile.
     Sessions {
@@ -170,6 +176,18 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum ExtensionsAction {
+    /// List installed extensions, marking which are active.
+    List,
+    /// Show one extension's manifest and what it contributes.
+    Show { name: String },
+    /// Activate an installed extension (clears it from the disabled list).
+    Enable { name: String },
+    /// Keep an extension installed but inactive.
+    Disable { name: String },
 }
 
 #[derive(Subcommand)]
@@ -299,6 +317,12 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Profiles { action }) => {
             profiles_cmd(action.unwrap_or(ProfilesAction::List), cli.json)
         }
+        Some(Command::Extensions { action }) => match action.unwrap_or(ExtensionsAction::List) {
+            ExtensionsAction::List => extensions::list(cli.json),
+            ExtensionsAction::Show { name } => extensions::show(&name, cli.json),
+            ExtensionsAction::Enable { name } => extensions::enable(&name, cli.json),
+            ExtensionsAction::Disable { name } => extensions::disable(&name, cli.json),
+        },
         Some(Command::Sessions { action }) => {
             sessions_cmd(action.unwrap_or(SessionsAction::List), cli.json)
         }
@@ -678,6 +702,7 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
         "inference.base_url" => Some(config.inference.base_url.clone()),
         "inference.model" => Some(config.inference.model.clone().unwrap_or_default()),
         "inference.device" => Some(config.inference.device.clone()),
+        "extensions.enabled" => Some(config.extensions.enabled.to_string()),
         _ => None,
     }
 }
@@ -688,9 +713,21 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "inference.base_url" => config.inference.base_url = value.to_string(),
         "inference.model" => config.inference.model = Some(value.to_string()),
         "inference.device" => config.inference.device = value.to_string(),
+        "extensions.enabled" => {
+            config.extensions.enabled = parse_bool(value)?;
+        }
         _ => return Err(format!("unknown or read-only config key '{key}'")),
     }
     Ok(())
+}
+
+/// Parse a boolean config value, accepting the usual spellings.
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected a boolean, got '{value}'")),
+    }
 }
 
 // --- init -------------------------------------------------------------------

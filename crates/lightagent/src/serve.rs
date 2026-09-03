@@ -24,7 +24,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::{
-    LightweightFactory, load_skills, mcp_tools, resolve_profile, web_context, workspace_context,
+    LightweightFactory, load_extensions, load_global_extensions, load_skills, mcp_tools,
+    resolve_profile, web_context, workspace_context,
 };
 
 /// Builds and drives a real run with the Lightweight provider per request.
@@ -93,7 +94,8 @@ impl RunFactory for LightweightRunFactory {
             .map(PathBuf::from)
             .unwrap_or_else(|| store.handle(&profile.id).workspace_dir());
         let profile_dir = store.handle(&profile.id).dir().to_path_buf();
-        let skills = load_skills(&self.root, &profile_dir);
+        let extensions = load_extensions(&self.root, &profile_dir);
+        let skills = load_skills(&self.root, &profile_dir, &extensions, &self.config);
         let delegation = Delegation {
             profiles: Arc::new(store),
             factory: Arc::new(LightweightFactory { base_url, api_key }),
@@ -132,6 +134,13 @@ impl RunFactory for LightweightRunFactory {
             executor = executor.with_skills(SkillContext { skills });
         }
 
+        let extension_instructions = extensions.instructions(&self.config.extensions);
+        if !extension_instructions.is_empty() {
+            profile
+                .persona
+                .push_str(&format!("\n\n{extension_instructions}"));
+        }
+
         let memory_catalog = crate::memory::recent_catalog(&profile_dir, &self.config);
         if !memory_catalog.is_empty() {
             profile.persona.push_str(&format!("\n\n{memory_catalog}"));
@@ -157,7 +166,8 @@ pub(crate) async fn build_run_manager() -> Result<RunManager, String> {
     let config = ConfigStore::at(&paths)
         .load()
         .map_err(|error| error.to_string())?;
-    let mcp = mcp_tools(&config).await;
+    let extensions = load_global_extensions(paths.root());
+    let mcp = mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
         config,
@@ -198,7 +208,8 @@ pub async fn run(
         }
     };
 
-    let mcp = mcp_tools(&config).await;
+    let extensions = load_global_extensions(paths.root());
+    let mcp = mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
         config,

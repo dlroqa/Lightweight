@@ -112,6 +112,11 @@ impl LightagentPaths {
         self.root.join("skills")
     }
 
+    /// Global extensions directory (installable capability bundles).
+    pub fn extensions_dir(&self) -> PathBuf {
+        self.root.join("extensions")
+    }
+
     /// The directory holding every profile.
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")
