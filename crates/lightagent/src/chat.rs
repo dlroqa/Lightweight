@@ -14,14 +14,14 @@ use std::time::{Duration, SystemTime};
 use lightagent_core::{
     AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config, ConfigStore,
     LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine, ProfileId, ProfileStore,
-    ProviderError, ProviderFactory, RunId, RunOutcome, StopReason,
+    ProviderError, ProviderFactory, RunId, RunOutcome, SkillStore, StopReason,
 };
 use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
 use lightagent_tools::{
-    BoundedExecutor, Delegation, Tool, ToolRegistry, WebContext, WebPolicy, Workspace,
-    WorkspaceContext, WorkspacePolicy,
+    BoundedExecutor, Delegation, SkillContext, Tool, ToolRegistry, WebContext, WebPolicy,
+    Workspace, WorkspaceContext, WorkspacePolicy,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -169,6 +169,17 @@ fn to_mcp_spec(entry: &McpServerEntry) -> McpServerSpec {
     }
 }
 
+/// Load the skills for a run: the global set plus the profile's own.
+pub(crate) fn load_skills(
+    home: &std::path::Path,
+    profile_dir: &std::path::Path,
+) -> Arc<SkillStore> {
+    Arc::new(SkillStore::load(&lightagent_core::skill_dirs(
+        home,
+        profile_dir,
+    )))
+}
+
 /// Builds Lightweight providers for delegated worker runs.
 pub(crate) struct LightweightFactory {
     pub(crate) base_url: String,
@@ -196,11 +207,13 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         .load()
         .map_err(|error| error.to_string())?;
     let store = ProfileStore::new(paths.root());
-    let profile = resolve_profile(&store, &config, profile)?;
+    let mut profile = resolve_profile(&store, &config, profile)?;
 
     let session_store = SessionStore::at_profile(&store.handle(&profile.id));
     let mut session = Session::new(profile.id.as_str(), "chat session");
     let workspace_dir = store.handle(&profile.id).workspace_dir();
+    let profile_dir = store.handle(&profile.id).dir().to_path_buf();
+    let skills = load_skills(paths.root(), &profile_dir);
 
     let base_url = profile
         .routing
@@ -252,6 +265,12 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     }
     if let Some(workspace) = workspace_context(&config, workspace_dir) {
         executor = executor.with_workspace(workspace);
+    }
+    if !skills.is_empty() {
+        profile
+            .persona
+            .push_str(&format!("\n\n{}", skills.catalog()));
+        executor = executor.with_skills(SkillContext { skills });
     }
 
     let agent = AgentLoop::from_profile(provider, executor, &profile);

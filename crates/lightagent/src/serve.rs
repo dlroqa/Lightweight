@@ -18,12 +18,14 @@ use lightagent_core::{
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::SessionStore;
-use lightagent_tools::{BoundedExecutor, Delegation, Tool, ToolRegistry};
+use lightagent_tools::{BoundedExecutor, Delegation, SkillContext, Tool, ToolRegistry};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::{LightweightFactory, mcp_tools, resolve_profile, web_context, workspace_context};
+use crate::chat::{
+    LightweightFactory, load_skills, mcp_tools, resolve_profile, web_context, workspace_context,
+};
 
 /// Builds and drives a real run with the Lightweight provider per request.
 struct LightweightRunFactory {
@@ -42,7 +44,7 @@ impl RunFactory for LightweightRunFactory {
         decisions: UnboundedReceiver<ApprovalDecision>,
     ) -> RunStatus {
         let store = ProfileStore::new(&self.root);
-        let profile = match resolve_profile(&store, &self.config, request.profile) {
+        let mut profile = match resolve_profile(&store, &self.config, request.profile) {
             Ok(profile) => profile,
             Err(error) => {
                 fail(&sink, &error);
@@ -84,6 +86,8 @@ impl RunFactory for LightweightRunFactory {
         };
 
         let workspace_dir = store.handle(&profile.id).workspace_dir();
+        let profile_dir = store.handle(&profile.id).dir().to_path_buf();
+        let skills = load_skills(&self.root, &profile_dir);
         let delegation = Delegation {
             profiles: Arc::new(store),
             factory: Arc::new(LightweightFactory { base_url, api_key }),
@@ -108,6 +112,12 @@ impl RunFactory for LightweightRunFactory {
         }
         if let Some(workspace) = workspace_context(&self.config, workspace_dir) {
             executor = executor.with_workspace(workspace);
+        }
+        if !skills.is_empty() {
+            profile
+                .persona
+                .push_str(&format!("\n\n{}", skills.catalog()));
+            executor = executor.with_skills(SkillContext { skills });
         }
 
         let agent = AgentLoop::from_profile(provider, executor, &profile);

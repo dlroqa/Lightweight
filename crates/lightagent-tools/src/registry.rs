@@ -12,7 +12,8 @@ use std::sync::Arc;
 use lightagent_core::ToolSchema;
 
 use crate::builtins::{
-    AgentDelegate, DateTimeNow, FsList, FsRead, FsWrite, TerminalRun, WebFetch, WebSearch,
+    AgentDelegate, DateTimeNow, FsList, FsRead, FsWrite, SkillRead, TerminalRun, WebFetch,
+    WebSearch,
 };
 use crate::definition::Tool;
 
@@ -53,6 +54,7 @@ impl ToolRegistry {
             .with(Arc::new(FsList::new()))
             .with(Arc::new(FsWrite::new()))
             .with(Arc::new(TerminalRun::new()))
+            .with(Arc::new(SkillRead::new()))
     }
 
     /// The built-in set a worker is given: everything except `agent.delegate`,
@@ -117,7 +119,8 @@ mod tests {
         assert!(registry.contains("fs.read"));
         assert!(registry.contains("fs.write"));
         assert!(registry.contains("terminal.run"));
-        assert_eq!(registry.schemas().len(), 8);
+        assert!(registry.contains("skill.read"));
+        assert_eq!(registry.schemas().len(), 9);
     }
 
     #[test]

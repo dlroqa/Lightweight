@@ -36,7 +36,8 @@ pub mod schema;
 pub mod workspace;
 
 pub use context::{
-    Clock, Delegation, ToolCtx, WebContext, WebPolicy, WorkspaceContext, WorkspacePolicy,
+    Clock, Delegation, SkillContext, ToolCtx, WebContext, WebPolicy, WorkspaceContext,
+    WorkspacePolicy,
 };
 pub use definition::{Tool, ToolDefinition};
 pub use executor::BoundedExecutor;

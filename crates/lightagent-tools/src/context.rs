@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use lightagent_core::{ProfileStore, ProviderFactory, RunId};
+use lightagent_core::{ProfileStore, ProviderFactory, RunId, SkillStore};
 use tokio_util::sync::CancellationToken;
 
 use crate::registry::ToolRegistry;
@@ -122,6 +122,14 @@ pub struct WorkspaceContext {
     pub policy: Arc<WorkspacePolicy>,
 }
 
+/// The skills a run's `skill.read` tool can serve, injected by the caller so this
+/// crate does not read the skills directories itself.
+#[derive(Clone)]
+pub struct SkillContext {
+    /// The loaded skills.
+    pub skills: Arc<SkillStore>,
+}
+
 /// The context handed to a [`Tool`](crate::Tool) when it runs.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -138,6 +146,8 @@ pub struct ToolCtx {
     pub web: Option<WebContext>,
     /// Present only when filesystem/terminal access is enabled for this run.
     pub workspace: Option<WorkspaceContext>,
+    /// Present only when skills are available for this run.
+    pub skills: Option<SkillContext>,
 }
 
 impl ToolCtx {
@@ -150,6 +160,7 @@ impl ToolCtx {
             delegation: None,
             web: None,
             workspace: None,
+            skills: None,
         }
     }
 
@@ -180,6 +191,12 @@ impl ToolCtx {
     /// Enable filesystem/terminal access with the given context.
     pub fn with_workspace(mut self, workspace: WorkspaceContext) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Make skills available to the run's `skill.read` tool.
+    pub fn with_skills(mut self, skills: SkillContext) -> Self {
+        self.skills = Some(skills);
         self
     }
 }

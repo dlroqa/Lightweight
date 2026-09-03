@@ -19,7 +19,7 @@ use lightagent_core::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::{Clock, Delegation, ToolCtx, WebContext, WorkspaceContext};
+use crate::context::{Clock, Delegation, SkillContext, ToolCtx, WebContext, WorkspaceContext};
 use crate::output::clamp;
 use crate::registry::ToolRegistry;
 use crate::schema;
@@ -39,6 +39,7 @@ pub struct BoundedExecutor {
     delegation: Option<Delegation>,
     web: Option<WebContext>,
     workspace: Option<WorkspaceContext>,
+    skills: Option<SkillContext>,
 }
 
 impl BoundedExecutor {
@@ -59,6 +60,7 @@ impl BoundedExecutor {
             delegation: None,
             web: None,
             workspace: None,
+            skills: None,
         }
     }
 
@@ -92,6 +94,12 @@ impl BoundedExecutor {
         self
     }
 
+    /// Make skills available to `skill.read`.
+    pub fn with_skills(mut self, skills: SkillContext) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
     /// The risk and scopes a call would carry, from its tool's definition.
     fn classify(&self, call: &ToolCall) -> Option<(RiskClass, Vec<Scope>)> {
         self.registry
@@ -117,6 +125,9 @@ impl BoundedExecutor {
         }
         if let Some(workspace) = &self.workspace {
             ctx = ctx.with_workspace(workspace.clone());
+        }
+        if let Some(skills) = &self.skills {
+            ctx = ctx.with_skills(skills.clone());
         }
         ctx
     }

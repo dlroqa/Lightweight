@@ -107,6 +107,11 @@ impl LightagentPaths {
         self.root.join("cache")
     }
 
+    /// Global skills directory.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+
     /// The directory holding every profile.
     pub fn profiles_dir(&self) -> PathBuf {
         self.root.join("profiles")

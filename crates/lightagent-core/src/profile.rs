@@ -209,6 +209,11 @@ impl ProfileHandle {
         self.dir.join("workspace")
     }
 
+    /// The profile's own skills directory (overrides the global set).
+    pub fn skills_dir(&self) -> PathBuf {
+        self.dir.join("skills")
+    }
+
     pub fn approvals_file(&self) -> PathBuf {
         self.dir.join("approvals.jsonl")
     }

@@ -28,6 +28,7 @@ pub mod paths;
 pub mod permissions;
 pub mod profile;
 pub mod provider;
+pub mod skills;
 pub mod tool_stream;
 
 pub use config::{
@@ -52,4 +53,5 @@ pub use provider::{
     AgentProvider, FinishReason, ProviderError, ProviderEvent, ProviderFactory, ProviderMessage,
     ProviderRequest, ProviderStream, ProviderToolCall, Role, Usage,
 };
+pub use skills::{Skill, SkillStore, skill_dirs};
 pub use tool_stream::ToolCallAccumulator;

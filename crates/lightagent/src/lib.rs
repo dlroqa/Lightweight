@@ -12,6 +12,7 @@
 
 mod banner;
 mod chat;
+mod import;
 mod serve;
 mod slash;
 
@@ -105,6 +106,11 @@ enum Command {
     },
     /// Report the environment, home, profile and provider.
     Doctor,
+    /// Import profiles and skills from another agent's home.
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
     /// Print the welcome mark and exit.
     Banner {
         /// Render unconditionally (bypasses the terminal check), for CI.
@@ -149,6 +155,22 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Import Hermes profiles (persona, model routing) and skills.
+    Hermes {
+        /// The Hermes home to read (default: $HERMES_HOME, else ~/.hermes).
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        /// Show what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite profiles and skills that already exist.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -227,6 +249,13 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             web_root,
         }) => serve::run(host, port, key_env, web_root).await,
         Some(Command::Doctor) => doctor(cli.json),
+        Some(Command::Import { source }) => match source {
+            ImportSource::Hermes {
+                from,
+                dry_run,
+                force,
+            } => import::hermes(from, dry_run, force, cli.json),
+        },
         Some(Command::Banner { preview }) => {
             if preview {
                 print!(
