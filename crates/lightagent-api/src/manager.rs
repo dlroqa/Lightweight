@@ -97,6 +97,12 @@ impl RunState {
         self.cancel.cancel();
     }
 
+    /// A clone of this run's cancellation token, so a caller can wait for the run
+    /// to be cancelled (e.g. while awaiting an external answer).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
     /// Submit an approval decision to a waiting run. Returns whether it was
     /// delivered (the run may already have moved on).
     pub fn decide(&self, decision: ApprovalDecision) -> bool {

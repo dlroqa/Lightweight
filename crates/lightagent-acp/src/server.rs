@@ -18,15 +18,16 @@
 //! confined tools), and each prompt is an independent run — in-session
 //! conversational history is not yet threaded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use lightagent_api::manager::{RunManager, RunState, StartRun};
+use lightagent_api::manager::{RunManager, RunState, RunStatus, StartRun};
 use lightagent_core::{AgentEvent, ApprovalDecision, ApprovalId, RunId, StopReason};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol;
 
@@ -118,8 +119,14 @@ impl AcpServer {
         match method {
             "initialize" => {
                 if let Some(id) = id {
+                    // Negotiate: speak the lower of our version and the client's.
+                    let requested = params
+                        .get("protocolVersion")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(protocol::PROTOCOL_VERSION as u64);
+                    let negotiated = requested.min(protocol::PROTOCOL_VERSION as u64);
                     let result = json!({
-                        "protocolVersion": protocol::PROTOCOL_VERSION,
+                        "protocolVersion": negotiated,
                         "agentCapabilities": {
                             "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
                         },
@@ -170,11 +177,17 @@ impl AcpServer {
                     return;
                 };
                 let text = protocol::prompt_text(params.get("prompt").unwrap_or(&Value::Null));
-                let profile = sessions
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .and_then(|session| session.profile.clone());
+                let profile = match sessions.lock().await.get(&session_id) {
+                    Some(session) => session.profile.clone(),
+                    None => {
+                        let _ = outbound.send(protocol::error(
+                            id,
+                            -32602,
+                            &format!("unknown session: {session_id}"),
+                        ));
+                        return;
+                    }
+                };
                 let task = PromptTask {
                     manager: self.manager.clone(),
                     outbound: outbound.clone(),
@@ -215,18 +228,22 @@ impl PromptTask {
                 profile,
             })
             .await;
+        let cancel = run.cancel_token();
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
             session.active = Some(Arc::clone(&run));
         }
 
         let mut seen = 0;
-        let mut reason = StopReason::EndTurn;
-        loop {
+        let mut completed_reason = StopReason::EndTurn;
+        // Approvals already answered, by id, so a pause that has not yet cleared
+        // (a denied tool does not reset it) is never re-requested.
+        let mut handled: HashSet<String> = HashSet::new();
+        let final_status = loop {
             let (events, status) = run.wait_from(seen).await;
             seen += events.len();
             for event in &events {
-                if let AgentEvent::RunCompleted { reason: r } = event {
-                    reason = *r;
+                if let AgentEvent::RunCompleted { reason } = event {
+                    completed_reason = *reason;
                 }
                 if let Some(update) = protocol::update_for(event) {
                     let _ = self.outbound.send(protocol::notification(
@@ -235,8 +252,16 @@ impl PromptTask {
                     ));
                 }
             }
-            if let Some(approval) = run.pending().await {
-                let granted = self.request_permission(&session_id, &approval).await;
+            if status.is_terminal() {
+                break status;
+            }
+            if status == RunStatus::AwaitingApproval
+                && let Some(approval) = run.pending().await
+                && handled.insert(approval.approval_id.clone())
+            {
+                let granted = self
+                    .request_permission(&session_id, &approval, &cancel)
+                    .await;
                 let decision = if granted {
                     ApprovalDecision::grant(ApprovalId::new())
                 } else {
@@ -244,21 +269,30 @@ impl PromptTask {
                 };
                 run.decide(decision);
             }
-            if status.is_terminal() {
-                break;
-            }
+        };
+
+        // Release the finished run so a later cancel is not aimed at it.
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            session.active = None;
         }
 
-        let _ = self.outbound.send(protocol::response(
-            req_id,
-            json!({ "stopReason": protocol::stop_reason(&reason) }),
-        ));
+        // The terminal status is authoritative — a cancel during an approval pause
+        // returns Cancelled with no RunCompleted event to read.
+        let reason = match final_status {
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::Failed => "refusal",
+            _ => protocol::stop_reason(&completed_reason),
+        };
+        let _ = self
+            .outbound
+            .send(protocol::response(req_id, json!({ "stopReason": reason })));
     }
 
     async fn request_permission(
         &self,
         session_id: &str,
         approval: &lightagent_api::manager::PendingApproval,
+        cancel: &CancellationToken,
     ) -> bool {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
@@ -274,21 +308,30 @@ impl PromptTask {
         let _ = self
             .outbound
             .send(protocol::request(id, "session/request_permission", params));
-        match receiver.await {
-            Ok(message) => {
-                let outcome = message
-                    .get("result")
-                    .and_then(|result| result.get("outcome"));
-                let selected = outcome
-                    .and_then(|outcome| outcome.get("outcome"))
-                    .and_then(Value::as_str)
-                    == Some("selected");
-                let option = outcome
-                    .and_then(|outcome| outcome.get("optionId"))
-                    .and_then(Value::as_str);
-                selected && option == Some("allow")
+        // Wake on the answer or on cancellation, so a cancel (or a client that
+        // will never answer) cannot park this task forever.
+        tokio::select! {
+            result = receiver => match result {
+                Ok(message) => {
+                    let outcome = message
+                        .get("result")
+                        .and_then(|result| result.get("outcome"));
+                    let selected = outcome
+                        .and_then(|outcome| outcome.get("outcome"))
+                        .and_then(Value::as_str)
+                        == Some("selected");
+                    let option = outcome
+                        .and_then(|outcome| outcome.get("optionId"))
+                        .and_then(Value::as_str);
+                    selected && option == Some("allow")
+                }
+                Err(_) => false,
+            },
+            _ = cancel.cancelled() => {
+                // Drop the waiter so a late answer is not routed to a gone task.
+                self.pending.lock().await.remove(&id);
+                false
             }
-            Err(_) => false,
         }
     }
 }
