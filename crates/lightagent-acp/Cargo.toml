@@ -1,0 +1,16 @@
+[package]
+name = "lightagent-acp"
+description = "An Agent Client Protocol (ACP) server exposing the Lightagent runtime to an editor over stdio JSON-RPC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightagent-core.workspace = true
+lightagent-api.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true

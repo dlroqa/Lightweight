@@ -979,6 +979,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "lightagent-acp",
  "lightagent-api",
  "lightagent-core",
  "lightagent-mcp",
@@ -988,6 +989,19 @@ dependencies = [
  "lightagent-store",
  "lightagent-tools",
  "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-acp"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-api",
+ "lightagent-core",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

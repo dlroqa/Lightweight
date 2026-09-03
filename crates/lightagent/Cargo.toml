@@ -23,10 +23,11 @@ lightagent-provider-lightweight.workspace = true
 lightagent-mcp.workspace = true
 lightagent-rag.workspace = true
 lightagent-memory.workspace = true
+lightagent-acp.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
 clap.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true

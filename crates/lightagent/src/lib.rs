@@ -10,6 +10,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod acp;
 mod banner;
 mod chat;
 mod import;
@@ -106,6 +107,8 @@ enum Command {
         #[arg(long)]
         web_root: Option<std::path::PathBuf>,
     },
+    /// Serve the Agent Client Protocol (ACP) over stdio, for an editor to drive.
+    Acp,
     /// Report the environment, home, profile and provider.
     Doctor,
     /// Import profiles and skills from another agent's home.
@@ -305,6 +308,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             key_env,
             web_root,
         }) => serve::run(host, port, key_env, web_root).await,
+        Some(Command::Acp) => acp::run().await,
         Some(Command::Doctor) => doctor(cli.json),
         Some(Command::Import { source }) => match source {
             ImportSource::Hermes {

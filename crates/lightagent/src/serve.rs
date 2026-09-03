@@ -144,6 +144,22 @@ fn fail(sink: &AgentEventSink, message: &str) {
     });
 }
 
+/// Build a run manager wired to the Lightweight provider and the configured MCP
+/// servers — shared by `serve` and `acp`.
+pub(crate) async fn build_run_manager() -> Result<RunManager, String> {
+    let paths = LightagentPaths::resolve().map_err(|error| error.to_string())?;
+    let config = ConfigStore::at(&paths)
+        .load()
+        .map_err(|error| error.to_string())?;
+    let mcp = mcp_tools(&config).await;
+    let factory = Arc::new(LightweightRunFactory {
+        root: paths.root().to_path_buf(),
+        config,
+        mcp_tools: mcp,
+    });
+    Ok(RunManager::new(factory))
+}
+
 /// Bind and serve the API until interrupted.
 pub async fn run(
     host: String,
