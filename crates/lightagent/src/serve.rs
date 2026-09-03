@@ -99,6 +99,9 @@ impl RunFactory for LightweightRunFactory {
         for tool in &self.mcp_tools {
             registry.insert(Arc::clone(tool));
         }
+        if let Some(tool) = crate::rag::rag_tool(&profile_dir, &self.config) {
+            registry.insert(tool);
+        }
         let mut executor = BoundedExecutor::new(
             registry,
             PolicyEngine::new(profile.approval_policy.into()),

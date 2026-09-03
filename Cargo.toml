@@ -23,6 +23,7 @@ members = [
     "crates/lightagent-store",
     "crates/lightagent-api",
     "crates/lightagent-mcp",
+    "crates/lightagent-rag",
     "crates/lightagent",
 ]
 
@@ -148,6 +149,7 @@ lightagent-tools = { path = "crates/lightagent-tools" }
 lightagent-store = { path = "crates/lightagent-store" }
 lightagent-api = { path = "crates/lightagent-api" }
 lightagent-mcp = { path = "crates/lightagent-mcp" }
+lightagent-rag = { path = "crates/lightagent-rag" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.

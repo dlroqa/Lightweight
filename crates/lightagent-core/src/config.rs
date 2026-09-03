@@ -270,6 +270,31 @@ impl Default for McpConfig {
     }
 }
 
+/// Retrieval (RAG) configuration.
+///
+/// Always available (retrieval reads the profile's own index); these only tune
+/// it. Chunking is applied at ingest, `top_k` at search.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RagConfig {
+    /// Default number of passages a search returns.
+    pub top_k: usize,
+    /// The most characters in one indexed chunk.
+    pub max_chunk_chars: usize,
+    /// How many characters consecutive chunks overlap.
+    pub chunk_overlap_chars: usize,
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            top_k: 5,
+            max_chunk_chars: 1200,
+            chunk_overlap_chars: 200,
+        }
+    }
+}
+
 /// Filesystem and terminal tool configuration.
 ///
 /// Off by default, like `web`: `fs.*` and `terminal.run` are declared to the
@@ -321,6 +346,8 @@ pub struct Config {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub rag: RagConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -434,6 +461,16 @@ impl Config {
                     }
                 }
             }
+        }
+        if self.rag.top_k == 0 {
+            return Err(ConfigError::Invalid(
+                "rag.top_k must be at least 1".to_owned(),
+            ));
+        }
+        if self.rag.max_chunk_chars == 0 {
+            return Err(ConfigError::Invalid(
+                "rag.max_chunk_chars must be at least 1".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -614,6 +651,17 @@ mod tests {
         config
             .validate()
             .expect("a valid enabled web section validates");
+    }
+
+    #[test]
+    fn rag_validation_rejects_zero_bounds() {
+        let mut config = Config::default();
+        config.validate().expect("defaults validate");
+        config.rag.top_k = 0;
+        assert!(config.validate().is_err());
+        config.rag.top_k = 5;
+        config.rag.max_chunk_chars = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

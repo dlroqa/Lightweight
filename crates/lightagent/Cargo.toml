@@ -21,6 +21,7 @@ lightagent-store.workspace = true
 lightagent-api.workspace = true
 lightagent-provider-lightweight.workspace = true
 lightagent-mcp.workspace = true
+lightagent-rag.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
 clap.workspace = true

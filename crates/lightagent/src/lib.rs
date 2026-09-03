@@ -13,6 +13,7 @@
 mod banner;
 mod chat;
 mod import;
+mod rag;
 mod serve;
 mod slash;
 
@@ -111,6 +112,11 @@ enum Command {
         #[command(subcommand)]
         source: ImportSource,
     },
+    /// Index documents and search them (retrieval) for the active profile.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
     /// Print the welcome mark and exit.
     Banner {
         /// Render unconditionally (bypasses the terminal check), for CI.
@@ -155,6 +161,27 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum RagAction {
+    /// Index a file, or every file in a directory.
+    Add {
+        path: std::path::PathBuf,
+        /// Name to index under (default: the file name).
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Search the index and print the best passages.
+    Search {
+        query: String,
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
+    /// List the indexed sources.
+    List,
+    /// Empty the index.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -255,6 +282,12 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
                 dry_run,
                 force,
             } => import::hermes(from, dry_run, force, cli.json),
+        },
+        Some(Command::Rag { action }) => match action {
+            RagAction::Add { path, source } => rag::add(path, source, cli.json),
+            RagAction::Search { query, top_k } => rag::search(query, top_k, cli.json),
+            RagAction::List => rag::list(cli.json),
+            RagAction::Clear => rag::clear(cli.json),
         },
         Some(Command::Banner { preview }) => {
             if preview {

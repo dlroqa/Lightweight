@@ -252,6 +252,9 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     for tool in mcp_tools(&config).await {
         registry.insert(tool);
     }
+    if let Some(tool) = crate::rag::rag_tool(&profile_dir, &config) {
+        registry.insert(tool);
+    }
     let mut executor = BoundedExecutor::new(
         registry,
         PolicyEngine::new(profile.approval_policy.into()),
