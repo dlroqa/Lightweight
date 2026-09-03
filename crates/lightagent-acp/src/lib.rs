@@ -9,9 +9,18 @@
 //! [`RunManager`](lightagent_api::manager::RunManager)'s doing, wrapped in the
 //! wire protocol.
 //!
-//! This targets the ACP wire shapes and is exercised by an in-process client in
-//! the tests; it has not been validated against a shipping editor, and each
-//! prompt is an independent run (in-session history is not yet threaded).
+//! The wire shapes are aligned to the published ACP JSON schema (v1.21.0,
+//! protocol version 1): the method names, the negotiated integer `protocolVersion`,
+//! the `initialize` capabilities (`loadSession`, `promptCapabilities`, `agentInfo`),
+//! `session/new` (accepting the editor's `cwd`, which becomes the run's confined
+//! workspace, and its `mcpServers`), the `session/update` variants
+//! (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`/`tool_call_update`
+//! with a `kind` and object `rawInput`), the `stopReason` values, and
+//! `session/request_permission` with `allow_once`/`reject_once` options. It is
+//! exercised by an in-process client in the tests but has not been run against a
+//! live editor build; `session/load` and client-provided fs/terminal remain out
+//! of scope, and each prompt is an independent run (in-session history is not yet
+//! threaded).
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

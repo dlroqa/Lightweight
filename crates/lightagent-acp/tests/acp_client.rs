@@ -97,7 +97,7 @@ async fn connect() -> (Writer, Reader, String) {
     assert_eq!(recv(&mut reader).await["result"]["protocolVersion"], 1);
     send(
         &mut client_write,
-        json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {} }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": { "cwd": "/tmp/project", "mcpServers": [] } }),
     )
     .await;
     let session_id = recv(&mut reader).await["result"]["sessionId"]

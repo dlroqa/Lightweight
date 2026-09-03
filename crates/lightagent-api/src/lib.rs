@@ -179,6 +179,7 @@ async fn create_run(
         .start(StartRun {
             message: body.message,
             profile: body.profile,
+            cwd: None,
         })
         .await;
     (

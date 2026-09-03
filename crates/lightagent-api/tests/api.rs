@@ -137,6 +137,7 @@ async fn a_run_drives_to_completion_and_buffers_its_events() {
         .start(StartRun {
             message: "what time is it?".into(),
             profile: None,
+            cwd: None,
         })
         .await;
 

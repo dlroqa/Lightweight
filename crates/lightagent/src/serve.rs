@@ -85,7 +85,13 @@ impl RunFactory for LightweightRunFactory {
             }
         };
 
-        let workspace_dir = store.handle(&profile.id).workspace_dir();
+        // An ACP session's `cwd` becomes the confined workspace root, so the
+        // agent edits the editor's project; otherwise the profile's own workspace.
+        let workspace_dir = request
+            .cwd
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| store.handle(&profile.id).workspace_dir());
         let profile_dir = store.handle(&profile.id).dir().to_path_buf();
         let skills = load_skills(&self.root, &profile_dir);
         let delegation = Delegation {

@@ -35,6 +35,9 @@ type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>;
 
 struct Session {
     profile: Option<String>,
+    /// The editor's working directory for this session (ACP `cwd`); becomes the
+    /// run's confined workspace root.
+    cwd: Option<String>,
     active: Option<Arc<RunState>>,
 }
 
@@ -128,8 +131,10 @@ impl AcpServer {
                     let result = json!({
                         "protocolVersion": negotiated,
                         "agentCapabilities": {
+                            "loadSession": false,
                             "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
                         },
+                        "agentInfo": { "name": "lightagent", "version": env!("CARGO_PKG_VERSION") },
                         "authMethods": [],
                     });
                     let _ = outbound.send(protocol::response(id, result));
@@ -143,14 +148,19 @@ impl AcpServer {
             "session/new" => {
                 if let Some(id) = id {
                     let session_id = format!("acp-{}", RunId::new().as_str());
+                    // `profile` is a Lightagent extension; `cwd` is the ACP
+                    // working directory (mcpServers are accepted but ignored —
+                    // the runtime uses its own configured MCP servers).
                     let profile = params
                         .get("profile")
                         .and_then(Value::as_str)
                         .map(str::to_owned);
+                    let cwd = params.get("cwd").and_then(Value::as_str).map(str::to_owned);
                     sessions.lock().await.insert(
                         session_id.clone(),
                         Session {
                             profile,
+                            cwd,
                             active: None,
                         },
                     );
@@ -177,8 +187,8 @@ impl AcpServer {
                     return;
                 };
                 let text = protocol::prompt_text(params.get("prompt").unwrap_or(&Value::Null));
-                let profile = match sessions.lock().await.get(&session_id) {
-                    Some(session) => session.profile.clone(),
+                let (profile, cwd) = match sessions.lock().await.get(&session_id) {
+                    Some(session) => (session.profile.clone(), session.cwd.clone()),
                     None => {
                         let _ = outbound.send(protocol::error(
                             id,
@@ -195,7 +205,7 @@ impl AcpServer {
                     sessions: Arc::clone(sessions),
                     next_id: Arc::clone(next_id),
                 };
-                tokio::spawn(task.run(id, session_id, text, profile));
+                tokio::spawn(task.run(id, session_id, text, profile, cwd));
             }
             other => {
                 if let Some(id) = id {
@@ -220,12 +230,20 @@ struct PromptTask {
 }
 
 impl PromptTask {
-    async fn run(self, req_id: Value, session_id: String, text: String, profile: Option<String>) {
+    async fn run(
+        self,
+        req_id: Value,
+        session_id: String,
+        text: String,
+        profile: Option<String>,
+        cwd: Option<String>,
+    ) {
         let run = self
             .manager
             .start(StartRun {
                 message: text,
                 profile,
+                cwd,
             })
             .await;
         let cancel = run.cancel_token();

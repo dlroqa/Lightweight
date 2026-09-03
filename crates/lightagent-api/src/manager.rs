@@ -50,6 +50,9 @@ impl RunStatus {
 pub struct StartRun {
     pub message: String,
     pub profile: Option<String>,
+    /// The working directory for this run (an ACP session's `cwd`); when set it
+    /// becomes the confined workspace root instead of the profile's default.
+    pub cwd: Option<String>,
 }
 
 /// The shared state of one run, observed by HTTP handlers.

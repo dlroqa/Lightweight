@@ -49,8 +49,9 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
             "sessionUpdate": "tool_call",
             "toolCallId": call.id,
             "title": call.name,
+            "kind": tool_kind(&call.name),
             "status": "pending",
-            "rawInput": call.arguments,
+            "rawInput": raw_input(&call.arguments),
         })),
         AgentEvent::ToolCallStarted { id, .. } => Some(json!({
             "sessionUpdate": "tool_call_update",
@@ -69,6 +70,27 @@ pub fn update_for(event: &AgentEvent) -> Option<Value> {
         })),
         _ => None,
     }
+}
+
+/// The ACP tool-call `kind` for a tool name, so an editor can pick the right
+/// icon and grouping. Namespaced built-ins map to their nature; anything else
+/// (including `mcp.*`) is `other`.
+pub fn tool_kind(name: &str) -> &'static str {
+    match name {
+        "fs.read" | "skill.read" => "read",
+        "fs.write" => "edit",
+        "fs.list" | "rag.search" | "memory.search" | "web.search" => "search",
+        "terminal.run" => "execute",
+        "web.fetch" => "fetch",
+        "agent.delegate" => "think",
+        _ => "other",
+    }
+}
+
+/// Parse a tool call's raw argument string into a JSON value for `rawInput`; an
+/// unparseable string is shown as a string rather than dropped.
+fn raw_input(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| Value::String(arguments.to_owned()))
 }
 
 /// The ACP `stopReason` string for a terminal [`StopReason`].
@@ -133,6 +155,20 @@ mod tests {
         let update = update_for(&AgentEvent::ToolCallRequested { call }).unwrap();
         assert_eq!(update["sessionUpdate"], "tool_call");
         assert_eq!(update["title"], "fs.read");
+        assert_eq!(update["kind"], "read", "kind is set for the editor");
+        assert_eq!(
+            update["rawInput"]["path"], "a",
+            "rawInput is parsed to an object"
+        );
+    }
+
+    #[test]
+    fn tool_kinds_cover_the_builtins() {
+        assert_eq!(tool_kind("fs.write"), "edit");
+        assert_eq!(tool_kind("terminal.run"), "execute");
+        assert_eq!(tool_kind("web.fetch"), "fetch");
+        assert_eq!(tool_kind("web.search"), "search");
+        assert_eq!(tool_kind("mcp.git.status"), "other");
     }
 
     #[test]
