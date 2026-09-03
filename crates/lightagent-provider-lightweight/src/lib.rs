@@ -15,10 +15,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod embed;
 pub mod provider;
 pub mod sse;
 pub mod tls;
 pub mod wire;
 
+pub use embed::EmbeddingClient;
 pub use provider::{LightweightProvider, ProviderConfig};
 pub use tls::ensure_provider;

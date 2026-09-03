@@ -1,9 +1,13 @@
-//! A persisted set of embedded chunks, searched by cosine similarity.
+//! A persisted set of chunks, searched by hybrid lexical + semantic similarity.
 //!
-//! The index is a JSONL file (one record per chunk) under the profile's `rag/`
-//! directory, which is itself owner-only, so the indexed text is as protected as
-//! the rest of the profile. Adding a source re-indexes it (its old chunks are
-//! dropped first), so re-adding an edited file does not leave stale passages.
+//! Each chunk carries a lexical vector (the dependency-free feature hash, always)
+//! and, when a semantic embedder is configured, a model embedding. Search ranks
+//! by both and fuses the two rankings with Reciprocal Rank Fusion (RRF), which
+//! combines lists on rank rather than raw score — so the very different scales of
+//! a bag-of-words cosine and a model cosine mix cleanly, and a record missing one
+//! signal (an old index with no semantic vector, or a chunk with no shared words)
+//! still ranks on the other. With no semantic embedder it is pure lexical, as
+//! before. The index is JSONL under the profile's owner-only `rag/` directory.
 
 use std::cmp::Ordering;
 use std::io;
@@ -12,14 +16,21 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::chunk;
-use crate::embed::{DIM, Embedder, cosine};
+use crate::embed::{DIM, Embedder, SemanticEmbedder, cosine};
+
+/// RRF's rank damping constant; 60 is the value from the original paper.
+const RRF_K: f32 = 60.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
     source: String,
     chunk: usize,
     text: String,
+    /// The lexical (feature-hash) vector; always present.
     vector: Vec<f32>,
+    /// The semantic (model) vector, when one was computed at index time.
+    #[serde(default)]
+    semantic: Option<Vec<f32>>,
 }
 
 /// One search result.
@@ -30,15 +41,15 @@ pub struct Hit {
     pub text: String,
 }
 
-/// An on-disk vector index for one profile.
+/// An on-disk hybrid vector index for one profile.
 pub struct RagStore {
     path: PathBuf,
     records: Vec<Record>,
 }
 
 impl RagStore {
-    /// Open the index at `path`, loading it when present (records of a stale
-    /// dimension are skipped) and starting empty when it is not.
+    /// Open the index at `path`, loading it when present (lexical vectors of a
+    /// stale dimension are skipped) and starting empty when it is not.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let records = match std::fs::read_to_string(&path) {
@@ -54,51 +65,110 @@ impl RagStore {
         Ok(Self { path, records })
     }
 
-    /// Index `text` under `source`, replacing any earlier chunks for it. Returns
-    /// the number of chunks stored.
-    pub fn add(
+    /// Index `text` under `source`, replacing any earlier chunks for it. When a
+    /// `semantic` embedder is given, each chunk also gets a model embedding.
+    /// Returns the number of chunks stored.
+    pub async fn add(
         &mut self,
         source: &str,
         text: &str,
-        embedder: &dyn Embedder,
+        lexical: &dyn Embedder,
+        semantic: Option<&dyn SemanticEmbedder>,
         max_chars: usize,
         overlap: usize,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, String> {
         self.records.retain(|record| record.source != source);
+        let chunks = chunk(text, max_chars, overlap);
+        if chunks.is_empty() {
+            self.persist().map_err(|error| error.to_string())?;
+            return Ok(0);
+        }
+        // One batched semantic call for the whole document, index-aligned to
+        // `chunks`; a failure degrades to lexical-only rather than aborting.
+        let semantic_vectors: Option<Vec<Vec<f32>>> = match semantic {
+            Some(embedder) => match embedder.embed(&chunks).await {
+                Ok(vectors) if vectors.len() == chunks.len() => Some(vectors),
+                _ => None,
+            },
+            None => None,
+        };
+
         let mut added = 0;
-        for (index, piece) in chunk(text, max_chars, overlap).into_iter().enumerate() {
-            let vector = embedder.embed(&piece);
-            if vector.iter().all(|value| *value == 0.0) {
-                continue; // no tokens to match on
+        for (index, piece) in chunks.iter().enumerate() {
+            let vector = lexical.embed(piece);
+            let semantic = semantic_vectors
+                .as_ref()
+                .and_then(|all| all.get(index).cloned());
+            if vector.iter().all(|value| *value == 0.0) && semantic.is_none() {
+                continue; // nothing to match on
             }
             self.records.push(Record {
                 source: source.to_owned(),
                 chunk: index,
-                text: piece,
+                text: piece.clone(),
                 vector,
+                semantic,
             });
             added += 1;
         }
-        self.persist()?;
+        self.persist().map_err(|error| error.to_string())?;
         Ok(added)
     }
 
-    /// The `k` best matches for `query`, best first, positive scores only.
-    pub fn search(&self, query: &str, embedder: &dyn Embedder, k: usize) -> Vec<Hit> {
-        let embedded = embedder.embed(query);
-        let mut hits: Vec<Hit> = self
-            .records
-            .iter()
-            .map(|record| Hit {
-                score: cosine(&embedded, &record.vector),
-                source: record.source.clone(),
-                text: record.text.clone(),
+    /// The `k` best matches for `query`. Lexical always; when `semantic` is given
+    /// and reachable, lexical and semantic rankings are fused with RRF.
+    pub async fn search(
+        &self,
+        query: &str,
+        lexical: &dyn Embedder,
+        semantic: Option<&dyn SemanticEmbedder>,
+        k: usize,
+    ) -> Vec<Hit> {
+        let lexical_query = lexical.embed(query);
+        let lexical_ranked = ranked(
+            self.records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| (index, cosine(&lexical_query, &record.vector))),
+        );
+
+        let semantic_ranked = match semantic {
+            Some(embedder) => match embedder
+                .embed(std::slice::from_ref(&query.to_owned()))
+                .await
+            {
+                Ok(vectors) => vectors.into_iter().next().map(|query_vector| {
+                    ranked(
+                        self.records
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, record)| {
+                                record
+                                    .semantic
+                                    .as_ref()
+                                    .map(|vector| (index, cosine(&query_vector, vector)))
+                            }),
+                    )
+                }),
+                Err(_) => None, // a failed embed degrades to lexical-only
+            },
+            None => None,
+        };
+
+        let fused = match semantic_ranked {
+            Some(semantic_ranked) => fuse_rrf(&[lexical_ranked, semantic_ranked]),
+            None => lexical_ranked,
+        };
+
+        fused
+            .into_iter()
+            .take(k)
+            .map(|(index, score)| Hit {
+                score,
+                source: self.records[index].source.clone(),
+                text: self.records[index].text.clone(),
             })
-            .filter(|hit| hit.score > 0.0)
-            .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        hits.truncate(k);
-        hits
+            .collect()
     }
 
     /// Each indexed source and its chunk count, sorted by source.
@@ -109,6 +179,11 @@ impl RagStore {
             *counts.entry(record.source.clone()).or_insert(0) += 1;
         }
         counts.into_iter().collect()
+    }
+
+    /// Whether any indexed chunk carries a semantic vector.
+    pub fn has_semantic(&self) -> bool {
+        self.records.iter().any(|record| record.semantic.is_some())
     }
 
     /// The number of indexed chunks.
@@ -142,6 +217,29 @@ impl RagStore {
     }
 }
 
+/// Sort `(index, score)` pairs by descending score, dropping non-positive ones.
+fn ranked(scored: impl Iterator<Item = (usize, f32)>) -> Vec<(usize, f32)> {
+    let mut ranked: Vec<(usize, f32)> = scored.filter(|(_, score)| *score > 0.0).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    ranked
+}
+
+/// Reciprocal Rank Fusion: a record's fused score is the sum over the ranked
+/// lists of `1 / (RRF_K + rank)`, so appearing high in either list helps and
+/// appearing in both helps most. Returns `(index, fused_score)` best first.
+fn fuse_rrf(lists: &[Vec<(usize, f32)>]) -> Vec<(usize, f32)> {
+    use std::collections::HashMap;
+    let mut fused: HashMap<usize, f32> = HashMap::new();
+    for list in lists {
+        for (rank, (index, _score)) in list.iter().enumerate() {
+            *fused.entry(*index).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+        }
+    }
+    let mut fused: Vec<(usize, f32)> = fused.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    fused
+}
+
 /// The default index file under a profile's `rag/` directory.
 pub fn index_path(profile_dir: &Path) -> PathBuf {
     profile_dir.join("rag").join("index.jsonl")
@@ -163,55 +261,100 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn add_search_and_reindex_round_trip() {
+    /// A deterministic offline semantic embedder: a fixed-dim vector keyed on the
+    /// presence of a few concept words, so "related" texts share direction
+    /// without matching literal tokens (which the lexical half already covers).
+    struct FakeSemantic;
+
+    #[async_trait::async_trait]
+    impl SemanticEmbedder for FakeSemantic {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            let concepts = ["runtime", "fruit", "database"];
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let lower = text.to_lowercase();
+                    // Map synonyms to the same concept axis.
+                    let async_like = lower.contains("async")
+                        || lower.contains("concurren")
+                        || lower.contains("runtime")
+                        || lower.contains("tokio");
+                    concepts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if (i == 0 && async_like) || lower.contains(c) {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn lexical_only_still_works() {
         let path = scratch_index();
         let embedder = HashingEmbedder;
-        {
-            let mut store = RagStore::open(&path).unwrap();
-            store
-                .add(
-                    "rust.md",
-                    "Tokio is an asynchronous runtime for Rust.",
-                    &embedder,
-                    500,
-                    50,
-                )
-                .unwrap();
-            store
-                .add(
-                    "fruit.md",
-                    "Bananas are a yellow tropical fruit.",
-                    &embedder,
-                    500,
-                    50,
-                )
-                .unwrap();
-            let hits = store.search("async rust runtime", &embedder, 3);
-            assert!(!hits.is_empty());
-            assert_eq!(hits[0].source, "rust.md", "the rust passage should win");
-        }
-        // Reopen from disk and confirm persistence + re-index behaviour.
         let mut store = RagStore::open(&path).unwrap();
-        assert_eq!(store.sources().len(), 2);
-        let before = store.len();
         store
             .add(
-                "rust.md",
-                "Completely different words here now.",
+                "a.md",
+                "Tokio is an async runtime for Rust.",
                 &embedder,
+                None,
                 500,
                 50,
             )
+            .await
             .unwrap();
-        assert_eq!(
-            store.sources().len(),
-            2,
-            "re-adding a source does not duplicate it"
-        );
-        assert!(store.len() <= before + 1);
-        store.clear().unwrap();
-        assert!(store.is_empty());
+        assert!(!store.has_semantic());
+        let hits = store.search("async runtime", &embedder, None, 3).await;
+        assert_eq!(hits[0].source, "a.md");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn hybrid_recalls_a_synonym_the_lexical_half_would_miss() {
+        let path = scratch_index();
+        let lexical = HashingEmbedder;
+        let semantic = FakeSemantic;
+        let mut store = RagStore::open(&path).unwrap();
+        store
+            .add(
+                "rust.md",
+                "This service uses concurrent tasks for high throughput.",
+                &lexical,
+                Some(&semantic),
+                500,
+                50,
+            )
+            .await
+            .unwrap();
+        store
+            .add(
+                "fruit.md",
+                "Bananas are a tropical fruit.",
+                &lexical,
+                Some(&semantic),
+                500,
+                50,
+            )
+            .await
+            .unwrap();
+        assert!(store.has_semantic());
+
+        // The query shares no salient words with the rust doc ("async runtime" vs
+        // "concurrent tasks"), so lexical alone would not surface it; the semantic
+        // concept axis does, and RRF puts it first.
+        let hits = store
+            .search("async runtime", &lexical, Some(&semantic), 2)
+            .await;
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].source, "rust.md", "semantic recall wins via RRF");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

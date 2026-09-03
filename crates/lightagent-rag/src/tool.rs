@@ -1,9 +1,9 @@
 //! `rag.search` — retrieve the passages most relevant to a query.
 //!
 //! [`RiskClass::Observe`](lightagent_core::RiskClass::Observe): it reads the
-//! profile's own indexed text and changes nothing. It holds its store directly
-//! (built by the caller from the profile's index), so it needs no `ToolCtx`
-//! injection — the same shape the MCP tools use.
+//! profile's own indexed text and changes nothing. It holds its store (and, for
+//! hybrid retrieval, an optional semantic embedder) directly, built by the
+//! caller, so it needs no `ToolCtx` injection — the same shape the MCP tools use.
 
 use std::sync::Arc;
 
@@ -13,21 +13,27 @@ use lightagent_tools::{Tool, ToolCtx, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::embed::HashingEmbedder;
+use crate::embed::{HashingEmbedder, SemanticEmbedder};
 use crate::store::RagStore;
 
 /// The `rag.search` tool.
 pub struct RagSearch {
     definition: ToolDefinition,
     store: Arc<RagStore>,
+    semantic: Option<Arc<dyn SemanticEmbedder>>,
     top_k: usize,
 }
 
 impl RagSearch {
     pub const NAME: &'static str = "rag.search";
 
-    /// Build the tool over an opened `store`, defaulting to `top_k` results.
-    pub fn new(store: Arc<RagStore>, top_k: usize) -> Self {
+    /// Build the tool over an opened `store`, an optional `semantic` embedder for
+    /// hybrid retrieval, defaulting to `top_k` results.
+    pub fn new(
+        store: Arc<RagStore>,
+        semantic: Option<Arc<dyn SemanticEmbedder>>,
+        top_k: usize,
+    ) -> Self {
         let parameters = json!({
             "type": "object",
             "properties": {
@@ -46,6 +52,7 @@ impl RagSearch {
                 vec![Scope::new("rag:search")],
             ),
             store,
+            semantic,
             top_k: top_k.max(1),
         }
     }
@@ -69,14 +76,17 @@ impl Tool for RagSearch {
             return ToolOutcome::error("could not read rag.search arguments");
         };
         let k = args.top_k.unwrap_or(self.top_k).clamp(1, 50);
-        let hits = self.store.search(&args.query, &HashingEmbedder, k);
+        let hits = self
+            .store
+            .search(&args.query, &HashingEmbedder, self.semantic.as_deref(), k)
+            .await;
         if hits.is_empty() {
             return ToolOutcome::ok("No relevant passages found.");
         }
         let mut out = String::new();
         for (rank, hit) in hits.iter().enumerate() {
             out.push_str(&format!(
-                "[{}] {} (score {:.2})\n{}\n\n",
+                "[{}] {} (score {:.3})\n{}\n\n",
                 rank + 1,
                 hit.source,
                 hit.score,
@@ -90,13 +100,12 @@ impl Tool for RagSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embed::HashingEmbedder;
     use tokio_util::sync::CancellationToken;
 
     #[test]
     fn tool_is_observe_class() {
         let store = Arc::new(RagStore::open(std::env::temp_dir().join("rag-none.jsonl")).unwrap());
-        let tool = RagSearch::new(store, 5);
+        let tool = RagSearch::new(store, None, 5);
         assert_eq!(tool.definition().risk, RiskClass::Observe);
     }
 
@@ -104,7 +113,7 @@ mod tests {
     async fn returns_a_message_when_empty() {
         let path = std::env::temp_dir().join(format!("rag-empty-{}.jsonl", std::process::id()));
         let store = Arc::new(RagStore::open(&path).unwrap());
-        let tool = RagSearch::new(store, 5);
+        let tool = RagSearch::new(store, None, 5);
         let out = tool
             .call(
                 &json!({ "query": "anything" }),
@@ -113,6 +122,5 @@ mod tests {
             .await;
         assert!(!out.is_error);
         assert!(out.content.contains("No relevant"));
-        let _ = HashingEmbedder; // keep the import meaningful across cfgs
     }
 }

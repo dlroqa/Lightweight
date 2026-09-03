@@ -10,9 +10,43 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore};
-use lightagent_rag::{HashingEmbedder, RagSearch, RagStore, index_path};
+use lightagent_provider_lightweight::EmbeddingClient;
+use lightagent_rag::{HashingEmbedder, RagSearch, RagStore, SemanticEmbedder, index_path};
 use lightagent_tools::Tool;
+
+/// A semantic embedder backed by an OpenAI-compatible embeddings endpoint.
+struct ProviderSemanticEmbedder {
+    client: EmbeddingClient,
+    model: String,
+}
+
+#[async_trait]
+impl SemanticEmbedder for ProviderSemanticEmbedder {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        self.client
+            .embed(&self.model, texts)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Build the semantic embedder when hybrid retrieval is configured, else `None`.
+pub(crate) fn semantic_embedder(config: &Config) -> Option<Arc<dyn SemanticEmbedder>> {
+    let semantic = &config.rag.semantic;
+    if !semantic.enabled {
+        return None;
+    }
+    let base_url = semantic.base_url.clone()?;
+    let model = semantic.model.clone()?;
+    let api_key = semantic
+        .api_key
+        .as_ref()
+        .and_then(|secret| secret.resolve());
+    let client = EmbeddingClient::new(base_url, api_key).ok()?;
+    Some(Arc::new(ProviderSemanticEmbedder { client, model }))
+}
 
 /// The `rag.search` tool for a run, or `None` when nothing is indexed.
 pub(crate) fn rag_tool(profile_dir: &Path, config: &Config) -> Option<Arc<dyn Tool>> {
@@ -20,7 +54,12 @@ pub(crate) fn rag_tool(profile_dir: &Path, config: &Config) -> Option<Arc<dyn To
     if store.is_empty() {
         return None;
     }
-    Some(Arc::new(RagSearch::new(Arc::new(store), config.rag.top_k)))
+    let semantic = semantic_embedder(config);
+    Some(Arc::new(RagSearch::new(
+        Arc::new(store),
+        semantic,
+        config.rag.top_k,
+    )))
 }
 
 /// Resolve the active profile's index path and the loaded config.
@@ -39,10 +78,11 @@ fn active_index() -> Result<(PathBuf, Config), String> {
 }
 
 /// `rag add <path>` — index a file, or every file in a directory.
-pub fn add(path: PathBuf, source: Option<String>, json: bool) -> Result<(), String> {
+pub async fn add(path: PathBuf, source: Option<String>, json: bool) -> Result<(), String> {
     let (index, config) = active_index()?;
     let mut store = RagStore::open(&index).map_err(|error| error.to_string())?;
     let embedder = HashingEmbedder;
+    let semantic = semantic_embedder(&config);
 
     let mut targets = Vec::new();
     if path.is_dir() {
@@ -78,9 +118,11 @@ pub fn add(path: PathBuf, source: Option<String>, json: bool) -> Result<(), Stri
                 &name,
                 &text,
                 &embedder,
+                semantic.as_deref(),
                 config.rag.max_chunk_chars,
                 config.rag.chunk_overlap_chars,
             )
+            .await
             .map_err(|error| error.to_string())?;
         total += added;
         indexed.push((name, added));
@@ -102,11 +144,14 @@ pub fn add(path: PathBuf, source: Option<String>, json: bool) -> Result<(), Stri
 }
 
 /// `rag search <query>` — the best passages for a query.
-pub fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), String> {
+pub async fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), String> {
     let (index, config) = active_index()?;
     let store = RagStore::open(&index).map_err(|error| error.to_string())?;
     let k = top_k.unwrap_or(config.rag.top_k).max(1);
-    let hits = store.search(&query, &HashingEmbedder, k);
+    let semantic = semantic_embedder(&config);
+    let hits = store
+        .search(&query, &HashingEmbedder, semantic.as_deref(), k)
+        .await;
 
     if json {
         let value = serde_json::json!({

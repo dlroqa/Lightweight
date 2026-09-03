@@ -318,8 +318,8 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             } => import::hermes(from, dry_run, force, cli.json),
         },
         Some(Command::Rag { action }) => match action {
-            RagAction::Add { path, source } => rag::add(path, source, cli.json),
-            RagAction::Search { query, top_k } => rag::search(query, top_k, cli.json),
+            RagAction::Add { path, source } => rag::add(path, source, cli.json).await,
+            RagAction::Search { query, top_k } => rag::search(query, top_k, cli.json).await,
             RagAction::List => rag::list(cli.json),
             RagAction::Clear => rag::clear(cli.json),
         },

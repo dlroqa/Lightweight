@@ -21,6 +21,6 @@ pub mod store;
 pub mod tool;
 
 pub use chunk::chunk;
-pub use embed::{DIM, Embedder, HashingEmbedder, cosine};
+pub use embed::{DIM, Embedder, HashingEmbedder, SemanticEmbedder, cosine};
 pub use store::{Hit, RagStore, index_path};
 pub use tool::RagSearch;

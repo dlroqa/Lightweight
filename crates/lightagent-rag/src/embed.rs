@@ -9,6 +9,16 @@
 //! and a document, which is what retrieval needs. The [`Embedder`] trait leaves
 //! room for a semantic backend later without changing the store or the tool.
 
+/// An async embedder backed by a real model (over the network), used for the
+/// semantic half of hybrid retrieval. Batched so a document's chunks — or a
+/// single query — are embedded in one round-trip. The implementation lives in
+/// the caller (it holds the HTTP client), so this crate stays transport-free.
+#[async_trait::async_trait]
+pub trait SemanticEmbedder: Send + Sync {
+    /// Embed each input, returning one vector per input in the same order.
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
+}
+
 /// The fixed vector dimension. Stored vectors of another dimension are ignored.
 pub const DIM: usize = 1024;
 

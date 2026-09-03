@@ -293,6 +293,24 @@ impl Default for MemoryConfig {
     }
 }
 
+/// The semantic (embedding-model) half of hybrid retrieval.
+///
+/// Off by default: retrieval is lexical until an OpenAI-compatible embeddings
+/// endpoint is configured (the Lightweight gateway serves none, so this points
+/// at e.g. an Ollama/llama.cpp/OpenAI server). When enabled and reachable, its
+/// vectors are fused with the lexical ranking; a failure degrades to lexical.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RagSemanticConfig {
+    pub enabled: bool,
+    /// The embeddings server root, e.g. `http://127.0.0.1:11434`.
+    pub base_url: Option<String>,
+    /// The embeddings model id.
+    pub model: Option<String>,
+    /// A bearer key for the endpoint, by reference. Never stored in the clear.
+    pub api_key: Option<SecretRef>,
+}
+
 /// Retrieval (RAG) configuration.
 ///
 /// Always available (retrieval reads the profile's own index); these only tune
@@ -306,6 +324,8 @@ pub struct RagConfig {
     pub max_chunk_chars: usize,
     /// How many characters consecutive chunks overlap.
     pub chunk_overlap_chars: usize,
+    /// The semantic half of hybrid retrieval.
+    pub semantic: RagSemanticConfig,
 }
 
 impl Default for RagConfig {
@@ -314,6 +334,7 @@ impl Default for RagConfig {
             top_k: 5,
             max_chunk_chars: 1200,
             chunk_overlap_chars: 200,
+            semantic: RagSemanticConfig::default(),
         }
     }
 }
@@ -497,6 +518,30 @@ impl Config {
                 "rag.max_chunk_chars must be at least 1".to_owned(),
             ));
         }
+        if self.rag.semantic.enabled {
+            match self.rag.semantic.base_url.as_deref().map(str::trim) {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {}
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "rag.semantic.base_url must be an http(s) URL when semantic is enabled"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if self
+                .rag
+                .semantic
+                .model
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "rag.semantic.model is required when semantic is enabled".to_owned(),
+                ));
+            }
+        }
         if self.memory.top_k == 0 {
             return Err(ConfigError::Invalid(
                 "memory.top_k must be at least 1".to_owned(),
@@ -528,6 +573,17 @@ impl Config {
                 .and_then(|search| search.as_object_mut())
         {
             search.insert(
+                "api_key".to_owned(),
+                serde_json::Value::String(api_key.redacted()),
+            );
+        }
+        if let Some(api_key) = &self.rag.semantic.api_key
+            && let Some(semantic) = value
+                .get_mut("rag")
+                .and_then(|rag| rag.get_mut("semantic"))
+                .and_then(|semantic| semantic.as_object_mut())
+        {
+            semantic.insert(
                 "api_key".to_owned(),
                 serde_json::Value::String(api_key.redacted()),
             );
@@ -681,6 +737,30 @@ mod tests {
         config
             .validate()
             .expect("a valid enabled web section validates");
+    }
+
+    #[test]
+    fn rag_semantic_validates_when_enabled_and_redacts_its_key() {
+        let mut config = Config::default();
+        config.rag.semantic.enabled = true;
+        assert!(config.validate().is_err(), "base_url required when enabled");
+        config.rag.semantic.base_url = Some("http://127.0.0.1:11434".to_owned());
+        assert!(config.validate().is_err(), "model required when enabled");
+        config.rag.semantic.model = Some("nomic-embed".to_owned());
+        config
+            .validate()
+            .expect("a valid semantic section validates");
+
+        config.rag.semantic.api_key = Some(SecretRef::env("EMBED_KEY"));
+        assert!(
+            config
+                .redacted_json()
+                .to_string()
+                .contains("${env:EMBED_KEY}")
+        );
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, config);
     }
 
     #[test]
