@@ -987,6 +987,7 @@ dependencies = [
  "lightagent-memory",
  "lightagent-provider-lightweight",
  "lightagent-rag",
+ "lightagent-runtime",
  "lightagent-store",
  "lightagent-tools",
  "reqwest",
@@ -1106,6 +1107,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "lightagent-runtime"
+version = "0.2.1"
+dependencies = [
+ "lightagent-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

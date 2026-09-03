@@ -403,6 +403,50 @@ impl Default for ExtensionsConfig {
     }
 }
 
+/// Device-aware runtime and model placement.
+///
+/// Read by `lightagent-runtime`, which speaks the gateway's control plane to
+/// report the engine's device and — only on an explicit `runtime place` — load a
+/// model with these parameters. The pinned engine runs on the CPU; the reserved
+/// device names are honoured now so the policy needs no change when GPU backends
+/// arrive. Every field maps to a knob the load endpoint already accepts; absent
+/// ones leave the engine's own default in place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// `auto`, `cpu`, `cuda`, `metal` or `rocm`. `auto` takes whatever the
+    /// engine offers.
+    pub preferred_device: String,
+    /// Whether a specific-but-unavailable device may fall back to the CPU.
+    pub allow_cpu_fallback: bool,
+    /// The context window to request on a placement. `None` lets the engine size
+    /// it to the machine.
+    pub n_ctx: Option<u32>,
+    /// Generation threads to request. `None` uses the engine's default.
+    pub threads: Option<u32>,
+    /// KV cache element type, in the engine's spelling (e.g. `q8_0`).
+    pub kv_type: Option<String>,
+    /// How weights are brought into memory: `auto`, `none`, `mmap`, `mlock` or
+    /// `mmap+mlock`.
+    pub load_mode: Option<String>,
+    /// Physical batch size to request. `None` uses the engine's default.
+    pub ubatch: Option<u32>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            preferred_device: "auto".to_owned(),
+            allow_cpu_fallback: true,
+            n_ctx: None,
+            threads: None,
+            kv_type: None,
+            load_mode: None,
+            ubatch: None,
+        }
+    }
+}
+
 /// The whole typed configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -424,6 +468,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub extensions: ExtensionsConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -576,6 +622,24 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "memory.top_k must be at least 1".to_owned(),
             ));
+        }
+        {
+            let device = self.runtime.preferred_device.trim().to_ascii_lowercase();
+            if !matches!(device.as_str(), "auto" | "cpu" | "cuda" | "metal" | "rocm") {
+                return Err(ConfigError::Invalid(format!(
+                    "runtime.preferred_device must be auto, cpu, cuda, metal or rocm, got {:?}",
+                    self.runtime.preferred_device
+                )));
+            }
+            for (name, value) in [
+                ("runtime.n_ctx", self.runtime.n_ctx),
+                ("runtime.threads", self.runtime.threads),
+                ("runtime.ubatch", self.runtime.ubatch),
+            ] {
+                if value == Some(0) {
+                    return Err(ConfigError::Invalid(format!("{name} must be at least 1")));
+                }
+            }
         }
         Ok(())
     }
@@ -788,6 +852,41 @@ mod tests {
                 .to_string()
                 .contains("${env:EMBED_KEY}")
         );
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, config);
+    }
+
+    #[test]
+    fn runtime_defaults_are_auto_cpu_and_validate() {
+        let config = Config::default();
+        assert_eq!(config.runtime.preferred_device, "auto");
+        assert!(config.runtime.allow_cpu_fallback);
+        config.validate().expect("runtime defaults validate");
+    }
+
+    #[test]
+    fn runtime_validation_rejects_unknown_device_and_zero_bounds() {
+        let mut config = Config::default();
+        config.runtime.preferred_device = "tpu".to_owned();
+        assert!(config.validate().is_err(), "an unknown device is rejected");
+        // The reserved GPU names are accepted now, before the engine reports them.
+        for device in ["auto", "cpu", "cuda", "metal", "rocm"] {
+            config.runtime.preferred_device = device.to_owned();
+            config
+                .validate()
+                .unwrap_or_else(|_| panic!("{device} should validate"));
+        }
+        config.runtime.n_ctx = Some(0);
+        assert!(config.validate().is_err(), "a zero context is rejected");
+    }
+
+    #[test]
+    fn runtime_section_round_trips() {
+        let mut config = Config::default();
+        config.runtime.preferred_device = "cuda".to_owned();
+        config.runtime.n_ctx = Some(8192);
+        config.runtime.kv_type = Some("q8_0".to_owned());
         let json = serde_json::to_string(&config).expect("serialize");
         let back: Config = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, config);

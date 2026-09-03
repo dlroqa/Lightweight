@@ -1,0 +1,16 @@
+[package]
+name = "lightagent-runtime"
+description = "Device-aware runtime/placement selector over the engine's control API (HTTP)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightagent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+tokio = { workspace = true }

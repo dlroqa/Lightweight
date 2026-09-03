@@ -17,6 +17,7 @@ mod extensions;
 mod import;
 mod memory;
 mod rag;
+mod runtime;
 mod serve;
 mod slash;
 
@@ -115,6 +116,11 @@ enum Command {
     },
     /// Serve the Agent Client Protocol (ACP) over stdio, for an editor to drive.
     Acp,
+    /// Report the engine's device and capabilities, or place a model on it.
+    Runtime {
+        #[command(subcommand)]
+        action: Option<RuntimeAction>,
+    },
     /// Report the environment, home, profile and provider.
     Doctor,
     /// Import profiles and skills from another agent's home.
@@ -188,6 +194,20 @@ enum ExtensionsAction {
     Enable { name: String },
     /// Keep an extension installed but inactive.
     Disable { name: String },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Report the engine's device, capabilities, the machine and the catalog.
+    Show,
+    /// Load a model with the configured runtime parameters (changes the engine).
+    Place {
+        /// The catalog id of the model to make resident.
+        model: String,
+        /// Reload even if the model is already the resident one.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -333,7 +353,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             web_root,
         }) => serve::run(host, port, key_env, web_root).await,
         Some(Command::Acp) => acp::run().await,
-        Some(Command::Doctor) => doctor(cli.json),
+        Some(Command::Runtime { action }) => match action.unwrap_or(RuntimeAction::Show) {
+            RuntimeAction::Show => runtime::show(cli.json).await,
+            RuntimeAction::Place { model, force } => runtime::place(model, force, cli.json).await,
+        },
+        Some(Command::Doctor) => doctor(cli.json).await,
         Some(Command::Import { source }) => match source {
             ImportSource::Hermes {
                 from,
@@ -392,7 +416,38 @@ fn active_profile_id(store: &ProfileStore) -> Result<Option<ProfileId>, String> 
 
 // --- doctor -----------------------------------------------------------------
 
-fn doctor(json: bool) -> Result<(), String> {
+/// What a best-effort device probe found, when the gateway answered in time.
+struct DeviceProbe {
+    device: String,
+    resident_model: Option<String>,
+    backend: Option<String>,
+}
+
+/// Ask the gateway for its device, bounded so a down gateway cannot stall the
+/// report. Any failure — unreachable, slow, an error status — yields `None`, and
+/// the report simply omits the line.
+async fn probe_device(config: &Config) -> Option<DeviceProbe> {
+    use lightagent_runtime::{RuntimeClient, RuntimeEndpoint};
+
+    let mut endpoint = RuntimeEndpoint::new(config.inference.base_url.clone());
+    if let Some(secret) = &config.inference.api_key
+        && let Some(value) = secret.resolve()
+    {
+        endpoint = endpoint.with_api_key(value);
+    }
+    let client = RuntimeClient::new(endpoint).ok()?;
+    let gateway = tokio::time::timeout(std::time::Duration::from_secs(2), client.gateway())
+        .await
+        .ok()?
+        .ok()?;
+    Some(DeviceProbe {
+        device: gateway.engine_capabilities.device,
+        resident_model: gateway.model,
+        backend: gateway.backend,
+    })
+}
+
+async fn doctor(json: bool) -> Result<(), String> {
     let paths = paths()?;
     let config = load_config(&paths)?;
     let store = ProfileStore::new(paths.root());
@@ -400,6 +455,7 @@ fn doctor(json: bool) -> Result<(), String> {
     let profiles = store.list().map_err(|error| error.to_string())?;
     let tool_count = ToolRegistry::builtin().names().len();
     let home_exists = paths.root().exists();
+    let device = probe_device(&config).await;
 
     if json {
         let value = serde_json::json!({
@@ -413,6 +469,10 @@ fn doctor(json: bool) -> Result<(), String> {
             "profiles": profiles.iter().map(|id| id.as_str().to_string()).collect::<Vec<_>>(),
             "tools": tool_count,
             "banner": std::io::stderr().is_terminal(),
+            "engine_reachable": device.is_some(),
+            "device": device.as_ref().map(|d| d.device.clone()),
+            "backend": device.as_ref().and_then(|d| d.backend.clone()),
+            "resident_model": device.as_ref().and_then(|d| d.resident_model.clone()),
         });
         println!("{value:#}");
         return Ok(());
@@ -454,6 +514,24 @@ fn doctor(json: bool) -> Result<(), String> {
         }
     ));
     out.push_str(&format!("Tools:     {tool_count} built-in\n"));
+    match &device {
+        Some(probe) => {
+            out.push_str(&format!(
+                "Engine:    reachable ({}), running on {}\n",
+                probe.backend.as_deref().unwrap_or("unknown backend"),
+                probe.device
+            ));
+            out.push_str(&format!(
+                "Resident:  {}\n",
+                probe.resident_model.as_deref().unwrap_or("(none loaded)")
+            ));
+        }
+        None => {
+            out.push_str(
+                "Engine:    not reachable (start the gateway, or check inference.base_url)\n",
+            );
+        }
+    }
     print!("{out}");
     Ok(())
 }
@@ -703,6 +781,13 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
         "inference.model" => Some(config.inference.model.clone().unwrap_or_default()),
         "inference.device" => Some(config.inference.device.clone()),
         "extensions.enabled" => Some(config.extensions.enabled.to_string()),
+        "runtime.preferred_device" => Some(config.runtime.preferred_device.clone()),
+        "runtime.allow_cpu_fallback" => Some(config.runtime.allow_cpu_fallback.to_string()),
+        "runtime.n_ctx" => config.runtime.n_ctx.map(|v| v.to_string()),
+        "runtime.threads" => config.runtime.threads.map(|v| v.to_string()),
+        "runtime.kv_type" => config.runtime.kv_type.clone(),
+        "runtime.load_mode" => config.runtime.load_mode.clone(),
+        "runtime.ubatch" => config.runtime.ubatch.map(|v| v.to_string()),
         _ => None,
     }
 }
@@ -716,9 +801,40 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "extensions.enabled" => {
             config.extensions.enabled = parse_bool(value)?;
         }
+        "runtime.preferred_device" => config.runtime.preferred_device = value.to_string(),
+        "runtime.allow_cpu_fallback" => {
+            config.runtime.allow_cpu_fallback = parse_bool(value)?;
+        }
+        "runtime.n_ctx" => config.runtime.n_ctx = parse_opt_u32(value)?,
+        "runtime.threads" => config.runtime.threads = parse_opt_u32(value)?,
+        "runtime.ubatch" => config.runtime.ubatch = parse_opt_u32(value)?,
+        "runtime.kv_type" => config.runtime.kv_type = parse_opt_string(value),
+        "runtime.load_mode" => config.runtime.load_mode = parse_opt_string(value),
         _ => return Err(format!("unknown or read-only config key '{key}'")),
     }
     Ok(())
+}
+
+/// Parse an optional string key: an empty value clears it.
+fn parse_opt_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse an optional `u32` key: an empty value clears it.
+fn parse_opt_u32(value: &str) -> Result<Option<u32>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("expected a non-negative integer, got '{value}'"))
 }
 
 /// Parse a boolean config value, accepting the usual spellings.
@@ -851,6 +967,24 @@ mod tests {
         let mut config = Config::default();
         assert!(get_key(&config, "nope").is_none());
         assert!(set_key(&mut config, "nope", "x").is_err());
+    }
+
+    #[test]
+    fn runtime_config_keys_round_trip() {
+        let mut config = Config::default();
+        assert_eq!(
+            get_key(&config, "runtime.preferred_device").as_deref(),
+            Some("auto")
+        );
+        // An optional numeric key reads as absent until set, then clears again.
+        assert!(get_key(&config, "runtime.n_ctx").is_none());
+        set_key(&mut config, "runtime.preferred_device", "cuda").unwrap();
+        set_key(&mut config, "runtime.n_ctx", "8192").unwrap();
+        assert_eq!(get_key(&config, "runtime.n_ctx").as_deref(), Some("8192"));
+        set_key(&mut config, "runtime.n_ctx", "").unwrap();
+        assert!(get_key(&config, "runtime.n_ctx").is_none());
+        // A non-numeric context is refused.
+        assert!(set_key(&mut config, "runtime.threads", "lots").is_err());
     }
 
     #[test]
