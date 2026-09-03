@@ -982,6 +982,7 @@ dependencies = [
  "lightagent-api",
  "lightagent-core",
  "lightagent-mcp",
+ "lightagent-memory",
  "lightagent-provider-lightweight",
  "lightagent-rag",
  "lightagent-store",
@@ -1035,6 +1036,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-memory"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "lightagent-rag",
+ "lightagent-tools",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

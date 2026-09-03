@@ -270,6 +270,29 @@ impl Default for McpConfig {
     }
 }
 
+/// Durable memory configuration.
+///
+/// Always available (writing is agent-initiated and approval-gated); these tune
+/// how much is surfaced. `inject_recent` recent memories are added to the system
+/// prompt each run (0 disables the snapshot), and `top_k` bounds a recall.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Recent memories injected into the system prompt (0 to disable).
+    pub inject_recent: usize,
+    /// Default number of memories a search returns.
+    pub top_k: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            inject_recent: 10,
+            top_k: 5,
+        }
+    }
+}
+
 /// Retrieval (RAG) configuration.
 ///
 /// Always available (retrieval reads the profile's own index); these only tune
@@ -348,6 +371,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub rag: RagConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -470,6 +495,11 @@ impl Config {
         if self.rag.max_chunk_chars == 0 {
             return Err(ConfigError::Invalid(
                 "rag.max_chunk_chars must be at least 1".to_owned(),
+            ));
+        }
+        if self.memory.top_k == 0 {
+            return Err(ConfigError::Invalid(
+                "memory.top_k must be at least 1".to_owned(),
             ));
         }
         Ok(())

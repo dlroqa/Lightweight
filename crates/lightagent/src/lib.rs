@@ -13,6 +13,7 @@
 mod banner;
 mod chat;
 mod import;
+mod memory;
 mod rag;
 mod serve;
 mod slash;
@@ -117,6 +118,11 @@ enum Command {
         #[command(subcommand)]
         action: RagAction,
     },
+    /// Write, recall and manage the active profile's durable memory.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Print the welcome mark and exit.
     Banner {
         /// Render unconditionally (bypasses the terminal check), for CI.
@@ -161,6 +167,30 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// Remember a fact.
+    Add {
+        text: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List every memory.
+    List,
+    /// Recall the memories most relevant to a query.
+    Search {
+        query: String,
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
+    /// Forget one memory by id.
+    Forget { id: String },
+    /// Forget everything.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -288,6 +318,13 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             RagAction::Search { query, top_k } => rag::search(query, top_k, cli.json),
             RagAction::List => rag::list(cli.json),
             RagAction::Clear => rag::clear(cli.json),
+        },
+        Some(Command::Memory { action }) => match action {
+            MemoryAction::Add { text, kind, tags } => memory::add(text, kind, tags, cli.json),
+            MemoryAction::List => memory::list(cli.json),
+            MemoryAction::Search { query, top_k } => memory::search(query, top_k, cli.json),
+            MemoryAction::Forget { id } => memory::forget(id, cli.json),
+            MemoryAction::Clear => memory::clear(cli.json),
         },
         Some(Command::Banner { preview }) => {
             if preview {

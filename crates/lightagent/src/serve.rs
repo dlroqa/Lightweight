@@ -102,6 +102,9 @@ impl RunFactory for LightweightRunFactory {
         if let Some(tool) = crate::rag::rag_tool(&profile_dir, &self.config) {
             registry.insert(tool);
         }
+        for tool in crate::memory::memory_tools(&profile_dir, &self.config) {
+            registry.insert(tool);
+        }
         let mut executor = BoundedExecutor::new(
             registry,
             PolicyEngine::new(profile.approval_policy.into()),
@@ -123,6 +126,10 @@ impl RunFactory for LightweightRunFactory {
             executor = executor.with_skills(SkillContext { skills });
         }
 
+        let memory_catalog = crate::memory::recent_catalog(&profile_dir, &self.config);
+        if !memory_catalog.is_empty() {
+            profile.persona.push_str(&format!("\n\n{memory_catalog}"));
+        }
         let agent = AgentLoop::from_profile(provider, executor, &profile);
         manager::drive(agent, request.message, sink, cancel, decisions).await
     }

@@ -255,6 +255,9 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     if let Some(tool) = crate::rag::rag_tool(&profile_dir, &config) {
         registry.insert(tool);
     }
+    for tool in crate::memory::memory_tools(&profile_dir, &config) {
+        registry.insert(tool);
+    }
     let mut executor = BoundedExecutor::new(
         registry,
         PolicyEngine::new(profile.approval_policy.into()),
@@ -276,6 +279,10 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         executor = executor.with_skills(SkillContext { skills });
     }
 
+    let memory_catalog = crate::memory::recent_catalog(&profile_dir, &config);
+    if !memory_catalog.is_empty() {
+        profile.persona.push_str(&format!("\n\n{memory_catalog}"));
+    }
     let agent = AgentLoop::from_profile(provider, executor, &profile);
 
     println!(
