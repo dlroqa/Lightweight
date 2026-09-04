@@ -66,10 +66,19 @@ impl AuthConfig {
         let provided = headers
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim);
+            .and_then(|value| {
+                // The auth scheme is case-insensitive per RFC 7235, and clients
+                // vary — accept `Bearer`, `bearer`, `BEARER`.
+                let (scheme, token) = value.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("bearer")
+                    .then_some(token.trim())
+            });
         match provided {
-            Some(token) if token == expected => {
+            // Constant-time compare, so a key sharing a prefix with the real one
+            // is not rejected measurably slower than one differing at the first
+            // byte — the same protection the inference gateway gives its keys.
+            Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
                 if self.scopes.contains(&Scope::Admin) || self.scopes.contains(&required) {
                     Ok(())
                 } else {
@@ -85,6 +94,26 @@ impl AuthConfig {
             )),
         }
     }
+}
+
+/// Compare two byte strings without leaking their contents through timing.
+///
+/// Reproduced from the inference gateway's own `constant_time_eq` rather than
+/// imported — this crate depends on no `lightweight-*` crate — so the API's key
+/// check has the same protection the gateway's does. The length difference is
+/// unavoidable and harmless; what matters is that a key sharing a prefix with the
+/// real one does not take measurably longer to reject than one that differs at
+/// the first byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 #[cfg(test)]
@@ -138,5 +167,30 @@ mod tests {
             auth.authorize(&headers_with("secret"), Scope::SessionsWrite)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        let auth = AuthConfig::keyed("secret", [Scope::RunsRead]);
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = format!("{scheme} secret").parse() {
+                headers.insert("authorization", value);
+            }
+            assert!(
+                auth.authorize(&headers, Scope::RunsRead).is_ok(),
+                "scheme {scheme:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_slices() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreu")); // differs at the last byte
+        assert!(!constant_time_eq(b"secret", b"xecret")); // differs at the first byte
+        assert!(!constant_time_eq(b"secret", b"secre")); // shorter
+        assert!(!constant_time_eq(b"secret", b"secrets")); // longer
+        assert!(constant_time_eq(b"", b""));
     }
 }

@@ -252,10 +252,9 @@ impl Connection for HttpConnection {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| McpError::Transport(error.to_string()))?;
+        // Bounded, so a remote server (which may be reached over the network and
+        // is not fully trusted) cannot exhaust memory with an unbounded body.
+        let text = read_bounded_text(response, MAX_HTTP_BODY_BYTES).await?;
         let message = if content_type.contains("text/event-stream") {
             sse_message_for(&text, id)
                 .ok_or_else(|| McpError::Protocol("no response in the event stream".to_owned()))?
@@ -276,6 +275,39 @@ impl Connection for HttpConnection {
         self.capture_session(&response);
         Ok(())
     }
+}
+
+/// The most bytes an HTTP MCP reply may be before it is refused.
+///
+/// A JSON-RPC message is small; this is a generous ceiling that only a runaway
+/// or hostile server reaches. Chosen to match the 8 MiB frame cap the provider
+/// adapter's SSE decoder uses.
+const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read a response body as text, refusing one larger than `cap`.
+///
+/// `reqwest::Response::text` would buffer the whole body however large it is;
+/// this streams it and stops with an error once `cap` is exceeded, so a server
+/// cannot exhaust memory with an unbounded reply.
+async fn read_bounded_text(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<String, McpError> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| McpError::Transport(error.to_string()))?
+    {
+        if buffer.len() + chunk.len() > cap {
+            return Err(McpError::Protocol(format!(
+                "the server's reply exceeded {cap} bytes"
+            )));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buffer)
+        .map_err(|error| McpError::Protocol(format!("the reply was not UTF-8: {error}")))
 }
 
 /// Find the JSON-RPC response with `id` among an SSE body's `data:` events.
@@ -307,6 +339,8 @@ fn sse_message_for(body: &str, id: i64) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn sse_body_yields_the_matching_response() {
@@ -319,5 +353,48 @@ mod tests {
             "falls back to a response"
         );
         assert!(sse_message_for("data: not json\n\n", 5).is_none());
+    }
+
+    /// A one-shot loopback server that answers with a body of `body_len` bytes.
+    async fn serve_body(body_len: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = "a".repeat(body_len);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_cap_is_read() {
+        lightagent_provider_lightweight::ensure_provider();
+        let url = serve_body(500).await;
+        let client = reqwest::Client::builder().build().unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        let text = read_bounded_text(response, 8192).await.unwrap();
+        assert_eq!(text.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_not_buffered() {
+        lightagent_provider_lightweight::ensure_provider();
+        let url = serve_body(4096).await;
+        let client = reqwest::Client::builder().build().unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        let error = read_bounded_text(response, 1024).await.unwrap_err();
+        match error {
+            McpError::Protocol(message) => assert!(message.contains("exceeded")),
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
     }
 }
