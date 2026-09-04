@@ -63,7 +63,7 @@ pub struct Delegation {
 /// to a value held only in memory), so this crate never learns the config format
 /// and never re-reads a secret. `allow_domains`, when non-empty, is both a fetch
 /// allow-list and the set of hosts exempt from the private-address guard.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebPolicy {
     /// When non-empty, a fetch host must match one of these (exactly or as a
     /// subdomain); such a host is also exempt from `block_private_addresses`.
@@ -82,6 +82,28 @@ pub struct WebPolicy {
     pub search_api_key: Option<String>,
     /// The most results a single search returns.
     pub search_max_results: usize,
+}
+
+// A hand-written `Debug` so the resolved search key can never reach a log or an
+// error through a `{:?}`, even if one is added later: its presence is shown, its
+// value never is. The comment on `search_api_key` is thereby made structural
+// rather than a promise.
+impl std::fmt::Debug for WebPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebPolicy")
+            .field("allow_domains", &self.allow_domains)
+            .field("block_private_addresses", &self.block_private_addresses)
+            .field("max_fetch_bytes", &self.max_fetch_bytes)
+            .field("timeout", &self.timeout)
+            .field("search_endpoint", &self.search_endpoint)
+            .field("search_query_param", &self.search_query_param)
+            .field(
+                "search_api_key",
+                &self.search_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("search_max_results", &self.search_max_results)
+            .finish()
+    }
 }
 
 /// Everything the web tools need to run, injected by the caller so this crate
@@ -198,5 +220,36 @@ impl ToolCtx {
     pub fn with_skills(mut self, skills: SkillContext) -> Self {
         self.skills = Some(skills);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_policy_debug_never_prints_the_key() {
+        let policy = WebPolicy {
+            allow_domains: vec!["example.com".to_owned()],
+            block_private_addresses: true,
+            max_fetch_bytes: 1024,
+            timeout: Duration::from_secs(5),
+            search_endpoint: Some("https://searx.test/search".to_owned()),
+            search_query_param: "q".to_owned(),
+            search_api_key: Some("super-secret-token".to_owned()),
+            search_max_results: 5,
+        };
+        let rendered = format!("{policy:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "the key leaked into Debug output: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "presence is still shown");
+        // A struct with no key shows None, not <redacted>.
+        let no_key = WebPolicy {
+            search_api_key: None,
+            ..policy
+        };
+        assert!(format!("{no_key:?}").contains("search_api_key: None"));
     }
 }

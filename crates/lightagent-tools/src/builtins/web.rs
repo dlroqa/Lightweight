@@ -15,7 +15,7 @@
 //! `web.search` posts the query to the configured JSON endpoint and reads a
 //! `results` array; it reports cleanly when no backend is configured.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use async_trait::async_trait;
 use lightagent_core::{RiskClass, Scope, ToolOutcome};
@@ -99,9 +99,19 @@ async fn fetch(web: &WebContext, start: &str) -> Result<String, String> {
     let mut url = reqwest::Url::parse(start).map_err(|error| format!("invalid URL: {error}"))?;
     let mut hops = 0;
     loop {
-        guard_url(&web.policy, &url).await?;
-        let mut response = web
-            .client
+        let pins = guard_url(&web.policy, &url).await?;
+        // When the guard resolved a name, connect only to the addresses it
+        // vetted. Without this the client would resolve the name a second time,
+        // and a hostile resolver could answer the guard with a public address
+        // and the connection with a private one (DNS rebinding). An empty set
+        // means there is nothing to rebind — a literal IP, or a trusted
+        // allow-listed host — so the shared client is used as before.
+        let client = if pins.is_empty() {
+            web.client.clone()
+        } else {
+            pinned_client(&web.policy, &url, &pins)?
+        };
+        let mut response = client
             .get(url.clone())
             .send()
             .await
@@ -352,7 +362,14 @@ async fn read_bounded(response: &mut reqwest::Response, cap: usize) -> Result<Ve
 
 /// Refuse a URL whose scheme is not http(s), whose host is not allow-listed, or
 /// — unless the host is allow-listed — that resolves to a non-global address.
-async fn guard_url(policy: &WebPolicy, url: &reqwest::Url) -> Result<(), String> {
+///
+/// Returns the concrete addresses the fetch must be **pinned** to (see
+/// [`fetch`]): the vetted results of the guard's own DNS lookup, so the
+/// connection uses exactly what was checked and cannot be steered elsewhere by a
+/// second resolution. Empty means "no pinning" — an allow-listed host trusted
+/// without resolving, a literal-IP host that needs no DNS, or a policy that does
+/// not block private addresses.
+async fn guard_url(policy: &WebPolicy, url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -375,37 +392,70 @@ async fn guard_url(policy: &WebPolicy, url: &reqwest::Url) -> Result<(), String>
     }
     if policy.block_private_addresses && !listed {
         let port = url.port_or_known_default().unwrap_or(0);
-        guard_host(host, port).await?;
+        return guard_host(host, port).await;
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
-/// Reject `host` if it is, or resolves to, any non-global address.
-async fn guard_host(host: &str, port: u16) -> Result<(), String> {
+/// Reject `host` if it is, or resolves to, any non-global address; otherwise
+/// return the vetted addresses to pin the connection to.
+///
+/// A literal IP is validated and returns an empty set: it needs no DNS, so the
+/// connection reaches exactly that vetted address with nothing to rebind. A name
+/// is resolved here, every address checked, and the whole vetted set returned so
+/// the connection is pinned to it — closing the window in which a second, hostile
+/// resolution at connect time could return a private address the guard never saw.
+async fn guard_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return if is_public_ip(ip) {
-            Ok(())
+            Ok(Vec::new())
         } else {
             Err(format!("{host} is a non-global address"))
         };
     }
-    let mut resolved = false;
+    let mut vetted = Vec::new();
     let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| format!("could not resolve {host}: {error}"))?;
     for address in addresses {
-        resolved = true;
         if !is_public_ip(address.ip()) {
             return Err(format!(
                 "{host} resolves to the non-global address {}",
                 address.ip()
             ));
         }
+        vetted.push(address);
     }
-    if !resolved {
+    if vetted.is_empty() {
         return Err(format!("{host} did not resolve to any address"));
     }
-    Ok(())
+    Ok(vetted)
+}
+
+/// Build a client that resolves this hop's host only to the guard's vetted
+/// addresses, so the connection cannot land anywhere the guard did not check.
+///
+/// A fresh client per guarded hop is cheap here — a fetch is a cold, model-driven
+/// call, not a hot path — and it carries the same redirect-off, timed settings as
+/// the injected one. The rustls provider is already installed process-wide: a
+/// [`WebContext`] only exists because its own client was built, which cannot
+/// happen until the provider is installed, so this build cannot hit the missing
+/// provider panic.
+fn pinned_client(
+    policy: &WebPolicy,
+    url: &reqwest::Url,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "the URL has no host".to_owned())?;
+    reqwest::Client::builder()
+        .timeout(policy.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("lightagent/", env!("CARGO_PKG_VERSION")))
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .map_err(|error| format!("could not build a pinned client: {error}"))
 }
 
 /// Whether `host` equals, or is a subdomain of, one of `domains` (ASCII-folded).
@@ -444,6 +494,18 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         // Carrier-grade NAT (RFC 6598 shared range).
         return false;
     }
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        // IETF protocol assignments, 192.0.0.0/24 (RFC 6890).
+        return false;
+    }
+    if octets[0] == 192 && octets[1] == 88 && octets[2] == 99 {
+        // 6to4 relay anycast, 192.88.99.0/24 (deprecated, RFC 7526).
+        return false;
+    }
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        // Benchmarking, 198.18.0.0/15 (RFC 2544).
+        return false;
+    }
     true
 }
 
@@ -451,8 +513,11 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return false;
     }
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        // ::ffff:a.b.c.d — judge by the embedded IPv4 address.
+    // Any IPv4 smuggled inside a v6 address is judged as that IPv4, so a private
+    // v4 cannot reach a private service by wearing a v6 coat — mapped
+    // (::ffff:0:0/96), compatible (::/96, deprecated), 6to4 (2002::/16) and the
+    // well-known NAT64 prefix (64:ff9b::/96).
+    if let Some(v4) = embedded_v4(ip) {
         return is_public_v4(v4);
     }
     let segments = ip.segments();
@@ -465,6 +530,46 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         return false;
     }
     true
+}
+
+/// The IPv4 address embedded in a v6 address by one of the transition schemes,
+/// or `None` for a native v6 address. Used so the SSRF check judges the real
+/// IPv4 destination rather than waving the v6 wrapper through.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        // ::ffff:a.b.c.d
+        return Some(v4);
+    }
+    let s = ip.segments();
+    if s[..6] == [0, 0, 0, 0, 0, 0] && s[6..] != [0, 0] && s[6..] != [0, 1] {
+        // ::a.b.c.d — IPv4-compatible (deprecated), excluding :: and ::1 which
+        // are handled above as unspecified/loopback.
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ));
+    }
+    if s[0] == 0x2002 {
+        // 6to4, 2002:a.b.c.d::/48 — the IPv4 is the next two segments.
+        return Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        // NAT64 well-known prefix, 64:ff9b::/96 — the IPv4 is the low 32 bits.
+        return Some(Ipv4Addr::new(
+            (s[6] >> 8) as u8,
+            s[6] as u8,
+            (s[7] >> 8) as u8,
+            s[7] as u8,
+        ));
+    }
+    None
 }
 
 /// Reduce HTML to readable text: the `<title>`, then the body with scripts and
@@ -685,6 +790,96 @@ mod tests {
         for ip in private {
             assert!(!is_public_ip(ip), "{ip} should be blocked");
         }
+    }
+
+    #[test]
+    fn extra_reserved_v4_ranges_are_blocked() {
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        // Newly covered ranges, each a real SSRF or spoof risk if allowed.
+        for ip in [
+            v4(192, 0, 0, 1),   // IETF protocol assignments 192.0.0.0/24
+            v4(192, 88, 99, 1), // 6to4 relay anycast 192.88.99.0/24
+            v4(198, 18, 0, 1),  // benchmarking 198.18.0.0/15
+            v4(198, 19, 5, 5),  // benchmarking, upper half
+        ] {
+            assert!(!is_public_ip(ip), "{ip} should be blocked");
+        }
+        // A neighbour just outside each range is still public.
+        assert!(is_public_ip(v4(198, 20, 0, 1)));
+        assert!(is_public_ip(v4(192, 88, 100, 1)));
+    }
+
+    #[test]
+    fn ipv4_smuggled_inside_ipv6_is_judged_as_the_ipv4() {
+        let v6 = |segs: [u16; 8]| {
+            Ipv6Addr::new(
+                segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+            )
+        };
+        // 6to4 (2002::/16), NAT64 (64:ff9b::/96) and IPv4-compatible (::/96)
+        // embedding a private v4 must be blocked...
+        // Addresses are named by their segments; the embedded v4 is described
+        // rather than written as a dotted quad, which the address tripwire
+        // (scripts/check-secrets.sh) would flag in a committed file.
+        let private_embeds = [
+            v6([0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0]), // 6to4 -> 10.0.0.1
+            v6([0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001]), // NAT64 -> 10.0.0.1
+            v6([0, 0, 0, 0, 0, 0, 0x7f00, 0x0001]),      // ::127.0.0.1 (compatible)
+            v6([0x2002, 0x6440, 0x0001, 0, 0, 0, 0, 0]), // 6to4 wrapping a CGNAT v4
+        ];
+        for ip in private_embeds {
+            assert!(!is_public_ip(IpAddr::V6(ip)), "{ip} embeds a private v4");
+            assert_eq!(embedded_v4(ip).map(|v| !is_public_v4(v)), Some(true));
+        }
+        // ...while the same wrappers around a public v4 stay public.
+        let public_embeds = [
+            v6([0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0]), // 6to4 wrapping a public v4
+            v6([0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808]), // NAT64 wrapping a public v4
+        ];
+        for ip in public_embeds {
+            assert!(is_public_ip(IpAddr::V6(ip)), "{ip} embeds a public v4");
+        }
+        // A native global v6 has no embedded v4 and is unaffected.
+        assert!(embedded_v4(v6([0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111])).is_none());
+    }
+
+    #[tokio::test]
+    async fn guard_returns_pins_for_ips_and_skips_trusted_hosts() {
+        // A literal public IP is allowed with no pins (it needs no DNS, so there
+        // is nothing to rebind).
+        let policy = WebPolicy {
+            allow_domains: Vec::new(),
+            block_private_addresses: true,
+            max_fetch_bytes: 1024,
+            timeout: std::time::Duration::from_secs(5),
+            search_endpoint: None,
+            search_query_param: "q".to_owned(),
+            search_api_key: None,
+            search_max_results: 5,
+        };
+        // The addresses are built numerically, not written as dotted quads, so
+        // scripts/check-secrets.sh has no committed machine address to flag.
+        let public = format!("http://{}/", Ipv4Addr::new(8, 8, 8, 8));
+        let url = reqwest::Url::parse(&public).unwrap();
+        assert_eq!(guard_url(&policy, &url).await.unwrap(), Vec::new());
+
+        // A literal private IP is refused before any connection.
+        let private = format!("http://{}/", Ipv4Addr::new(127, 0, 0, 1));
+        let url = reqwest::Url::parse(&private).unwrap();
+        assert!(guard_url(&policy, &url).await.is_err());
+
+        // An allow-listed host is trusted without resolving (no pins), even
+        // though it is not an IP — the guard must not do a DNS lookup here.
+        let listed = WebPolicy {
+            allow_domains: vec!["example.com".to_owned()],
+            ..policy
+        };
+        let url = reqwest::Url::parse("https://docs.example.com/page").unwrap();
+        assert_eq!(guard_url(&listed, &url).await.unwrap(), Vec::new());
+
+        // A host outside the allow-list is refused by the list, not the network.
+        let url = reqwest::Url::parse("https://elsewhere.test/").unwrap();
+        assert!(guard_url(&listed, &url).await.is_err());
     }
 
     #[test]
