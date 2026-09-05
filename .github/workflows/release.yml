@@ -132,6 +132,20 @@ jobs:
           HERMES_REQUIRE_SANDBOXED_LAUNCH: '1'
         run: bash ./scripts/smoke-artifacts.sh
 
+      # The Lightagent CLI rides in the same release, packaged the same way as
+      # the engine's — `package-lightagent.sh` mirrors `package-cli.sh` and drops
+      # its archive into `dist-cli/`, which the upload step below already globs,
+      # so it flows into SHA256SUMS and the release assets with no further wiring.
+      # Placed after the engine smoke test above, which reads the first archive in
+      # `dist-cli/`, so that test still sees a single archive when it runs. The
+      # per-triple archive matches the engine CLI's own single-arch convention
+      # (only the desktop app is universal). Its contents and run are covered by
+      # `smoke-lightagent-package.sh` in check.yml.
+      - name: The Lightagent CLI archive
+        run: |
+          cargo build --release -p lightagent --target ${{ matrix.triple }}
+          bash ./scripts/package-lightagent.sh ${{ matrix.triple }}
+
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
