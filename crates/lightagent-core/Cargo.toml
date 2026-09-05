@@ -1,0 +1,18 @@
+[package]
+name = "lightagent-core"
+description = "Provider-neutral agent runtime: run ids, events, the agent loop, profiles, config and paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+directories.workspace = true

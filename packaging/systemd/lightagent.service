@@ -1,0 +1,61 @@
+# Run the Lightagent API as a user service. Linux example; not installed by
+# anything.
+#
+# Lightagent is the agent harness: `lightagent serve` exposes its HTTP + SSE API
+# (runs, sessions, tools, approvals) and, given --web-root, the WebUI panel. It
+# talks to a running inference gateway over HTTP — start that separately (see
+# hermes-gateway.service beside this file), and point Lightagent at it with
+# `lightagent config set inference.base_url ...`.
+#
+# Every value lives in the environment file below, outside this repository,
+# because none of it belongs to the project: the bind addresses and the API key
+# are one operator's choices on one machine.
+#
+#   mkdir -p ~/.config/lightagent
+#   cp packaging/systemd/lightagent.env.example ~/.config/lightagent/env
+#   chmod 600 ~/.config/lightagent/env          # it may hold an API key
+#   $EDITOR ~/.config/lightagent/env
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/lightagent.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lightagent
+#
+# `loginctl enable-linger $USER` keeps it running after logout.
+#
+# Run `lightagent init` once before enabling the service, so the isolated home
+# and a profile exist. macOS (launchd) and Windows service wrappers are not
+# shipped, because none has been tested; `lightagent serve` in the foreground
+# works everywhere and needs none of this.
+
+[Unit]
+Description=Lightagent agent harness API
+Documentation=https://github.com/dlroqa/Lightweight
+# The API binds a specific address, which may belong to an interface that comes
+# up late — a LAN lease, or an overlay network still connecting.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/lightagent/env
+# LIGHTAGENT_SERVE_ARGS is deliberately unquoted so systemd splits it into
+# arguments: one operator passes a single --host, another passes several, and a
+# networked bind adds `--key-env LIGHTAGENT_API_KEY` here (see the env example).
+ExecStart=%h/.local/bin/lightagent serve $LIGHTAGENT_SERVE_ARGS
+
+# A crashed service should come back; one that cannot start should not spin.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=3
+StartLimitIntervalSec=120
+
+# Modest hardening. This process reads the operator's isolated Lightagent home
+# and may spawn tools they enabled, so it is not sandboxed away from those.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=default.target

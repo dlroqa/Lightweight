@@ -972,6 +972,182 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightagent"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "clap",
+ "futures-util",
+ "lightagent-acp",
+ "lightagent-api",
+ "lightagent-core",
+ "lightagent-extensions",
+ "lightagent-mcp",
+ "lightagent-memory",
+ "lightagent-provider-lightweight",
+ "lightagent-rag",
+ "lightagent-runtime",
+ "lightagent-store",
+ "lightagent-tools",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-acp"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-api",
+ "lightagent-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-api"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "lightagent-core",
+ "lightagent-store",
+ "lightagent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-core"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "directories",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-extensions"
+version = "0.2.1"
+dependencies = [
+ "lightagent-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lightagent-mcp"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "lightagent-provider-lightweight",
+ "lightagent-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-memory"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "lightagent-rag",
+ "lightagent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-provider-lightweight"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "lightagent-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-rag"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "lightagent-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "lightagent-runtime"
+version = "0.2.1"
+dependencies = [
+ "lightagent-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "lightagent-store"
+version = "0.2.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "lightagent-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "lightagent-tools"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "lightagent-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "lightweight-api"
 version = "0.2.1"
 dependencies = [

@@ -1,0 +1,14 @@
+[package]
+name = "lightagent-store"
+description = "Persistent agent sessions, run metadata and tool history, stored owner-private per profile."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightagent-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true

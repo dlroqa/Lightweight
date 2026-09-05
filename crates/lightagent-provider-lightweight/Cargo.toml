@@ -1,0 +1,20 @@
+[package]
+name = "lightagent-provider-lightweight"
+description = "AgentProvider adapter speaking the OpenAI-compatible gateway over HTTP/SSE."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lightagent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+bytes.workspace = true

@@ -17,6 +17,18 @@ members = [
     "crates/lightweight-system-info",
     "crates/lightweight-observability",
     "crates/lightweight-sys",
+    "crates/lightagent-core",
+    "crates/lightagent-provider-lightweight",
+    "crates/lightagent-tools",
+    "crates/lightagent-store",
+    "crates/lightagent-api",
+    "crates/lightagent-mcp",
+    "crates/lightagent-rag",
+    "crates/lightagent-memory",
+    "crates/lightagent-acp",
+    "crates/lightagent-extensions",
+    "crates/lightagent-runtime",
+    "crates/lightagent",
 ]
 
 [workspace.package]
@@ -133,6 +145,19 @@ lightweight-gateway = { path = "crates/lightweight-gateway" }
 lightweight-system-info = { path = "crates/lightweight-system-info" }
 lightweight-observability = { path = "crates/lightweight-observability" }
 lightweight-sys = { path = "crates/lightweight-sys" }
+
+# --- lightagent (agent harness; strictly additive, no edge into lightweight-*) ---
+lightagent-core = { path = "crates/lightagent-core" }
+lightagent-provider-lightweight = { path = "crates/lightagent-provider-lightweight" }
+lightagent-tools = { path = "crates/lightagent-tools" }
+lightagent-store = { path = "crates/lightagent-store" }
+lightagent-api = { path = "crates/lightagent-api" }
+lightagent-mcp = { path = "crates/lightagent-mcp" }
+lightagent-rag = { path = "crates/lightagent-rag" }
+lightagent-memory = { path = "crates/lightagent-memory" }
+lightagent-acp = { path = "crates/lightagent-acp" }
+lightagent-extensions = { path = "crates/lightagent-extensions" }
+lightagent-runtime = { path = "crates/lightagent-runtime" }
 
 # ---------------------------------------------------------------------------
 # Build profiles tuned for a 4-core 1.5 GHz CPU with ~2.3 GB free RAM.

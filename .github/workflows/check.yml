@@ -94,6 +94,18 @@ jobs:
       - name: What this machine reports
         run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
 
+      # The Lightagent welcome mark, rendered on a real (stronger) runner and
+      # through a non-TTY pipe, proving the preview path is TTY-independent.
+      # Property-asserted (half-block present in colour; no escapes under
+      # NO_COLOR), never byte-matched, so a runner's terminal cannot flake it.
+      # One leg only: the mark is platform-independent.
+      - name: Lightagent welcome mark renders
+        if: matrix.label == 'linux-x64'
+        run: |
+          cargo run -q -p lightagent --bin lightagent -- banner --preview | grep -q $'▀'
+          NO_COLOR=1 cargo run -q -p lightagent --bin lightagent -- banner --preview | { ! grep -q $'\x1b'; }
+          cargo run -q -p lightagent --bin lightagent -- tools list --json | grep -q datetime.now
+
   # Rendering: prove the icon pipeline runs and produces the right shape.
   #
   # Separate from the gate because it needs Pillow, a tool-time dependency the
@@ -195,6 +207,22 @@ jobs:
           sudo apt-get install -y xvfb
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           xvfb-run --auto-servernum ./scripts/test-artifacts.sh
+
+      # The Lightagent CLI archive is a separate product surface with its own
+      # packaging (packaging/lightagent/), so it is exercised as its own step
+      # rather than folded into the gateway artifact checks above. `--target`
+      # matches the build above so its binary lands under `target/<triple>/release`,
+      # the path the smoke script prefers, and the rust-cache is shared. The smoke
+      # script builds, packages, unpacks and *runs* the binary.
+      - name: Lightagent package
+        run: |
+          cargo build --release -p lightagent --target x86_64-unknown-linux-gnu
+          ./scripts/smoke-lightagent-package.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lightagent-cli
+          path: dist-cli/lightagent-*.tar.gz
+          if-no-files-found: error
 
   # The Flatpak build, which is the primary public Linux artifact.
   #

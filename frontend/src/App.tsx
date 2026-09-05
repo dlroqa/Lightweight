@@ -1,6 +1,8 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import { Shell } from "./components/Shell";
+import { Agent } from "./screens/Agent";
+import { AgentTools } from "./screens/AgentTools";
 import { Chat } from "./screens/Chat";
 import { Dashboard } from "./screens/Dashboard";
 import { AccessScreen } from "./screens/AccessScreen";
@@ -16,6 +18,8 @@ export function App() {
     <Routes>
       <Route element={<Shell />}>
         <Route index element={<Dashboard />} />
+        <Route path="agent" element={<Agent />} />
+        <Route path="agent/tools" element={<AgentTools />} />
         <Route path="chat" element={<Chat />} />
         <Route path="models" element={<Models />} />
         <Route path="inference" element={<Inference />} />

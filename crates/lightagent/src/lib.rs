@@ -1,0 +1,995 @@
+//! The `lightagent` command-line interface.
+//!
+//! A thin surface over the one runtime: every command drives `lightagent-core`
+//! and `lightagent-tools`, and the interface owns no agent logic of its own. The
+//! default action is an interactive chat; the other commands set up and inspect
+//! the isolated home, its profiles ("bots"), the configuration, the tools and
+//! the provider.
+
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+mod acp;
+mod banner;
+mod chat;
+mod extensions;
+mod import;
+mod memory;
+mod rag;
+mod runtime;
+mod serve;
+mod slash;
+
+use std::io::IsTerminal as _;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use lightagent_core::{
+    AgentProfile, Config, ConfigStore, LightagentPaths, ProfileId, ProfileStore,
+};
+use lightagent_store::{SessionId, SessionStore};
+use lightagent_tools::ToolRegistry;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The Lightagent CLI.
+#[derive(Parser)]
+#[command(
+    name = "lightagent",
+    about = "Lightagent — local intelligence with live tools",
+    version,
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// Emit JSON instead of a human-readable report.
+    #[arg(long, global = true)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start an interactive agent chat (the default action).
+    Chat {
+        /// The profile ("bot") to run; defaults to the active one.
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Set up the isolated home, a first profile and the configuration.
+    Init {
+        /// Reconfigure even if a home already exists.
+        #[arg(long)]
+        force: bool,
+        /// The profile id to create (default: `default`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// The provider base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// The default model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Show or change configuration.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+    /// List the models the provider offers.
+    Models,
+    /// List the enabled tools.
+    Tools {
+        #[command(subcommand)]
+        action: Option<ToolsAction>,
+    },
+    /// Manage agent profiles ("bots").
+    Profiles {
+        #[command(subcommand)]
+        action: Option<ProfilesAction>,
+    },
+    /// List and toggle installed extensions (capability bundles).
+    Extensions {
+        #[command(subcommand)]
+        action: Option<ExtensionsAction>,
+    },
+    /// List and inspect saved sessions for the active profile.
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+    /// Serve the Lightagent HTTP API (runs, sessions, tools, approvals + SSE).
+    Serve {
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind.
+        #[arg(long, default_value_t = 8735)]
+        port: u16,
+        /// Environment variable holding the API key (required off loopback).
+        #[arg(long)]
+        key_env: Option<String>,
+        /// Serve the built WebUI panel from this directory (e.g. frontend/dist).
+        #[arg(long)]
+        web_root: Option<std::path::PathBuf>,
+    },
+    /// Serve the Agent Client Protocol (ACP) over stdio, for an editor to drive.
+    Acp,
+    /// Report the engine's device and capabilities, or place a model on it.
+    Runtime {
+        #[command(subcommand)]
+        action: Option<RuntimeAction>,
+    },
+    /// Report the environment, home, profile and provider.
+    Doctor,
+    /// Import profiles and skills from another agent's home.
+    Import {
+        #[command(subcommand)]
+        source: ImportSource,
+    },
+    /// Index documents and search them (retrieval) for the active profile.
+    Rag {
+        #[command(subcommand)]
+        action: RagAction,
+    },
+    /// Write, recall and manage the active profile's durable memory.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+    /// Print the welcome mark and exit.
+    Banner {
+        /// Render unconditionally (bypasses the terminal check), for CI.
+        #[arg(long)]
+        preview: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the configuration, secrets shown only as references.
+    Show,
+    /// Print the path to the config file.
+    Path,
+    /// Read one dotted key (e.g. `inference.base_url`).
+    Get { key: String },
+    /// Set one dotted key.
+    Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+enum ToolsAction {
+    /// List the tools, their risk class and description.
+    List,
+}
+
+#[derive(Subcommand)]
+enum ProfilesAction {
+    /// List the profiles and mark the active one.
+    List,
+    /// Show one profile.
+    Show { id: String },
+    /// Create a profile.
+    Create {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        persona: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Make a profile the active one.
+    Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum ExtensionsAction {
+    /// List installed extensions, marking which are active.
+    List,
+    /// Show one extension's manifest and what it contributes.
+    Show { name: String },
+    /// Activate an installed extension (clears it from the disabled list).
+    Enable { name: String },
+    /// Keep an extension installed but inactive.
+    Disable { name: String },
+}
+
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Report the engine's device, capabilities, the machine and the catalog.
+    Show,
+    /// Load a model with the configured runtime parameters (changes the engine).
+    Place {
+        /// The catalog id of the model to make resident.
+        model: String,
+        /// Reload even if the model is already the resident one.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// Remember a fact.
+    Add {
+        text: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List every memory.
+    List,
+    /// Recall the memories most relevant to a query.
+    Search {
+        query: String,
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
+    /// Forget one memory by id.
+    Forget { id: String },
+    /// Forget everything.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum RagAction {
+    /// Index a file, or every file in a directory.
+    Add {
+        path: std::path::PathBuf,
+        /// Name to index under (default: the file name).
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Search the index and print the best passages.
+    Search {
+        query: String,
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
+    /// List the indexed sources.
+    List,
+    /// Empty the index.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Import Hermes profiles (persona, model routing) and skills.
+    Hermes {
+        /// The Hermes home to read (default: $HERMES_HOME, else ~/.hermes).
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        /// Show what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite profiles and skills that already exist.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List saved sessions, newest first.
+    List,
+    /// Show one session's transcript and run history.
+    Show { id: String },
+    /// Delete one session.
+    Delete { id: String },
+}
+
+/// Entry point: parse, dispatch, and turn an error into a message and exit code.
+pub fn run_cli() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(dispatch(cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn dispatch(cli: Cli) -> Result<(), String> {
+    match cli.command {
+        None => {
+            greet(cli.json);
+            if std::io::stdin().is_terminal() {
+                chat::run(None, cli.json).await
+            } else {
+                println!(
+                    "Run `lightagent --help` for the available commands, or `lightagent chat` to start."
+                );
+                Ok(())
+            }
+        }
+        Some(Command::Chat { profile }) => {
+            greet(cli.json);
+            chat::run(profile, cli.json).await
+        }
+        Some(Command::Init {
+            force,
+            profile,
+            base_url,
+            model,
+        }) => init(force, profile, base_url, model, cli.json),
+        Some(Command::Config { action }) => {
+            config_cmd(action.unwrap_or(ConfigAction::Show), cli.json)
+        }
+        Some(Command::Models) => models(cli.json).await,
+        Some(Command::Tools { action }) => {
+            let _ = action.unwrap_or(ToolsAction::List);
+            tools_list(cli.json)
+        }
+        Some(Command::Profiles { action }) => {
+            profiles_cmd(action.unwrap_or(ProfilesAction::List), cli.json)
+        }
+        Some(Command::Extensions { action }) => match action.unwrap_or(ExtensionsAction::List) {
+            ExtensionsAction::List => extensions::list(cli.json),
+            ExtensionsAction::Show { name } => extensions::show(&name, cli.json),
+            ExtensionsAction::Enable { name } => extensions::enable(&name, cli.json),
+            ExtensionsAction::Disable { name } => extensions::disable(&name, cli.json),
+        },
+        Some(Command::Sessions { action }) => {
+            sessions_cmd(action.unwrap_or(SessionsAction::List), cli.json)
+        }
+        Some(Command::Serve {
+            host,
+            port,
+            key_env,
+            web_root,
+        }) => serve::run(host, port, key_env, web_root).await,
+        Some(Command::Acp) => acp::run().await,
+        Some(Command::Runtime { action }) => match action.unwrap_or(RuntimeAction::Show) {
+            RuntimeAction::Show => runtime::show(cli.json).await,
+            RuntimeAction::Place { model, force } => runtime::place(model, force, cli.json).await,
+        },
+        Some(Command::Doctor) => doctor(cli.json).await,
+        Some(Command::Import { source }) => match source {
+            ImportSource::Hermes {
+                from,
+                dry_run,
+                force,
+            } => import::hermes(from, dry_run, force, cli.json),
+        },
+        Some(Command::Rag { action }) => match action {
+            RagAction::Add { path, source } => rag::add(path, source, cli.json).await,
+            RagAction::Search { query, top_k } => rag::search(query, top_k, cli.json).await,
+            RagAction::List => rag::list(cli.json),
+            RagAction::Clear => rag::clear(cli.json),
+        },
+        Some(Command::Memory { action }) => match action {
+            MemoryAction::Add { text, kind, tags } => memory::add(text, kind, tags, cli.json),
+            MemoryAction::List => memory::list(cli.json),
+            MemoryAction::Search { query, top_k } => memory::search(query, top_k, cli.json),
+            MemoryAction::Forget { id } => memory::forget(id, cli.json),
+            MemoryAction::Clear => memory::clear(cli.json),
+        },
+        Some(Command::Banner { preview }) => {
+            if preview {
+                print!(
+                    "{}",
+                    banner::render(VERSION, std::env::var_os("NO_COLOR").is_none())
+                );
+            } else if banner::should_show(cli.json) {
+                banner::print(VERSION);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Print the welcome mark before an interactive action, honouring every gate.
+fn greet(json: bool) {
+    if banner::should_show(json) {
+        banner::print(VERSION);
+    }
+}
+
+/// Resolve the home paths, mapping the error to a message.
+fn paths() -> Result<LightagentPaths, String> {
+    LightagentPaths::resolve().map_err(|error| error.to_string())
+}
+
+fn load_config(paths: &LightagentPaths) -> Result<Config, String> {
+    ConfigStore::at(paths)
+        .load()
+        .map_err(|error| error.to_string())
+}
+
+fn active_profile_id(store: &ProfileStore) -> Result<Option<ProfileId>, String> {
+    store.active().map_err(|error| error.to_string())
+}
+
+// --- doctor -----------------------------------------------------------------
+
+/// What a best-effort device probe found, when the gateway answered in time.
+struct DeviceProbe {
+    device: String,
+    resident_model: Option<String>,
+    backend: Option<String>,
+}
+
+/// Ask the gateway for its device, bounded so a down gateway cannot stall the
+/// report. Any failure — unreachable, slow, an error status — yields `None`, and
+/// the report simply omits the line.
+async fn probe_device(config: &Config) -> Option<DeviceProbe> {
+    use lightagent_runtime::{RuntimeClient, RuntimeEndpoint};
+
+    let mut endpoint = RuntimeEndpoint::new(config.inference.base_url.clone());
+    if let Some(secret) = &config.inference.api_key
+        && let Some(value) = secret.resolve()
+    {
+        endpoint = endpoint.with_api_key(value);
+    }
+    let client = RuntimeClient::new(endpoint).ok()?;
+    let gateway = tokio::time::timeout(std::time::Duration::from_secs(2), client.gateway())
+        .await
+        .ok()?
+        .ok()?;
+    Some(DeviceProbe {
+        device: gateway.engine_capabilities.device,
+        resident_model: gateway.model,
+        backend: gateway.backend,
+    })
+}
+
+async fn doctor(json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let config = load_config(&paths)?;
+    let store = ProfileStore::new(paths.root());
+    let active = active_profile_id(&store)?;
+    let profiles = store.list().map_err(|error| error.to_string())?;
+    let tool_count = ToolRegistry::builtin().names().len();
+    let home_exists = paths.root().exists();
+    let device = probe_device(&config).await;
+
+    if json {
+        let value = serde_json::json!({
+            "version": VERSION,
+            "home": paths.root().display().to_string(),
+            "home_exists": home_exists,
+            "config_file": paths.config_file().display().to_string(),
+            "provider": config.inference.provider,
+            "base_url": config.inference.base_url,
+            "active_profile": active.as_ref().map(|id| id.as_str().to_string()),
+            "profiles": profiles.iter().map(|id| id.as_str().to_string()).collect::<Vec<_>>(),
+            "tools": tool_count,
+            "banner": std::io::stderr().is_terminal(),
+            "engine_reachable": device.is_some(),
+            "device": device.as_ref().map(|d| d.device.clone()),
+            "backend": device.as_ref().and_then(|d| d.backend.clone()),
+            "resident_model": device.as_ref().and_then(|d| d.resident_model.clone()),
+        });
+        println!("{value:#}");
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Lightagent {VERSION}\n"));
+    out.push_str(&format!(
+        "Home:      {}{}\n",
+        paths.root().display(),
+        if home_exists {
+            ""
+        } else {
+            "  (not created — run `lightagent init`)"
+        }
+    ));
+    out.push_str(&format!("Config:    {}\n", paths.config_file().display()));
+    out.push_str(&format!(
+        "Provider:  {} @ {}\n",
+        config.inference.provider, config.inference.base_url
+    ));
+    out.push_str(&format!(
+        "Profile:   {}\n",
+        active
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or("(none active)")
+    ));
+    out.push_str(&format!(
+        "Profiles:  {}\n",
+        if profiles.is_empty() {
+            "(none)".to_string()
+        } else {
+            profiles
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    out.push_str(&format!("Tools:     {tool_count} built-in\n"));
+    match &device {
+        Some(probe) => {
+            out.push_str(&format!(
+                "Engine:    reachable ({}), running on {}\n",
+                probe.backend.as_deref().unwrap_or("unknown backend"),
+                probe.device
+            ));
+            out.push_str(&format!(
+                "Resident:  {}\n",
+                probe.resident_model.as_deref().unwrap_or("(none loaded)")
+            ));
+        }
+        None => {
+            out.push_str(
+                "Engine:    not reachable (start the gateway, or check inference.base_url)\n",
+            );
+        }
+    }
+    print!("{out}");
+    Ok(())
+}
+
+// --- tools ------------------------------------------------------------------
+
+fn tools_list(json: bool) -> Result<(), String> {
+    let registry = ToolRegistry::builtin();
+    let mut rows = Vec::new();
+    for name in registry.names() {
+        if let Some(tool) = registry.get(&name) {
+            let definition = tool.definition();
+            rows.push((
+                definition.name.clone(),
+                definition.risk.as_str().to_string(),
+                definition.description.clone(),
+            ));
+        }
+    }
+
+    if json {
+        let value: Vec<_> = rows
+            .iter()
+            .map(|(name, risk, description)| {
+                serde_json::json!({ "name": name, "risk": risk, "description": description })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(value));
+        return Ok(());
+    }
+
+    let mut out = String::from("Tools:\n");
+    for (name, risk, description) in rows {
+        out.push_str(&format!("  {name:<16} [{risk}]  {description}\n"));
+    }
+    print!("{out}");
+    Ok(())
+}
+
+// --- profiles ---------------------------------------------------------------
+
+fn profiles_cmd(action: ProfilesAction, json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let store = ProfileStore::new(paths.root());
+    match action {
+        ProfilesAction::List => {
+            let active = active_profile_id(&store)?;
+            let profiles = store.list().map_err(|error| error.to_string())?;
+            if json {
+                let value = serde_json::json!({
+                    "active": active.as_ref().map(|id| id.as_str().to_string()),
+                    "profiles": profiles.iter().map(|id| id.as_str().to_string()).collect::<Vec<_>>(),
+                });
+                println!("{value:#}");
+                return Ok(());
+            }
+            if profiles.is_empty() {
+                println!("No profiles yet. Create one with `lightagent profiles create <id>`.");
+                return Ok(());
+            }
+            for id in profiles {
+                let marker = if active.as_ref() == Some(&id) {
+                    "* "
+                } else {
+                    "  "
+                };
+                println!("{marker}{}", id.as_str());
+            }
+            Ok(())
+        }
+        ProfilesAction::Show { id } => {
+            let id = ProfileId::new(&id).map_err(|error| error.to_string())?;
+            let profile = store.load(&id).map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&profile).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("id:      {}", profile.id.as_str());
+                println!("name:    {}", profile.name);
+                println!("model:   {}", profile.routing.model);
+                println!("persona: {}", first_line(&profile.persona));
+            }
+            Ok(())
+        }
+        ProfilesAction::Create {
+            id,
+            name,
+            persona,
+            model,
+        } => {
+            let id = ProfileId::new(&id).map_err(|error| error.to_string())?;
+            let profile = AgentProfile::new(
+                id.clone(),
+                name.unwrap_or_else(|| id.as_str().to_string()),
+                persona.unwrap_or_else(|| "You are a helpful local agent.".to_string()),
+                model.unwrap_or_else(|| "default".to_string()),
+            );
+            store.save(&profile).map_err(|error| error.to_string())?;
+            println!("Created profile '{}'.", id.as_str());
+            Ok(())
+        }
+        ProfilesAction::Use { id } => {
+            let id = ProfileId::new(&id).map_err(|error| error.to_string())?;
+            store.set_active(&id).map_err(|error| error.to_string())?;
+            println!("Active profile is now '{}'.", id.as_str());
+            Ok(())
+        }
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
+}
+
+// --- sessions ---------------------------------------------------------------
+
+fn sessions_cmd(action: SessionsAction, json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let store = ProfileStore::new(paths.root());
+    let active = active_profile_id(&store)?
+        .ok_or_else(|| "no active profile — run `lightagent init` first".to_string())?;
+    let handle = store.handle(&active);
+    let sessions = SessionStore::at_profile(&handle);
+
+    match action {
+        SessionsAction::List => {
+            let list = sessions.list().map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&list).map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
+            if list.is_empty() {
+                println!("No saved sessions for profile '{}'.", active.as_str());
+                return Ok(());
+            }
+            for summary in list {
+                println!(
+                    "{}  {:<24}  {} msgs, {} runs",
+                    summary.id.as_str(),
+                    truncate(&summary.title, 24),
+                    summary.message_count,
+                    summary.run_count
+                );
+            }
+            Ok(())
+        }
+        SessionsAction::Show { id } => {
+            let id = SessionId::parse(&id).map_err(|error| error.to_string())?;
+            let session = sessions.load(&id).map_err(|error| error.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&session).map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
+            println!(
+                "session {}  (profile {})",
+                session.id.as_str(),
+                session.profile
+            );
+            println!("title: {}", session.title);
+            for message in &session.messages {
+                println!("  [{}] {}", message.role, first_line(&message.content));
+            }
+            for run in &session.runs {
+                println!(
+                    "  run {} — {} ({} tool calls)",
+                    run.run_id,
+                    run.stop_reason.as_deref().unwrap_or("?"),
+                    run.tools.len()
+                );
+            }
+            Ok(())
+        }
+        SessionsAction::Delete { id } => {
+            let id = SessionId::parse(&id).map_err(|error| error.to_string())?;
+            if sessions.delete(&id).map_err(|error| error.to_string())? {
+                println!("Deleted session {}.", id.as_str());
+            } else {
+                println!("No session {} to delete.", id.as_str());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+// --- config -----------------------------------------------------------------
+
+fn config_cmd(action: ConfigAction, json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let store = ConfigStore::at(&paths);
+    match action {
+        ConfigAction::Path => {
+            println!("{}", store.path().display());
+            Ok(())
+        }
+        ConfigAction::Show => {
+            let config = store.load().map_err(|error| error.to_string())?;
+            let value = config.redacted_json();
+            if json {
+                println!("{value}");
+            } else {
+                println!("{value:#}");
+            }
+            Ok(())
+        }
+        ConfigAction::Get { key } => {
+            let config = store.load().map_err(|error| error.to_string())?;
+            match get_key(&config, &key) {
+                Some(value) => {
+                    println!("{value}");
+                    Ok(())
+                }
+                None => Err(format!("unknown or unreadable config key '{key}'")),
+            }
+        }
+        ConfigAction::Set { key, value } => {
+            let mut config = store.load().map_err(|error| error.to_string())?;
+            set_key(&mut config, &key, &value)?;
+            store.save(&config).map_err(|error| error.to_string())?;
+            println!("Set {key} = {value}");
+            Ok(())
+        }
+    }
+}
+
+/// Read a small, fixed set of dotted keys.
+fn get_key(config: &Config, key: &str) -> Option<String> {
+    match key {
+        "inference.provider" => Some(config.inference.provider.clone()),
+        "inference.base_url" => Some(config.inference.base_url.clone()),
+        "inference.model" => Some(config.inference.model.clone().unwrap_or_default()),
+        "inference.device" => Some(config.inference.device.clone()),
+        "extensions.enabled" => Some(config.extensions.enabled.to_string()),
+        "runtime.preferred_device" => Some(config.runtime.preferred_device.clone()),
+        "runtime.allow_cpu_fallback" => Some(config.runtime.allow_cpu_fallback.to_string()),
+        "runtime.n_ctx" => config.runtime.n_ctx.map(|v| v.to_string()),
+        "runtime.threads" => config.runtime.threads.map(|v| v.to_string()),
+        "runtime.kv_type" => config.runtime.kv_type.clone(),
+        "runtime.load_mode" => config.runtime.load_mode.clone(),
+        "runtime.ubatch" => config.runtime.ubatch.map(|v| v.to_string()),
+        _ => None,
+    }
+}
+
+/// Write a small, fixed set of dotted keys.
+fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "inference.base_url" => config.inference.base_url = value.to_string(),
+        "inference.model" => config.inference.model = Some(value.to_string()),
+        "inference.device" => config.inference.device = value.to_string(),
+        "extensions.enabled" => {
+            config.extensions.enabled = parse_bool(value)?;
+        }
+        "runtime.preferred_device" => config.runtime.preferred_device = value.to_string(),
+        "runtime.allow_cpu_fallback" => {
+            config.runtime.allow_cpu_fallback = parse_bool(value)?;
+        }
+        "runtime.n_ctx" => config.runtime.n_ctx = parse_opt_u32(value)?,
+        "runtime.threads" => config.runtime.threads = parse_opt_u32(value)?,
+        "runtime.ubatch" => config.runtime.ubatch = parse_opt_u32(value)?,
+        "runtime.kv_type" => config.runtime.kv_type = parse_opt_string(value),
+        "runtime.load_mode" => config.runtime.load_mode = parse_opt_string(value),
+        _ => return Err(format!("unknown or read-only config key '{key}'")),
+    }
+    Ok(())
+}
+
+/// Parse an optional string key: an empty value clears it.
+fn parse_opt_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parse an optional `u32` key: an empty value clears it.
+fn parse_opt_u32(value: &str) -> Result<Option<u32>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("expected a non-negative integer, got '{value}'"))
+}
+
+/// Parse a boolean config value, accepting the usual spellings.
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(format!("expected a boolean, got '{value}'")),
+    }
+}
+
+// --- init -------------------------------------------------------------------
+
+fn init(
+    force: bool,
+    profile: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    json: bool,
+) -> Result<(), String> {
+    let paths = paths()?;
+    let already = paths.config_file().exists();
+    if already && !force {
+        return Err(format!(
+            "already initialised at {} — pass --force to reconfigure",
+            paths.root().display()
+        ));
+    }
+    paths.scaffold().map_err(|error| error.to_string())?;
+
+    let mut config = ConfigStore::at(&paths)
+        .load()
+        .map_err(|error| error.to_string())?;
+    if let Some(base_url) = base_url {
+        config.inference.base_url = base_url;
+    }
+    if let Some(model) = &model {
+        config.inference.model = Some(model.clone());
+    }
+    ConfigStore::at(&paths)
+        .save(&config)
+        .map_err(|error| error.to_string())?;
+
+    let profile_id = profile.unwrap_or_else(|| "default".to_string());
+    let id = ProfileId::new(&profile_id).map_err(|error| error.to_string())?;
+    let store = ProfileStore::new(paths.root());
+    if store.load(&id).is_err() {
+        let profile = AgentProfile::new(
+            id.clone(),
+            "Default",
+            "You are Lightagent, a helpful local agent with live tools.",
+            model.unwrap_or_else(|| "default".to_string()),
+        );
+        store.save(&profile).map_err(|error| error.to_string())?;
+    }
+    store.set_active(&id).map_err(|error| error.to_string())?;
+
+    if json {
+        let value = serde_json::json!({
+            "home": paths.root().display().to_string(),
+            "config_file": paths.config_file().display().to_string(),
+            "active_profile": id.as_str(),
+            "base_url": config.inference.base_url,
+        });
+        println!("{value:#}");
+    } else {
+        println!("Initialised Lightagent at {}", paths.root().display());
+        println!("  active profile: {}", id.as_str());
+        println!("  provider:       {}", config.inference.base_url);
+        println!("Run `lightagent chat` to start.");
+    }
+    Ok(())
+}
+
+// --- models -----------------------------------------------------------------
+
+async fn models(json: bool) -> Result<(), String> {
+    use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
+
+    let paths = paths()?;
+    let config = load_config(&paths)?;
+    let mut provider_config = ProviderConfig::new(config.inference.base_url.clone(), "default");
+    if let Some(secret) = &config.inference.api_key
+        && let Some(value) = secret.resolve()
+    {
+        provider_config = provider_config.with_api_key(value);
+    }
+    let provider = LightweightProvider::new(provider_config).map_err(|error| error.to_string())?;
+
+    match provider.models().await {
+        Ok(models) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_value(&models).map_err(|e| e.to_string())?
+                );
+            } else if models.is_empty() {
+                println!("The provider offers no models (is one loaded?).");
+            } else {
+                for model in models {
+                    println!("{model}");
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "could not reach the provider at {}: {error}",
+            config.inference.base_url
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_config_keys_round_trip() {
+        let mut config = Config::default();
+        assert_eq!(
+            get_key(&config, "inference.base_url").as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        set_key(&mut config, "inference.model", "demo").unwrap();
+        assert_eq!(get_key(&config, "inference.model").as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let mut config = Config::default();
+        assert!(get_key(&config, "nope").is_none());
+        assert!(set_key(&mut config, "nope", "x").is_err());
+    }
+
+    #[test]
+    fn runtime_config_keys_round_trip() {
+        let mut config = Config::default();
+        assert_eq!(
+            get_key(&config, "runtime.preferred_device").as_deref(),
+            Some("auto")
+        );
+        // An optional numeric key reads as absent until set, then clears again.
+        assert!(get_key(&config, "runtime.n_ctx").is_none());
+        set_key(&mut config, "runtime.preferred_device", "cuda").unwrap();
+        set_key(&mut config, "runtime.n_ctx", "8192").unwrap();
+        assert_eq!(get_key(&config, "runtime.n_ctx").as_deref(), Some("8192"));
+        set_key(&mut config, "runtime.n_ctx", "").unwrap();
+        assert!(get_key(&config, "runtime.n_ctx").is_none());
+        // A non-numeric context is refused.
+        assert!(set_key(&mut config, "runtime.threads", "lots").is_err());
+    }
+
+    #[test]
+    fn first_line_takes_only_the_first() {
+        assert_eq!(first_line("a\nb\nc"), "a");
+        assert_eq!(first_line(""), "");
+    }
+}
