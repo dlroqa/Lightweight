@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`hermes serve --agent-upstream <ORIGIN>`** forwards the panel's agent
+  screens to the separate agent server (`lightagent serve`). The agent API lives
+  on its own server and port (`http://127.0.0.1:8735` by default); the gateway
+  now reverse-proxies `/api/lightagent/*` to it, streaming responses (including
+  the run event stream), so the panel's agent, tools and chat screens are
+  same-origin with the rest of the panel and need no CORS — the same property
+  `--web-root` gives the control API. Pass `off` to disable it. The cross-origin
+  write guard covers the proxied surface, and a gateway with no upstream is
+  unchanged.
+
 ## [0.2.1] - 2026-09-01
 
 Public reach and multi-model serving. The gateway can now sit behind a trusted

@@ -80,7 +80,10 @@ and settings in the two directories M0 chose for them. On those seams sits a
 **control panel** — React and TypeScript, eight screens — served by the gateway
 itself, so the panel and the API are the same origin and no CORS layer exists
 anywhere. A browser on another machine reaches it over the exposed bind for
-free.
+free. The panel's agent screens talk to a separate agent server
+(`lightagent serve`); `hermes serve --agent-upstream <origin>` reverse-proxies
+`/api/lightagent/*` to it (default `http://127.0.0.1:8735`, `off` to disable), so
+those screens stay same-origin too.
 
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, and keeps serving
