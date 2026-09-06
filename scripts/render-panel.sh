@@ -34,9 +34,14 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${HOME:-}/.cargo/env" ]; then
   . "${HOME:-}/.cargo/env"
 fi
 
-# A scratch home so the render never reads or writes a developer's real agent
-# profile or the gateway's real data directory.
+# A scratch home for each server so the render never reads or writes a
+# developer's real agent profile or the gateway's real data directory — and so a
+# clean CI runner, which has neither, is configured from nothing rather than
+# failing on a missing profile. `LIGHTAGENT_HOME` roots the agent server;
+# `HERMES_GATEWAY_HOME` roots the gateway.
 WORK="$(mktemp -d)"
+export LIGHTAGENT_HOME="$WORK/agent-home"
+export HERMES_GATEWAY_HOME="$WORK/gateway-home"
 AGENT_LOG="$WORK/agent.log"
 GATEWAY_LOG="$WORK/gateway.log"
 AGENT_PID=""
@@ -79,9 +84,14 @@ if [ ! -f frontend/dist/index.html ]; then
   ( cd frontend && npm run build )
 fi
 
+# The agent server refuses to start without an active profile; a fresh
+# `LIGHTAGENT_HOME` has none, so scaffold one. `init` is non-interactive and
+# needs no model or network — it writes the config and a `default` profile.
+echo "== init the agent home =="
+./target/debug/lightagent init >/dev/null
+
 echo "== start agent API (port $AGENT_PORT) =="
-HERMES_HOME="$WORK/agent-home" \
-  ./target/debug/lightagent serve --host 127.0.0.1 --port "$AGENT_PORT" \
+./target/debug/lightagent serve --host 127.0.0.1 --port "$AGENT_PORT" \
   >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
 wait_for "http://127.0.0.1:$AGENT_PORT/api/lightagent/v1/tools" "agent API"
