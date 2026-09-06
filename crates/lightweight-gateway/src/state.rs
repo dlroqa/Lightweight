@@ -73,6 +73,21 @@ pub struct GatewayConfig {
     /// `None` means no panel is served and every unmatched path is a 404,
     /// which is what every existing deployment and every test does today.
     pub web_root: Option<std::path::PathBuf>,
+    /// The origin of the Lightagent API server (`lightagent serve`), when this
+    /// gateway should reverse-proxy the panel's agent screens to it.
+    ///
+    /// `None` — the default, and every deployment before this — means the gateway
+    /// serves no agent surface at all: a request under `/api/lightagent` matches
+    /// no route and falls to the panel fallback like any other unknown path,
+    /// which is exactly the `<!doctype …>` the agent screens choked on. `Some`
+    /// registers a proxy at `/api/lightagent` and `/api/lightagent/*` that
+    /// forwards each request verbatim to `{origin}`, so the panel's agent, tools
+    /// and chat screens are same-origin with the rest of it and need no CORS —
+    /// the same property [`web_root`] gives the control API. A base origin only,
+    /// scheme through port with no path, e.g. `http://127.0.0.1:8735`.
+    ///
+    /// [`web_root`]: GatewayConfig::web_root
+    pub agent_upstream: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -88,6 +103,7 @@ impl Default for GatewayConfig {
             paths: None,
             bound_addresses: Vec::new(),
             web_root: None,
+            agent_upstream: None,
         }
     }
 }
