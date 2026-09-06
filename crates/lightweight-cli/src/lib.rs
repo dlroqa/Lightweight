@@ -170,6 +170,17 @@ enum Command {
         /// it. Without this, `/` is a 404 and the API is unchanged.
         #[arg(long, value_name = "DIR")]
         web_root: Option<PathBuf>,
+        /// Forward the panel's agent screens to the agent server at this origin.
+        ///
+        /// The agent API (`lightagent serve`) runs on its own server and port;
+        /// the panel's Agent, Tools and Chat screens call it under
+        /// `/api/lightagent`. Proxying it from here puts it on the gateway's own
+        /// origin, so those screens work without a CORS policy — the same
+        /// property `--web-root` gives the control API. Defaults to the agent
+        /// server's own loopback default; pass `off` to serve no agent surface,
+        /// in which case those screens are inert.
+        #[arg(long, value_name = "ORIGIN", default_value = "http://127.0.0.1:8735")]
+        agent_upstream: String,
         /// Require this key on every request.
         ///
         /// Optional on loopback and mandatory as soon as any bind is reachable
@@ -639,6 +650,7 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
             api_key,
             concurrency,
             web_root,
+            agent_upstream,
             behind_proxy,
         } => {
             // Only this command needs an async runtime, so it is built here
@@ -675,6 +687,12 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
                 behind_proxy: *behind_proxy || env_flag("HERMES_BEHIND_PROXY"),
                 concurrency: *concurrency,
                 web_root: web_root.clone(),
+                // `off` (or an empty value) serves no agent surface; anything
+                // else is the origin to forward `/api/lightagent` to.
+                agent_upstream: match agent_upstream.trim() {
+                    "" | "off" => None,
+                    origin => Some(origin.to_owned()),
+                },
             }))?;
             Ok(ExitCode::SUCCESS)
         }

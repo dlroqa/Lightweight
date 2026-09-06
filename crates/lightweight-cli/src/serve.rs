@@ -97,6 +97,15 @@ pub struct ServeOptions {
     /// the panel same-origin with the API, so no CORS policy has to be written
     /// to let a page talk to the gateway it was served by.
     pub web_root: Option<PathBuf>,
+    /// Origin of the agent server (`lightagent serve`) to forward the panel's
+    /// agent screens to, or `None` to serve no agent surface.
+    ///
+    /// The agent API lives on its own server and port; this makes the gateway
+    /// proxy `/api/lightagent/*` to it so the panel's agent, tools and chat
+    /// screens are same-origin with the rest of the panel, the same reason
+    /// [`web_root`](Self::web_root) exists. A base origin only, e.g.
+    /// `http://127.0.0.1:8735`.
+    pub agent_upstream: Option<String>,
 }
 
 /// How many requests to serve at once, as the operator asked for it.
@@ -409,6 +418,7 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
                 paths: Some(paths.clone()),
                 bound_addresses: bound.clone(),
                 web_root: options.web_root.clone(),
+                agent_upstream: options.agent_upstream.clone(),
                 ..GatewayConfig::default()
             },
         )
@@ -488,6 +498,12 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
         "gateway listening"
     );
     println!("  logs     {}", paths.logs_dir().display());
+    if let Some(upstream) = &options.agent_upstream {
+        // The panel's agent screens are forwarded here, so it shares this
+        // gateway's origin rather than needing a second one the browser would
+        // refuse. A 502 from the panel now means this server is not up.
+        println!("  agent    /api/lightagent → {upstream}");
+    }
 
     // On stderr, and after the summary rather than before the model load, for
     // one reason: this is the last thing the operator sees before the gateway
@@ -1315,6 +1331,7 @@ mod tests {
             behind_proxy: false,
             concurrency: Concurrency::Auto,
             web_root: None,
+            agent_upstream: None,
         }
     }
 

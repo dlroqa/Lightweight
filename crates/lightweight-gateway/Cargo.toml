@@ -32,6 +32,11 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
+# Forwarding the panel's agent screens to the separate agent server (see
+# `agent_proxy`). `rustls` for the crypto provider `reqwest` insists on before
+# it will build a client, even for the plain-HTTP loopback this proxy talks to.
+reqwest.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 lightweight-backend-mock.workspace = true
@@ -39,8 +44,6 @@ lightweight-backend-mock.workspace = true
 # rather than a hand-rolled byte array. A dev-dependency only: nothing shipped
 # builds the fixtures feature.
 lightweight-gguf = { workspace = true, features = ["fixtures"] }
-reqwest.workspace = true
-rustls.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [[bin]]

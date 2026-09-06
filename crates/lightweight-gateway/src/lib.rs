@@ -14,6 +14,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod agent_proxy;
 pub mod auth;
 pub mod benchmark;
 pub mod catalog;
@@ -39,7 +40,7 @@ pub use state::{GatewayConfig, GatewayState};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 
 /// The service `axum::serve` is handed, with the peer address attached.
 ///
@@ -89,7 +90,11 @@ pub fn app(state: Arc<GatewayState>) -> Router {
     // whether to honour `CF-Connecting-IP` from this, and only a gateway started
     // behind a trusted proxy sets it.
     let trust_forwarded = TrustForwarded(state.config.trust_forwarded);
-    Router::new()
+    // Whether this gateway fronts a separate agent server. Read before `state`
+    // is moved into `with_state`, and decides whether the proxy route below is
+    // registered at all — a gateway without an upstream is exactly as it was.
+    let proxies_agent = state.config.agent_upstream.is_some();
+    let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/api/v1/metrics", get(routes::metrics_json))
@@ -155,7 +160,21 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         )
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.
-        .fallback(web::serve)
+        .fallback(web::serve);
+
+    // The panel's agent screens, forwarded to the separate agent server so they
+    // share this origin — see [`agent_proxy`]. Added before the layers below so
+    // the same cross-origin write guard and in-flight accounting apply to it,
+    // and after the fallback so it is a real route that wins over the panel's
+    // catch-all for `/api/lightagent`. Absent entirely when no upstream is
+    // configured, so a plain gateway carries no route it will never serve.
+    if proxies_agent {
+        router = router
+            .route("/api/lightagent", any(agent_proxy::proxy))
+            .route("/api/lightagent/{*rest}", any(agent_proxy::proxy));
+    }
+
+    router
         // Wrapped around every route rather than written into each handler:
         // there are a dozen of them, and a gauge that a new endpoint can forget
         // to join is a gauge that quietly stops being true.
@@ -191,7 +210,14 @@ async fn count_in_flight(
     // running, so counting those would pin this gauge at one on a gateway doing
     // nothing and add one to every reading of it - including the reading being
     // taken by the request doing the asking.
-    if is_monitoring(request.uri().path()) {
+    //
+    // A proxied agent request is excluded for a different reason: this gauge is
+    // the *engine's* load, and an agent run does not hold an engine slot here —
+    // it runs on the server this only forwards to, where an SSE tail can stay
+    // open for minutes. Counting it would inflate a reading about work this
+    // gateway is not doing.
+    let path = request.uri().path();
+    if is_monitoring(path) || is_agent_proxy(path) {
         return next.run(request).await;
     }
 
@@ -218,6 +244,14 @@ async fn count_in_flight(
 /// same-origin rule. Written as a layer, not a line in each handler, for the
 /// same reason `count_in_flight` is: a guard a new endpoint can forget to join
 /// is a guard that quietly stops being true.
+///
+/// The proxied agent surface under `/api/lightagent/` is guarded on the same
+/// terms. It is forwarded to a loopback agent server that, being loopback,
+/// requires no key of its own — so without this a page on another origin could
+/// start a run or answer an approval through the gateway while the user was only
+/// looking at the panel. A same-origin call from the panel echoes the gateway's
+/// authority in `Origin` and passes; a non-browser caller sends none and is left
+/// to the agent server's own auth, exactly as under `/api/v1`.
 async fn guard_control_writes(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -229,7 +263,8 @@ async fn guard_control_writes(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
-    let is_control = request.uri().path().starts_with("/api/v1/");
+    let path = request.uri().path();
+    let is_control = path.starts_with("/api/v1/") || is_agent_proxy(path);
 
     if is_write
         && is_control
@@ -260,4 +295,12 @@ fn is_monitoring(path: &str) -> bool {
             | "/api/v1/logs"
             | "/api/v1/events"
     )
+}
+
+/// Whether a path belongs to the proxied agent surface.
+///
+/// The forwarding routes are `/api/lightagent` and everything beneath it; both
+/// the write guard and the in-flight gauge treat the whole prefix as one.
+fn is_agent_proxy(path: &str) -> bool {
+    path == "/api/lightagent" || path.starts_with("/api/lightagent/")
 }
