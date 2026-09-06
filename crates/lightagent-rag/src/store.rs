@@ -251,13 +251,16 @@ mod tests {
     use crate::embed::HashingEmbedder;
 
     fn scratch_index() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-wide counter makes each call's directory unique regardless of
+        // clock resolution: two tests running in parallel must never share a dir,
+        // or one test's remove_dir_all(parent) would delete the other's live
+        // scratch out from under it. The pid keeps concurrent test binaries apart.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "lightagent-rag-{}-{}/index.jsonl",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            "lightagent-rag-{}-{unique}/index.jsonl",
+            std::process::id()
         ))
     }
 
