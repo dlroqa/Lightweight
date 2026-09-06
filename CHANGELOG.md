@@ -4,17 +4,44 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-06
+
+A patch release. When the control panel is served by the gateway, its agent
+screens — Agent, Tools and Chat — now reach the agent API instead of falling
+through to the panel's own HTML, so they work the same way the rest of the panel
+already did.
+
+### Fixed
+
+- **The panel's agent screens reach the agent API through the gateway.** The
+  agent API (`lightagent serve`) runs on its own server and port, and the gateway
+  had no route for its `/api/lightagent` prefix, so those calls fell to the panel
+  fallback and came back as `index.html` — which the panel's JSON parse rejected.
+  The gateway now reverse-proxies `/api/lightagent/*` to the agent server,
+  streaming responses (including the run event stream), so the agent, tools and
+  chat screens are same-origin with the rest of the panel and need no CORS — the
+  same property `--web-root` gives the control API. Configured by `hermes serve
+  --agent-upstream <origin>` (default `http://127.0.0.1:8735`, `off` to disable);
+  the cross-origin write guard covers the proxied surface, and a gateway with no
+  upstream is unchanged.
+- **An intermittent failure in the RAG store tests.** Two tests shared a scratch
+  directory keyed only on a timestamp, so under parallel execution one could
+  delete the other's directory mid-run; each call now gets a unique directory.
+  Test-only — no runtime behaviour changed.
+
+## [0.3.0] - 2026-09-04
+
+The first release to include Lightagent, the agent harness, alongside the
+Lightweight inference engine. A minor bump: Lightagent is a large, strictly
+additive product surface, and the engine's binaries, tests and dependency policy
+are untouched, so nothing existing breaks.
+
 ### Added
 
-- **`hermes serve --agent-upstream <ORIGIN>`** forwards the panel's agent
-  screens to the separate agent server (`lightagent serve`). The agent API lives
-  on its own server and port (`http://127.0.0.1:8735` by default); the gateway
-  now reverse-proxies `/api/lightagent/*` to it, streaming responses (including
-  the run event stream), so the panel's agent, tools and chat screens are
-  same-origin with the rest of the panel and need no CORS — the same property
-  `--web-root` gives the control API. Pass `off` to disable it. The cross-origin
-  write guard covers the proxied surface, and a gateway with no upstream is
-  unchanged.
+- **Lightagent, the agent harness.** New crates and a new `lightagent` binary
+  serving the agent runtime — runs, sessions, tools, approvals and their event
+  stream — with agent screens in the shared control panel, added alongside the
+  inference engine without changing it.
 
 ## [0.2.1] - 2026-09-01
 
