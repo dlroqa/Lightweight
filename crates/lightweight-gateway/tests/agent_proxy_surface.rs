@@ -28,6 +28,10 @@ fn ensure_provider() {
 async fn start_agent_server() -> String {
     let app = Router::new()
         .route(
+            "/health",
+            get(|| async { axum::Json(json!({"status": "ok", "service": "lightagent"})) }),
+        )
+        .route(
             "/api/lightagent/v1/tools",
             get(|| async {
                 axum::Json(json!({
@@ -192,4 +196,62 @@ async fn an_unreachable_upstream_is_a_clear_json_502_not_an_html_fallback() {
             .is_some_and(|m| m.contains("agent server")),
         "the body must name what failed: {body}"
     );
+}
+
+#[tokio::test]
+async fn settings_detects_an_existing_agent_and_start_is_idempotent() {
+    ensure_provider();
+    let upstream = start_agent_server().await;
+    let gateway = start_gateway(Some(upstream.clone())).await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{gateway}/api/v1/agent-server/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["can_start"], false);
+        assert_eq!(body["upstream"], upstream);
+    }
+    let body: Value = client
+        .get(format!("{gateway}/api/v1/agent-server"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "running");
+}
+
+#[tokio::test]
+async fn settings_cannot_start_disabled_or_remote_agents() {
+    ensure_provider();
+    for upstream in [None, Some("http://192.0.2.1:8735".into())] {
+        let gateway = start_gateway(upstream).await;
+        let response = reqwest::Client::new()
+            .post(format!("{gateway}/api/v1/agent-server/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "agent_start_failed");
+    }
+}
+
+#[tokio::test]
+async fn a_cross_origin_request_cannot_start_an_agent() {
+    ensure_provider();
+    let gateway = start_gateway(None).await;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/api/v1/agent-server/start"))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
 }

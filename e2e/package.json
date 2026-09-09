@@ -5,7 +5,8 @@
   "description": "Headless render + smoke of the panel against a live gateway and agent server.",
   "type": "module",
   "scripts": {
-    "render": "node render.mjs"
+    "render": "node render.mjs",
+    "agent-server": "node agent-server.mjs"
   },
   "devDependencies": {
     "playwright": "1.55.0"

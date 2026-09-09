@@ -118,4 +118,8 @@ echo "== render the panel in a headless browser =="
 PANEL_BASE="http://127.0.0.1:$GATEWAY_PORT" OUT_DIR="$OUT_DIR" \
   node e2e/render.mjs
 
+# A separate isolated gateway starts with its agent stopped, so Settings must
+# recover from a setup error and launch the real process through its button.
+node e2e/agent-server.mjs
+
 echo "Panel render complete. Screenshots in $OUT_DIR/"

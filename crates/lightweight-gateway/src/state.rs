@@ -111,6 +111,8 @@ pub struct GatewayState {
     pub backend: Arc<dyn InferenceBackend>,
     pub catalog: Arc<Catalog>,
     pub config: GatewayConfig,
+    /// The local agent process started from Settings.
+    pub agent_server: Arc<crate::agent_server::AgentServer>,
     /// The live authentication policy.
     ///
     /// Seeded from `config.auth` at startup and swapped by [`refresh_keys`] when
@@ -184,6 +186,7 @@ impl GatewayState {
             catalog,
             auth,
             config,
+            agent_server: Arc::new(crate::agent_server::AgentServer::default()),
             scheduler,
             metrics: Arc::new(Metrics::new()),
             manager: None,

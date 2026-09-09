@@ -4,7 +4,7 @@ import { api } from "../api/client";
 import { bytes } from "../api/format";
 import { wasRead } from "../api/types";
 import { Card } from "../components/Card";
-import { Row, Switch } from "../components/Bits";
+import { Pill, Row, Switch } from "../components/Bits";
 import { TopBar } from "../components/Shell";
 import { usePoll } from "../hooks/usePoll";
 import { usePreferences } from "../state/preferences";
@@ -49,6 +49,7 @@ export function SettingsScreen() {
       <TopBar title="Settings" subtitle="Customise the panel and the gateway" />
 
       <div className="page">
+        <AgentServerSettings />
         {offline && (
           <div className="notice notice--warn">
             Settings could not be read from the gateway, so changes are being
@@ -230,5 +231,66 @@ function ToggleRow({
       </div>
       <Switch checked={checked} onChange={onChange} label={label} disabled={disabled} />
     </div>
+  );
+}
+
+function AgentServerSettings() {
+  const server = usePoll(api.agentServer, 2000);
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const status = server.data;
+  const pending = starting || status?.status === "starting";
+  const running = !server.error && status?.status === "running";
+  const message = startError ?? server.error?.message ?? status?.message;
+
+  async function startServer() {
+    setStarting(true);
+    setStartError(null);
+    try {
+      await api.startAgentServer();
+      await server.refresh();
+    } catch (cause) {
+      setStartError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  return (
+    <Card title="Lightagent server">
+      <p className="card__note">
+        Start the agent server to enable Agent, Agent Tools, and Chat.
+        A server started here runs until the gateway closes.
+      </p>
+      <Row label="Status">
+        <span role="status" aria-live="polite">
+          <Pill tone={running ? "ok" : pending ? "info" : "warn"}>
+            {server.error ? "Status unavailable" : pending ? "Starting…" : running ? "Running" :
+              status?.status === "failed" ? "Failed to start" :
+              status?.status === "unavailable" ? "Not responding" :
+              status ? "Stopped" : "Checking…"}
+          </Pill>
+        </span>
+      </Row>
+      <Row label="Address">{status?.upstream ?? "Not configured"}</Row>
+      {message && (
+        <div className="notice notice--warn" role="alert" style={{ whiteSpace: "pre-wrap", marginTop: 12 }}>
+          {message}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+        <button
+          type="button"
+          className="btn btn--primary"
+          disabled={pending || running || !status?.can_start || !!server.error}
+          onClick={() => void startServer()}
+        >
+          {pending ? "Starting…" : running ? "Server running" : "Start server"}
+        </button>
+        <button type="button" className="btn" onClick={() => void server.refresh()}>
+          Refresh status
+        </button>
+      </div>
+    </Card>
   );
 }

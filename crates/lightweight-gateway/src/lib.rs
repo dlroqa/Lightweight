@@ -15,6 +15,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod agent_proxy;
+pub mod agent_server;
 pub mod auth;
 pub mod benchmark;
 pub mod catalog;
@@ -154,6 +155,8 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             "/api/v1/gateway/keys/{id}/limit",
             axum::routing::put(store_api::set_key_limit),
         )
+        .route("/api/v1/agent-server", get(agent_server::status))
+        .route("/api/v1/agent-server/start", post(agent_server::start))
         // Reserve the agent namespace even when no upstream is configured.
         // The handler returns a JSON setup error instead of the SPA document.
         .route("/api/lightagent", any(agent_proxy::proxy))

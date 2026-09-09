@@ -95,7 +95,7 @@ pub async fn proxy(State(state): State<Arc<GatewayState>>, request: Request) -> 
                 StatusCode::BAD_GATEWAY,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 error_body(&format!(
-                    "could not reach the agent server at {upstream}: {error}. Start `lightagent serve` and check the gateway's --agent-upstream address."
+                    "could not reach the agent server at {upstream}: {error}. Open Settings and start the Lightagent server, or run `lightagent serve` and check the gateway's --agent-upstream address."
                 )),
             )
                 .into_response();
@@ -162,7 +162,7 @@ fn error_body(message: &str) -> String {
 /// the plain-HTTP loopback this only ever talks to — so [`ensure_provider`] runs
 /// first, and the fallback keeps the lint against `unwrap` honest for a build
 /// that cannot in practice fail here.
-fn client() -> &'static reqwest::Client {
+pub(crate) fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         ensure_provider();

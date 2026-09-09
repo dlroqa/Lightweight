@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { Wrench } from "lucide-react";
 
 import { agentApi, type ToolInfo } from "../api/agent";
@@ -58,6 +59,9 @@ export function AgentTools() {
               <button type="button" className="btn" onClick={() => setAttempt((value) => value + 1)}>
                 Retry
               </button>
+              <Link className="btn" to="/settings" style={{ marginLeft: 8 }}>
+                Server settings
+              </Link>
             </div>
           ) : !tools ? (
             <span className="muted">Loading…</span>

@@ -7,6 +7,7 @@
  */
 
 import type {
+  AgentServerStatus,
   ApiErrorBody,
   BenchmarkRun,
   Conversation,
@@ -277,6 +278,10 @@ export const api = {
       "/api/v1/gateway/config",
       { method: "PUT", body: JSON.stringify(body) },
     ),
+
+  agentServer: () => request<AgentServerStatus>("/api/v1/agent-server"),
+  startAgentServer: () =>
+    request<AgentServerStatus>("/api/v1/agent-server/start", { method: "POST" }),
 
   settings: () => request<Settings>("/api/v1/settings"),
   saveSettings: (settings: Settings) =>

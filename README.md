@@ -85,10 +85,16 @@ free. The panel's agent screens talk to a separate agent server
 `/api/lightagent/*` to it (default `http://127.0.0.1:8735`, `off` to disable), so
 those screens stay same-origin too.
 
-If Agent Tools cannot connect, start `lightagent serve` (run `lightagent init`
-once first for a new installation). The desktop shell starts only the inference
-gateway; the agent server must be running separately. For a different agent
-address, start the gateway with `--agent-upstream <origin>`. A disabled proxy
+If Agent Tools cannot connect, open **Settings → Lightagent server → Start
+server**. Settings shows startup progress and any error returned by the agent
+(run `lightagent init` once first for a new installation). The gateway can start
+an agent at a configured `http://127.0.0.1:<port>` or `http://localhost:<port>`
+origin. It looks for `lightagent` beside its own executable, then on `PATH`;
+set `LIGHTAGENT_BIN` before starting the gateway to use a different binary.
+The child inherits the gateway's environment, including `LIGHTAGENT_HOME`, and
+stops when the gateway shuts down. An agent already running is left alone.
+You can also start `lightagent serve` yourself. For a different agent address,
+start the gateway with `--agent-upstream <origin>`. A disabled proxy
 returns a JSON setup error; an unreachable agent returns a connection error.
 After correcting the connection, click **Retry** in Agent Tools. If the panel
 reports a non-JSON response, check that the running gateway is a current build
