@@ -1,0 +1,89 @@
+# Render the panel end to end and prove the agent screens work.
+#
+# The unit and integration gate is `check.yml`, which runs `cargo test
+# --workspace` — including the socket-level proxy test in
+# `crates/lightweight-gateway/tests/agent_proxy_surface.rs`. This workflow is
+# the tier above that: it boots the *two real servers* the product runs — the
+# agent API (`lightagent serve`) and the gateway that proxies it (`hermes
+# serve --web-root`) — loads the built panel in a real headless browser, and
+# asserts the agent screens render their data instead of the `<!doctype …>`
+# fallback that a missing proxy served. It lives in its own workflow, not as a
+# copy of the test gate, so the two never drift; the orchestration is in
+# `scripts/render-panel.sh` so it is identical locally and here.
+#
+# Every screen is screenshotted and uploaded — on failure too — so a human can
+# eyeball the panel on a pull request the way the `icons` job lets them eyeball
+# the icons.
+name: render panel
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    name: render panel
+    # Linux only: the panel is platform-independent, and a browser render on one
+    # runner proves the seam between the two servers on all of them. The check
+    # gate already runs on every platform.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # As in check.yml: the toolchain is pinned in rust-toolchain.toml and
+      # `rustup show` installs it, so there is no second copy of the pin here.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: render-panel
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      # The panel is built by the render script if `frontend/dist` is absent;
+      # its deps are installed here so that build has what it needs. The e2e
+      # package carries only Playwright.
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix e2e
+
+      # `--with-deps` installs the system libraries headless Chromium needs on a
+      # fresh runner; the browser itself is pinned by the Playwright version in
+      # e2e/package.json. No xvfb: headless shell needs no display.
+      - name: Install the render browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      # The whole thing: build the binaries, start both servers wired as the
+      # product wires them, assert the proxied endpoint returns JSON, then render
+      # and check every screen.
+      - name: Render and check the panel
+        run: bash ./scripts/render-panel.sh
+
+      # Always, so a failed render still uploads the screenshot of the screen
+      # that broke — the fastest way to see what a red run is complaining about.
+      - name: Upload the rendered screens
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: panel-screens
+          path: e2e/screens/
+          if-no-files-found: error

@@ -5,6 +5,10 @@
 /apps/desktop/node_modules
 /apps/desktop/dist
 /apps/desktop/release
+/e2e/node_modules
+# Rendered panel screenshots, produced by scripts/render-panel.sh and uploaded
+# as a CI artifact rather than committed.
+/e2e/screens
 /fixtures/generated
 /runtime
 *.gguf
