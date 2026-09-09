@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-09
+
+A patch release. When Agent Tools cannot connect, the agent server can now be
+started from the panel itself — the desktop shell no longer requires a separate
+terminal to bring the agent screens to life. Strictly additive: a gateway with
+no configurable agent origin, or an agent already running, is left exactly as
+before.
+
+### Added
+
+- **Start the Lightagent server from Settings.** A new *Lightagent server* card
+  shows the agent server's status (checking, running, stopped, starting, failed
+  or not responding) and its address, polling every two seconds, and offers a
+  *Start server* button that enables the Agent, Agent Tools and Chat screens
+  without leaving the panel. The gateway starts the child at its configured
+  `http://127.0.0.1:<port>` or `http://localhost:<port>` upstream, resolving the
+  `lightagent` binary beside its own executable, then on `PATH`, with
+  `LIGHTAGENT_BIN` as an override. The child inherits the gateway's environment
+  (including `LIGHTAGENT_HOME`) and stops when the gateway shuts down; an agent
+  already answering is left running. New gateway routes
+  `GET /api/v1/agent-server` and `POST /api/v1/agent-server/start` back the
+  card, and startup progress and any error the agent returns are surfaced in
+  Settings. The README documents the flow, and an end-to-end check exercises the
+  start path.
+
 ## [0.3.2] - 2026-09-09
 
 A patch release. A gateway that fronts the panel without an agent upstream no
