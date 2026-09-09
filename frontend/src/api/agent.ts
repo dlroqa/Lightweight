@@ -2,8 +2,9 @@
  * Talking to the Lightagent HTTP API (`/api/lightagent/v1`).
  *
  * Same-origin, like the rest of the panel: in development Vite proxies
- * `/api/lightagent` to the agent server, and in production `lightagent serve
- * --web-root` serves this bundle itself. Distinct from the inference gateway's
+ * `/api/lightagent` to the agent server, and in production the gateway proxies
+ * it via `--agent-upstream` (or `lightagent serve --web-root` serves the panel
+ * itself). Distinct from the inference gateway's
  * `/api/v1`, which the other screens use.
  */
 
@@ -46,11 +47,18 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`${response.status}: ${body || response.statusText}`);
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new Error(
+      "The agent API returned a non-JSON response. Start `lightagent serve` and connect the gateway with `--agent-upstream http://127.0.0.1:8735` (use your agent's address if different). If the gateway does not support this option, update it first.",
+    );
   }
-  return (await response.json()) as T;
+  const body = await response.json();
+  if (!response.ok) {
+    const message = typeof body?.error === "string" ? body.error : response.statusText;
+    throw new Error(`${response.status}: ${message}`);
+  }
+  return body as T;
 }
 
 export const agentApi = {

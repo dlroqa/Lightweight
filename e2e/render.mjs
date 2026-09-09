@@ -74,6 +74,46 @@ async function settle(page, route) {
   return page.evaluate(() => document.body.innerText).catch(() => "");
 }
 
+// Older gateways can still return the SPA document for API requests. Show a
+// useful remedy, then prove Retry recovers against the real agent endpoint.
+async function checkToolsRecovery(context) {
+  for (const failure of [
+    {
+      status: 200,
+      contentType: "text/html",
+      body: "<!doctype html><title>Panel</title>",
+      expected: "--agent-upstream",
+    },
+    {
+      status: 502,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "Agent server unavailable. Start lightagent serve." }),
+      expected: "Agent server unavailable. Start lightagent serve.",
+    },
+  ]) {
+    const page = await context.newPage();
+    try {
+      const endpoint = "**/api/lightagent/v1/tools";
+      await page.route(endpoint, (route) => route.fulfill(failure));
+      await page.goto(`${BASE}/#/agent/tools`);
+      await page.getByRole("alert").getByText(failure.expected, { exact: false }).waitFor();
+      const text = await page.getByRole("alert").innerText();
+      if (text.includes("<!doctype") || text.includes("is not valid JSON") || text.includes('{"error"')) {
+        throw new Error(`Agent Tools exposed a raw response: ${text}`);
+      }
+      await page.unroute(endpoint);
+      await page.getByRole("button", { name: "Retry", exact: true }).click();
+      await page.getByText("datetime.now", { exact: true }).waitFor();
+      if (await page.getByRole("alert").count()) {
+        throw new Error("Agent Tools kept the error after a successful retry");
+      }
+    } finally {
+      await page.close();
+    }
+  }
+  console.log("  [ok] agent-tools error messages and retry recovery");
+}
+
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   const browser = await chromium.launch();
@@ -116,6 +156,12 @@ async function main() {
     } finally {
       await page.close();
     }
+  }
+
+  try {
+    await checkToolsRecovery(context);
+  } catch (err) {
+    failures.push(`agent-tools recovery: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   await context.close();

@@ -294,6 +294,24 @@ async fn gateway_with_a_panel(tag: &str) -> (TempDir, Server) {
 }
 
 #[tokio::test]
+async fn an_unconfigured_agent_returns_json_even_when_the_panel_is_served() {
+    ensure_provider();
+    let (_dir, server) = gateway_with_a_panel("panel-agent-unconfigured").await;
+    for path in [
+        "/api/lightagent",
+        "/api/lightagent/v1/tools",
+        "/api/lightagent/v1/sessions",
+    ] {
+        let response = reqwest::get(format!("{}{path}", server.base))
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 503, "{path} must not return index.html");
+        let body: serde_json::Value = response.json().await.expect("JSON error");
+        assert!(body["error"].as_str().unwrap().contains("--agent-upstream"));
+    }
+}
+
+#[tokio::test]
 async fn the_panel_is_served_from_the_gateway_that_answers_its_calls() {
     ensure_provider();
     // The property that makes a CORS layer unnecessary: one origin serves both.

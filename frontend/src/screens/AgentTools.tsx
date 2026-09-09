@@ -28,9 +28,12 @@ function riskTone(risk: string): Tone {
 export function AgentTools() {
   const [tools, setTools] = useState<ToolInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let live = true;
+    setError(null);
+    setTools(null);
     agentApi
       .tools()
       .then((response) => {
@@ -42,7 +45,7 @@ export function AgentTools() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [attempt]);
 
   return (
     <>
@@ -50,7 +53,12 @@ export function AgentTools() {
       <div className="page">
         <Card title="Enabled tools">
           {error ? (
-            <p className="muted">Could not reach the agent API: {error}</p>
+            <div role="alert">
+              <p className="muted">Could not reach the agent API: {error}</p>
+              <button type="button" className="btn" onClick={() => setAttempt((value) => value + 1)}>
+                Retry
+              </button>
+            </div>
           ) : !tools ? (
             <span className="muted">Loading…</span>
           ) : tools.length === 0 ? (

@@ -40,13 +40,20 @@ const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 /// Forward one request to the configured agent server and stream its answer
 /// back.
 ///
-/// Registered only when [`GatewayConfig::agent_upstream`] is set, so the missing
-/// upstream is a defensive `404` rather than a real path.
+/// A missing upstream returns a JSON setup error, including when a panel is
+/// configured, so an API request can never fall through to `index.html`.
 ///
 /// [`GatewayConfig::agent_upstream`]: crate::state::GatewayConfig::agent_upstream
 pub async fn proxy(State(state): State<Arc<GatewayState>>, request: Request) -> Response {
     let Some(upstream) = state.config.agent_upstream.as_deref() else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            error_body(
+                "The agent API is not configured. Start `lightagent serve` and restart the gateway with `--agent-upstream http://127.0.0.1:8735` (use your agent's address if different).",
+            ),
+        )
+            .into_response();
     };
 
     let (parts, body) = request.into_parts();
@@ -88,7 +95,7 @@ pub async fn proxy(State(state): State<Arc<GatewayState>>, request: Request) -> 
                 StatusCode::BAD_GATEWAY,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 error_body(&format!(
-                    "could not reach the agent server at {upstream}: {error}"
+                    "could not reach the agent server at {upstream}: {error}. Start `lightagent serve` and check the gateway's --agent-upstream address."
                 )),
             )
                 .into_response();

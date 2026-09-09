@@ -85,6 +85,15 @@ free. The panel's agent screens talk to a separate agent server
 `/api/lightagent/*` to it (default `http://127.0.0.1:8735`, `off` to disable), so
 those screens stay same-origin too.
 
+If Agent Tools cannot connect, start `lightagent serve` (run `lightagent init`
+once first for a new installation). The desktop shell starts only the inference
+gateway; the agent server must be running separately. For a different agent
+address, start the gateway with `--agent-upstream <origin>`. A disabled proxy
+returns a JSON setup error; an unreachable agent returns a connection error.
+After correcting the connection, click **Retry** in Agent Tools. If the panel
+reports a non-JSON response, check that the running gateway is a current build
+with the agent proxy enabled.
+
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, and keeps serving
 after its window is closed. Keys are the gateway's own — hashed on disk, created

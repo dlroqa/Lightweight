@@ -90,11 +90,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
     // whether to honour `CF-Connecting-IP` from this, and only a gateway started
     // behind a trusted proxy sets it.
     let trust_forwarded = TrustForwarded(state.config.trust_forwarded);
-    // Whether this gateway fronts a separate agent server. Read before `state`
-    // is moved into `with_state`, and decides whether the proxy route below is
-    // registered at all — a gateway without an upstream is exactly as it was.
-    let proxies_agent = state.config.agent_upstream.is_some();
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/api/v1/metrics", get(routes::metrics_json))
@@ -158,21 +154,13 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             "/api/v1/gateway/keys/{id}/limit",
             axum::routing::put(store_api::set_key_limit),
         )
+        // Reserve the agent namespace even when no upstream is configured.
+        // The handler returns a JSON setup error instead of the SPA document.
+        .route("/api/lightagent", any(agent_proxy::proxy))
+        .route("/api/lightagent/{*rest}", any(agent_proxy::proxy))
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.
         .fallback(web::serve);
-
-    // The panel's agent screens, forwarded to the separate agent server so they
-    // share this origin — see [`agent_proxy`]. Added before the layers below so
-    // the same cross-origin write guard and in-flight accounting apply to it,
-    // and after the fallback so it is a real route that wins over the panel's
-    // catch-all for `/api/lightagent`. Absent entirely when no upstream is
-    // configured, so a plain gateway carries no route it will never serve.
-    if proxies_agent {
-        router = router
-            .route("/api/lightagent", any(agent_proxy::proxy))
-            .route("/api/lightagent/{*rest}", any(agent_proxy::proxy));
-    }
 
     router
         // Wrapped around every route rather than written into each handler:

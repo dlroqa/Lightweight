@@ -76,11 +76,9 @@ pub struct GatewayConfig {
     /// The origin of the Lightagent API server (`lightagent serve`), when this
     /// gateway should reverse-proxy the panel's agent screens to it.
     ///
-    /// `None` — the default, and every deployment before this — means the gateway
-    /// serves no agent surface at all: a request under `/api/lightagent` matches
-    /// no route and falls to the panel fallback like any other unknown path,
-    /// which is exactly the `<!doctype …>` the agent screens choked on. `Some`
-    /// registers a proxy at `/api/lightagent` and `/api/lightagent/*` that
+    /// `None` returns a JSON setup error under `/api/lightagent`, keeping agent
+    /// requests out of the panel's HTML fallback. `Some` enables the proxy at
+    /// `/api/lightagent` and `/api/lightagent/*` that
     /// forwards each request verbatim to `{origin}`, so the panel's agent, tools
     /// and chat screens are same-origin with the rest of it and need no CORS —
     /// the same property [`web_root`] gives the control API. A base origin only,

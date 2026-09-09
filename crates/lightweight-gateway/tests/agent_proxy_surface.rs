@@ -150,10 +150,8 @@ async fn a_cross_origin_write_is_refused_before_it_reaches_the_upstream() {
 }
 
 #[tokio::test]
-async fn without_an_upstream_the_agent_path_is_not_a_proxy_route() {
-    // Additivity: a gateway told nothing about an agent server is exactly as it
-    // was — the path matches no route and falls to the fallback, which with no
-    // panel configured is a plain 404, never a hang or a 502 to some default.
+async fn without_an_upstream_the_agent_path_returns_a_json_setup_error() {
+    // No implicit connection to a default service, and no HTML fallback.
     ensure_provider();
     let gateway = start_gateway(None).await;
 
@@ -162,7 +160,9 @@ async fn without_an_upstream_the_agent_path_is_not_a_proxy_route() {
         .send()
         .await
         .expect("request");
-    assert_eq!(response.status(), 404);
+    assert_eq!(response.status(), 503);
+    let body: Value = response.json().await.expect("JSON setup error");
+    assert!(body["error"].as_str().unwrap().contains("--agent-upstream"));
 }
 
 #[tokio::test]
