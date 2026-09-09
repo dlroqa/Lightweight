@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-09
+
+A patch release. The command line is now a single `lightweight` binary rather
+than `lightweight` plus a `hermes` twin, and the desktop app and CLI archives
+now carry the `lightagent` agent binary alongside it, so starting the agent
+from the panel works on a fresh install without a separate `lightagent` on the
+host.
+
+### Changed
+
+- **One CLI binary, `lightweight`.** The duplicate `hermes` command (the same
+  tool under a second name) is removed; `lightweight` is the inference gateway
+  CLI. The command-line archive is renamed accordingly — `lightweight-*-<target
+  -triple>.tar.gz` / `.zip` instead of `hermes-*` — and the Linux service and
+  environment examples become `lightweight-inference-gateway.service` /
+  `.env.example`. Anyone invoking `hermes` should switch to `lightweight`; the
+  subcommands are unchanged.
+
+### Fixed
+
+- **The agent binary ships with the app, and the gateway can find it.** The
+  desktop installers and the CLI archives now include `lightagent` next to
+  `lightweight` (both built, version-checked, and — on macOS — `lipo`-merged per
+  binary during staging), so *Settings → Lightagent server → Start server*
+  works on a fresh install. The gateway resolves `lightagent` from an explicit
+  `LIGHTAGENT_BIN`, then beside its own executable, then from `~/.local/bin` on
+  Unix — the documented per-user install location, which a desktop launcher's
+  smaller PATH would otherwise miss.
+
 ## [0.3.3] - 2026-09-09
 
 A patch release. When Agent Tools cannot connect, the agent server can now be
