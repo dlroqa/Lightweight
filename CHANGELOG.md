@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-09
+
+A patch release. A gateway that fronts the panel without an agent upstream no
+longer answers the agent screens with its own HTML, and when something is
+genuinely misconfigured the panel now says what to do about it instead of
+surfacing a raw parse error.
+
+### Fixed
+
+- **An unconfigured agent proxy returns a setup error, not the panel's HTML.**
+  The `/api/lightagent` namespace is now a real route even when no
+  `--agent-upstream` is set, answering with a `503` JSON setup error naming the
+  fix rather than falling through to the panel fallback and returning
+  `index.html` — the `<!doctype …>` the agent screens choked on. A configured
+  gateway proxies exactly as before.
+- **Agent Tools explains a bad response and offers Retry.** The panel rejects a
+  non-JSON response from the agent API with an actionable message (start
+  `lightagent serve`, connect the gateway with `--agent-upstream`) and adds a
+  Retry that re-runs the load once the connection is corrected, instead of
+  showing `… is not valid JSON`. The end-to-end render check now proves both the
+  message and the recovery.
+
 ## [0.3.1] - 2026-09-06
 
 A patch release. When the control panel is served by the gateway, its agent
