@@ -63,20 +63,46 @@ fn local_address(upstream: Option<&str>) -> Result<(String, u16), String> {
 }
 
 fn binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("LIGHTAGENT_BIN") {
-        return path.into();
+    select_binary(
+        std::env::var_os("LIGHTAGENT_BIN").map(PathBuf::from),
+        std::env::current_exe().ok(),
+        std::env::var_os("HOME").map(PathBuf::from),
+        |path| path.is_file(),
+    )
+}
+
+fn select_binary(
+    explicit: Option<PathBuf>,
+    current: Option<PathBuf>,
+    home: Option<PathBuf>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    // An explicit override is authoritative, including when it is missing:
+    // report that path instead of silently launching a different installation.
+    if let Some(path) = explicit {
+        return path;
     }
     let name = if cfg!(windows) {
         "lightagent.exe"
     } else {
         "lightagent"
     };
-    if let Ok(current) = std::env::current_exe()
+    if let Some(current) = current
         && let Some(dir) = current.parent()
     {
         let sibling = dir.join(name);
-        if sibling.is_file() {
+        if exists(&sibling) {
             return sibling;
+        }
+    }
+    // Desktop launchers often inherit a smaller PATH than terminal shells.
+    // This is the documented per-user CLI install location on Linux/macOS.
+    if cfg!(unix)
+        && let Some(home) = home
+    {
+        let installed = home.join(".local/bin").join(name);
+        if exists(&installed) {
+            return installed;
         }
     }
     PathBuf::from(name)
@@ -156,7 +182,8 @@ pub async fn start(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -
     let mut inner = state.agent_server.inner.lock().await;
     let upstream = state.config.agent_upstream.clone().unwrap_or_default();
     if !inner.active && !healthy(&upstream).await {
-        let mut command = Command::new(binary());
+        let executable = binary();
+        let mut command = Command::new(&executable);
         command
             .args(["serve", "--host", &host, "--port", &port.to_string()])
             .stdin(Stdio::null())
@@ -167,7 +194,8 @@ pub async fn start(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -
             Ok(child) => child,
             Err(error) => {
                 let message = format!(
-                    "Could not start lightagent serve: {error}. Install/build the lightagent binary beside the gateway or on PATH, or set LIGHTAGENT_BIN before starting the gateway."
+                    "Could not start lightagent serve using {}: {error}. Install/build the lightagent binary beside the gateway, in ~/.local/bin, or on PATH; alternatively set LIGHTAGENT_BIN before starting the gateway.",
+                    executable.display()
                 );
                 inner.error = Some(message.clone());
                 return failure(StatusCode::SERVICE_UNAVAILABLE, &message);
@@ -273,6 +301,48 @@ async fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_override_and_bundled_binary_take_priority() {
+        let override_path = PathBuf::from("custom-agent");
+        assert_eq!(
+            select_binary(Some(override_path.clone()), None, None, |_| false),
+            override_path
+        );
+        let name = if cfg!(windows) {
+            "lightagent.exe"
+        } else {
+            "lightagent"
+        };
+        assert_eq!(
+            select_binary(
+                None,
+                Some(PathBuf::from("bundle/bin/hermes")),
+                Some(PathBuf::from("home")),
+                |_| true
+            ),
+            PathBuf::from("bundle/bin").join(name)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_finds_the_user_install_without_a_shell_path() {
+        let installed = PathBuf::from("home/.local/bin/lightagent");
+        assert_eq!(
+            select_binary(
+                None,
+                Some(PathBuf::from("bundle/bin/hermes")),
+                Some(PathBuf::from("home")),
+                |path| path == installed
+            ),
+            installed
+        );
+        assert_eq!(
+            select_binary(None, None, Some(PathBuf::from("home")), |_| false),
+            PathBuf::from("lightagent")
+        );
+    }
 
     #[test]
     fn only_local_http_origins_can_launch_a_process() {

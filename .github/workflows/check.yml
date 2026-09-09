@@ -92,7 +92,7 @@ jobs:
       # real machines is worth more than one that quotes four assertions, and
       # this is where those numbers come from.
       - name: What this machine reports
-        run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
+        run: cargo run -q -p lightweight-cli --bin lightweight -- sysinfo
 
       # The Lightagent welcome mark, rendered on a real (stronger) runner and
       # through a non-TTY pipe, proving the preview path is TTY-independent.

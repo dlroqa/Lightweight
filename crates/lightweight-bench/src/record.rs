@@ -182,7 +182,7 @@ impl Scenario {
     /// The scenarios a default run measures.
     ///
     /// [`Scenario::ConcurrentDecode`] is deliberately absent: adding it here
-    /// would change what every existing `hermes bench` invocation produces,
+    /// would change what every existing `lightweight bench` invocation produces,
     /// and it has nothing to say about an engine with one slot.
     pub const ALL: [Self; 3] = [Self::ColdPrefill, Self::CachedPrefill, Self::Decode];
 

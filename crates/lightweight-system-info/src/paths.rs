@@ -195,7 +195,7 @@ impl DataPaths {
         self.data.join("catalog.json")
     }
 
-    /// Fitted memory coefficients, written by `hermes bench --fit`.
+    /// Fitted memory coefficients, written by `lightweight bench --fit`.
     ///
     /// Beside the catalog rather than in `benchmarks_dir`: a benchmark run is a
     /// record of one measurement and there are many of them, while this is the

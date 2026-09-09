@@ -6,8 +6,8 @@ drives a running inference gateway. It is a **separate product surface** from th
 archive script and its own systemd unit, none of which touch the gateway's
 packaging.
 
-Everything here is additive. No existing crate, workflow, or gateway packaging
-file is changed by shipping Lightagent this way.
+Desktop installers also bundle the Lightagent executable beside the gateway,
+so Settings can start the agent API without a separate CLI installation.
 
 ## The binary archive
 
@@ -41,6 +41,19 @@ lightagent doctor               # confirms the home, the profile and the gateway
 `~/.local/bin` on the `PATH` is all that is needed; nothing is installed
 system-wide and nothing is code-signed. Verify the download against `SHA256SUMS`
 from the same release.
+
+## Using the terminal harness
+
+Run `lightagent` from any directory to open interactive chat, or use
+`lightagent chat --profile <id>` to select a profile. `/help` shows the chat
+commands, `/tools` lists tools, and `/exit` closes the session. Tool calls that
+require approval prompt in the terminal; conversations are saved under the
+active profile in `~/.lightagent`.
+
+Terminal chat calls the inference gateway directly. It does not require the
+desktop app or a running `lightagent serve` process. A gateway with a loaded
+model must still be available at `inference.base_url`. Configure the origin
+without `/v1`, since the CLI appends that path itself.
 
 ## Running the API as a service (Linux)
 

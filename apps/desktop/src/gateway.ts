@@ -15,7 +15,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-/** The port `hermes serve` uses when nothing says otherwise. */
+/** The port `lightweight serve` uses when nothing says otherwise. */
 export const DEFAULT_PORT = 11434;
 
 /** How long a probe waits before deciding nothing is there. */
@@ -90,14 +90,14 @@ export interface BinarySearch {
 }
 
 /**
- * Where the `hermes` binary might be, in the order it should be looked for.
+ * Where the `lightweight` binary might be, in the order it should be looked for.
  *
  * Ordered so a developer's build wins over a stale packaged copy, and an
  * explicit override wins over both — the last thing anyone debugging this wants
  * is to be silently running a different binary than the one they just built.
  */
 export function candidatePaths(search: BinarySearch): string[] {
-  const executable = process.platform === "win32" ? "hermes.exe" : "hermes";
+  const executable = process.platform === "win32" ? "lightweight.exe" : "lightweight";
   const candidates: string[] = [];
 
   if (search.override) candidates.push(search.override);
@@ -126,9 +126,9 @@ export function resolveBinary(
   const found = candidates.find(exists);
   if (found) return found;
   throw new Error(
-    `The hermes binary could not be found. Looked in:\n${candidates
+    `The lightweight binary could not be found. Looked in:\n${candidates
       .map((path) => `  ${path}`)
-      .join("\n")}\nBuild it with \`cargo build --release\`, or set HERMES_BIN.`,
+      .join("\n")}\nBuild it with \`cargo build --release\`, or set LIGHTWEIGHT_BIN.`,
   );
 }
 
@@ -181,7 +181,7 @@ export function planLaunch(options: LaunchOptions): Launch {
   // its own keys, hashed, and a key shared with a remote agent must survive a
   // restart of this shell — a fresh `randomBytes` every launch is exactly the
   // bug that broke. An exposed bind now needs a key created first (in the panel
-  // or with `hermes key create`); the gateway refuses to start otherwise and
+  // or with `lightweight key create`); the gateway refuses to start otherwise and
   // says so, which the panel's bind-config flow steers the user through.
   return { argv, env };
 }
@@ -259,7 +259,7 @@ export class GatewaySupervisor {
    * Attach to a gateway already serving on `port`, or start one.
    *
    * Attaching is preferred, and not only to avoid a second engine on a machine
-   * that can barely hold one: a user who started `hermes serve` in a terminal
+   * that can barely hold one: a user who started `lightweight serve` in a terminal
    * has a gateway with their own flags, their own model and their own bind, and
    * replacing it with the shell's defaults would be the shell overruling them.
    */

@@ -10,7 +10,7 @@ import react from "@vitejs/plugin-react";
  * gateway taken in order to answer a question about where a file is served
  * from.
  *
- * `11434` is the port `hermes serve` uses by default. Set `HERMES_DEV_ORIGIN`
+ * `11434` is the port `lightweight serve` uses by default. Set `HERMES_DEV_ORIGIN`
  * in the environment or a `.env` file when the gateway is elsewhere.
  */
 const PROXIED = ["/api", "/v1", "/health", "/props", "/version", "/metrics"];

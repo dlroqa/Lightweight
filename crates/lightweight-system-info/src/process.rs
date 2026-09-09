@@ -9,7 +9,7 @@
 //! so that is what this adds, and Linux is left exactly as it was.
 //!
 //! Until M10 there was no reading at all off Linux, and the consequences were
-//! quiet rather than loud: `hermes bench --fit` skipped every sample because
+//! quiet rather than loud: `lightweight bench --fit` skipped every sample because
 //! none had a peak, so `calibration.json` could never be written on a Mac or a
 //! Windows machine; the engine RSS gauges reported nothing; and a model swap
 //! credited nothing back.

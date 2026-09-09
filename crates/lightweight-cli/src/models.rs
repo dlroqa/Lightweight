@@ -1,4 +1,4 @@
-//! `hermes models` — the catalog, without a server running.
+//! `lightweight models` — the catalog, without a server running.
 //!
 //! Everything here works against the catalog file directly. That is the point:
 //! "what models does this machine have, and will this one fit?" is a question
@@ -20,12 +20,12 @@ pub fn open(paths: &DataPaths) -> Result<CatalogStore, String> {
     CatalogStore::open(paths.catalog_file()).map_err(crate::serve::describe)
 }
 
-/// `hermes models list`.
+/// `lightweight models list`.
 pub fn list(out: &mut String, store: &CatalogStore) {
     if store.is_empty() {
         let _ = writeln!(
             out,
-            "No models yet.\n\n  hermes models available          what can be downloaded\n  hermes models add <id>           download one\n  hermes models import <file>      register a .gguf you already have"
+            "No models yet.\n\n  lightweight models available          what can be downloaded\n  lightweight models add <id>           download one\n  lightweight models import <file>      register a .gguf you already have"
         );
         return;
     }
@@ -60,7 +60,7 @@ pub fn list(out: &mut String, store: &CatalogStore) {
     }
 }
 
-/// `hermes models available`.
+/// `lightweight models available`.
 pub fn available(out: &mut String, store: &CatalogStore) {
     let _ = writeln!(out, "Models this build is known to run:\n");
     for model in manifest::MODELS {
@@ -77,11 +77,11 @@ pub fn available(out: &mut String, store: &CatalogStore) {
     }
     let _ = writeln!(
         out,
-        "\nAnything else with a direct https link works too:\n  hermes models add --url <link> [--sha256 <digest>]"
+        "\nAnything else with a direct https link works too:\n  lightweight models add --url <link> [--sha256 <digest>]"
     );
 }
 
-/// `hermes models import <path>`.
+/// `lightweight models import <path>`.
 pub async fn import(
     out: &mut String,
     paths: &DataPaths,
@@ -101,7 +101,7 @@ pub async fn import(
     Ok(())
 }
 
-/// `hermes models add <id>` and `hermes models add --url <link>`.
+/// `lightweight models add <id>` and `lightweight models add --url <link>`.
 pub async fn add(
     out: &mut String,
     paths: &DataPaths,
@@ -132,7 +132,7 @@ pub async fn add(
     Ok(())
 }
 
-/// `hermes models remove <id>`.
+/// `lightweight models remove <id>`.
 pub fn remove(
     out: &mut String,
     store: &mut CatalogStore,
@@ -201,7 +201,7 @@ fn describe_added(out: &mut String, model: &InstalledModel) {
     }
     let _ = writeln!(
         out,
-        "\nWhat it costs to load here:\n  hermes estimate {} --ctx 4096",
+        "\nWhat it costs to load here:\n  lightweight estimate {} --ctx 4096",
         model.path.display()
     );
 }
@@ -262,7 +262,7 @@ pub fn add_request(
         }),
         (Some(_), Some(_)) => Err("give either a pinned id or --url, not both".to_owned()),
         (None, None) => Err(
-            "name a pinned model or pass --url. `hermes models available` lists the pinned ones."
+            "name a pinned model or pass --url. `lightweight models available` lists the pinned ones."
                 .to_owned(),
         ),
     }
@@ -291,8 +291,8 @@ mod tests {
     fn an_empty_catalog_says_what_to_do_next_rather_than_nothing() {
         let mut out = String::new();
         list(&mut out, &CatalogStore::in_memory());
-        assert!(out.contains("hermes models available"));
-        assert!(out.contains("hermes models import"));
+        assert!(out.contains("lightweight models available"));
+        assert!(out.contains("lightweight models import"));
     }
 
     #[test]

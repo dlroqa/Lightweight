@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The bare `hermes` binary, as an archive.
+# The bare `lightweight` binary, as an archive.
 #
 # The desktop installers carry a copy of this binary too, but buried inside an
 # application bundle. The service wrappers in `packaging/` install a binary at
-# `~/.local/bin/hermes`, and that is what this archive is for: `hermes serve`
+# `~/.local/bin/lightweight`, and that is what this archive is for: `lightweight serve`
 # in a terminal or under systemd, launchd or Task Scheduler, with no Electron
 # and no window.
 #
@@ -27,28 +27,21 @@ case "$TRIPLE" in
 esac
 
 # A host build lands in `target/release`; a cross build lands under the triple.
-BINARY="target/$TRIPLE/release/hermes$EXE"
-[ -f "$BINARY" ] || BINARY="target/release/hermes$EXE"
+BINARY="target/$TRIPLE/release/lightweight$EXE"
+[ -f "$BINARY" ] || BINARY="target/release/lightweight$EXE"
 [ -f "$BINARY" ] || {
-  echo "no binary at target/$TRIPLE/release/hermes$EXE or target/release/hermes$EXE" >&2
+  echo "no binary at target/$TRIPLE/release/lightweight$EXE or target/release/lightweight$EXE" >&2
   echo "build it first: cargo build --release -p lightweight-cli" >&2
   exit 1
 }
 
-NAME="hermes-$VERSION-$TRIPLE"
+NAME="lightweight-$VERSION-$TRIPLE"
 OUT="dist-cli"
 STAGE="$OUT/$NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
-cp "$BINARY" "$STAGE/hermes$EXE"
-
-# The same program under its second name. `lightweight` prints a welcome mark
-# and is otherwise identical to `hermes`; shipping both means a user can reach
-# for either. It sits beside the release binary, cross build or host build.
-LIGHT="target/$TRIPLE/release/lightweight$EXE"
-[ -f "$LIGHT" ] || LIGHT="target/release/lightweight$EXE"
-[ -f "$LIGHT" ] && cp "$LIGHT" "$STAGE/lightweight$EXE"
+cp "$BINARY" "$STAGE/lightweight$EXE"
 
 cp LICENSE "$STAGE/LICENSE"
 
@@ -57,12 +50,12 @@ cp LICENSE "$STAGE/LICENSE"
 ENGINE_BUILD="$(sed -n 's/.*PINNED_BUILD: &str = "\([^"]*\)".*/\1/p' \
   crates/lightweight-backend-llamacpp/src/manifest.rs | head -1)"
 cat > "$STAGE/README.md" <<EOF
-# Hermes $VERSION — $TRIPLE
+# Lightweight $VERSION — $TRIPLE
 
-A local CPU inference gateway. Run \`./hermes serve --help\` to start.
-(\`./lightweight\` is the same tool with a welcome banner.)
+A local CPU inference gateway. Run \`./lightweight serve --help\` to start.
+The agent harness is a separate executable, \`lightagent\`.
 
-- **The inference engine is not in this archive.** Hermes downloads the pinned
+- **The inference engine is not in this archive.** Lightweight downloads the pinned
   llama.cpp build (\`$ENGINE_BUILD\`) for this platform on first use, verifies it
   against a SHA-256 recorded in the source, and keeps it in its own cache
   directory. Nothing is compiled on your machine.
@@ -70,7 +63,7 @@ A local CPU inference gateway. Run \`./hermes serve --help\` to start.
   from the same release.
 - To run it as a service on Linux, there is a systemd unit example in
   \`packaging/systemd/\` in the repository. On macOS and Windows, run
-  \`./hermes serve\` from a terminal — no launchd or Task Scheduler example is
+  \`./lightweight serve\` from a terminal — no launchd or Task Scheduler example is
   shipped, because none has been tested.
 EOF
 

@@ -933,7 +933,7 @@ pub async fn describe_gateway(state: &GatewayState) -> GatewayReport {
 ///
 /// Reading it here rather than caching it: it is written by a benchmark that
 /// may finish at any time, and a cached count would tell somebody who just ran
-/// `hermes bench --fit` that nothing had happened. It is a small file read on
+/// `lightweight bench --fit` that nothing had happened. It is a small file read on
 /// an endpoint a panel polls slowly, which is the trade M6b.1 already made for
 /// the disk probe.
 fn describe_calibration(state: &GatewayState) -> CalibrationReport {
@@ -1331,7 +1331,7 @@ pub struct BenchmarkBody {
 /// that is exactly what it is.
 ///
 /// Varying the parameters means reloading the engine, which takes minutes and
-/// would interrupt whoever is being served. That is `hermes bench`, which
+/// would interrupt whoever is being served. That is `lightweight bench`, which
 /// brings its own engine.
 pub async fn run_benchmark(
     State(state): State<Arc<GatewayState>>,

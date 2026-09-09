@@ -1,5 +1,5 @@
 // Exercise Settings against real processes in isolated homes. Build the panel,
-// `hermes`, and `lightagent` first, then run `npm run agent-server` here.
+// `lightweight`, and `lightagent` first, then run `npm run agent-server` here.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const gatewayBinary = resolve(process.env.GATEWAY_BIN ?? join(root, "target/debug/hermes"));
+const gatewayBinary = resolve(process.env.GATEWAY_BIN ?? join(root, "target/debug/lightweight"));
 const agentBinary = resolve(process.env.LIGHTAGENT_BIN ?? join(root, "target/debug/lightagent"));
 const home = await mkdtemp(join(tmpdir(), "lightagent-settings-"));
 const env = { ...process.env, HERMES_GATEWAY_HOME: join(home, "gateway"),

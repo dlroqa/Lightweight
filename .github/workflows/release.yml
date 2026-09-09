@@ -70,7 +70,7 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
 
-      - run: cargo build --release -p lightweight-cli --target ${{ matrix.triple }}
+      - run: cargo build --release -p lightweight-cli -p lightagent --target ${{ matrix.triple }}
       - run: npm run build --prefix frontend
 
       - name: The CLI archive
@@ -209,7 +209,7 @@ jobs:
       # between them the two branches of the staging script's binary resolution
       # - `target/<triple>/release` and `target/release` - are both exercised by
       # every release, rather than one of them being discovered by a release.
-      - run: cargo build --release -p lightweight-cli
+      - run: cargo build --release -p lightweight-cli -p lightagent
       - run: npm run build --prefix frontend
       - run: npm --prefix apps/desktop run package -- --linux flatpak
 
@@ -266,7 +266,7 @@ jobs:
           mount="$(mktemp -d)"
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
           app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
-          binary="$app/Contents/Resources/bin/hermes"
+          binary="$app/Contents/Resources/bin/lightweight"
           lipo -info "$binary"
           # The real assertion: this is an Intel machine, and the binary from
           # the universal DMG runs on it.
@@ -399,7 +399,7 @@ jobs:
             echo "| Windows x86-64 | \`Lightweight-Setup-*.exe\` |"
             echo "| Linux x86-64 (sandboxed) | \`Lightweight-*.flatpak\` |"
             echo "| Linux x86-64 (portable) | \`Lightweight-*.AppImage\` |"
-            echo "| Command line only | \`hermes-*-<target-triple>.tar.gz\` / \`.zip\` |"
+            echo "| Command line only | \`lightweight-*-<target-triple>.tar.gz\` / \`.zip\` |"
             echo
             echo "Two Linux builds, because the difference is real: the Flatpak"
             echo "keeps its Chromium sandbox on a host that does not allow"
@@ -424,7 +424,7 @@ jobs:
             echo "platform and checks it against a SHA-256 recorded in the source."
             echo
             echo "Calibration is intentionally deferred for pinned llama.cpp b10590:"
-            echo "\`hermes bench --fit\` safely refuses every honest fit, so the"
+            echo "\`lightweight bench --fit\` safely refuses every honest fit, so the"
             echo "shipped estimates remain conservative by 1.37×–2.85×."
             echo
             echo '```'

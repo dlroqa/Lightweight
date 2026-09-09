@@ -273,7 +273,7 @@ impl GatewayState {
     /// One definition, because a benchmark taken through this gateway and a fit
     /// looked up by it have to agree about what "the same engine" means. The
     /// build is stated by the backend rather than guessed here, which is what
-    /// makes a run taken by `hermes bench` comparable with one taken through
+    /// makes a run taken by `lightweight bench` comparable with one taken through
     /// the API.
     pub fn engine_fingerprint(&self) -> lightweight_bench::EngineFingerprint {
         lightweight_bench::engine_fingerprint(self.backend.as_ref())

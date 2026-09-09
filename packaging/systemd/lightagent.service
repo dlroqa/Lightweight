@@ -4,7 +4,7 @@
 # Lightagent is the agent harness: `lightagent serve` exposes its HTTP + SSE API
 # (runs, sessions, tools, approvals) and, given --web-root, the WebUI panel. It
 # talks to a running inference gateway over HTTP — start that separately (see
-# hermes-gateway.service beside this file), and point Lightagent at it with
+# lightweight-inference-gateway.service beside this file), and point Lightagent at it with
 # `lightagent config set inference.base_url ...`.
 #
 # Every value lives in the environment file below, outside this repository,

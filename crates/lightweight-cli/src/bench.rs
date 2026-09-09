@@ -1,4 +1,4 @@
-//! `hermes bench` — measure what this machine does with a model.
+//! `lightweight bench` — measure what this machine does with a model.
 //!
 //! It brings its own engine. A sweep reloads between buckets, which takes
 //! minutes and holds a model resident the whole time, and doing that to a

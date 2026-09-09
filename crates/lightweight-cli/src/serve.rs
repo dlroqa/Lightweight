@@ -365,7 +365,9 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
             .await?,
         ),
         None => {
-            println!("no model loaded — use `hermes models list` and the control API to load one");
+            println!(
+                "no model loaded — use `lightweight models list` and the control API to load one"
+            );
             None
         }
     };
@@ -637,7 +639,7 @@ struct LoadShape {
     cache_type: GgmlType,
     concurrency: u32,
     cpu: CpuInfo,
-    /// Where `hermes bench --fit` writes this machine's coefficients.
+    /// Where `lightweight bench --fit` writes this machine's coefficients.
     ///
     /// Carried here rather than rediscovered, so that a `--data-dir` override
     /// reaches the estimate as well as everything else this process writes.
@@ -928,7 +930,7 @@ fn build_manager(
 
 /// Render an error with its remedies, the way every command reports one.
 ///
-/// `pub(crate)` so `hermes models` reports catalog errors identically; the
+/// `pub(crate)` so `lightweight models` reports catalog errors identically; the
 /// body is unchanged.
 pub(crate) fn describe<E: Actionable>(err: E) -> String {
     let mut out = err.to_string();
@@ -962,7 +964,7 @@ fn effective_hosts(options: &ServeOptions, config: &lightweight_store::ApiConfig
 /// Each value may be a literal address in either family, or a name. Accepting
 /// names is what keeps addresses out of configuration files and out of this
 /// repository: a machine's overlay address can be reissued, but its name
-/// usually cannot, and `hermes serve --host "$(hostname)"` works on a LAN, on a
+/// usually cannot, and `lightweight serve --host "$(hostname)"` works on a LAN, on a
 /// mesh network, and on a laptop that moves between them.
 ///
 /// A name that resolves to several addresses yields several binds — which is
@@ -1294,7 +1296,7 @@ fn finalize_auth(
 fn behind_proxy_without_key() -> String {
     let mut message = String::from(
         "--behind-proxy publishes this gateway through a proxy, so an API key is required.\n\n  \
-         Mint one for a tenant:\n\n    hermes key create --name <label>\n",
+         Mint one for a tenant:\n\n    lightweight key create --name <label>\n",
     );
     if let Ok(suggestion) = lightweight_gateway::auth::generate_key() {
         message.push_str(&format!(
@@ -1649,7 +1651,7 @@ mod tests {
         let err = finalize_auth(&loopback, None, Vec::new(), true)
             .expect_err("a proxied bind with no key must be refused");
         assert!(err.contains("--behind-proxy"), "{err}");
-        assert!(err.contains("hermes key create"), "{err}");
+        assert!(err.contains("lightweight key create"), "{err}");
     }
 
     #[test]

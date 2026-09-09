@@ -4,7 +4,7 @@
 # --workspace` — including the socket-level proxy test in
 # `crates/lightweight-gateway/tests/agent_proxy_surface.rs`. This workflow is
 # the tier above that: it boots the *two real servers* the product runs — the
-# agent API (`lightagent serve`) and the gateway that proxies it (`hermes
+# agent API (`lightagent serve`) and the gateway that proxies it (`lightweight
 # serve --web-root`) — loads the built panel in a real headless browser, and
 # asserts the agent screens render their data instead of the `<!doctype …>`
 # fallback that a missing proxy served. It lives in its own workflow, not as a

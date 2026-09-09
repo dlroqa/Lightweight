@@ -93,7 +93,7 @@ pub const MIN_R_SQUARED: f64 = 0.95;
 /// Why a fit was not used.
 ///
 /// Returned rather than logged and swallowed, because every one of these is
-/// something a person running `hermes bench` would want to be told.
+/// something a person running `lightweight bench` would want to be told.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Untrusted {
     /// No fit for this machine, this engine build and this bucket.
@@ -151,7 +151,7 @@ impl Untrusted {
             ),
             Self::NoGoodnessOfFit => {
                 "the fit was recorded before goodness of fit was, so it cannot be judged; \
-                 re-run `hermes bench --fit`"
+                 re-run `lightweight bench --fit`"
                     .to_owned()
             }
             Self::NegativeTerm => {
@@ -301,7 +301,7 @@ pub fn apply(
 
 /// The fingerprint of the engine a backend is driving.
 ///
-/// One definition for the three places that need one - `hermes bench`, the
+/// One definition for the three places that need one - `lightweight bench`, the
 /// gateway's benchmark endpoint and the load path's calibration lookup -
 /// because a fit is looked up by exactly the key a run was recorded with, and
 /// two spellings of "the same engine" would mean a machine could never find its

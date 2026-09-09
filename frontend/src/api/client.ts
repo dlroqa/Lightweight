@@ -91,7 +91,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       0,
       "gateway_unreachable",
       "The gateway is not responding. Is it still running?",
-      [{ label: "Check that `hermes serve` is running, then try again." }],
+      [{ label: "Check that `lightweight serve` is running, then try again." }],
     );
   }
 

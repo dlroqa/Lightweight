@@ -207,7 +207,7 @@ function updateTray(state: GatewayState): void {
     {
       // The shell no longer holds a key to copy: keys are the gateway's own,
       // hashed, and are created and shown once in the panel (or with
-      // `hermes key create`). The tray points there rather than pretending to
+      // `lightweight key create`). The tray points there rather than pretending to
       // have a credential it deliberately never sees.
       label: "Manage API keys\u2026",
       click: () => {
@@ -250,7 +250,7 @@ async function start(): Promise<void> {
   let binary: string;
   try {
     binary = resolveBinary({
-      override: process.env.HERMES_BIN,
+      override: process.env.LIGHTWEIGHT_BIN,
       resourcesPath: process.resourcesPath,
       repoRoot: repoRoot(),
     });

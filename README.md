@@ -1,4 +1,4 @@
-# Hermes CPU Inference Gateway
+# Lightweight CPU Inference Gateway
 
 A local, **CPU and RAM only** LLM inference platform: an OpenAI-compatible
 gateway, GGUF model management, and a desktop UI. No GPU is required anywhere,
@@ -29,7 +29,7 @@ Every artifact is built and then *run* on the platform it is for, by
 | Windows x86-64 | `Lightweight-Setup-*.exe` |
 | Linux x86-64, sandboxed | `Lightweight-*.flatpak` |
 | Linux x86-64, portable | `Lightweight-*.AppImage` |
-| Command line only | `hermes-*-<target-triple>.tar.gz` / `.zip` |
+| Inference gateway CLI | `lightweight-*-<target-triple>.tar.gz` / `.zip` |
 
 Two facts worth knowing before the first launch:
 
@@ -45,6 +45,41 @@ Two facts worth knowing before the first launch:
 Of the two Linux builds, prefer the Flatpak: it keeps its Chromium sandbox on a
 host that does not allow unprivileged user namespaces, where the AppImage
 refuses to start rather than run unsandboxed.
+
+## Lightagent terminal harness
+
+Lightagent also runs directly in a terminal. Launch `lightagent` (or
+`lightagent chat`) for interactive chat with tools, approvals, profiles, and
+saved sessions. The desktop app and `lightagent serve` are optional; terminal
+chat connects directly to the configured inference gateway.
+
+To install the current source build on Linux or macOS:
+
+```sh
+cargo build -p lightagent --bin lightagent
+mkdir -p ~/.local/bin
+install -m755 target/debug/lightagent ~/.local/bin/lightagent
+# If ~/.local/bin is not already on PATH, add it in your shell configuration:
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For a new installation, initialize the agent once, then launch it:
+
+```sh
+lightagent init --base-url http://127.0.0.1:11434
+lightagent doctor
+lightagent
+```
+
+Keep an inference gateway running with a model loaded. Use the gateway's origin
+as the base URL, without `/v1`; Lightagent adds the API path itself. For an
+existing installation, `lightagent config set inference.base_url <origin>`
+changes the endpoint without reinitializing profiles. In chat, `/help` lists
+commands, `/tools` lists available tools, and `/exit` leaves the harness.
+
+The terminal and API share `~/.lightagent` by default. Set `LIGHTAGENT_HOME` to
+use a separate home. For release archives and platform installation details,
+see [Packaging Lightagent](packaging/lightagent/README.md).
 
 ## Status
 
@@ -81,7 +116,7 @@ and settings in the two directories M0 chose for them. On those seams sits a
 itself, so the panel and the API are the same origin and no CORS layer exists
 anywhere. A browser on another machine reaches it over the exposed bind for
 free. The panel's agent screens talk to a separate agent server
-(`lightagent serve`); `hermes serve --agent-upstream <origin>` reverse-proxies
+(`lightagent serve`); `lightweight serve --agent-upstream <origin>` reverse-proxies
 `/api/lightagent/*` to it (default `http://127.0.0.1:8735`, `off` to disable), so
 those screens stay same-origin too.
 
@@ -89,7 +124,8 @@ If Agent Tools cannot connect, open **Settings → Lightagent server → Start
 server**. Settings shows startup progress and any error returned by the agent
 (run `lightagent init` once first for a new installation). The gateway can start
 an agent at a configured `http://127.0.0.1:<port>` or `http://localhost:<port>`
-origin. It looks for `lightagent` beside its own executable, then on `PATH`;
+origin. Desktop packages include both binaries. The gateway looks for `lightagent`
+beside its own executable, then in `~/.local/bin` on Linux/macOS, then on `PATH`;
 set `LIGHTAGENT_BIN` before starting the gateway to use a different binary.
 The child inherits the gateway's environment, including `LIGHTAGENT_HOME`, and
 stops when the gateway shuts down. An agent already running is left alone.
@@ -103,7 +139,7 @@ with the agent proxy enabled.
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, and keeps serving
 after its window is closed. Keys are the gateway's own — hashed on disk, created
-in the panel or with `hermes key create`, and shown once — so a key shared with a
+in the panel or with `lightweight key create`, and shown once — so a key shared with a
 remote agent survives a restart of the shell.
 `npm run package` builds this platform's installers — a Flatpak and an AppImage
 on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
@@ -120,7 +156,7 @@ set, because the weights are mmapped and the kernel already counts them. And the
 panel offers a context and a KV cache type per load, priced by the gateway before
 the button is pressed.
 
-And it can now be **measured rather than described**. `hermes bench` brings its
+And it can now be **measured rather than described**. `lightweight bench` brings its
 own engine, sizes its prompts by asking the tokenizer, and records what this
 machine did with a model — prefill, decode, what prefix reuse saves, cores
 actually kept busy, peak memory against what was predicted — beside a
@@ -242,12 +278,12 @@ cargo run -p lightweight-cli -- serve
 ### Benchmarks
 
 ```sh
-hermes bench model.gguf                          # its own engine, then gone
-hermes bench model.gguf --ubatch 128,512 --fit   # a sweep, and a calibration fit
+lightweight bench model.gguf                          # its own engine, then gone
+lightweight bench model.gguf --ubatch 128,512 --fit   # a sweep, and a calibration fit
 curl -X POST "$BASE/api/v1/benchmarks"           # measure what is already loaded
 ```
 
-`hermes bench` never disturbs a running gateway: it starts its own engine,
+`lightweight bench` never disturbs a running gateway: it starts its own engine,
 reloads between buckets — `VmHWM` is a high-water mark for the life of a
 process, so a second bucket in the same engine would inherit the first one's
 peak — and shuts down after. The gateway's own benchmark is the smaller one, and
@@ -274,12 +310,12 @@ that makes it. See [benchmarks/](benchmarks/).
 ### Models
 
 ```sh
-hermes models list                    # what this machine has
-hermes models available               # the pinned models, with sizes
-hermes models add qwen3-1.7b-q4_k_m   # download one, digest checked
-hermes models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
-hermes models import ~/models/mine.gguf   # referenced where it is, not copied
-hermes models remove <id> [--delete]
+lightweight models list                    # what this machine has
+lightweight models available               # the pinned models, with sizes
+lightweight models add qwen3-1.7b-q4_k_m   # download one, digest checked
+lightweight models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
+lightweight models import ~/models/mine.gguf   # referenced where it is, not copied
+lightweight models remove <id> [--delete]
 ```
 
 A HuggingFace link is verified against the sha256 the site publishes for the
@@ -330,7 +366,7 @@ busy — a second slot takes a core rather than finding one. **Memory**: at that
 many slots a full-sized window for every client must still fit, and a machine
 that cannot hold them serves fewer clients well rather than more badly. On the
 development box that is one slot, which is what the flag has always defaulted
-to; on a sixteen-core machine it is four. `hermes serve` prints which rule
+to; on a sixteen-core machine it is four. `lightweight serve` prints which rule
 decided, and a number overrides both.
 
 The slot count follows the *engine*, not the command line: it is re-derived on
@@ -491,19 +527,19 @@ Headscale, Netmaker, ZeroTier, Nebula and a hand-rolled WireGuard are all the
 same case:
 
 ```sh
-hermes key create --name my-agent          # printed once; stored hashed
-hermes serve model.gguf --host <address-or-name>
+lightweight key create --name my-agent          # printed once; stored hashed
+lightweight serve model.gguf --host <address-or-name>
 
 # A machine holding several addresses can serve on each of them, with one
 # engine and one queue behind them all:
-hermes serve model.gguf --host <lan-name> --host <mesh-name>
+lightweight serve model.gguf --host <lan-name> --host <mesh-name>
 ```
 
 A remote agent then authenticates with the key it was given:
 
 ```sh
 export OPENAI_BASE_URL=http://<address-or-name>:11434/v1
-export OPENAI_API_KEY=sk-lw-…               # the key hermes key create printed
+export OPENAI_API_KEY=sk-lw-…               # the key lightweight key create printed
 ```
 
 `--host` takes an address in either family or a **name**, resolved at startup.
@@ -512,13 +548,13 @@ survives it. The default port is **11434** — the common local-LLM port — so 
 client that assumes it finds the gateway without being told.
 
 Because 11434 is also Ollama's default, a machine already running Ollama holds
-it, and `hermes serve` then fails with `address in use` rather than moving the
+it, and `lightweight serve` then fails with `address in use` rather than moving the
 port on its own — a remote agent's URL must not shift underneath it. The failure
 names the likely culprit and offers the fix. When you do want any free port, ask
 for one explicitly:
 
 ```sh
-hermes serve model.gguf --port auto        # or --port 0; the chosen port is printed
+lightweight serve model.gguf --port auto        # or --port 0; the chosen port is printed
 ```
 
 `--port auto` reports the kernel-assigned port on the startup line and in the
@@ -544,8 +580,8 @@ machine-local. The header is trusted only from a loopback peer, so it cannot be
 spoofed from off the machine.
 
 ```sh
-hermes key create --name my-agent            # printed once
-hermes serve model.gguf --behind-proxy       # still on 127.0.0.1:11434, now key-required
+lightweight key create --name my-agent            # printed once
+lightweight serve model.gguf --behind-proxy       # still on 127.0.0.1:11434, now key-required
 
 cloudflared tunnel login                     # pick your Cloudflare zone
 cloudflared tunnel create lightweight
@@ -566,13 +602,13 @@ drops a request whose first byte takes longer than ~100 s, so for a cold load or
 a long generation prefer `stream: true` — the gateway keeps the connection alive
 with SSE keep-alives while it works.
 
-### Several models, isolated per tenant (`hermes fleet`)
+### Several models, isolated per tenant (`lightweight fleet`)
 
 The engine is single-resident by design, so serving several models — and keeping
 one tenant's traffic from evicting another's — means **one gateway per model**,
 each with its own data root (`HERMES_GATEWAY_HOME`) and therefore its own keys,
-rate limits and catalog. `hermes fleet` reads a manifest, caps it at **four
-models**, and launches each as its own `hermes serve … --behind-proxy`:
+rate limits and catalog. `lightweight fleet` reads a manifest, caps it at **four
+models**, and launches each as its own `lightweight serve … --behind-proxy`:
 
 ```json
 // ~/.config/CpuInferenceGateway/fleet.json  (or pass --config <path>)
@@ -585,9 +621,9 @@ models**, and launches each as its own `hermes serve … --behind-proxy`:
 ```
 
 ```sh
-HERMES_GATEWAY_HOME=/srv/lw/qwen  hermes key create --name tenant-a   # per-profile keys
-HERMES_GATEWAY_HOME=/srv/lw/llama hermes key create --name tenant-b
-hermes fleet                                                          # launches both; Ctrl-C stops all
+HERMES_GATEWAY_HOME=/srv/lw/qwen  lightweight key create --name tenant-a   # per-profile keys
+HERMES_GATEWAY_HOME=/srv/lw/llama lightweight key create --name tenant-b
+lightweight fleet                                                          # launches both; Ctrl-C stops all
 ```
 
 Point one tunnel `ingress` rule at each model's port (`qwen.api.example.com` →
@@ -604,7 +640,7 @@ its own service unit instead.
 Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,
 or wherever `HERMES_GATEWAY_HOME` points), both owner-only:
 
-* **`api.json`** — the bind hosts and port. Written by `hermes config` or by the
+* **`api.json`** — the bind hosts and port. Written by `lightweight config` or by the
   panel's *Serve on* control, and read beneath the command-line flags: a typed
   `--host`/`--port` always wins, and the file speaks only when one was not given.
 * **`api-keys.json`** — the API keys, stored as SHA-256 hashes and a display
@@ -613,10 +649,10 @@ or wherever `HERMES_GATEWAY_HOME` points), both owner-only:
   work as a single static key alongside the named ones.
 
 ```sh
-hermes key create --name ci --per-minute 60 --per-day 2000
-hermes key list                # names, prefixes and limits — never the secret
-hermes key revoke <id>
-hermes config show             # what api.json currently holds
+lightweight key create --name ci --per-minute 60 --per-day 2000
+lightweight key list                # names, prefixes and limits — never the secret
+lightweight key revoke <id>
+lightweight config show             # what api.json currently holds
 ```
 
 Per-key limits are enforced live: a key over its ceiling gets a `429` with a
@@ -631,20 +667,21 @@ click rather than a reading of `ip addr`. Creating and revoking keys, and
 widening the bind set, are refused from a remote session: those take access to
 the machine itself.
 
-Every command above is also available as `lightweight` — the same tool, which
-prints a small feather on an interactive terminal to confirm you are in.
-`hermes` is unchanged.
+The gateway command is `lightweight`; the agent harness command is `lightagent`.
+This project does not build or ship a `hermes` executable, keeping Hermes Agent
+independent. Desktop launchers use `LIGHTWEIGHT_BIN` for an explicit gateway
+binary override. Existing gateway data paths and configuration keys are retained.
 
 Ask the machine what it can be reached at rather than guessing:
 
 ```sh
-hermes sysinfo            # the Network section lists every bindable address
-hermes sysinfo --json     # same, under "reachable_addresses", for scripts
+lightweight sysinfo            # the Network section lists every bindable address
+lightweight sysinfo --json     # same, under "reachable_addresses", for scripts
 ```
 
 ### The one that catches everyone
 
-`hermes serve --host "$(hostname)"` is the obvious way to ask for remote access,
+`lightweight serve --host "$(hostname)"` is the obvious way to ask for remote access,
 and on most Linux installs it serves **nobody**. Debian and Ubuntu write
 `127.0.1.1 <hostname>` into `/etc/hosts` at install time, and that entry beats
 whatever a LAN or an overlay network publishes for the same name. Every signal
@@ -665,7 +702,7 @@ warning: --host "hermes" resolved only to 127.0.1.1, which is loopback.
     --host 192.0.2.10
     --host 198.51.100.4
 
-  Bind one of those, or a name that resolves to one, and create a key with `hermes key create`.
+  Bind one of those, or a name that resolves to one, and create a key with `lightweight key create`.
 ```
 
 It warns rather than refuses: a name that resolves to loopback is unusual but
@@ -678,7 +715,7 @@ A second trap sits next to it, and no software can detect this one for you: the
 name your **overlay network** knows a machine by is not necessarily its local
 hostname. If the name was already taken in the network, the machine will have
 been given another — a host whose `hostname` is `hermes` can be `hermes-1` on
-the mesh, with `hermes` belonging to somebody else entirely. `hermes sysinfo`
+the mesh, with `hermes` belonging to somebody else entirely. `lightweight sysinfo`
 reports addresses, which are unambiguous; check the name against the network's
 own listing before trusting it.
 
@@ -728,14 +765,14 @@ minimum 64,000 required by … Choose a model with at least 64K context.
 
 That is a client policy, not a fault in either side. Serving such a client
 means loading a model at 64K, and the KV cache for that is measured in
-gigabytes — `hermes estimate model.gguf --ctx 65536` says whether this machine
+gigabytes — `lightweight estimate model.gguf --ctx 65536` says whether this machine
 can, before anything is loaded. On a machine that cannot, the honest options
 are a client with a lower floor or more memory; advertising a window the
 gateway is not serving would trade a clear refusal for silent truncation.
 
 ### Keeping it running
 
-`hermes serve` in the foreground needs nothing from any platform and is the
+`lightweight serve` in the foreground needs nothing from any platform and is the
 portable answer. For a machine that should serve after logout,
 `packaging/systemd/` holds a Linux `systemd --user` example whose every value —
 model, addresses, key — comes from a file outside the repository. M10 shipped the

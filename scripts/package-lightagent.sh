@@ -62,7 +62,7 @@ A local agent harness with live tools. Run \`./lightagent --help\`, then
 \`./lightagent init\` to set up its isolated home, and \`./lightagent chat\`.
 
 - **Lightagent needs a running inference gateway.** It talks to an
-  OpenAI-compatible gateway (such as \`hermes serve\`) over HTTP; it does not hold
+  OpenAI-compatible gateway (such as \`lightweight serve\`) over HTTP; it does not hold
   a model itself. Point it at one with
   \`./lightagent config set inference.base_url http://127.0.0.1:11434\`, then
   check it with \`./lightagent doctor\`.

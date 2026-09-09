@@ -206,7 +206,7 @@ pub struct SystemReport {
 }
 
 /// The reachable addresses, classified. Advisory only — the same list
-/// `hermes sysinfo` prints, and never load-bearing on any gateway decision.
+/// `lightweight sysinfo` prints, and never load-bearing on any gateway decision.
 #[derive(Debug, Serialize)]
 pub struct NetworkReport {
     addresses: Vec<AddressReport>,

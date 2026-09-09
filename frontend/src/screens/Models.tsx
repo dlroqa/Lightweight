@@ -680,7 +680,7 @@ function EstimatePanel({ estimate }: { estimate: Estimate }) {
 /**
  * Why the context on offer is the one on offer.
  *
- * The same three sentences `hermes serve` prints, so the CLI and the panel
+ * The same three sentences `lightweight serve` prints, so the CLI and the panel
  * cannot describe the same decision differently.
  */
 function sourceLabel(
@@ -856,7 +856,7 @@ function AddModel({ onDone }: { onDone: () => void }) {
  *
  * Powers of two around the engine's default of 512. Not derived from the
  * machine, because this one is not a machine limit: it is a throughput and
- * memory trade whose right answer is measured, which is what `hermes bench`
+ * memory trade whose right answer is measured, which is what `lightweight bench`
  * is for.
  */
 const UBATCH_CHOICES = [64, 128, 256, 512, 1024, 2048];

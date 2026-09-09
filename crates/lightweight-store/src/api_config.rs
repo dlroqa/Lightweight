@@ -20,7 +20,7 @@
 //! Hosts are stored as the strings the user typed — a name or a literal — not
 //! as resolved addresses. An overlay network can reissue an address, and a name
 //! usually survives it; resolving at every start rather than freezing an
-//! address into the file is the same choice `hermes serve` already makes.
+//! address into the file is the same choice `lightweight serve` already makes.
 
 use std::path::{Path, PathBuf};
 

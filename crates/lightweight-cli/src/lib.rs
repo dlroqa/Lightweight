@@ -29,31 +29,10 @@ use lightweight_system_info::{
     CpuInfo, MemoryProbe, SystemMemoryProbe, classified_addresses, reachable_addresses,
 };
 
-/// Which name the program was invoked as.
-///
-/// The binary was `hermes` and stays `hermes`, byte for byte — the 0.1.2 rename
-/// kept the command deliberately. `lightweight` is a second, additive entry
-/// point over the very same command tree, distinguished only by a welcome mark
-/// it prints and by the name that appears in its own `--help`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Personality {
-    Hermes,
-    Lightweight,
-}
-
-impl Personality {
-    const fn binary_name(self) -> &'static str {
-        match self {
-            Self::Hermes => "hermes",
-            Self::Lightweight => "lightweight",
-        }
-    }
-}
-
 #[derive(Parser)]
 #[command(
-    name = "hermes",
-    about = "Hermes CPU Inference Gateway",
+    name = "lightweight",
+    about = "Lightweight CPU Inference Gateway",
     version,
     disable_help_subcommand = true
 )]
@@ -294,7 +273,7 @@ enum Command {
     /// Serve several models at once, one isolated gateway per model.
     ///
     /// Reads a JSON manifest listing up to four models — each with its own port,
-    /// data directory and keys — and launches each as a `hermes serve …
+    /// data directory and keys — and launches each as a `lightweight serve …
     /// --behind-proxy` child. One tenant's traffic can never evict or disturb
     /// another's, because each model is its own process. Point a reverse proxy
     /// or Cloudflare Tunnel at the per-model ports to publish them.
@@ -345,7 +324,7 @@ enum ModelsAction {
     Import { path: PathBuf },
     /// Download a model.
     ///
-    /// Either one of the pinned ids from `hermes models available`, whose
+    /// Either one of the pinned ids from `lightweight models available`, whose
     /// digest is recorded in this build, or any direct https link with
     /// `--url`. A HuggingFace link is verified against the digest the site
     /// publishes; any other link is recorded rather than verified unless you
@@ -372,7 +351,7 @@ enum ModelsAction {
     },
 }
 
-/// `hermes models ...`.
+/// `lightweight models ...`.
 ///
 /// The read-only actions need no async runtime; import and add do, because they
 /// hash and download. Built here rather than around every command, the same way
@@ -478,7 +457,7 @@ fn key_command(cli: &Cli, out: &mut String, action: &KeyAction) -> Result<ExitCo
             } else if keys.is_empty() {
                 line!(
                     out,
-                    "No API keys. Create one with `hermes key create --name <label>`."
+                    "No API keys. Create one with `lightweight key create --name <label>`."
                 );
             } else {
                 for record in &keys {
@@ -571,24 +550,13 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|err| format!("could not start the async runtime: {err}"))
 }
 
-/// Appends a formatted line to the output buffer.
-///
-/// Reports are rendered into a `String` and written once, rather than printed a
-/// line at a time. Two reasons: `println!` panics if the reader has closed the
-/// pipe - `hermes sysinfo | head` would crash, because Rust ignores SIGPIPE at
-/// startup and turns it into a write error - and a rendered `String` is
-/// something tests can assert against.
-/// Run the CLI under a given name.
-///
-/// The single entry point both binaries call. `hermes` behaves exactly as it
-/// always has; `lightweight` adds the welcome mark and its own program name in
-/// help, and nothing else.
-pub fn run_cli(personality: Personality) -> ExitCode {
-    let mut command = <Cli as clap::CommandFactory>::command().name(personality.binary_name());
+/// Run the Lightweight CLI. The `hermes` command belongs to Hermes Agent.
+pub fn run_cli() -> ExitCode {
+    let mut command = <Cli as clap::CommandFactory>::command();
 
     // Bare `lightweight`, with no subcommand: greet and show what it can do,
-    // exiting cleanly. `hermes` keeps clap's usage error, unchanged.
-    if personality == Personality::Lightweight && std::env::args_os().count() == 1 {
+    // exiting cleanly.
+    if std::env::args_os().count() == 1 {
         if banner::should_show(false) {
             banner::print(env!("CARGO_PKG_VERSION"));
         }
@@ -607,7 +575,7 @@ pub fn run_cli(personality: Personality) -> ExitCode {
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
 
     // The welcome mark, once the run is known not to be machine-readable.
-    if personality == Personality::Lightweight && banner::should_show(cli.json) {
+    if banner::should_show(cli.json) {
         banner::print(env!("CARGO_PKG_VERSION"));
     }
 
@@ -770,7 +738,7 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
             } else {
                 lightweight_memory::ComputeModel::default()
             };
-            // This machine's own coefficients when `hermes bench --fit` has
+            // This machine's own coefficients when `lightweight bench --fit` has
             // earned them for exactly these settings, and the shipped ones
             // otherwise. A data directory that cannot be discovered is not a
             // reason to refuse an estimate: it means there is nowhere a fit
@@ -1168,7 +1136,7 @@ mod tests {
     /// Reports are rendered into a buffer rather than printed line by line.
     ///
     /// That is not a style preference. `println!` panics when the reader has
-    /// closed the pipe, so `hermes sysinfo | head` used to abort with
+    /// closed the pipe, so `lightweight sysinfo | head` used to abort with
     /// "failed printing to stdout: Broken pipe" - a crash in an ordinary
     /// invocation, in a crate that denies panics. Rust ignores SIGPIPE at
     /// startup, so the signal never arrives and the write returns an error

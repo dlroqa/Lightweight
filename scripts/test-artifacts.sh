@@ -52,7 +52,8 @@ fi
 # 2. The payload the shell cannot run without.
 # ---------------------------------------------------------------------------
 for required in \
-  resources/bin/hermes \
+  resources/bin/lightweight \
+  resources/bin/lightagent \
   resources/panel/index.html \
   resources/app.asar \
   chrome-sandbox
@@ -64,10 +65,16 @@ do
   fi
 done
 
-if "$EXTRACT/resources/bin/hermes" --version >/dev/null 2>&1; then
-  pass "the packaged hermes binary runs ($("$EXTRACT/resources/bin/hermes" --version))"
+if "$EXTRACT/resources/bin/lightweight" --version >/dev/null 2>&1; then
+  pass "the packaged lightweight binary runs ($("$EXTRACT/resources/bin/lightweight" --version))"
 else
-  fail "the packaged hermes binary does not run"
+  fail "the packaged lightweight binary does not run"
+fi
+
+if "$EXTRACT/resources/bin/lightagent" --version >/dev/null 2>&1; then
+  pass "the packaged lightagent binary runs"
+else
+  fail "the packaged lightagent binary does not run"
 fi
 
 # The tray and window icons travel in `dist/`, not `build/`: an icon loaded from

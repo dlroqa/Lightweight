@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the panel end to end and assert the agent screens actually work.
 #
-# The panel is one bundle over two servers — the inference gateway (`hermes
+# The panel is one bundle over two servers — the inference gateway (`lightweight
 # serve`), which answers `/api/v1` and serves the panel, and the agent API
 # (`lightagent serve`) under `/api/lightagent/v1`, which the gateway proxies.
 # The screens that broke (Agent, Tools, Chat) are the proxied ones: with no
@@ -79,7 +79,7 @@ wait_for() {
 echo "== build =="
 # Debug binaries: this proves the wiring, and a release build would cost minutes
 # the render does not need. The frontend is built only if it has not been.
-cargo build -p lightagent --bin lightagent -p lightweight-cli --bin hermes
+cargo build -p lightagent --bin lightagent -p lightweight-cli --bin lightweight
 if [ ! -f frontend/dist/index.html ]; then
   ( cd frontend && npm run build )
 fi
@@ -97,7 +97,7 @@ AGENT_PID=$!
 wait_for "http://127.0.0.1:$AGENT_PORT/api/lightagent/v1/tools" "agent API"
 
 echo "== start gateway (port $GATEWAY_PORT), proxying the agent =="
-./target/debug/hermes serve --host 127.0.0.1 --port "$GATEWAY_PORT" \
+./target/debug/lightweight serve --host 127.0.0.1 --port "$GATEWAY_PORT" \
   --web-root frontend/dist \
   --agent-upstream "http://127.0.0.1:$AGENT_PORT" \
   >"$GATEWAY_LOG" 2>&1 &

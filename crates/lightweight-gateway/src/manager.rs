@@ -9,7 +9,7 @@
 //!    about to be replaced.
 //! 2. **Drain**, because nothing is preempted. The generation in flight when a
 //!    swap is requested runs to its end.
-//! 3. **Admit against this machine's free memory**, exactly as `hermes serve`
+//! 3. **Admit against this machine's free memory**, exactly as `lightweight serve`
 //!    does. A model that fits on the developer's box is not a model that fits.
 //! 4. **Load**, which unloads the previous engine first — two models resident
 //!    at once is the memory spike admission control exists to prevent.
@@ -361,7 +361,7 @@ impl ModelManager {
 
     /// Add the model named on the command line to the catalog.
     ///
-    /// Tolerant on purpose. `hermes serve <model.gguf>` is about serving, and a
+    /// Tolerant on purpose. `lightweight serve <model.gguf>` is about serving, and a
     /// model already in the catalog, or a file we cannot hash, must not be
     /// reported as a failure of the thing the user actually asked for. The
     /// installer already treats identical bytes as the model it already has.
@@ -485,7 +485,7 @@ impl Throttle {
 
 /// Where the context a load will use came from.
 ///
-/// Reported so the panel can say the same sentence `hermes serve` prints, and
+/// Reported so the panel can say the same sentence `lightweight serve` prints, and
 /// so "why that number?" is answerable without reading the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -622,7 +622,7 @@ pub async fn load_model(
         None => base,
     };
 
-    // Admission control, exactly as `hermes serve` does it: never promise a
+    // Admission control, exactly as `lightweight serve` does it: never promise a
     // model will run because its weights fit.
     let estimator = Estimator::headless();
     let snapshot = match state.memory_snapshot() {

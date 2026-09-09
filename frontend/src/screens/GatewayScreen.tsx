@@ -30,7 +30,7 @@ function calibrationNote(calibration: GatewayReport["calibration"]): string {
     return "the calibration file could not be read";
   }
   if (calibration.state === "absent") {
-    return "run `hermes bench --fit` to measure this machine";
+    return "run `lightweight bench --fit` to measure this machine";
   }
   if (calibration.fits_for_this_machine === 0) {
     return `${calibration.fits} fit(s) on file, none for this machine and engine`;
@@ -157,7 +157,7 @@ export function GatewayScreen() {
                   <div className="notice notice--warn" style={{ marginTop: 14 }}>
                     The calibration file exists and could not be read, so every
                     estimate uses the shipped coefficients. Loading still works;
-                    re-run <code>hermes bench --fit</code> to replace it.
+                    re-run <code>lightweight bench --fit</code> to replace it.
                   </div>
                 )}
 

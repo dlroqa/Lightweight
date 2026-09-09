@@ -64,7 +64,7 @@ export function Performance() {
 
   // The panel's benchmark measures the model that is already loaded, at the
   // parameters it is already loaded with. Varying those means reloading the
-  // engine, which is `hermes bench` — and doing it here would interrupt
+  // engine, which is `lightweight bench` — and doing it here would interrupt
   // whoever this gateway is serving.
   async function runBenchmark() {
     setRunning(true);
@@ -334,7 +334,7 @@ export function Performance() {
             These figures describe this machine and this engine build. They are
             not a property of the software and do not transfer to other
             hardware. To vary context, batch size or thread count, use{" "}
-            <code>hermes bench</code>, which brings its own engine rather than
+            <code>lightweight bench</code>, which brings its own engine rather than
             interrupting this one.
           </div>
         </Card>

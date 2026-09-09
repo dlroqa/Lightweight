@@ -8,7 +8,7 @@
 //! Sweeping parameters means reloading the engine, which takes minutes and
 //! holds the gateway's only slot the whole time. Doing that to a gateway that
 //! somebody is being served by would be a strange way to find out how fast it
-//! is, so that job belongs to `hermes bench`, which brings its own engine.
+//! is, so that job belongs to `lightweight bench`, which brings its own engine.
 
 use std::sync::Arc;
 
@@ -91,7 +91,7 @@ pub async fn run(
         machine: MachineFingerprint::detect(),
         // Stated by the backend rather than guessed here. Without it a run
         // taken through the gateway could never be compared with one taken by
-        // `hermes bench` against the very same engine - and a fit looked up on
+        // `lightweight bench` against the very same engine - and a fit looked up on
         // the load path has to agree with both, which is why this now comes
         // from one place.
         engine: state.engine_fingerprint(),

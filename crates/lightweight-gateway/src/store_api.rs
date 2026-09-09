@@ -698,7 +698,7 @@ fn validate_and_save(
             return Err((
                 "hosts",
                 "binding to an address other machines can reach needs an API key; \
-                 create one first with `hermes key create`"
+                 create one first with `lightweight key create`"
                     .to_owned(),
             ));
         }

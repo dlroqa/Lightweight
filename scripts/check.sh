@@ -79,7 +79,7 @@ else
   echo "== frontend == skipped: npm unavailable"
 fi
 
-# The desktop shell. Its tests drive the real `hermes` binary - starting a
+# The desktop shell. Its tests drive the real `lightweight` binary - starting a
 # gateway, stopping it, and proving a second shell attaches instead of killing
 # the first one's - so they need the workspace built, which by this point it is.
 if [ -d apps/desktop/node_modules ]; then

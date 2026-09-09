@@ -73,11 +73,11 @@ describe("probing", () => {
 describe("finding the binary", () => {
   it("prefers an explicit override over everything", () => {
     const paths = candidatePaths({
-      override: "/opt/hermes",
+      override: "/opt/lightweight",
       repoRoot: "/repo",
       resourcesPath: "/app/resources",
     });
-    assert.equal(paths[0], "/opt/hermes");
+    assert.equal(paths[0], "/opt/lightweight");
   });
 
   it("prefers a release build over a debug one", () => {
@@ -103,10 +103,10 @@ describe("finding the binary", () => {
   });
 
   it("asks for the executable name this platform uses", () => {
-    // A Windows build that looked for `hermes` would search for a file that
+    // A Windows build that looked for `lightweight` would search for a file that
     // cannot exist beside a binary that does - the defect `scripts-stage.mjs`
     // fixed in the packaging, with nothing pinning it on this side.
-    const expected = process.platform === "win32" ? "hermes.exe" : "hermes";
+    const expected = process.platform === "win32" ? "lightweight.exe" : "lightweight";
     const paths = candidatePaths({ repoRoot: "/repo", resourcesPath: "/app" });
     assert.ok(paths.length >= 3, `expected every candidate: ${paths}`);
     for (const path of paths) {
@@ -122,7 +122,7 @@ describe("finding the binary", () => {
     //
     // The expected paths are built the way `candidatePaths` builds them rather
     // than written out with forward slashes: Windows joins with `\\` and calls
-    // the binary `hermes.exe`, so a literal `/repo/target/release/hermes` here
+    // the binary `lightweight.exe`, so a literal `/repo/target/release/lightweight` here
     // failed on that platform against an error message that was perfectly
     // correct. What is being asserted is that every path it looked in appears
     // in the message, which is exactly this loop.
@@ -171,7 +171,7 @@ describe("planning a launch", () => {
     // key shared with a remote agent broke on the next restart. Keys are now the
     // gateway's own, hashed and persisted; the shell carries none.
     for (const hosts of [undefined, ["127.0.0.1"], ["127.0.0.1", "192.0.2.10"]]) {
-      const launch = planLaunch({ binary: "hermes", port: 11434, hosts });
+      const launch = planLaunch({ binary: "lightweight", port: 11434, hosts });
       assert.equal(
         (launch as { apiKey?: string }).apiKey,
         undefined,
@@ -188,7 +188,7 @@ describe("planning a launch", () => {
   it("never puts a credential in the command line", () => {
     // /proc/<pid>/cmdline is world-readable; --api-key must never appear there.
     const launch = planLaunch({
-      binary: "hermes",
+      binary: "lightweight",
       port: 11434,
       hosts: ["192.0.2.10"],
     });
@@ -197,7 +197,7 @@ describe("planning a launch", () => {
 
   it("passes the port, the hosts and the panel through", () => {
     const launch = planLaunch({
-      binary: "hermes",
+      binary: "lightweight",
       port: 8080,
       hosts: ["127.0.0.1", "192.0.2.10"],
       webRoot: "/panel/dist",

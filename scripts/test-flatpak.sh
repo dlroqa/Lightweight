@@ -106,7 +106,8 @@ fi
 # 4. The payload, and the engine's own binary, seen from inside the sandbox.
 # ---------------------------------------------------------------------------
 for required in \
-  "/app/lib/$APP_ID/resources/bin/hermes" \
+  "/app/lib/$APP_ID/resources/bin/lightweight" \
+  "/app/lib/$APP_ID/resources/bin/lightagent" \
   "/app/lib/$APP_ID/resources/panel/index.html" \
   "/app/lib/$APP_ID/resources/app.asar"
 do
@@ -117,11 +118,17 @@ do
   fi
 done
 
-version="$(flatpak run --command="/app/lib/$APP_ID/resources/bin/hermes" "$APP_ID" --version 2>&1 || true)"
-if echo "$version" | grep -qi 'hermes'; then
-  pass "the packaged hermes binary runs against the runtime ($version)"
+version="$(flatpak run --command="/app/lib/$APP_ID/resources/bin/lightweight" "$APP_ID" --version 2>&1 || true)"
+if echo "$version" | grep -qi 'lightweight'; then
+  pass "the packaged lightweight binary runs against the runtime ($version)"
 else
-  fail "the packaged hermes binary does not run inside the runtime: $version"
+  fail "the packaged lightweight binary does not run inside the runtime: $version"
+fi
+
+if flatpak run --command="/app/lib/$APP_ID/resources/bin/lightagent" "$APP_ID" --version >/dev/null 2>&1; then
+  pass "the packaged lightagent binary runs inside the runtime"
+else
+  fail "the packaged lightagent binary does not run inside the runtime"
 fi
 
 # ---------------------------------------------------------------------------
@@ -133,7 +140,7 @@ fi
 # ---------------------------------------------------------------------------
 probe='set -e
     mkdir -p "$XDG_DATA_HOME/probe"
-    cp "/app/lib/APPID/resources/bin/hermes" "$XDG_DATA_HOME/probe/engine-stand-in"
+    cp "/app/lib/APPID/resources/bin/lightweight" "$XDG_DATA_HOME/probe/engine-stand-in"
     "$XDG_DATA_HOME/probe/engine-stand-in" --version'
 probe="${probe//APPID/$APP_ID}"
 if out="$(flatpak run --command=sh "$APP_ID" -c "$probe" 2>&1)"; then

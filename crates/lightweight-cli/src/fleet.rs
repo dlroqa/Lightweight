@@ -1,11 +1,11 @@
-//! `hermes fleet`: run up to a few isolated per-model gateways at once.
+//! `lightweight fleet`: run up to a few isolated per-model gateways at once.
 //!
 //! The engine is single-resident by design, so the way to serve several models
 //! — and to keep one tenant's traffic from evicting another's — is several
 //! gateways, one per model, each re-rooted with its own `HERMES_GATEWAY_HOME`
 //! so its keys, rate limits, catalog and settings are its own. This command
 //! reads a small manifest, enforces the ceiling, and launches each entry as a
-//! child `hermes serve … --behind-proxy`.
+//! child `lightweight serve … --behind-proxy`.
 //!
 //! Nothing here shares memory between models: each entry is a separate process
 //! precisely so the isolation is the operating system's to enforce, not this
@@ -109,7 +109,7 @@ impl std::fmt::Display for FleetError {
             Self::TooMany { count } => write!(
                 f,
                 "a fleet is limited to {MAX_MODELS} models, but {count} were configured. \
-                 Serve fewer, or run the extras as their own `hermes serve` on another host."
+                 Serve fewer, or run the extras as their own `lightweight serve` on another host."
             ),
             Self::DuplicateName { name } => {
                 write!(
@@ -146,7 +146,7 @@ impl std::fmt::Display for FleetError {
             Self::NoKey { name, profile } => write!(
                 f,
                 "the profile for {name} has no API key, and a gateway behind a proxy needs one. \
-                 Mint it with:\n\n    HERMES_GATEWAY_HOME={} hermes key create --name {name}",
+                 Mint it with:\n\n    HERMES_GATEWAY_HOME={} lightweight key create --name {name}",
                 profile.display()
             ),
         }
@@ -287,7 +287,7 @@ pub fn run(config: Option<PathBuf>) -> Result<ExitCode, String> {
 ///
 /// The children share this process's group, so an interactive Ctrl-C — and a
 /// service manager's SIGTERM under the default cgroup kill — reaches each
-/// `hermes serve` directly and it shuts its own engine down cleanly. This
+/// `lightweight serve` directly and it shuts its own engine down cleanly. This
 /// parent's job is therefore to wait for the signal and then wait for the
 /// children to finish, rather than to kill them out from under their cleanup.
 /// Auto-restart of a gateway that dies on its own is deliberately left out of

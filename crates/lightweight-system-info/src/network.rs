@@ -2,7 +2,7 @@
 //!
 //! This exists because of a failure that is silent in the worst way. A user who
 //! wants to serve the gateway to their other devices reaches for the machine's
-//! name — `hermes serve --host "$(hostname)"` — and on most Linux installs that
+//! name — `lightweight serve --host "$(hostname)"` — and on most Linux installs that
 //! name is mapped to a **loopback** address in `/etc/hosts` (Debian writes
 //! `127.0.1.1 <hostname>`), which wins over anything the network publishes. The
 //! bind succeeds, the gateway reports that it is serving, authentication stays

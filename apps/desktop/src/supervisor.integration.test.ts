@@ -2,7 +2,7 @@
  * The supervisor against the real gateway binary.
  *
  * Opt-in by presence, like the Rust suite's real-engine tier: if there is no
- * built `hermes` to drive, this says so and skips rather than passing quietly.
+ * built `lightweight` to drive, this says so and skips rather than passing quietly.
  *
  * What it proves is the whole of M6b.4's substance, and none of it can be
  * proven with a fake: that a gateway really starts, really answers, really
@@ -24,7 +24,7 @@ const repoRoot = join(import.meta.dirname, "..", "..", "..");
 // for a file that cannot exist on Windows, found nothing, and skipped its whole
 // suite - so the one check that proves a real gateway starts and stops would
 // have reported green on Windows without ever running.
-const executable = process.platform === "win32" ? "hermes.exe" : "hermes";
+const executable = process.platform === "win32" ? "lightweight.exe" : "lightweight";
 const binary = join(repoRoot, "target", "debug", executable);
 const available = existsSync(binary);
 
@@ -75,7 +75,7 @@ describe("the supervisor against a real gateway", { skip: !available && `no bina
 
   it("a second shell attaches instead of starting a rival", async () => {
     // Two engines on a machine that can barely hold one is the obvious cost.
-    // The subtler one: a user who started `hermes serve` themselves has their
+    // The subtler one: a user who started `lightweight serve` themselves has their
     // own flags, model and bind, and replacing that would be the shell
     // overruling them.
     const first = new GatewaySupervisor();

@@ -212,7 +212,7 @@ pub fn fit_run(run: &BenchmarkRun) -> Vec<Fit> {
         // The exact term this peak actually contains, which is not the same on
         // every platform: a macOS footprint excludes the mapped weights, and
         // subtracting them anyway underflowed and silently threw the sample
-        // away - which is why `hermes bench --fit` could fit nothing there.
+        // away - which is why `lightweight bench --fit` could fit nothing there.
         let exact = prediction.exact_within(sample.peak_kind, sample.params);
         let Some(residual) = peak.get().checked_sub(exact) else {
             // The engine used less than the exactly-computed half. That is not
@@ -433,7 +433,7 @@ mod tests {
     ///
     /// The defect this exists for is silent: subtracting weights a macOS
     /// footprint never counted underflows, `fit_run` skips the sample, and
-    /// `hermes bench --fit` reports a run with no fits in it and no reason why.
+    /// `lightweight bench --fit` reports a run with no fits in it and no reason why.
     #[test]
     fn a_footprint_peak_is_not_asked_to_contain_the_weights() {
         let weights = Bytes::from_mib(700).get();

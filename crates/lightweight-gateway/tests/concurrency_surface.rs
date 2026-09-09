@@ -64,7 +64,7 @@ impl Harness {
                 .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let server = tokio::spawn(async move {
-            // Through `service`, exactly as `hermes serve` does: without it
+            // Through `service`, exactly as `lightweight serve` does: without it
             // every request would arrive with the same scheduling key and
             // these tests would pass while proving nothing.
             let _ = axum::serve(listener, lightweight_gateway::service(app)).await;

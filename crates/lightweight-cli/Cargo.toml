@@ -11,10 +11,6 @@ name = "lightweight_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hermes"
-path = "src/bin/hermes.rs"
-
-[[bin]]
 name = "lightweight"
 path = "src/bin/lightweight.rs"
 
