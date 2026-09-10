@@ -1020,6 +1020,7 @@ dependencies = [
  "lightagent-store",
  "lightagent-tools",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

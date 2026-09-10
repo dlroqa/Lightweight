@@ -152,19 +152,21 @@ impl Default for SecurityConfig {
     }
 }
 
+/// The built-in, account-free search endpoint offered by `lightagent setup web`.
+pub const DUCKDUCKGO_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+
 /// A search backend for `web.search`.
 ///
 /// `web.search` sends the query to `endpoint` (adding `query_param=<query>`) and
-/// parses a JSON response with a `results` array of objects carrying a `title`,
-/// a `url`, and a snippet under `content`, `snippet` or `description` — SearXNG's
-/// `format=json` shape, and a common minimal one. No backend ships by default, so
-/// the tool reports that none is configured until an operator sets `endpoint`.
-/// A key, when the endpoint needs one, is held by reference and sent as
-/// `Authorization: Bearer <key>`.
+/// parses either DuckDuckGo's HTML results or a JSON response with a `results`
+/// array of objects carrying a `title`, a `url`, and a snippet under `content`,
+/// `snippet` or `description` — SearXNG's `format=json` shape, and a common
+/// minimal one. A key, when the endpoint needs one, is held by reference and sent
+/// as `Authorization: Bearer <key>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchConfig {
-    /// The JSON search endpoint, e.g. `https://searx.example/search?format=json`.
+    /// A DuckDuckGo HTML or JSON search endpoint.
     pub endpoint: Option<String>,
     /// The query-string parameter the endpoint reads the query from.
     pub query_param: String,

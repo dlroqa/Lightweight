@@ -40,6 +40,11 @@ lightagent                     # opens terminal chat
 system-wide and nothing is code-signed. Verify the download against `SHA256SUMS`
 from the same release.
 
+After the initial install, `lightagent update --check` reports whether a newer
+release exists and `lightagent update` installs the latest published tag through
+Cargo into the same installation root. `LIGHTAGENT_INSTALL_ROOT` overrides the
+destination when needed.
+
 ## Using the terminal harness
 
 Run `lightagent` from any directory to open interactive chat, or use
@@ -47,6 +52,11 @@ Run `lightagent` from any directory to open interactive chat, or use
 commands, `/tools` lists tools, and `/exit` closes the session. Tool calls that
 require approval prompt in the terminal; conversations are saved under the
 active profile in `~/.lightagent`.
+
+The prompt streams provider-supplied reasoning in a separate panel and reports
+context usage, output tokens, token rate, and elapsed response time. Its startup
+dashboard shows the release version and date, active profile and model, session,
+tools, and skills beside the Lightagent logo.
 
 No `init` is required for terminal chat. A fresh installation uses a built-in
 default profile and `http://127.0.0.1:11434`; existing settings and the active
@@ -63,6 +73,13 @@ OpenAI-compatible endpoints, add or remove saved providers, and select a model
 from the chosen endpoint. Provider secrets are stored only as references to
 environment variables.
 `lightagent setup gateway` remains an alias for the provider screen.
+
+Run `lightagent setup web` and choose **Agentic search — DuckDuckGo (no
+account)** to give terminal chat native `web.search` and `web.fetch` tools with
+no API key. For current or niche questions, the agent searches, evaluates the
+results, fetches useful full pages, verifies important claims, refines its query
+when needed, and includes the source URLs in its answer. A SearXNG or compatible
+JSON search endpoint can be selected instead.
 
 Terminal chat calls the inference gateway directly. It does not require the
 desktop app or a running `lightagent serve` process. A gateway with a loaded

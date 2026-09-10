@@ -24,8 +24,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::{
-    LightweightFactory, configured_model, load_extensions, load_global_extensions, load_skills,
-    mcp_tools, resolve_profile, web_context, workspace_context,
+    LightweightFactory, configured_builtin_registry, configured_model, load_extensions,
+    load_global_extensions, load_skills, mcp_tools, resolve_profile, web_context,
+    web_research_instructions, workspace_context,
 };
 
 /// Builds and drives a real run with the Lightweight provider per request.
@@ -95,7 +96,7 @@ impl RunFactory for LightweightRunFactory {
             worker_per_call: Duration::from_secs(60),
             worker_max_output_bytes: 262_144,
         };
-        let mut registry = ToolRegistry::builtin();
+        let mut registry = configured_builtin_registry(&self.config, !skills.is_empty());
         for tool in &self.mcp_tools {
             registry.insert(Arc::clone(tool));
         }
@@ -131,6 +132,10 @@ impl RunFactory for LightweightRunFactory {
             profile
                 .persona
                 .push_str(&format!("\n\n{extension_instructions}"));
+        }
+
+        if let Some(instructions) = web_research_instructions(&self.config) {
+            profile.persona.push_str(&format!("\n\n{instructions}"));
         }
 
         let memory_catalog = crate::memory::recent_catalog(&profile_dir, &self.config);

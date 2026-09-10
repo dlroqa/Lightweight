@@ -15,6 +15,7 @@
 //! Each character is one pixel in the logo palette; `.` is transparent.
 //! Two pixel rows render into one terminal row with the upper-half block `▀`.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 
 /// The 56-column logo fits comfortably in a standard 80-column terminal.
@@ -82,6 +83,17 @@ const STAR_BOLT: &[&str] = &[
     "............................Y...........................",
 ];
 
+/// Live chat metadata rendered beside the logo at startup.
+pub(crate) struct StartupInfo<'a> {
+    pub(crate) version: &'a str,
+    pub(crate) release_date: &'a str,
+    pub(crate) profile: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) session: &'a str,
+    pub(crate) tools: &'a [String],
+    pub(crate) skills: &'a [String],
+}
+
 /// RGB for a pixel role, or `None` for a clear pixel.
 fn rgb(pixel: u8) -> Option<(u8, u8, u8)> {
     match pixel {
@@ -111,25 +123,18 @@ pub fn print(version: &str) {
     eprint!("{}", render(version, colour));
 }
 
+/// Print the interactive startup dashboard to stderr.
+pub(crate) fn print_startup(info: &StartupInfo<'_>) {
+    let colour = std::env::var_os("NO_COLOR").is_none();
+    eprint!("{}", render_startup(info, terminal_width(), colour));
+}
+
 /// Build the mark as a string, so the choice of colour is testable without a
 /// terminal.
 pub fn render(version: &str, colour: bool) -> String {
-    let cols = STAR_BOLT.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut out = String::from("\n");
-    let rows: Vec<&[u8]> = STAR_BOLT.iter().map(|row| row.as_bytes()).collect();
-
-    for pair in rows.chunks(2) {
-        out.push_str("  ");
-        let top = pair[0];
-        let bottom = pair.get(1).copied().unwrap_or(b"");
-        for col in 0..cols {
-            let upper = top.get(col).copied().unwrap_or(b'.');
-            let lower = bottom.get(col).copied().unwrap_or(b'.');
-            out.push_str(&cell(upper, lower, colour));
-        }
-        if colour {
-            out.push_str("\x1b[0m");
-        }
+    for line in logo_lines(colour) {
+        out.push_str(&line);
         out.push('\n');
     }
 
@@ -143,6 +148,174 @@ pub fn render(version: &str, colour: bool) -> String {
         ));
     }
     out
+}
+
+fn logo_lines(colour: bool) -> Vec<String> {
+    let cols = STAR_BOLT.iter().map(|row| row.len()).max().unwrap_or(0);
+    let rows: Vec<&[u8]> = STAR_BOLT.iter().map(|row| row.as_bytes()).collect();
+    let mut lines = Vec::with_capacity(rows.len().div_ceil(2));
+
+    for pair in rows.chunks(2) {
+        let mut line = String::from("  ");
+        let top = pair[0];
+        let bottom = pair.get(1).copied().unwrap_or(b"");
+        for col in 0..cols {
+            let upper = top.get(col).copied().unwrap_or(b'.');
+            let lower = bottom.get(col).copied().unwrap_or(b'.');
+            line.push_str(&cell(upper, lower, colour));
+        }
+        if colour {
+            line.push_str("\x1b[0m");
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(132)
+        .clamp(112, 180)
+}
+
+fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String {
+    const LEFT_WIDTH: usize = 60;
+    let width = width.max(112);
+    let right_width = width.saturating_sub(LEFT_WIDTH + 7);
+    let logo = logo_lines(colour);
+    let details = startup_details(info, right_width);
+    let rows = logo.len().max(details.len());
+    let title = format!(" Lightagent v{} ({}) ", info.version, info.release_date);
+    let mut out = String::from("\n");
+    out.push_str(&paint_border(
+        &labelled_border('┌', '┐', &title, width),
+        colour,
+    ));
+    out.push('\n');
+
+    for row in 0..rows {
+        let left = logo.get(row).map(String::as_str).unwrap_or("");
+        let left_visible = if row < logo.len() {
+            STAR_BOLT[0].len() + 2
+        } else {
+            0
+        };
+        let right = details.get(row).map(String::as_str).unwrap_or("");
+        out.push_str(&paint_border("│", colour));
+        out.push(' ');
+        out.push_str(left);
+        out.push_str(&" ".repeat(LEFT_WIDTH.saturating_sub(left_visible)));
+        out.push(' ');
+        out.push_str(&paint_border("│", colour));
+        out.push(' ');
+        out.push_str(&paint_detail(right, colour));
+        out.push_str(&" ".repeat(right_width.saturating_sub(right.chars().count())));
+        out.push(' ');
+        out.push_str(&paint_border("│", colour));
+        out.push('\n');
+    }
+
+    out.push_str(&paint_border(&labelled_border('└', '┘', "", width), colour));
+    out.push_str("\n\n");
+    out
+}
+
+fn startup_details(info: &StartupInfo<'_>, width: usize) -> Vec<String> {
+    let mut lines = vec!["Available Tools".to_owned()];
+    let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for tool in info.tools {
+        let (group, action) = tool.split_once('.').unwrap_or(("other", tool.as_str()));
+        groups.entry(group).or_default().push(action);
+    }
+    if groups.is_empty() {
+        lines.push("(none enabled)".to_owned());
+    } else {
+        for (group, actions) in groups {
+            lines.push(fit_line(&format!("{group}: {}", actions.join(", ")), width));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Available Skills".to_owned());
+    lines.extend(wrap_names(info.skills, width));
+    lines.push(String::new());
+    lines.push(fit_line(&format!("Profile: {}", info.profile), width));
+    lines.push(fit_line(&format!("Model: {}", info.model), width));
+    lines.push(fit_line(&format!("Session: {}", info.session), width));
+    lines.push(String::new());
+    lines.push(fit_line(
+        &format!(
+            "{} tools · {} skills · /help for commands",
+            info.tools.len(),
+            info.skills.len()
+        ),
+        width,
+    ));
+    lines
+}
+
+fn wrap_names(names: &[String], width: usize) -> Vec<String> {
+    if names.is_empty() {
+        return vec!["(none installed)".to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for name in names {
+        let separator = if line.is_empty() { "" } else { ", " };
+        if !line.is_empty() && line.chars().count() + separator.len() + name.chars().count() > width
+        {
+            lines.push(line);
+            line = String::new();
+        }
+        if !line.is_empty() {
+            line.push_str(", ");
+        }
+        line.push_str(name);
+    }
+    if !line.is_empty() {
+        lines.push(fit_line(&line, width));
+    }
+    lines
+}
+
+fn fit_line(line: &str, width: usize) -> String {
+    if line.chars().count() <= width {
+        return line.to_owned();
+    }
+    let keep = width.saturating_sub(1);
+    format!("{}…", line.chars().take(keep).collect::<String>())
+}
+
+fn labelled_border(left: char, right: char, label: &str, width: usize) -> String {
+    let mut line = left.to_string();
+    line.push('─');
+    line.push_str(label);
+    let remaining = width.saturating_sub(line.chars().count() + 1);
+    line.push_str(&"─".repeat(remaining));
+    line.push(right);
+    line
+}
+
+fn paint_border(text: &str, colour: bool) -> String {
+    if colour {
+        format!("\x1b[38;2;190;112;18m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn paint_detail(text: &str, colour: bool) -> String {
+    if !colour || text.is_empty() {
+        return text.to_owned();
+    }
+    if matches!(text, "Available Tools" | "Available Skills") {
+        return format!("\x1b[1;33m{text}\x1b[0m");
+    }
+    if let Some((label, value)) = text.split_once(": ") {
+        return format!("\x1b[38;2;160;112;0m{label}:\x1b[0m \x1b[38;2;255;252;214m{value}\x1b[0m");
+    }
+    format!("\x1b[38;2;164;121;16m{text}\x1b[0m")
 }
 
 /// One rendered character for an upper/lower pixel pair.
@@ -226,5 +399,33 @@ mod tests {
         for (index, row) in STAR_BOLT.iter().enumerate() {
             assert_eq!(row.len(), width, "row {index} has the wrong width");
         }
+    }
+
+    #[test]
+    fn startup_places_live_metadata_beside_the_logo() {
+        let tools = vec!["fs.read".to_owned(), "web.search".to_owned()];
+        let skills = vec!["research".to_owned(), "notes".to_owned()];
+        let dashboard = render_startup(
+            &StartupInfo {
+                version: "0.3.5",
+                release_date: "2026-09-09",
+                profile: "default",
+                model: "minicpm5-1b@16k",
+                session: "session-1",
+                tools: &tools,
+                skills: &skills,
+            },
+            132,
+            false,
+        );
+        assert!(dashboard.contains("Lightagent v0.3.5 (2026-09-09)"));
+        assert!(dashboard.contains("Available Tools"));
+        assert!(dashboard.contains("fs: read"));
+        assert!(dashboard.contains("Available Skills"));
+        assert!(dashboard.contains("research, notes"));
+        assert!(dashboard.contains("Profile: default"));
+        assert!(dashboard.contains("Model: minicpm5-1b@16k"));
+        assert!(dashboard.contains("Session: session-1"));
+        assert!(dashboard.lines().all(|line| line.chars().count() <= 132));
     }
 }

@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A built-in CLI updater.** `lightagent update --check` compares the running
+  version with the latest published GitHub release, and `lightagent update`
+  installs that exact release tag through Cargo into the current installation
+  root. JSON output is available for update checks and
+  `LIGHTAGENT_INSTALL_ROOT` supports explicit installation layouts.
+- **A live terminal startup dashboard and turn status.** Interactive chat now
+  places the Lightagent logo beside the release version and date, active
+  profile, resolved model, session, enabled tools, and installed skills. During
+  a response it streams provider-supplied reasoning separately from the final
+  answer and reports context use, output tokens, token rate, and elapsed time.
+- **No-account agentic web research.** `lightagent setup web` can now configure
+  DuckDuckGo search without an account or API key, while preserving SearXNG and
+  compatible JSON endpoints as an alternative. The native `web.search` and
+  `web.fetch` tools are exposed only when configured, fetched page text is
+  bounded, and the agent follows a search, evaluate, fetch, verify, refine and
+  synthesize loop for requests that need current evidence. Terminal chat and
+  the Agent API use the same web capabilities and instructions.
+
+### Changed
+
+- **Tool declarations now match the effective configuration.** Terminal chat
+  and the Agent API advertise web, filesystem, terminal, and skill tools only
+  when their backing capability is enabled and available. This keeps smaller
+  local models from selecting tools that cannot run.
+
+### Fixed
+
+- **The Lightagent package smoke test is independent of a developer's running
+  gateway.** Its clean-home `doctor` check now targets reserved port zero, so a
+  gateway already serving on the normal local port cannot create a false
+  packaging failure.
+
 ## [0.3.5] - 2026-09-09
 
 A patch release. Terminal Lightagent gains a guided `setup` command and no

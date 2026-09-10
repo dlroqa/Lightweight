@@ -12,8 +12,9 @@
 //! hop, so a fetch cannot be steered onto a loopback or private service (an SSRF
 //! guard). HTML is reduced to readable text without an HTML dependency.
 //!
-//! `web.search` posts the query to the configured JSON endpoint and reads a
-//! `results` array; it reports cleanly when no backend is configured.
+//! `web.search` sends the query to the configured endpoint. It supports
+//! DuckDuckGo's HTML results directly and JSON endpoints with a `results`
+//! array, such as SearXNG; it reports cleanly when no backend is configured.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -28,6 +29,8 @@ use crate::definition::{Tool, ToolDefinition};
 
 /// The most redirect hops `web.fetch` follows, each re-guarded.
 const MAX_REDIRECTS: u32 = 5;
+/// Keep one fetched page small enough to leave room for reasoning and follow-up searches.
+const MAX_READABLE_CHARS: usize = 50_000;
 
 /// `web.fetch` — fetch a URL and return its readable text.
 pub struct WebFetch {
@@ -147,7 +150,11 @@ async fn fetch(web: &WebContext, start: &str) -> Result<String, String> {
             .unwrap_or("")
             .to_ascii_lowercase();
         let body = read_bounded(&mut response, web.policy.max_fetch_bytes).await?;
-        return Ok(render_fetch(&url, &content_type, &body));
+        return Ok(limit_readable_text(render_fetch(
+            &url,
+            &content_type,
+            &body,
+        )));
     }
 }
 
@@ -286,14 +293,96 @@ async fn search(web: &WebContext, query: &str, requested: Option<usize>) -> Resu
             response.status().as_u16()
         ));
     }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let body = read_bounded(&mut response, policy.max_fetch_bytes).await?;
-    let json: Value = serde_json::from_slice(&body)
-        .map_err(|error| format!("search endpoint did not return JSON: {error}"))?;
-    let hits = parse_search_results(&json, limit);
+    let hits = if content_type.contains("html") {
+        let endpoint_host = reqwest::Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        if !endpoint_host
+            .as_deref()
+            .is_some_and(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
+        {
+            return Err(
+                "search endpoint returned HTML; use DuckDuckGo HTML or a JSON endpoint".to_owned(),
+            );
+        }
+        parse_duckduckgo_results(&String::from_utf8_lossy(&body), limit)
+    } else {
+        let json: Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("search endpoint did not return JSON: {error}"))?;
+        parse_search_results(&json, limit)
+    };
     if hits.is_empty() {
         return Ok(format!("No results for {query:?}."));
     }
     Ok(render_search(query, &hits))
+}
+
+fn parse_duckduckgo_results(html: &str, limit: usize) -> Vec<SearchHit> {
+    html.split("result results_links")
+        .skip(1)
+        .filter_map(|result| {
+            let (href, title) = anchor_with_class(result, "result__a")?;
+            let url = duckduckgo_target(&href)?;
+            let snippet = anchor_with_class(result, "result__snippet")
+                .map(|(_, text)| text)
+                .unwrap_or_default();
+            Some(SearchHit {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
+fn anchor_with_class(html: &str, class: &str) -> Option<(String, String)> {
+    let marker = format!("class=\"{class}\"");
+    let class_at = html.find(&marker)?;
+    let open_at = html[..class_at].rfind("<a")?;
+    let tag_end = html[class_at..].find('>')? + class_at;
+    let tag = &html[open_at..=tag_end];
+    let href_at = tag.find("href=\"")? + "href=\"".len();
+    let href_end = tag[href_at..].find('"')? + href_at;
+    let close_at = html[tag_end + 1..].find("</a>")? + tag_end + 1;
+    let href = decode_entities(&tag[href_at..href_end]);
+    let title = collapse_whitespace(&decode_entities(&strip_tags(&html[tag_end + 1..close_at])));
+    (!href.is_empty() && !title.is_empty()).then_some((href, title))
+}
+
+fn duckduckgo_target(href: &str) -> Option<String> {
+    let absolute = if href.starts_with("//") {
+        format!("https:{href}")
+    } else {
+        href.to_owned()
+    };
+    let url = reqwest::Url::parse(&absolute).ok()?;
+    if url
+        .host_str()
+        .is_some_and(|host| host == "duckduckgo.com" || host.ends_with(".duckduckgo.com"))
+        && url.path() == "/l/"
+    {
+        return url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "uddg").then(|| value.into_owned()));
+    }
+    matches!(url.scheme(), "http" | "https").then_some(absolute)
+}
+
+fn limit_readable_text(text: String) -> String {
+    if text.chars().count() <= MAX_READABLE_CHARS {
+        return text;
+    }
+    let mut limited = text.chars().take(MAX_READABLE_CHARS).collect::<String>();
+    limited.push_str("\n\n[page text truncated]");
+    limited
 }
 
 /// One search result.
@@ -932,6 +1021,47 @@ mod tests {
 
         assert!(parse_search_results(&json!({}), 10).is_empty());
         assert_eq!(parse_search_results(&json, 1).len(), 1, "limit is honoured");
+    }
+
+    #[test]
+    fn duckduckgo_html_results_become_search_hits() {
+        let html = r#"
+            <div class="result results_links result--web">
+              <h2 class="result__title">
+                <a rel="nofollow" class="result__a"
+                   href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnews&amp;rut=abc">
+                   Example &amp; News
+                </a>
+              </h2>
+              <a class="result__snippet" href="https://example.com/news">
+                Fresh <b>details</b> from the source.
+              </a>
+            </div>
+            <div class="result results_links result--web">
+              <h2><a class="result__a" href="https://second.example/article">Second</a></h2>
+              <a class="result__snippet" href="https://second.example/article">Another result.</a>
+            </div>
+        "#;
+
+        let hits = parse_duckduckgo_results(html, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Example & News");
+        assert_eq!(hits[0].url, "https://example.com/news");
+        assert_eq!(hits[0].snippet, "Fresh details from the source.");
+        assert_eq!(hits[1].url, "https://second.example/article");
+        assert_eq!(parse_duckduckgo_results(html, 1).len(), 1);
+    }
+
+    #[test]
+    fn fetched_readable_text_is_capped() {
+        let text = "x".repeat(MAX_READABLE_CHARS + 25);
+        let limited = limit_readable_text(text);
+        assert_eq!(
+            limited.chars().take(MAX_READABLE_CHARS).count(),
+            MAX_READABLE_CHARS
+        );
+        assert_eq!(limited.chars().nth(MAX_READABLE_CHARS), Some('\n'));
+        assert!(limited.ends_with("[page text truncated]"));
     }
 
     #[tokio::test]

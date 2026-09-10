@@ -21,6 +21,7 @@ mod runtime;
 mod serve;
 mod setup;
 mod slash;
+mod update;
 
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
@@ -33,6 +34,7 @@ use lightagent_store::{SessionId, SessionStore};
 use lightagent_tools::ToolRegistry;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASE_DATE: &str = env!("LIGHTAGENT_RELEASE_DATE");
 
 /// The Lightagent CLI.
 #[derive(Parser)]
@@ -150,6 +152,15 @@ enum Command {
         /// Render unconditionally (bypasses the terminal check), for CI.
         #[arg(long)]
         preview: bool,
+    },
+    /// Check for or install the latest published Lightagent CLI.
+    Update {
+        /// Report whether an update is available without installing it.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when this version is already current.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -313,9 +324,8 @@ pub fn run_cli() -> ExitCode {
 async fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
         None => {
-            greet(cli.json);
             if std::io::stdin().is_terminal() {
-                chat::run(None, cli.json).await
+                chat::run(None, cli.json, VERSION, RELEASE_DATE).await
             } else {
                 println!(
                     "Run `lightagent --help` for the available commands, or `lightagent chat` to start."
@@ -324,8 +334,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             }
         }
         Some(Command::Chat { profile }) => {
-            greet(cli.json);
-            chat::run(profile, cli.json).await
+            chat::run(profile, cli.json, VERSION, RELEASE_DATE).await
         }
         Some(Command::Init {
             force,
@@ -397,13 +406,9 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-    }
-}
-
-/// Print the welcome mark before an interactive action, honouring every gate.
-fn greet(json: bool) {
-    if banner::should_show(json) {
-        banner::print(VERSION);
+        Some(Command::Update { check, force }) => {
+            update::run(VERSION, check, force, cli.json).await
+        }
     }
 }
 
@@ -789,6 +794,12 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
         "inference.model" => Some(config.inference.model.clone().unwrap_or_default()),
         "inference.device" => Some(config.inference.device.clone()),
         "extensions.enabled" => Some(config.extensions.enabled.to_string()),
+        "web.enabled" => Some(config.web.enabled.to_string()),
+        "web.search.endpoint" => Some(config.web.search.endpoint.clone().unwrap_or_default()),
+        "web.search.query_param" => Some(config.web.search.query_param.clone()),
+        "web.search.max_results" => Some(config.web.search.max_results.to_string()),
+        "web.max_fetch_bytes" => Some(config.web.max_fetch_bytes.to_string()),
+        "web.timeout_secs" => Some(config.web.timeout_secs.to_string()),
         "runtime.preferred_device" => Some(config.runtime.preferred_device.clone()),
         "runtime.allow_cpu_fallback" => Some(config.runtime.allow_cpu_fallback.to_string()),
         "runtime.n_ctx" => config.runtime.n_ctx.map(|v| v.to_string()),
@@ -808,6 +819,18 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "inference.device" => config.inference.device = value.to_string(),
         "extensions.enabled" => {
             config.extensions.enabled = parse_bool(value)?;
+        }
+        "web.enabled" => config.web.enabled = parse_bool(value)?,
+        "web.search.endpoint" => config.web.search.endpoint = parse_opt_string(value),
+        "web.search.query_param" => config.web.search.query_param = value.trim().to_owned(),
+        "web.search.max_results" => {
+            config.web.search.max_results = parse_usize(value, "web.search.max_results")?;
+        }
+        "web.max_fetch_bytes" => {
+            config.web.max_fetch_bytes = parse_usize(value, "web.max_fetch_bytes")?;
+        }
+        "web.timeout_secs" => {
+            config.web.timeout_secs = parse_u64(value, "web.timeout_secs")?;
         }
         "runtime.preferred_device" => config.runtime.preferred_device = value.to_string(),
         "runtime.allow_cpu_fallback" => {
@@ -843,6 +866,20 @@ fn parse_opt_u32(value: &str) -> Result<Option<u32>, String> {
         .parse::<u32>()
         .map(Some)
         .map_err(|_| format!("expected a non-negative integer, got '{value}'"))
+}
+
+fn parse_usize(value: &str, key: &str) -> Result<usize, String> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{key} expects a non-negative integer, got '{value}'"))
+}
+
+fn parse_u64(value: &str, key: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{key} expects a non-negative integer, got '{value}'"))
 }
 
 /// Parse a boolean config value, accepting the usual spellings.

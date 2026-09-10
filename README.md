@@ -69,10 +69,27 @@ Once installed, start chatting with one command:
 lightagent
 ```
 
+Check for and install future CLI releases without locating the source checkout:
+
+```sh
+lightagent update --check
+lightagent update
+```
+
+The updater installs the latest published tag through Cargo into the same bin
+root as the running executable. Set `LIGHTAGENT_INSTALL_ROOT` to override that
+location.
+
 No `init` is required: a fresh installation uses a built-in default profile and
 connects to `http://127.0.0.1:11434`. Existing settings and the active profile
 are reused. `lightagent init` is optional for creating a saved initial profile
 or choosing a custom endpoint; `lightagent doctor` checks the connection.
+
+The interactive prompt streams provider-supplied reasoning in a separate panel
+and shows the active model, context usage, output tokens, token rate, and elapsed
+time after each response. Models that do not emit reasoning simply show the
+answer panel. Its startup dashboard places the Lightagent logo beside the
+release version and date, active profile and model, session, tools, and skills.
 
 Run `lightagent setup` for a guided terminal menu. It shows current values and
 lets you select the gateway/model, local file and terminal tools, web
@@ -87,6 +104,26 @@ and removal of saved providers. After choosing a provider it fetches the
 available models and presents them as a second picker. API keys are saved only
 as environment-variable references.
 `lightagent setup gateway` remains an alias for the provider screen.
+
+For realtime web research, run `lightagent setup web` and choose **Agentic
+search — DuckDuckGo (no account)**. This enables two native tools:
+`web.search` finds relevant pages and `web.fetch` reads their full text. For
+questions that need current or niche information, Lightagent guides a capable
+tool-calling model through a bounded research loop: identify what needs
+evidence, search, evaluate sources, fetch the useful pages, cross-check, refine
+when needed, and answer with source URLs. Web content is treated as untrusted
+evidence rather than agent instructions.
+
+The same no-account setup can be applied without the menu:
+
+```sh
+lightagent config set web.enabled true
+lightagent config set web.search.endpoint https://html.duckduckgo.com/html/
+```
+
+Choose the custom endpoint option in `lightagent setup web` to use SearXNG or
+another service that returns a JSON `results` array. Search quality and tool use
+still depend on the selected model's ability to make native tool calls.
 
 Keep an inference gateway running with a model loaded. Use the gateway's origin
 as the base URL, without `/v1`; Lightagent adds the API path itself. For an

@@ -4,7 +4,9 @@ use std::io::{BufRead, IsTerminal as _, Write};
 
 use clap::ValueEnum;
 use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
-use lightagent_core::{ApprovalPolicy, Config, ConfigStore, LightagentPaths, ProfileStore};
+use lightagent_core::{
+    ApprovalPolicy, Config, ConfigStore, DUCKDUCKGO_SEARCH_ENDPOINT, LightagentPaths, ProfileStore,
+};
 use lightagent_core::{SavedProvider, SecretRef};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 
@@ -308,12 +310,8 @@ fn configure_tools_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<boo
     config.mcp.enabled = enabled(4);
 
     if config.web.enabled && config.web.search.endpoint.is_none() {
-        let endpoint = Input::<String>::with_theme(theme)
-            .with_prompt("SearXNG search URL")
-            .with_initial_text("http://127.0.0.1:8080/search?format=json")
-            .interact_text()
-            .map_err(dialog_error)?;
-        config.web.search.endpoint = nonempty(endpoint);
+        use_duckduckgo(config);
+        eprintln!("Web search will use DuckDuckGo (no account or API key required).");
     }
     if config.tools.enabled && config.tools.workspace.is_none() {
         let workspace = Input::<String>::with_theme(theme)
@@ -335,14 +333,21 @@ fn configure_tools_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<boo
 fn configure_web_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<bool, String> {
     let default = if !config.web.enabled {
         0
-    } else if config.web.search.endpoint.is_some() {
+    } else if uses_duckduckgo(config) {
         2
+    } else if config.web.search.endpoint.is_some() {
+        3
     } else {
         1
     };
     let Some(selected) = Select::with_theme(theme)
         .with_prompt("Web tools")
-        .items(["Off", "Fetch web pages", "Fetch web pages and search"])
+        .items([
+            "Off",
+            "Fetch web pages only",
+            "Agentic search — DuckDuckGo (no account)",
+            "Agentic search — SearXNG or custom JSON endpoint",
+        ])
         .default(default)
         .interact_opt()
         .map_err(dialog_error)?
@@ -351,11 +356,14 @@ fn configure_web_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<bool,
     };
     config.web.enabled = selected != 0;
     if selected == 2 {
+        use_duckduckgo(config);
+    } else if selected == 3 {
         let current = config
             .web
             .search
             .endpoint
             .as_deref()
+            .filter(|_| !uses_duckduckgo(config))
             .unwrap_or("http://127.0.0.1:8080/search?format=json");
         let endpoint = Input::<String>::with_theme(theme)
             .with_prompt("SearXNG search URL")
@@ -363,7 +371,7 @@ fn configure_web_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<bool,
             .interact_text()
             .map_err(dialog_error)?;
         config.web.search.endpoint = nonempty(endpoint);
-    } else if selected == 1 {
+    } else {
         config.web.search.endpoint = None;
     }
     Ok(true)
@@ -570,26 +578,36 @@ fn configure_web<R: BufRead, W: Write>(
 ) -> Result<(), String> {
     let default = if !config.web.enabled {
         1
-    } else if config.web.search.endpoint.is_some() {
+    } else if uses_duckduckgo(config) {
         3
+    } else if config.web.search.endpoint.is_some() {
+        4
     } else {
         2
     };
     let selected = prompt.choose(
         "Web tools",
-        &["Off", "Fetch web pages", "Fetch web pages and search"],
+        &[
+            "Off",
+            "Fetch web pages only",
+            "Agentic search — DuckDuckGo (no account)",
+            "Agentic search — SearXNG or custom JSON endpoint",
+        ],
         default,
     )?;
     config.web.enabled = selected != 1;
     if selected == 3 {
+        use_duckduckgo(config);
+    } else if selected == 4 {
         let current = config
             .web
             .search
             .endpoint
             .as_deref()
+            .filter(|_| !uses_duckduckgo(config))
             .unwrap_or("http://127.0.0.1:8080/search?format=json");
         config.web.search.endpoint = nonempty(prompt.input("SearXNG search URL", current)?);
-    } else if selected == 2 {
+    } else {
         config.web.search.endpoint = None;
     }
     Ok(())
@@ -645,17 +663,29 @@ fn summary(config: &Config, writer: &mut impl Write) -> Result<(), String> {
         (true, true) => "files + terminal",
     };
     let web = if !config.web.enabled {
-        "off"
-    } else if config.web.search.endpoint.is_some() {
-        "fetch + search"
+        "off".to_owned()
+    } else if uses_duckduckgo(config) {
+        "agentic search (DuckDuckGo) + fetch".to_owned()
+    } else if let Some(endpoint) = &config.web.search.endpoint {
+        format!("agentic search ({endpoint}) + fetch")
     } else {
-        "fetch"
+        "fetch only".to_owned()
     };
     writeln!(writer, "Current settings:").map_err(io_error)?;
     writeln!(writer, "  Gateway: {}", config.inference.base_url).map_err(io_error)?;
     writeln!(writer, "  Model:   {model}").map_err(io_error)?;
     writeln!(writer, "  Tools:   {tools}").map_err(io_error)?;
     writeln!(writer, "  Web:     {web}\n").map_err(io_error)
+}
+
+fn uses_duckduckgo(config: &Config) -> bool {
+    config.web.search.endpoint.as_deref() == Some(DUCKDUCKGO_SEARCH_ENDPOINT)
+}
+
+fn use_duckduckgo(config: &mut Config) {
+    config.web.search.endpoint = Some(DUCKDUCKGO_SEARCH_ENDPOINT.to_owned());
+    config.web.search.query_param = "q".to_owned();
+    config.web.search.api_key = None;
 }
 
 fn nonempty(value: String) -> Option<String> {
@@ -750,7 +780,7 @@ mod tests {
         let mut config = Config::default();
         let mut output = Vec::new();
         let mut prompt = Prompt {
-            reader: Cursor::new("3\nhttps://search.example/search?format=json\n"),
+            reader: Cursor::new("4\nhttps://search.example/search?format=json\n"),
             writer: &mut output,
         };
         configure_web(&mut config, &mut prompt).unwrap();
@@ -759,5 +789,19 @@ mod tests {
             config.web.search.endpoint.as_deref(),
             Some("https://search.example/search?format=json")
         );
+    }
+
+    #[test]
+    fn web_search_can_use_duckduckgo_without_an_account() {
+        let mut config = Config::default();
+        let mut output = Vec::new();
+        let mut prompt = Prompt {
+            reader: Cursor::new("3\n"),
+            writer: &mut output,
+        };
+        configure_web(&mut config, &mut prompt).unwrap();
+        assert!(config.web.enabled);
+        assert!(uses_duckduckgo(&config));
+        assert!(config.web.search.api_key.is_none());
     }
 }
