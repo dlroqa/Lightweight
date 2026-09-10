@@ -63,19 +63,43 @@ install -m755 target/debug/lightagent ~/.local/bin/lightagent
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-For a new installation, initialize the agent once, then launch it:
+Once installed, start chatting with one command:
 
 ```sh
-lightagent init --base-url http://127.0.0.1:11434
-lightagent doctor
 lightagent
 ```
+
+No `init` is required: a fresh installation uses a built-in default profile and
+connects to `http://127.0.0.1:11434`. Existing settings and the active profile
+are reused. `lightagent init` is optional for creating a saved initial profile
+or choosing a custom endpoint; `lightagent doctor` checks the connection.
+
+Run `lightagent setup` for a guided terminal menu. It shows current values and
+lets you select the gateway/model, local file and terminal tools, web
+fetch/search, and approval behavior without editing `config.json`. A section can
+be opened directly with `lightagent setup provider`, `tools`, `web`, or
+`approvals`. The Tools screen is an interactive checklist: use ↑/↓ to navigate,
+Space to toggle capabilities, Enter to save, or Escape to cancel.
+
+The Gateway screen is also a keyboard-driven picker. It includes local
+Lightweight, named custom OpenAI-compatible endpoints, manual endpoint entry,
+and removal of saved providers. After choosing a provider it fetches the
+available models and presents them as a second picker. API keys are saved only
+as environment-variable references.
+`lightagent setup gateway` remains an alias for the provider screen.
 
 Keep an inference gateway running with a model loaded. Use the gateway's origin
 as the base URL, without `/v1`; Lightagent adds the API path itself. For an
 existing installation, `lightagent config set inference.base_url <origin>`
 changes the endpoint without reinitializing profiles. In chat, `/help` lists
 commands, `/tools` lists available tools, and `/exit` leaves the harness.
+
+Lightagent checks the gateway's current model before every generation. A
+matching explicit profile model takes precedence over `inference.model`; when
+Lightweight advertises one resident model, Lightagent follows it even if a
+profile contains an older model ID. Switching models in the Models screen is
+therefore reflected in terminal chat and the Agent API without reconfiguration.
+When no model is loaded, Lightagent reports that directly.
 
 The terminal and API share `~/.lightagent` by default. Set `LIGHTAGENT_HOME` to
 use a separate home. For release archives and platform installation details,

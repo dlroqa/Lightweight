@@ -29,6 +29,7 @@ lightagent-runtime.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
 clap.workspace = true
+dialoguer.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util.workspace = true
 serde_json.workspace = true

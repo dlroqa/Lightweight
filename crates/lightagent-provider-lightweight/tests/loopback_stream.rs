@@ -1,7 +1,7 @@
 //! End-to-end offline test of the adapter against a hand-written SSE server.
 //!
-//! A `tokio::net::TcpListener` on `127.0.0.1:0` accepts one connection, reads
-//! the request, and writes a `text/event-stream` response reproducing the whole
+//! A `tokio::net::TcpListener` on `127.0.0.1:0` answers model discovery and then
+//! writes a `text/event-stream` response reproducing the whole
 //! contract: a role chunk with empty content, a reasoning delta, two-index
 //! tool-call deltas with split arguments and id-once, a mid-stream keep-alive
 //! comment, a finish chunk with `tool_calls`, an empty-`choices` usage chunk,
@@ -34,20 +34,32 @@ const STREAM_BODY: &str = concat!(
 );
 
 async fn serve_once(listener: TcpListener) {
-    if let Ok((mut socket, _)) = listener.accept().await {
-        // Read the request until the header terminator; ignore the body.
-        let mut buf = [0u8; 4096];
-        // A single read is enough to get past the headers on loopback.
-        let _ = socket.read(&mut buf).await;
-
-        let response = format!(
+    for response in [
+        concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Length: 24\r\n",
+            "Connection: close\r\n",
+            "\r\n",
+            "{\"data\":[{\"id\":\"m@8k\"}]}"
+        )
+        .to_owned(),
+        format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/event-stream\r\n\
              Cache-Control: no-cache\r\n\
              Connection: close\r\n\
              \r\n\
              {STREAM_BODY}"
-        );
+        ),
+    ] {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        // Read the request until the header terminator; ignore the body.
+        let mut buf = [0u8; 4096];
+        // A single read is enough to get past the headers on loopback.
+        let _ = socket.read(&mut buf).await;
         let _ = socket.write_all(response.as_bytes()).await;
         let _ = socket.flush().await;
         let _ = socket.shutdown().await;

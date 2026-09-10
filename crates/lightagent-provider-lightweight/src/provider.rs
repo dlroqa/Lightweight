@@ -29,7 +29,8 @@ use crate::wire::{ChatChunk, ModelsResponse};
 pub struct ProviderConfig {
     /// The OpenAI-compatible base URL, e.g. `http://127.0.0.1:11434`.
     pub base_url: String,
-    /// The catalog model id sent on every request.
+    /// The catalog model id sent on every request. Empty or `default` discovers
+    /// the model advertised by the gateway before each generation.
     pub model: String,
     /// The bearer key, when the gateway requires one. Loopback needs none.
     pub api_key: Option<String>,
@@ -76,9 +77,40 @@ impl LightweightProvider {
         self.config.base_url.trim_end_matches('/')
     }
 
-    /// List the models the gateway serves, newest catalog id first.
+    /// Resolve the configured model against the gateway's current model list.
+    ///
+    /// Do not cache: the panel can load a different model between runs. A
+    /// configured model wins when the gateway advertises it. Lightweight serves
+    /// one resident model, so that sole model wins over a stale profile value.
+    pub async fn resolve_model(&self) -> Result<String, ProviderError> {
+        let configured = self.config.model.trim();
+        let models = self
+            .models()
+            .await?
+            .into_iter()
+            .filter(|model| !model.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !configured.is_empty() && models.iter().any(|model| model == configured) {
+            return Ok(self.config.model.clone());
+        }
+        match models.as_slice() {
+            [model] => Ok(model.clone()),
+            [] => Err(ProviderError::Upstream(
+                "No model is loaded. Load a model in Lightweight's Models screen, then retry."
+                    .into(),
+            )),
+            _ => Err(ProviderError::Upstream(format!(
+                "Model {configured:?} is not available. The provider advertises multiple models; set inference.model or the profile's model to one of them."
+            ))),
+        }
+    }
+
+    /// List the model IDs currently advertised by the gateway.
     pub async fn models(&self) -> Result<Vec<String>, ProviderError> {
-        let mut request = self.client.get(format!("{}/v1/models", self.base()));
+        let mut request = self
+            .client
+            .get(format!("{}/v1/models", self.base()))
+            .timeout(std::time::Duration::from_secs(10));
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
         }
@@ -198,7 +230,9 @@ impl AgentProvider for LightweightProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
-        let body = build_body(&self.config, &request);
+        let mut config = self.config.clone();
+        config.model = self.resolve_model().await?;
+        let body = build_body(&config, &request);
         let mut builder = self
             .client
             .post(format!("{}/v1/chat/completions", self.base()))

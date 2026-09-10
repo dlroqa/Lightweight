@@ -58,8 +58,11 @@ fi
 cat > "$STAGE/README.md" <<EOF
 # Lightagent $VERSION — $TRIPLE
 
-A local agent harness with live tools. Run \`./lightagent --help\`, then
-\`./lightagent init\` to set up its isolated home, and \`./lightagent chat\`.
+A local agent harness with live tools. Run \`./lightagent\` to open terminal
+chat. No init is required: the default gateway is http://127.0.0.1:11434.
+Existing settings and the active profile are reused. Run
+\`./lightagent setup\` for guided configuration or \`./lightagent --help\` for
+more commands.
 
 - **Lightagent needs a running inference gateway.** It talks to an
   OpenAI-compatible gateway (such as \`lightweight serve\`) over HTTP; it does not hold

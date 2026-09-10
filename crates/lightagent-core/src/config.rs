@@ -28,6 +28,16 @@ pub enum SecretRef {
     Env { var: String },
 }
 
+/// A named OpenAI-compatible endpoint saved for quick switching in the CLI.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedProvider {
+    pub name: String,
+    pub base_url: String,
+    /// Optional API key reference. The secret itself is never persisted.
+    #[serde(default)]
+    pub api_key: Option<SecretRef>,
+}
+
 impl SecretRef {
     /// A reference to the environment variable `var`.
     pub fn env(var: impl Into<String>) -> Self {
@@ -70,6 +80,8 @@ pub struct InferenceConfig {
     pub model: Option<String>,
     /// The provider API key, by reference. Loopback needs none.
     pub api_key: Option<SecretRef>,
+    /// Named custom endpoints offered by the interactive provider picker.
+    pub saved_providers: Vec<SavedProvider>,
 }
 
 impl Default for InferenceConfig {
@@ -81,6 +93,7 @@ impl Default for InferenceConfig {
             allow_cpu_fallback: true,
             model: None,
             api_key: None,
+            saved_providers: Vec::new(),
         }
     }
 }
@@ -505,6 +518,20 @@ impl Config {
                 self.inference.base_url
             )));
         }
+        for saved in &self.inference.saved_providers {
+            if saved.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "a saved provider has an empty name".to_owned(),
+                ));
+            }
+            let url = saved.base_url.trim();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(ConfigError::Invalid(format!(
+                    "saved provider {:?} must have an http(s) URL, got {:?}",
+                    saved.name, saved.base_url
+                )));
+            }
+        }
         if self.agent.max_turns == 0 {
             return Err(ConfigError::Invalid(
                 "agent.max_turns must be at least 1".to_owned(),
@@ -660,6 +687,22 @@ impl Config {
                 serde_json::Value::String(api_key.redacted()),
             );
         }
+        if let Some(providers) = value
+            .get_mut("inference")
+            .and_then(|inference| inference.get_mut("saved_providers"))
+            .and_then(|providers| providers.as_array_mut())
+        {
+            for (saved, rendered) in self.inference.saved_providers.iter().zip(providers) {
+                if let Some(api_key) = &saved.api_key
+                    && let Some(object) = rendered.as_object_mut()
+                {
+                    object.insert(
+                        "api_key".to_owned(),
+                        serde_json::Value::String(api_key.redacted()),
+                    );
+                }
+            }
+        }
         if let Some(api_key) = &self.web.search.api_key
             && let Some(search) = value
                 .get_mut("web")
@@ -790,12 +833,21 @@ mod tests {
         let store = ConfigStore::new(dir.join("config.json"));
         let mut config = Config::default();
         config.inference.model = Some("lfm2@8k".to_owned());
+        config.inference.saved_providers.push(SavedProvider {
+            name: "Lab".to_owned(),
+            base_url: "https://models.example".to_owned(),
+            api_key: Some(SecretRef::env("LAB_API_KEY")),
+        });
         config.security.approval_policy = ApprovalPolicy::Strict;
         config.web.allow_domains.push("example.com".to_owned());
 
         store.save(&config).expect("save");
         let loaded = store.load().expect("load");
         assert_eq!(loaded, config);
+        assert_eq!(
+            config.redacted_json()["inference"]["saved_providers"][0]["api_key"],
+            "${env:LAB_API_KEY}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

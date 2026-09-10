@@ -19,6 +19,7 @@ mod memory;
 mod rag;
 mod runtime;
 mod serve;
+mod setup;
 mod slash;
 
 use std::io::IsTerminal as _;
@@ -71,6 +72,12 @@ enum Command {
         /// The default model id.
         #[arg(long)]
         model: Option<String>,
+    },
+    /// Configure Lightagent with an interactive menu.
+    Setup {
+        /// Open one setup section directly.
+        #[arg(value_enum)]
+        section: Option<setup::Section>,
     },
     /// Show or change configuration.
     Config {
@@ -326,6 +333,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             base_url,
             model,
         }) => init(force, profile, base_url, model, cli.json),
+        Some(Command::Setup { section }) => setup::run(section, cli.json).await,
         Some(Command::Config { action }) => {
             config_cmd(action.unwrap_or(ConfigAction::Show), cli.json)
         }

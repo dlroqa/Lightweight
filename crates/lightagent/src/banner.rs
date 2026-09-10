@@ -1,10 +1,9 @@
 //! The `lightagent` welcome mark.
 //!
-//! Typing `lightagent` prints, before anything else, a deliberately simplified
-//! pixel star with a lightning bolt through it — the product's mark — exactly as
-//! the `lightweight` binary greets with its feather. The grid is committed here
-//! rather than rendered from a raster at run time; the full-colour artwork lives
-//! in `icon/lightagent-source.png` and this grid is the reduction of it.
+//! Typing `lightagent` prints a terminal adaptation of the supplied pixel-art
+//! logo: a gold star, a white/cyan lightning bolt, sparkles and pixel lettering.
+//! The character grid keeps the artwork portable without image-protocol support
+//! or runtime image decoding.
 //!
 //! Three rules keep the decoration out of the way, matching the sibling binary:
 //!
@@ -13,42 +12,87 @@
 //!   * **`NO_COLOR` and `LIGHTAGENT_NO_BANNER`** — the first drops to a
 //!     monochrome silhouette, the second turns the mark off entirely.
 //!
-//! Each character is one pixel: `Y` star yellow, `O` star orange, `C` bolt cyan,
-//! `W` bolt highlight, `.` clear. Two pixel rows render into one terminal row
-//! with the upper-half block `▀`, doubling the vertical resolution for free.
+//! Each character is one pixel in the logo palette; `.` is transparent.
+//! Two pixel rows render into one terminal row with the upper-half block `▀`.
 
 use std::io::IsTerminal as _;
 
-/// One pixel per character; two rows per rendered line. 19 columns wide, so the
-/// mark plus its two-space indent stays well within an 80-column terminal.
+/// The 56-column logo fits comfortably in a standard 80-column terminal.
 const STAR_BOLT: &[&str] = &[
-    ".........Y.........",
-    ".........Y.........",
-    "........YYY.C......",
-    "........YYYC.......",
-    ".......YYYYC.......",
-    "YYYYYYYYYYCYYYYYYYY",
-    ".YYYYYYYYWCYYYYYYY.",
-    "..YYYYYYYCYYYYYYY..",
-    "...YYYYYCWYYYYYY...",
-    "....OOOOCOOOOOO....",
-    "....OOOCWOOOOOO....",
-    "...OOOOC...OOOOO...",
-    "..OOOOOW....OOOOO..",
-    "..OOOOC......OOOO..",
-    ".OOOO.C.......OOOO.",
-    ".OOO..C........OOO.",
-    "OOO.............OOO",
-    "OO...............OO",
+    ".........................................CCC............",
+    "........................................CCBC............",
+    ".......................................CCBCC............",
+    ".........................CCCC.........CCBBC.............",
+    ".........................CBBC........CCBCCC.............",
+    "........................CCBBCC......CCBCBC..............",
+    "........................CBBBBC.....CCBWBCC..............",
+    "............Y.....PB...CCBYYBCC...CCBWCBC...............",
+    "...........YHY.........CBBWYBBC..CCBWWBCC....CC.........",
+    "..........YHWHY.......CCBBWYBBC.CCBCWCBC....CC..........",
+    ".....CC....YHY........CBBYWYYBCCCBCWCBCC...CC....Y......",
+    "......CC....Y.........CBBWWYYBCCBCWWCCC.........YHY.....",
+    ".......CC............CCBBWWYYBCBCWWCBC.........YHWHY....",
+    "........CC...........CBBWWWYCCBCWWCBCC..........YHY.....",
+    "....PB..............CCBBWWWCCBCCWWCBC............Y......",
+    "....................CBBBWWCCBCCWWCBCC...................",
+    "...................CCBBWWCCBCCWWWCBC.........PB.........",
+    "...CCCCCCCCCCCCCCCCCBBBWCCBCCWWWCBCCCCCCCCCCCCCCCC......",
+    "...CBBBBBBBBBBBBBBBBBBBCCBCCWWWCCBBBBBBBBBBBBBBBBC......",
+    "...CCBBBBBBBBBBBBBBBBBCCBCCWWWWCBCBBBBBBBBBBBBBBCC......",
+    "....CCBYYYHHHHHHHHHYYCCBCCCWWWCBBCYHHHHHHHHHYYBCC.......",
+    ".....CCBYYYHHHHHHHYYCCBCCCWWWWCBCCCCHHHHHHYYYBCC........",
+    "......CCBBYYHHHHHYYCCBCCCWWWWCBBBBBCHHHHYYYBBCC.........",
+    ".......CCBBYYYYYYYCCBCCCWWWWCCCCCBCCYYYYYYBBCC..........",
+    "........CCBBBAAAACCBCCCWWWWWWWWCBCCAAAAABBBCC...........",
+    ".........CCBBBAACCBCCCCCCCCWWWCBCCAAAAABBBCC............",
+    "..........CCBBBBCBBBBBBBBCWWWCBCCAAAABBBBCC.............",
+    "...........CCBBBCCCCCCCBCWWWCBCCAAAABBBBCC..............",
+    "............CCBBBBAACCBCWWWCBCCAAAABBBBCC...............",
+    ".............CCBBBAACBBWWWCBCCAAAAABBBCC................",
+    ".............CCBBAACCBCWWCBCCAAAAAAABBC.................",
+    ".............CBBBAYCBCWWCBCCAAAYYYAABBCC..........PB....",
+    ".............CBBBYCCBWWCBCCOOOOOYYYOBBBC................",
+    "..........PB.CBBBCCBWWCBCCBBOOOOOYYOBBBC................",
+    ".......CC....CBBOCBCWCBCCBBBBOOOOWYYBBBC................",
+    "......CC....CCBBCCCWCBCCBBBBBBOOOOYYOBBC................",
+    ".....CC.....CBBCCBWCBCCBBBCCBBBBOOWYOBBCC....CC.........",
+    ".....YHY....CBBCBWCBCCBBCCCCCCBBBOOWYBBBC.....CC........",
+    "....YHWHY...CBCCWCBCCBCCC....CCBBBBOOBBBC......CC.......",
+    ".....YHY....CBCBCBCCCCC.......CCCBBBOOBBC...............",
+    "......Y....CCBBCBCBCC...........CCCBBOBBC...............",
+    "...........CBBCBCCCC........Y.....CCCBBBCC..............",
+    "...........CCBBCCC.........YHY......CCBBBC..............",
+    "...........CCBCC..........YHWHY......CCCBC..............",
+    "..........CCBCC.........PB.YHY..PB.....CCC..............",
+    "..........CBCC..............Y...........................",
+    "..........CCC...........................................",
+    "........................................................",
+    ".......W....W......W.....W.......................W......",
+    ".......YB...BB.....YB....YB......................YB.....",
+    ".......YB...Y.YYYY.YYY..YYY.YYY..YYYY.YYYY.YYY..YYY.....",
+    ".......YB...YBYBBYBYBBY.BYBBBBBY.YBBYBYBBYBYBBY.BYBB....",
+    ".......YB...YBYYYYBYB.YB.YB.YYYYBYYYYBYYYYBYB.YB.YB.....",
+    ".......OB...OBBBBOBOB.OB.OB.OBBOBBBBOBOBBBBOB.OB.OB.....",
+    ".......OOOO.OBOOOOBOB.OB.OO.OOOOBOOOOBOOOO.OB.OB.OO.....",
+    ".......BBBBBBBBBBBBBB.BB.BBBBBBBBBBBBBBBBBBBB.BB.BBB....",
+    "............................Y...........................",
+    "...........................YHY..........................",
+    "........CCCCCCCCCCCCCCCCPCYHWHYCPCCCCCCCCCCCCCCCC.......",
+    "...........................YHY..........................",
+    "............................Y...........................",
 ];
 
 /// RGB for a pixel role, or `None` for a clear pixel.
 fn rgb(pixel: u8) -> Option<(u8, u8, u8)> {
     match pixel {
-        b'Y' => Some((250, 205, 45)),  // star, upper
-        b'O' => Some((240, 150, 35)),  // star, lower
-        b'C' => Some((52, 226, 212)),  // bolt
-        b'W' => Some((228, 255, 255)), // bolt highlight
+        b'Y' => Some((255, 232, 0)),   // gold star and lettering
+        b'H' => Some((255, 255, 130)), // star glints
+        b'A' => Some((255, 163, 0)),   // amber
+        b'O' => Some((255, 112, 0)),   // orange shading
+        b'C' => Some((0, 238, 255)),   // cyan bolt and outline
+        b'B' => Some((20, 24, 174)),   // deep blue edging
+        b'P' => Some((170, 0, 255)),   // purple sparkles
+        b'W' => Some((245, 255, 255)), // white highlights
         _ => None,
     }
 }
@@ -113,7 +157,7 @@ fn cell(upper: u8, lower: u8, colour: bool) -> String {
         };
     }
     match (up, low) {
-        (None, None) => " ".to_owned(),
+        (None, None) => "\x1b[0m ".to_owned(),
         (Some((r, g, b)), None) => format!("\x1b[49m\x1b[38;2;{r};{g};{b}m\u{2580}"),
         (None, Some((r, g, b))) => format!("\x1b[49m\x1b[38;2;{r};{g};{b}m\u{2584}"),
         (Some((tr, tg, tb)), Some((br, bg, bb))) => {
@@ -128,16 +172,16 @@ mod tests {
 
     fn strip_ansi(line: &str) -> String {
         let mut out = String::new();
-        let mut bytes = line.bytes().peekable();
-        while let Some(byte) = bytes.next() {
-            if byte == 0x1b {
-                for next in bytes.by_ref() {
-                    if next == b'm' {
+        let mut chars = line.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for next in chars.by_ref() {
+                    if next == 'm' {
                         break;
                     }
                 }
             } else {
-                out.push(byte as char);
+                out.push(ch);
             }
         }
         out

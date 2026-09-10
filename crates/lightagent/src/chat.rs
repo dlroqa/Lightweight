@@ -253,15 +253,7 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         .base_url
         .clone()
         .unwrap_or_else(|| config.inference.base_url.clone());
-    let model = if profile.routing.model.is_empty() {
-        config
-            .inference
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".to_string())
-    } else {
-        profile.routing.model.clone()
-    };
+    let model = configured_model(&profile.routing.model, &config);
     let api_key = config
         .inference
         .api_key
@@ -273,6 +265,10 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
         provider_config = provider_config.with_api_key(key.clone());
     }
     let provider = LightweightProvider::new(provider_config).map_err(|error| error.to_string())?;
+    let active_model = provider
+        .resolve_model()
+        .await
+        .map_err(|error| error.to_string())?;
 
     let delegation = Delegation {
         profiles: Arc::new(store),
@@ -328,7 +324,7 @@ pub async fn run(profile: Option<String>, _json: bool) -> Result<(), String> {
     println!(
         "Lightagent chat — profile '{}', model '{}'.",
         profile.id.as_str(),
-        model
+        active_model
     );
     println!("Type a message, or /help for commands. /exit to leave.");
 
@@ -543,10 +539,43 @@ fn default_profile(config: &Config) -> Result<AgentProfile, String> {
         .model
         .clone()
         .unwrap_or_else(|| "default".to_string());
-    Ok(AgentProfile::new(
+    let mut profile = AgentProfile::new(
         id,
         "Default",
         "You are Lightagent, a helpful local agent with live tools.",
         model,
-    ))
+    );
+    profile.approval_policy = config.security.approval_policy;
+    Ok(profile)
+}
+
+/// A default profile inherits the configured model; an explicit profile wins.
+pub(crate) fn configured_model(profile_model: &str, config: &Config) -> String {
+    if profile_model.trim().is_empty() || profile_model == "default" {
+        config
+            .inference
+            .model
+            .clone()
+            .unwrap_or_else(|| "default".into())
+    } else {
+        profile_model.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn a_default_profile_inherits_the_configured_model() {
+        let mut config = Config::default();
+        config.inference.model = Some("minicpm5-1b-q4_k_m@16k".into());
+        assert_eq!(
+            configured_model("default", &config),
+            "minicpm5-1b-q4_k_m@16k"
+        );
+        assert_eq!(configured_model("", &config), "minicpm5-1b-q4_k_m@16k");
+        assert_eq!(configured_model("pinned-model", &config), "pinned-model");
+        assert_eq!(configured_model("default", &Config::default()), "default");
+    }
 }

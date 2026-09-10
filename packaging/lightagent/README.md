@@ -33,9 +33,7 @@ model of its own.
 ```sh
 tar -xzf lightagent-<version>-<triple>.tar.gz
 install -Dm755 lightagent-<version>-<triple>/lightagent ~/.local/bin/lightagent
-lightagent init                 # scaffolds ~/.lightagent and a first profile
-lightagent config set inference.base_url http://127.0.0.1:11434
-lightagent doctor               # confirms the home, the profile and the gateway
+lightagent                     # opens terminal chat
 ```
 
 `~/.local/bin` on the `PATH` is all that is needed; nothing is installed
@@ -49,6 +47,22 @@ Run `lightagent` from any directory to open interactive chat, or use
 commands, `/tools` lists tools, and `/exit` closes the session. Tool calls that
 require approval prompt in the terminal; conversations are saved under the
 active profile in `~/.lightagent`.
+
+No `init` is required for terminal chat. A fresh installation uses a built-in
+default profile and `http://127.0.0.1:11434`; existing settings and the active
+profile are reused. Use `lightagent init` to create a saved initial profile,
+or `lightagent config set inference.base_url <origin>` for another gateway.
+`lightagent doctor` checks the configuration and connection.
+
+Use `lightagent setup` for interactive menus that configure the gateway/model,
+local tools, web access and approval prompts. Open one menu directly with
+`lightagent setup provider`, `tools`, `web` or `approvals`. In the Tools screen,
+use ↑/↓ to navigate, Space to toggle, Enter to save, or Escape to cancel.
+The Gateway screen can switch between local Lightweight and named custom
+OpenAI-compatible endpoints, add or remove saved providers, and select a model
+from the chosen endpoint. Provider secrets are stored only as references to
+environment variables.
+`lightagent setup gateway` remains an alias for the provider screen.
 
 Terminal chat calls the inference gateway directly. It does not require the
 desktop app or a running `lightagent serve` process. A gateway with a loaded

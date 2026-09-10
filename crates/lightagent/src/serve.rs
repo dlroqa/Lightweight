@@ -24,8 +24,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::{
-    LightweightFactory, load_extensions, load_global_extensions, load_skills, mcp_tools,
-    resolve_profile, web_context, workspace_context,
+    LightweightFactory, configured_model, load_extensions, load_global_extensions, load_skills,
+    mcp_tools, resolve_profile, web_context, workspace_context,
 };
 
 /// Builds and drives a real run with the Lightweight provider per request.
@@ -58,15 +58,7 @@ impl RunFactory for LightweightRunFactory {
             .base_url
             .clone()
             .unwrap_or_else(|| self.config.inference.base_url.clone());
-        let model = if profile.routing.model.is_empty() {
-            self.config
-                .inference
-                .model
-                .clone()
-                .unwrap_or_else(|| "default".to_string())
-        } else {
-            profile.routing.model.clone()
-        };
+        let model = configured_model(&profile.routing.model, &self.config);
         let api_key = self
             .config
             .inference
