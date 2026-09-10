@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-09-10
+
+A patch release for Lightagent retrieval. It adds one-call realtime RAG tuned
+for quantized local models and improves indexed sparse retrieval with BM25.
+Existing web, RAG, provider, and profile configuration remains compatible.
+
 ### Added
 
 - **One-call realtime RAG for quantized models.** The new `rag.realtime` tool
