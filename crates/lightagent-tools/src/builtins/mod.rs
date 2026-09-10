@@ -20,4 +20,4 @@ pub use delegate::AgentDelegate;
 pub use fs::{FsList, FsRead, FsWrite};
 pub use skill::SkillRead;
 pub use terminal::TerminalRun;
-pub use web::{WebFetch, WebSearch};
+pub use web::{WebFetch, WebSearch, WebSearchHit, fetch_text, search_results};

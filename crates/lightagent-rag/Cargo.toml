@@ -1,6 +1,6 @@
 [package]
 name = "lightagent-rag"
-description = "Dependency-free lexical retrieval (chunking, feature-hashed embeddings, a persisted vector store) and a rag.search tool for the Lightagent runtime."
+description = "Hybrid indexed and realtime retrieval tools for the Lightagent runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,11 @@ lightagent-tools.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
+rustls.workspace = true
 tokio = { workspace = true }
 tokio-util.workspace = true

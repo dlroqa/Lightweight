@@ -90,7 +90,7 @@ impl Tool for WebFetch {
                 return ToolOutcome::error(format!("could not read fetch arguments: {error}"));
             }
         };
-        match fetch(&web, &args.url).await {
+        match fetch_text(&web, &args.url).await {
             Ok(text) => ToolOutcome::ok(text),
             Err(message) => ToolOutcome::error(message),
         }
@@ -98,7 +98,11 @@ impl Tool for WebFetch {
 }
 
 /// Follow `start` under the guard, up to [`MAX_REDIRECTS`] hops.
-async fn fetch(web: &WebContext, start: &str) -> Result<String, String> {
+/// Fetch one page through the same redirect and SSRF guards as [`WebFetch`].
+///
+/// Composite tools such as realtime RAG use this typed entry point rather than
+/// calling `web.fetch` and reparsing its rendered [`ToolOutcome`].
+pub async fn fetch_text(web: &WebContext, start: &str) -> Result<String, String> {
     let mut url = reqwest::Url::parse(start).map_err(|error| format!("invalid URL: {error}"))?;
     let mut hops = 0;
     loop {
@@ -259,14 +263,25 @@ impl Tool for WebSearch {
                 return ToolOutcome::error(format!("could not read search arguments: {error}"));
             }
         };
-        match search(&web, &args.query, args.max_results).await {
-            Ok(text) => ToolOutcome::ok(text),
+        match search_results(&web, &args.query, args.max_results).await {
+            Ok(hits) if hits.is_empty() => {
+                ToolOutcome::ok(format!("No results for {:?}.", args.query))
+            }
+            Ok(hits) => ToolOutcome::ok(render_search(&args.query, &hits)),
             Err(message) => ToolOutcome::error(message),
         }
     }
 }
 
-async fn search(web: &WebContext, query: &str, requested: Option<usize>) -> Result<String, String> {
+/// Search the configured backend and return structured results.
+///
+/// This is public so a composite retrieval tool can search and fetch without
+/// forcing a small model through a brittle multi-tool planning loop.
+pub async fn search_results(
+    web: &WebContext,
+    query: &str,
+    requested: Option<usize>,
+) -> Result<Vec<WebSearchHit>, String> {
     let policy = &web.policy;
     let Some(endpoint) = &policy.search_endpoint else {
         return Err("no search backend is configured (set web.search.endpoint)".to_owned());
@@ -318,13 +333,10 @@ async fn search(web: &WebContext, query: &str, requested: Option<usize>) -> Resu
             .map_err(|error| format!("search endpoint did not return JSON: {error}"))?;
         parse_search_results(&json, limit)
     };
-    if hits.is_empty() {
-        return Ok(format!("No results for {query:?}."));
-    }
-    Ok(render_search(query, &hits))
+    Ok(hits)
 }
 
-fn parse_duckduckgo_results(html: &str, limit: usize) -> Vec<SearchHit> {
+fn parse_duckduckgo_results(html: &str, limit: usize) -> Vec<WebSearchHit> {
     html.split("result results_links")
         .skip(1)
         .filter_map(|result| {
@@ -333,7 +345,7 @@ fn parse_duckduckgo_results(html: &str, limit: usize) -> Vec<SearchHit> {
             let snippet = anchor_with_class(result, "result__snippet")
                 .map(|(_, text)| text)
                 .unwrap_or_default();
-            Some(SearchHit {
+            Some(WebSearchHit {
                 title,
                 url,
                 snippet,
@@ -386,17 +398,17 @@ fn limit_readable_text(text: String) -> String {
 }
 
 /// One search result.
-#[derive(Debug, PartialEq)]
-struct SearchHit {
-    title: String,
-    url: String,
-    snippet: String,
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebSearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
 }
 
 /// Read a `results` array of `{title, url, content|snippet|description}` from a
 /// search response — SearXNG's shape and a common minimal one. An item without a
 /// `url` is skipped; a missing title falls back to the URL.
-fn parse_search_results(json: &Value, limit: usize) -> Vec<SearchHit> {
+fn parse_search_results(json: &Value, limit: usize) -> Vec<WebSearchHit> {
     let Some(results) = json.get("results").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -409,7 +421,7 @@ fn parse_search_results(json: &Value, limit: usize) -> Vec<SearchHit> {
                 .iter()
                 .find_map(|key| item.get(*key).and_then(Value::as_str))
                 .unwrap_or("");
-            Some(SearchHit {
+            Some(WebSearchHit {
                 title: title.to_owned(),
                 url: url.to_owned(),
                 snippet: snippet.to_owned(),
@@ -419,7 +431,7 @@ fn parse_search_results(json: &Value, limit: usize) -> Vec<SearchHit> {
         .collect()
 }
 
-fn render_search(query: &str, hits: &[SearchHit]) -> String {
+fn render_search(query: &str, hits: &[WebSearchHit]) -> String {
     let mut out = format!("Results for {query:?}:\n\n");
     for (index, hit) in hits.iter().enumerate() {
         out.push_str(&format!("{}. {}\n{}\n", index + 1, hit.title, hit.url));

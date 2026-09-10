@@ -103,6 +103,9 @@ impl RunFactory for LightweightRunFactory {
         if let Some(tool) = crate::rag::rag_tool(&profile_dir, &self.config) {
             registry.insert(tool);
         }
+        if let Some(tool) = crate::rag::realtime_rag_tool(&self.config) {
+            registry.insert(tool);
+        }
         for tool in crate::memory::memory_tools(&profile_dir, &self.config) {
             registry.insert(tool);
         }

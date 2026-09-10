@@ -1131,8 +1131,11 @@ name = "lightagent-rag"
 version = "0.3.6"
 dependencies = [
  "async-trait",
+ "futures-util",
  "lightagent-core",
  "lightagent-tools",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

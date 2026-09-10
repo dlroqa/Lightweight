@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **One-call realtime RAG for quantized models.** The new `rag.realtime` tool
+  searches the configured live backend, fetches candidate pages concurrently
+  through the existing redirect and SSRF guards, chunks on natural boundaries,
+  ranks with BM25 and an optional bounded semantic pass, suppresses duplicate
+  passages, and returns compact citation-ready evidence. This removes the need
+  for a small local model to orchestrate a multi-turn search/fetch pipeline.
+
+### Changed
+
+- **Sparse RAG ranking now uses BM25.** Indexed-document retrieval discounts
+  corpus-wide words and saturates repetition before reciprocal-rank fusion with
+  semantic results, improving exact-term precision without another model call.
+
 ## [0.3.6] - 2026-09-09
 
 A patch release focused on the Lightagent terminal harness. It adds a direct

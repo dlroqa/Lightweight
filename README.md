@@ -106,13 +106,15 @@ as environment-variable references.
 `lightagent setup gateway` remains an alias for the provider screen.
 
 For realtime web research, run `lightagent setup web` and choose **Agentic
-search — DuckDuckGo (no account)**. This enables two native tools:
-`web.search` finds relevant pages and `web.fetch` reads their full text. For
-questions that need current or niche information, Lightagent guides a capable
-tool-calling model through a bounded research loop: identify what needs
-evidence, search, evaluate sources, fetch the useful pages, cross-check, refine
-when needed, and answer with source URLs. Web content is treated as untrusted
-evidence rather than agent instructions.
+search — DuckDuckGo (no account)**. This enables `rag.realtime`, a one-call
+retrieval tool that searches, fetches candidate pages concurrently, splits them
+at readable boundaries, ranks passages with BM25 plus optional semantic
+embeddings, removes duplicates, and returns a compact evidence pack with source
+URLs. It is designed for quantized local models: the model supplies one complete
+query and synthesizes the selected evidence instead of reliably coordinating a
+long search/fetch/rerank sequence. The lower-level `web.search` and `web.fetch`
+tools remain available for follow-up research. Web content is treated as
+untrusted evidence rather than agent instructions.
 
 The same no-account setup can be applied without the menu:
 
@@ -122,8 +124,9 @@ lightagent config set web.search.endpoint https://html.duckduckgo.com/html/
 ```
 
 Choose the custom endpoint option in `lightagent setup web` to use SearXNG or
-another service that returns a JSON `results` array. Search quality and tool use
-still depend on the selected model's ability to make native tool calls.
+another service that returns a JSON `results` array. Retrieval works without an
+embedding model; when `rag.semantic` is enabled, the top sparse candidates get a
+single batched semantic pass and both rankings are fused.
 
 Keep an inference gateway running with a model loaded. Use the gateway's origin
 as the base URL, without `/v1`; Lightagent adds the API path itself. For an

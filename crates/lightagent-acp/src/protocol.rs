@@ -79,7 +79,7 @@ pub fn tool_kind(name: &str) -> &'static str {
     match name {
         "fs.read" | "skill.read" => "read",
         "fs.write" => "edit",
-        "fs.list" | "rag.search" | "memory.search" | "web.search" => "search",
+        "fs.list" | "rag.search" | "rag.realtime" | "memory.search" | "web.search" => "search",
         "terminal.run" => "execute",
         "web.fetch" => "fetch",
         "agent.delegate" => "think",

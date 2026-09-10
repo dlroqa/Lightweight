@@ -1,13 +1,11 @@
 //! A persisted set of chunks, searched by hybrid lexical + semantic similarity.
 //!
-//! Each chunk carries a lexical vector (the dependency-free feature hash, always)
-//! and, when a semantic embedder is configured, a model embedding. Search ranks
-//! by both and fuses the two rankings with Reciprocal Rank Fusion (RRF), which
-//! combines lists on rank rather than raw score — so the very different scales of
-//! a bag-of-words cosine and a model cosine mix cleanly, and a record missing one
-//! signal (an old index with no semantic vector, or a chunk with no shared words)
-//! still ranks on the other. With no semantic embedder it is pure lexical, as
-//! before. The index is JSONL under the profile's owner-only `rag/` directory.
+//! Each chunk carries the text needed for BM25, a dependency-free feature-hash
+//! vector used for compatibility and deduplication, and, when configured, a model
+//! embedding. BM25 and dense results are combined with Reciprocal Rank Fusion
+//! (RRF), which mixes rankings rather than incomparable raw score scales. With no
+//! semantic embedder retrieval is model-free. The index is JSONL under the
+//! profile's owner-only `rag/` directory.
 
 use std::cmp::Ordering;
 use std::io;
@@ -16,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::chunk;
-use crate::embed::{DIM, Embedder, SemanticEmbedder, cosine};
+use crate::embed::{DIM, Embedder, SemanticEmbedder, cosine, lexical_terms};
 
 /// RRF's rank damping constant; 60 is the value from the original paper.
 const RRF_K: f32 = 60.0;
@@ -39,6 +37,142 @@ pub struct Hit {
     pub score: f32,
     pub source: String,
     pub text: String,
+}
+
+/// An ephemeral passage to rank without writing it into the profile index.
+/// Realtime retrieval uses this for freshly fetched web pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Passage {
+    pub source: String,
+    pub text: String,
+}
+
+/// Rank fresh passages with BM25 and, when configured, a bounded semantic pass.
+///
+/// The sparse first stage considers every passage. The semantic endpoint sees
+/// at most `semantic_candidates` passages selected by BM25 plus one leading
+/// passage per source, keeping latency and embedding work bounded while retaining
+/// a path for synonym-only matches. Query and passages are embedded in one batch.
+pub async fn search_passages(
+    query: &str,
+    passages: &[Passage],
+    semantic: Option<&dyn SemanticEmbedder>,
+    k: usize,
+    semantic_candidates: usize,
+) -> Vec<Hit> {
+    use std::collections::{HashMap, HashSet};
+
+    let lexical = crate::embed::HashingEmbedder;
+    let records: Vec<Record> = passages
+        .iter()
+        .enumerate()
+        .map(|(index, passage)| Record {
+            source: passage.source.clone(),
+            chunk: index,
+            text: passage.text.clone(),
+            vector: lexical.embed(&passage.text),
+            semantic: None,
+        })
+        .collect();
+    let lexical_ranked = bm25_ranked(&records, query);
+
+    let semantic_ranked = if let Some(embedder) = semantic {
+        let cap = semantic_candidates.max(k).min(records.len());
+        let mut candidate_indices = Vec::with_capacity(cap);
+        let mut seen = HashSet::new();
+        // Preserve one route into every high-ranked web source even when its
+        // wording shares no token with the query.
+        for (index, record) in records.iter().enumerate() {
+            if candidate_indices.len() == cap {
+                break;
+            }
+            let first_for_source = records[..index]
+                .iter()
+                .all(|earlier| earlier.source != record.source);
+            if first_for_source && seen.insert(index) {
+                candidate_indices.push(index);
+            }
+        }
+        for (index, _) in &lexical_ranked {
+            if candidate_indices.len() == cap {
+                break;
+            }
+            if seen.insert(*index) {
+                candidate_indices.push(*index);
+            }
+        }
+        for index in 0..records.len() {
+            if candidate_indices.len() == cap {
+                break;
+            }
+            if seen.insert(index) {
+                candidate_indices.push(index);
+            }
+        }
+
+        let mut texts = Vec::with_capacity(candidate_indices.len() + 1);
+        texts.push(query.to_owned());
+        texts.extend(
+            candidate_indices
+                .iter()
+                .map(|index| records[*index].text.clone()),
+        );
+        match embedder.embed(&texts).await {
+            Ok(vectors) if vectors.len() == texts.len() => {
+                let query_vector = &vectors[0];
+                Some(ranked(candidate_indices.iter().enumerate().map(
+                    |(offset, index)| (*index, cosine(query_vector, &vectors[offset + 1])),
+                )))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let ranked = match semantic_ranked {
+        Some(semantic_ranked) if !semantic_ranked.is_empty() => {
+            fuse_rrf(&[lexical_ranked, semantic_ranked])
+        }
+        _ if !lexical_ranked.is_empty() => lexical_ranked,
+        // Search-engine ordering is the best deterministic fallback when no
+        // passage shares a term and the semantic endpoint is absent/down.
+        _ => records
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (index, 1.0 / (index + 1) as f32))
+            .collect(),
+    };
+
+    let mut per_source: HashMap<&str, usize> = HashMap::new();
+    let mut selected: Vec<(usize, f32)> = Vec::new();
+    for (index, score) in ranked {
+        if selected.len() == k {
+            break;
+        }
+        let record = &records[index];
+        if per_source.get(record.source.as_str()).copied().unwrap_or(0) >= 2 {
+            continue;
+        }
+        // Suppress boilerplate and mirrored passages without a model reranker.
+        if selected
+            .iter()
+            .any(|(chosen, _)| cosine(&records[*chosen].vector, &record.vector) > 0.92)
+        {
+            continue;
+        }
+        *per_source.entry(record.source.as_str()).or_insert(0) += 1;
+        selected.push((index, score));
+    }
+
+    selected
+        .into_iter()
+        .map(|(index, score)| Hit {
+            score,
+            source: records[index].source.clone(),
+            text: records[index].text.clone(),
+        })
+        .collect()
 }
 
 /// An on-disk hybrid vector index for one profile.
@@ -120,17 +254,15 @@ impl RagStore {
     pub async fn search(
         &self,
         query: &str,
-        lexical: &dyn Embedder,
+        _lexical: &dyn Embedder,
         semantic: Option<&dyn SemanticEmbedder>,
         k: usize,
     ) -> Vec<Hit> {
-        let lexical_query = lexical.embed(query);
-        let lexical_ranked = ranked(
-            self.records
-                .iter()
-                .enumerate()
-                .map(|(index, record)| (index, cosine(&lexical_query, &record.vector))),
-        );
+        // BM25 is the sparse retriever. Unlike a plain bag-of-words cosine it
+        // discounts corpus-wide terms and saturates repeated words, which makes
+        // exact names and rare facts much more reliable without asking the
+        // generator (or another model) to rewrite the query.
+        let lexical_ranked = bm25_ranked(&self.records, query);
 
         let semantic_ranked = match semantic {
             Some(embedder) => match embedder
@@ -220,8 +352,69 @@ impl RagStore {
 /// Sort `(index, score)` pairs by descending score, dropping non-positive ones.
 fn ranked(scored: impl Iterator<Item = (usize, f32)>) -> Vec<(usize, f32)> {
     let mut ranked: Vec<(usize, f32)> = scored.filter(|(_, score)| *score > 0.0).collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     ranked
+}
+
+/// Okapi BM25 over the stored chunk text and source name.
+fn bm25_ranked(records: &[Record], query: &str) -> Vec<(usize, f32)> {
+    use std::collections::{HashMap, HashSet};
+
+    let query_terms: Vec<String> = lexical_terms(query).collect();
+    if query_terms.is_empty() || records.is_empty() {
+        return Vec::new();
+    }
+
+    let documents: Vec<Vec<String>> = records
+        .iter()
+        .map(|record| lexical_terms(&format!("{} {}", record.source, record.text)).collect())
+        .collect();
+    let average_length =
+        documents.iter().map(Vec::len).sum::<usize>() as f32 / documents.len() as f32;
+    if average_length == 0.0 {
+        return Vec::new();
+    }
+
+    let wanted: HashSet<&str> = query_terms.iter().map(String::as_str).collect();
+    let mut document_frequency: HashMap<&str, usize> = HashMap::new();
+    for document in &documents {
+        let present: HashSet<&str> = document
+            .iter()
+            .map(String::as_str)
+            .filter(|term| wanted.contains(term))
+            .collect();
+        for term in present {
+            *document_frequency.entry(term).or_insert(0) += 1;
+        }
+    }
+
+    // Robertson's common k1/b values are robust defaults for prose and code.
+    const K1: f32 = 1.2;
+    const B: f32 = 0.75;
+    let corpus_size = documents.len() as f32;
+    ranked(documents.iter().enumerate().map(|(index, document)| {
+        let mut frequencies: HashMap<&str, usize> = HashMap::new();
+        for term in document {
+            if wanted.contains(term.as_str()) {
+                *frequencies.entry(term.as_str()).or_insert(0) += 1;
+            }
+        }
+        let length_normalization = 1.0 - B + B * document.len() as f32 / average_length;
+        let score = query_terms.iter().fold(0.0, |score, term| {
+            let frequency = frequencies.get(term.as_str()).copied().unwrap_or(0) as f32;
+            if frequency == 0.0 {
+                return score;
+            }
+            let df = document_frequency.get(term.as_str()).copied().unwrap_or(0) as f32;
+            let idf = (1.0 + (corpus_size - df + 0.5) / (df + 0.5)).ln();
+            score + idf * frequency * (K1 + 1.0) / (frequency + K1 * length_normalization)
+        });
+        (index, score)
+    }))
 }
 
 /// Reciprocal Rank Fusion: a record's fused score is the sum over the ranked
@@ -232,11 +425,15 @@ fn fuse_rrf(lists: &[Vec<(usize, f32)>]) -> Vec<(usize, f32)> {
     let mut fused: HashMap<usize, f32> = HashMap::new();
     for list in lists {
         for (rank, (index, _score)) in list.iter().enumerate() {
-            *fused.entry(*index).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+            *fused.entry(*index).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
         }
     }
     let mut fused: Vec<(usize, f32)> = fused.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     fused
 }
 
@@ -359,5 +556,79 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].source, "rust.md", "semantic recall wins via RRF");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn bm25_prefers_the_rare_exact_fact() {
+        let path = scratch_index();
+        let lexical = HashingEmbedder;
+        let mut store = RagStore::open(&path).unwrap();
+        store
+            .add(
+                "general.md",
+                "The guide describes the general release process and the common checklist.",
+                &lexical,
+                None,
+                500,
+                50,
+            )
+            .await
+            .unwrap();
+        store
+            .add(
+                "specific.md",
+                "Zephyr shipped during the September release window.",
+                &lexical,
+                None,
+                500,
+                50,
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .search("when did Zephyr ship?", &lexical, None, 2)
+            .await;
+        assert_eq!(hits[0].source, "specific.md");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    struct CountingSemantic(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl SemanticEmbedder for CountingSemantic {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.0
+                .store(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_semantic_stage_is_batched_and_bounded() {
+        let passages: Vec<Passage> = (0..100)
+            .map(|index| Passage {
+                source: format!("https://source{}.test", index % 5),
+                text: format!("topic passage number {index} with distinct evidence"),
+            })
+            .collect();
+        let semantic = CountingSemantic(std::sync::atomic::AtomicUsize::new(0));
+
+        let hits = search_passages("topic", &passages, Some(&semantic), 5, 12).await;
+
+        assert!(!hits.is_empty());
+        assert_eq!(
+            semantic.0.load(std::sync::atomic::Ordering::SeqCst),
+            13,
+            "one query plus the bounded candidate pool is sent in one batch"
+        );
+        assert!(
+            hits.iter()
+                .map(|hit| hit.source.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 2,
+            "the final evidence should not collapse onto one source"
+        );
     }
 }

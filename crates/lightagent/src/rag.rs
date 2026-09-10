@@ -13,7 +13,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore};
 use lightagent_provider_lightweight::EmbeddingClient;
-use lightagent_rag::{HashingEmbedder, RagSearch, RagStore, SemanticEmbedder, index_path};
+use lightagent_rag::{
+    HashingEmbedder, RagSearch, RagStore, RealtimeRag, SemanticEmbedder, index_path,
+};
 use lightagent_tools::Tool;
 
 /// A semantic embedder backed by an OpenAI-compatible embeddings endpoint.
@@ -59,6 +61,20 @@ pub(crate) fn rag_tool(profile_dir: &Path, config: &Config) -> Option<Arc<dyn To
         Arc::new(store),
         semantic,
         config.rag.top_k,
+    )))
+}
+
+/// The one-call realtime web retriever, available with a configured search backend.
+pub(crate) fn realtime_rag_tool(config: &Config) -> Option<Arc<dyn Tool>> {
+    if !config.web.enabled || config.web.search.endpoint.is_none() {
+        return None;
+    }
+    Some(Arc::new(RealtimeRag::new(
+        semantic_embedder(config),
+        config.rag.top_k,
+        config.web.search.max_results,
+        config.rag.max_chunk_chars,
+        config.rag.chunk_overlap_chars,
     )))
 }
 

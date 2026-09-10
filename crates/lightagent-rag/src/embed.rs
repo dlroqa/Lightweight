@@ -36,7 +36,7 @@ pub struct HashingEmbedder;
 impl Embedder for HashingEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut vector = vec![0f32; DIM];
-        for token in tokenize(text) {
+        for token in lexical_terms(text) {
             let hash = fnv1a(token.as_bytes());
             let index = (hash % DIM as u64) as usize;
             let sign = if (hash >> 63) & 1 == 1 { -1.0 } else { 1.0 };
@@ -57,7 +57,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Lowercase alphanumeric tokens of length ≥ 2.
-fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
+pub(crate) fn lexical_terms(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| word.len() >= 2)
         .map(|word| word.to_lowercase())
