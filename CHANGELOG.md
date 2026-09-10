@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-09-09
+
+A patch release focused on the Lightagent terminal harness. It adds a direct
+self-update path, a more informative streaming chat interface, and native
+no-account web research. Existing configuration and profiles remain compatible.
+
 ### Added
 
 - **A built-in CLI updater.** `lightagent update --check` compares the running
