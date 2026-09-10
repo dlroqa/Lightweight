@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-09
+
+A patch release. Terminal Lightagent gains a guided `setup` command and no
+longer needs `init` before a first chat, and it now follows the model loaded in
+Lightweight instead of a fixed profile value. Strictly additive: existing
+configuration and profiles are reused unchanged.
+
+### Added
+
+- **`lightagent setup`, a guided configuration menu.** One interactive command
+  configures the gateway and model, local file and terminal tools, web
+  fetch/search, and approval prompts, showing current values and writing
+  `config.json` for the user. A real terminal gets a keyboard-driven picker
+  (arrows, Space, Enter, Escape); a non-TTY falls back to a numbered stdin/
+  stdout prompt. A section opens directly with `lightagent setup provider`
+  (alias `gateway`/`model`), `tools`, `web`, or `approvals`. The provider picker
+  offers local Lightweight, named custom OpenAI-compatible endpoints, manual
+  entry, and removal of saved providers; API keys are stored only as
+  environment-variable references, never as secrets.
+- **Saved providers.** `inference.saved_providers` records named endpoints for
+  quick switching, validated for a non-empty name and an http(s) URL and
+  redacted like the other keys.
+
+### Changed
+
+- **Lightagent follows the gateway's loaded model.** Before each generation the
+  provider resolves the configured model against the gateway's `/v1/models`: an
+  advertised explicit model wins, otherwise the sole resident model is used, so
+  switching models in the panel is reflected in terminal chat and the Agent API
+  without reconfiguration; when no model is loaded it says so. `init` is now
+  optional — a fresh installation uses a built-in default profile at
+  `http://127.0.0.1:11434`. The `lightagent` welcome mark is redrawn from the
+  source logo.
+
 ## [0.3.4] - 2026-09-09
 
 A patch release. The command line is now a single `lightweight` binary rather
