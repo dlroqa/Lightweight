@@ -11,10 +11,18 @@
 //! [`RunLimits`] bounds the run, including repeated-identical-call detection
 //! that stops a model stuck in a loop.
 //!
+//! The wall-clock budget is checked at each turn boundary, so a turn or tool
+//! already in flight always finishes. When the budget runs out right after a
+//! tool batch, the model has not read those results yet, and ending there
+//! would throw away the work. [`WallClockPolicy`] decides what happens
+//! instead: take one final turn with tools withheld so the model answers from
+//! what it gathered, or pause the run ([`RunOutcome::OutOfTime`]) so an
+//! interactive caller can ask whether to continue.
+//!
 //! [`approval_for`]: crate::invoker::ToolInvoker::approval_for
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -27,12 +35,50 @@ use crate::permissions::{ApprovalDecision, ApprovalNeed, ApprovalRequest};
 use crate::profile::AgentProfile;
 use crate::provider::{
     AgentProvider, FinishReason, ProviderEvent, ProviderMessage, ProviderRequest, ProviderToolCall,
-    Usage,
+    Role, Usage,
 };
 use crate::tool_stream::ToolCallAccumulator;
 
 /// A channel a streaming run sends each [`AgentEvent`] to as it happens.
 pub type AgentEventSink = tokio::sync::mpsc::UnboundedSender<AgentEvent>;
+
+/// The instruction added to the final, tool-less turn a run takes when its
+/// wall-clock budget runs out with tool results the model has not read yet.
+/// Sent only with that one request, never kept in the conversation.
+const WRAP_UP_INSTRUCTION: &str = "The time budget for this request has run out, so no more \
+    tools can be called. Answer the original request now, as well as you can, from the tool \
+    results above, and say briefly if anything is incomplete.";
+
+/// What a run does when its wall-clock budget runs out while tool results the
+/// model has not read yet are waiting.
+///
+/// Either way the budget stays a turn-boundary check: nothing in flight is cut
+/// short. A run with no unread results (only possible before its first turn)
+/// simply ends with [`StopReason::WallClockExceeded`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WallClockPolicy {
+    /// Take one final turn with tools withheld so the model answers from what
+    /// it already gathered, then end with [`StopReason::WallClockExceeded`].
+    /// The default: right for callers with nobody to ask.
+    #[default]
+    WrapUp,
+    /// Pause the run and return [`RunOutcome::OutOfTime`], so an interactive
+    /// caller can ask whether to continue it
+    /// ([`AgentLoop::continue_out_of_time`]).
+    Pause,
+}
+
+/// How to continue a run that paused on its wall-clock budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Continuation {
+    /// Restart the wall clock and carry on with tools, exactly where the run
+    /// stopped. Only time is renewed: the turn and tool-call budgets still
+    /// count across the whole run.
+    Extend,
+    /// Take the final, tool-less turn now, so the model answers from what it
+    /// already gathered, and end.
+    WrapUp,
+}
 
 /// What a run needs beyond its provider and invoker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +91,9 @@ pub struct RunConfig {
     pub limits: RunLimits,
     /// The orchestrator run, for a delegated child (Slice 3/4).
     pub parent: Option<RunId>,
+    /// What happens when the wall-clock budget runs out with unread tool
+    /// results.
+    pub on_wall_clock: WallClockPolicy,
 }
 
 impl RunConfig {
@@ -54,6 +103,7 @@ impl RunConfig {
             system: None,
             limits: RunLimits::default(),
             parent: None,
+            on_wall_clock: WallClockPolicy::default(),
         }
     }
 }
@@ -85,20 +135,34 @@ pub enum RunOutcome {
         request: ApprovalRequest,
         suspended: Box<Suspended>,
     },
+    /// The run used up its wall-clock budget, `elapsed` so far, with tool
+    /// results the model has not read yet, and paused instead of ending. Only
+    /// returned under [`WallClockPolicy::Pause`]; the last event is an
+    /// [`AgentEvent::WallClockPaused`]. Continue it with
+    /// [`AgentLoop::continue_out_of_time`], passing `suspended`, or drop it.
+    OutOfTime {
+        events: Vec<AgentEvent>,
+        elapsed: Duration,
+        suspended: Box<Suspended>,
+    },
 }
 
 impl RunOutcome {
     /// The cumulative event log for this outcome.
     pub fn events(&self) -> &[AgentEvent] {
         match self {
-            Self::Completed { events } | Self::AwaitingApproval { events, .. } => events,
+            Self::Completed { events }
+            | Self::AwaitingApproval { events, .. }
+            | Self::OutOfTime { events, .. } => events,
         }
     }
 
     /// Take the cumulative event log, whichever variant this is.
     pub fn into_events(self) -> Vec<AgentEvent> {
         match self {
-            Self::Completed { events } | Self::AwaitingApproval { events, .. } => events,
+            Self::Completed { events }
+            | Self::AwaitingApproval { events, .. }
+            | Self::OutOfTime { events, .. } => events,
         }
     }
 
@@ -111,12 +175,13 @@ impl RunOutcome {
     pub fn approval_request(&self) -> Option<&ApprovalRequest> {
         match self {
             Self::AwaitingApproval { request, .. } => Some(request),
-            Self::Completed { .. } => None,
+            Self::Completed { .. } | Self::OutOfTime { .. } => None,
         }
     }
 }
 
-/// A paused run, resumable once a decision is available.
+/// A paused run, resumable once a decision (or, for a run out of time, a
+/// [`Continuation`]) is available.
 ///
 /// Opaque by design: it carries exactly the state the loop needs to continue —
 /// the conversation so far, the run's bounds and counters, and the tool batch
@@ -152,6 +217,9 @@ struct Driver {
     /// When set, each emitted event is also sent here live, for a streaming
     /// caller. Persisted across a suspend so a resume keeps streaming.
     sink: Option<AgentEventSink>,
+    /// Set once the wall clock has run out and the run owes its final,
+    /// tool-less answer turn.
+    wrap_up: bool,
 }
 
 impl Driver {
@@ -172,6 +240,8 @@ enum TurnResult {
     Finished(Box<RunOutcome>),
     /// The model asked for tools; `driver.pending` now holds the batch.
     Batch,
+    /// The wall clock ran out with unread tool results, and the run pauses.
+    OutOfTime(Duration),
 }
 
 /// What processing a tool batch produced.
@@ -213,8 +283,17 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             system,
             limits: profile.limits,
             parent: None,
+            on_wall_clock: WallClockPolicy::default(),
         };
         Self::new(provider, invoker, config)
+    }
+
+    /// Choose what a run does when its wall clock runs out with unread tool
+    /// results. An interactive caller that can ask whether to continue sets
+    /// [`WallClockPolicy::Pause`].
+    pub fn with_wall_clock_policy(mut self, policy: WallClockPolicy) -> Self {
+        self.config.on_wall_clock = policy;
+        self
     }
 
     /// The run's configuration.
@@ -271,6 +350,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
             call_counts: BTreeMap::new(),
             pending: None,
             sink,
+            wrap_up: false,
         };
         driver.emit(AgentEvent::RunStarted {
             run,
@@ -325,8 +405,31 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         self.drive(driver, cancel).await
     }
 
-    /// The main turn/batch loop, shared by [`run`](Self::run) and
-    /// [`resume`](Self::resume).
+    /// Continue a run that paused on its wall-clock budget
+    /// ([`RunOutcome::OutOfTime`]), from exactly where it stopped: the whole
+    /// conversation, including the tool results the model has not read yet, is
+    /// carried over.
+    ///
+    /// [`Continuation::Extend`] restarts the wall clock and lets the run carry
+    /// on with tools; [`Continuation::WrapUp`] takes the final, tool-less turn
+    /// now. The returned log is cumulative, as with [`resume`](Self::resume).
+    pub async fn continue_out_of_time(
+        &self,
+        suspended: Box<Suspended>,
+        how: Continuation,
+        cancel: CancellationToken,
+    ) -> Result<RunOutcome, AgentError> {
+        let mut driver = suspended.driver;
+        match how {
+            Continuation::Extend => driver.started = Instant::now(),
+            Continuation::WrapUp => driver.wrap_up = true,
+        }
+        self.drive(driver, cancel).await
+    }
+
+    /// The main turn/batch loop, shared by [`run`](Self::run),
+    /// [`resume`](Self::resume) and
+    /// [`continue_out_of_time`](Self::continue_out_of_time).
     async fn drive(
         &self,
         mut driver: Driver,
@@ -339,6 +442,13 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                 match self.take_turn(&mut driver, &cancel).await? {
                     TurnResult::Finished(outcome) => return Ok(*outcome),
                     TurnResult::Batch => {}
+                    TurnResult::OutOfTime(elapsed) => {
+                        return Ok(RunOutcome::OutOfTime {
+                            events: driver.events.clone(),
+                            elapsed,
+                            suspended: Box::new(Suspended { driver }),
+                        });
+                    }
                 }
             }
 
@@ -377,23 +487,54 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         driver: &mut Driver,
         cancel: &CancellationToken,
     ) -> Result<TurnResult, AgentError> {
-        driver.turn += 1;
-
-        if let Some(budget) = driver.limits.wall_clock()
+        // The budget is checked before the turn is counted, so a pause that is
+        // later continued does not spend a turn.
+        if !driver.wrap_up
+            && let Some(budget) = driver.limits.wall_clock()
             && driver.started.elapsed() >= budget
         {
-            driver.emit(AgentEvent::RunCompleted {
-                reason: StopReason::WallClockExceeded,
-            });
-            return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
-                events: std::mem::take(&mut driver.events),
-            })));
+            // Every call in a batch leaves a result, so a tool message last
+            // means the model has not read what its tools returned.
+            let unread_results = driver
+                .messages
+                .last()
+                .is_some_and(|message| message.role == Role::Tool);
+            if !unread_results {
+                driver.emit(AgentEvent::RunCompleted {
+                    reason: StopReason::WallClockExceeded,
+                });
+                return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
+                    events: std::mem::take(&mut driver.events),
+                })));
+            }
+            match self.config.on_wall_clock {
+                WallClockPolicy::Pause => {
+                    let elapsed = driver.started.elapsed();
+                    driver.emit(AgentEvent::WallClockPaused {
+                        elapsed_secs: elapsed.as_secs(),
+                    });
+                    return Ok(TurnResult::OutOfTime(elapsed));
+                }
+                WallClockPolicy::WrapUp => driver.wrap_up = true,
+            }
         }
 
+        driver.turn += 1;
+
+        // The final turn after the clock ran out offers no tools and says why,
+        // so the model answers from what it has instead of asking for more.
+        // The instruction rides on this one request only.
+        let (messages, tools) = if driver.wrap_up {
+            let mut messages = driver.messages.clone();
+            messages.push(ProviderMessage::user(WRAP_UP_INSTRUCTION));
+            (messages, Vec::new())
+        } else {
+            (driver.messages.clone(), self.invoker.schemas())
+        };
         let request = ProviderRequest {
             model: driver.model.clone(),
-            messages: driver.messages.clone(),
-            tools: self.invoker.schemas(),
+            messages,
+            tools,
             temperature: None,
             max_tokens: None,
         };
@@ -451,6 +592,18 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
 
         let (reason, usage) = finish.unwrap_or((FinishReason::Stop, None));
         driver.emit(AgentEvent::TurnCompleted { usage });
+
+        // The wrap-up turn is the last one whatever it produced: its answer
+        // stands, and any tool calls it asked for anyway are not run. The stop
+        // reason still records that the clock, not the model, ended the run.
+        if driver.wrap_up && !matches!(reason, FinishReason::Error) {
+            driver.emit(AgentEvent::RunCompleted {
+                reason: StopReason::WallClockExceeded,
+            });
+            return Ok(TurnResult::Finished(Box::new(RunOutcome::Completed {
+                events: std::mem::take(&mut driver.events),
+            })));
+        }
 
         match reason {
             FinishReason::Stop | FinishReason::Length => {
@@ -874,5 +1027,185 @@ mod tests {
             .filter(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
             .count();
         assert_eq!(started, 2);
+    }
+
+    /// An auto-approving invoker whose one tool outlasts a one-second budget,
+    /// so the wall clock runs out right after its result lands — the moment a
+    /// fetched page would otherwise be thrown away.
+    struct SlowInvoker;
+
+    #[async_trait]
+    impl ToolInvoker for SlowInvoker {
+        fn schemas(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema::new(
+                "datetime.now",
+                "the time",
+                serde_json::json!({"type": "object"}),
+            )]
+        }
+
+        fn approval_for(&self, _call: &ToolCall) -> ApprovalNeed {
+            ApprovalNeed::AutoApprove
+        }
+
+        async fn invoke(&self, _call: &ToolCall, _cancel: CancellationToken) -> ToolOutcome {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            ToolOutcome::ok("the fetched evidence")
+        }
+    }
+
+    fn one_second_budget(model: &str) -> RunConfig {
+        let mut config = RunConfig::new(model);
+        config.limits.wall_clock_secs = Some(1);
+        config
+    }
+
+    fn stop_reason(events: &[AgentEvent]) -> Option<StopReason> {
+        match events.last() {
+            Some(AgentEvent::RunCompleted { reason }) => Some(*reason),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_time_before_any_tool_ends_without_a_turn() {
+        let mock = MockProvider::new(vec![stop_turn("never")]);
+        let inspector = mock.clone();
+        let mut config = RunConfig::new("m@8k");
+        config.limits.wall_clock_secs = Some(0);
+        let agent = AgentLoop::new(mock, NullInvoker, config);
+        let events = agent
+            .run("go", CancellationToken::new())
+            .await
+            .expect("run")
+            .into_events();
+
+        assert_eq!(stop_reason(&events), Some(StopReason::WallClockExceeded));
+        assert!(inspector.requests().is_empty(), "no turn is taken");
+    }
+
+    #[tokio::test]
+    async fn out_of_time_with_unread_results_wraps_up_without_tools() {
+        let mock = MockProvider::new(vec![tool_turn(), stop_turn("answer from evidence")]);
+        let inspector = mock.clone();
+        let agent = AgentLoop::new(mock, SlowInvoker, one_second_budget("m@8k"));
+        let events = agent
+            .run("go", CancellationToken::new())
+            .await
+            .expect("run")
+            .into_events();
+
+        let requests = inspector.requests();
+        assert_eq!(requests.len(), 2, "one final turn after the clock ran out");
+        let wrap_up = &requests[1];
+        assert!(wrap_up.tools.is_empty(), "the final turn offers no tools");
+        assert!(
+            wrap_up
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.content == "the fetched evidence"),
+            "the model reads what its tool returned"
+        );
+        let last = wrap_up.messages.last().expect("a message");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(last.content, WRAP_UP_INSTRUCTION);
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Content { text } if text == "answer from evidence")
+        ));
+        assert_eq!(stop_reason(&events), Some(StopReason::WallClockExceeded));
+    }
+
+    #[tokio::test]
+    async fn a_wrap_up_turn_that_asks_for_tools_runs_none() {
+        let mock = MockProvider::new(vec![tool_turn(), tool_turn()]);
+        let agent = AgentLoop::new(mock, SlowInvoker, one_second_budget("m@8k"));
+        let events = agent
+            .run("go", CancellationToken::new())
+            .await
+            .expect("run")
+            .into_events();
+
+        let started = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(started, 1, "the wrap-up turn's tool call is not run");
+        assert_eq!(stop_reason(&events), Some(StopReason::WallClockExceeded));
+    }
+
+    #[tokio::test]
+    async fn out_of_time_pauses_then_extends_where_it_stopped() {
+        let mock = MockProvider::new(vec![tool_turn(), stop_turn("all done")]);
+        let inspector = mock.clone();
+        let agent = AgentLoop::new(mock, SlowInvoker, one_second_budget("m@8k"))
+            .with_wall_clock_policy(WallClockPolicy::Pause);
+
+        let paused = agent
+            .run("go", CancellationToken::new())
+            .await
+            .expect("run");
+        let RunOutcome::OutOfTime {
+            events,
+            elapsed,
+            suspended,
+        } = paused
+        else {
+            panic!("expected the run to pause out of time");
+        };
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::WallClockPaused { elapsed_secs: 1.. })
+        ));
+        assert_eq!(inspector.requests().len(), 1, "no turn after the pause");
+
+        let done = agent
+            .continue_out_of_time(suspended, Continuation::Extend, CancellationToken::new())
+            .await
+            .expect("continue");
+        let requests = inspector.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].tools.is_empty(),
+            "an extended run keeps its tools"
+        );
+        assert_eq!(
+            requests[1]
+                .messages
+                .last()
+                .map(|m| (m.role, m.content.as_str())),
+            Some((Role::Tool, "the fetched evidence")),
+            "the run picks up with the unread result, and no wrap-up instruction"
+        );
+        let events = done.into_events();
+        assert!(
+            matches!(events[0], AgentEvent::RunStarted { .. }),
+            "cumulative log"
+        );
+        assert_eq!(stop_reason(&events), Some(StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn a_paused_run_can_wrap_up_on_request() {
+        let mock = MockProvider::new(vec![tool_turn(), stop_turn("best effort")]);
+        let inspector = mock.clone();
+        let agent = AgentLoop::new(mock, SlowInvoker, one_second_budget("m@8k"))
+            .with_wall_clock_policy(WallClockPolicy::Pause);
+
+        let RunOutcome::OutOfTime { suspended, .. } = agent
+            .run("go", CancellationToken::new())
+            .await
+            .expect("run")
+        else {
+            panic!("expected the run to pause out of time");
+        };
+        let events = agent
+            .continue_out_of_time(suspended, Continuation::WrapUp, CancellationToken::new())
+            .await
+            .expect("continue")
+            .into_events();
+
+        assert!(inspector.requests()[1].tools.is_empty());
+        assert_eq!(stop_reason(&events), Some(StopReason::WallClockExceeded));
     }
 }

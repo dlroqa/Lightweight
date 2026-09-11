@@ -40,7 +40,10 @@ pub use event::{AgentEvent, StopReason};
 pub use ids::RunId;
 pub use invoker::{NullInvoker, ToolCall, ToolInvoker, ToolOutcome, ToolSchema};
 pub use limits::RunLimits;
-pub use loop_::{AgentError, AgentEventSink, AgentLoop, RunConfig, RunOutcome, Suspended};
+pub use loop_::{
+    AgentError, AgentEventSink, AgentLoop, Continuation, RunConfig, RunOutcome, Suspended,
+    WallClockPolicy,
+};
 pub use mock::MockProvider;
 pub use paths::{LightagentPaths, PathsError};
 pub use permissions::{

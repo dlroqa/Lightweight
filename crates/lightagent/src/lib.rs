@@ -801,6 +801,16 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
                 .unwrap_or_default(),
         ),
         "inference.device" => Some(config.inference.device.clone()),
+        "agent.max_turns" => Some(config.agent.max_turns.to_string()),
+        "agent.max_tool_calls" => Some(config.agent.max_tool_calls.to_string()),
+        // Empty means no time limit.
+        "agent.wall_clock_secs" => Some(
+            config
+                .agent
+                .wall_clock_secs
+                .map(|secs| secs.to_string())
+                .unwrap_or_default(),
+        ),
         "extensions.enabled" => Some(config.extensions.enabled.to_string()),
         "web.enabled" => Some(config.web.enabled.to_string()),
         "web.search.endpoint" => Some(config.web.search.endpoint.clone().unwrap_or_default()),
@@ -830,6 +840,19 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
             config.inference.api_key = parse_opt_string(value).map(SecretRef::env);
         }
         "inference.device" => config.inference.device = value.to_string(),
+        "agent.max_turns" => {
+            config.agent.max_turns = parse_u32(value, "agent.max_turns")?;
+        }
+        "agent.max_tool_calls" => {
+            config.agent.max_tool_calls = parse_u32(value, "agent.max_tool_calls")?;
+        }
+        // An empty value (or `none`) removes the time limit.
+        "agent.wall_clock_secs" => {
+            config.agent.wall_clock_secs = match value.trim() {
+                "" | "none" => None,
+                _ => Some(parse_u64(value, "agent.wall_clock_secs")?),
+            };
+        }
         "extensions.enabled" => {
             config.extensions.enabled = parse_bool(value)?;
         }
@@ -879,6 +902,13 @@ fn parse_opt_u32(value: &str) -> Result<Option<u32>, String> {
         .parse::<u32>()
         .map(Some)
         .map_err(|_| format!("expected a non-negative integer, got '{value}'"))
+}
+
+fn parse_u32(value: &str, key: &str) -> Result<u32, String> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{key} expects a non-negative integer, got '{value}'"))
 }
 
 fn parse_usize(value: &str, key: &str) -> Result<usize, String> {
@@ -1026,6 +1056,27 @@ mod tests {
         );
         set_key(&mut config, "inference.api_key", "").unwrap();
         assert_eq!(get_key(&config, "inference.api_key").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn agent_limit_keys_round_trip() {
+        let mut config = Config::default();
+        assert_eq!(
+            get_key(&config, "agent.wall_clock_secs").as_deref(),
+            Some("300")
+        );
+        set_key(&mut config, "agent.wall_clock_secs", "900").unwrap();
+        assert_eq!(config.agent.wall_clock_secs, Some(900));
+        set_key(&mut config, "agent.wall_clock_secs", "none").unwrap();
+        assert_eq!(config.agent.wall_clock_secs, None);
+        assert_eq!(
+            get_key(&config, "agent.wall_clock_secs").as_deref(),
+            Some("")
+        );
+
+        set_key(&mut config, "agent.max_turns", "12").unwrap();
+        assert_eq!(get_key(&config, "agent.max_turns").as_deref(), Some("12"));
+        assert!(set_key(&mut config, "agent.max_tool_calls", "many").is_err());
     }
 
     #[test]
