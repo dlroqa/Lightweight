@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use lightagent_core::{
-    AgentProfile, Config, ConfigStore, LightagentPaths, ProfileId, ProfileStore,
+    AgentProfile, Config, ConfigStore, LightagentPaths, ProfileId, ProfileStore, SecretRef,
 };
 use lightagent_store::{SessionId, SessionStore};
 use lightagent_tools::ToolRegistry;
@@ -792,6 +792,14 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
         "inference.provider" => Some(config.inference.provider.clone()),
         "inference.base_url" => Some(config.inference.base_url.clone()),
         "inference.model" => Some(config.inference.model.clone().unwrap_or_default()),
+        "inference.api_key" => Some(
+            config
+                .inference
+                .api_key
+                .as_ref()
+                .map(SecretRef::redacted)
+                .unwrap_or_default(),
+        ),
         "inference.device" => Some(config.inference.device.clone()),
         "extensions.enabled" => Some(config.extensions.enabled.to_string()),
         "web.enabled" => Some(config.web.enabled.to_string()),
@@ -816,6 +824,11 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
         "inference.base_url" => config.inference.base_url = value.to_string(),
         "inference.model" => config.inference.model = Some(value.to_string()),
+        // The value is an environment-variable name, never the secret itself.
+        // An empty value clears the reference.
+        "inference.api_key" => {
+            config.inference.api_key = parse_opt_string(value).map(SecretRef::env);
+        }
         "inference.device" => config.inference.device = value.to_string(),
         "extensions.enabled" => {
             config.extensions.enabled = parse_bool(value)?;
@@ -1005,6 +1018,14 @@ mod tests {
         );
         set_key(&mut config, "inference.model", "demo").unwrap();
         assert_eq!(get_key(&config, "inference.model").as_deref(), Some("demo"));
+
+        set_key(&mut config, "inference.api_key", "LIGHTAGENT_PROVIDER_KEY").unwrap();
+        assert_eq!(
+            get_key(&config, "inference.api_key").as_deref(),
+            Some("${env:LIGHTAGENT_PROVIDER_KEY}")
+        );
+        set_key(&mut config, "inference.api_key", "").unwrap();
+        assert_eq!(get_key(&config, "inference.api_key").as_deref(), Some(""));
     }
 
     #[test]

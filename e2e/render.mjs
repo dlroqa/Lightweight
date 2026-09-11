@@ -19,6 +19,7 @@ import { mkdir } from "node:fs/promises";
 import { chromium } from "playwright";
 
 const BASE = (process.env.PANEL_BASE ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
+const MODEL_GATEWAY_BASE = (process.env.MODEL_GATEWAY_BASE ?? "").replace(/\/+$/, "");
 const OUT_DIR = process.env.OUT_DIR ?? "screens";
 // A route settles when the panel has either rendered its data or surfaced its
 // own error; this is the ceiling on waiting for whichever comes first.
@@ -114,6 +115,60 @@ async function checkToolsRecovery(context) {
   console.log("  [ok] agent-tools error messages and retry recovery");
 }
 
+// Drive the real agent server through the real gateway proxy. The model side
+// is deterministic, but everything after its tool-call delta is production:
+// Lightagent executes datetime.now, streams the lifecycle over SSE, performs
+// the follow-up model turn, and the React screen folds those events into a
+// completed answer and tool card.
+async function checkToolUsingRun(context) {
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(String(error)));
+  try {
+    await page.goto(`${BASE}/#/agent`, { waitUntil: "domcontentloaded" });
+    await page.getByLabel("Message").fill("What time is it in UTC?");
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+
+    await page.getByText("The local tool completed successfully.", { exact: true }).waitFor({
+      timeout: SETTLE_MS,
+    });
+    await page.getByText("datetime.now", { exact: true }).waitFor();
+    await page.getByText("done", { exact: true }).waitFor();
+
+    const text = await page.evaluate(() => document.body.innerText);
+    if (!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(text)) {
+      throw new Error("datetime.now result was not rendered");
+    }
+    if (!text.includes("Tool calls") || !text.includes("ok")) {
+      throw new Error("the completed tool card was not rendered");
+    }
+    if (FALLBACK_SIGNS.some((sign) => text.includes(sign))) {
+      throw new Error("the completed run shows an agent API fallback error");
+    }
+    if (errors.length) throw new Error(`uncaught page error — ${errors[0]}`);
+
+    await page.screenshot({ path: `${OUT_DIR}/agent-run.png`, fullPage: true });
+
+    if (MODEL_GATEWAY_BASE) {
+      const response = await fetch(`${MODEL_GATEWAY_BASE}/__test__/last-request`);
+      assertResponse(response, "model request inspection");
+      const request = await response.json();
+      if (request.message_count < 4) {
+        throw new Error(`follow-up model turn did not receive tool history: ${JSON.stringify(request)}`);
+      }
+    }
+  } finally {
+    await page.close();
+  }
+  console.log("  [ok] authenticated default-model tool run streamed and rendered");
+}
+
+function assertResponse(response, description) {
+  if (!response.ok) {
+    throw new Error(`${description} returned HTTP ${response.status}`);
+  }
+}
+
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   const browser = await chromium.launch();
@@ -162,6 +217,12 @@ async function main() {
     await checkToolsRecovery(context);
   } catch (err) {
     failures.push(`agent-tools recovery: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    await checkToolUsingRun(context);
+  } catch (err) {
+    failures.push(`agent tool run: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   await context.close();

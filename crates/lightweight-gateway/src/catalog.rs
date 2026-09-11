@@ -59,17 +59,22 @@ impl ResidentModel {
 
     /// Whether a client's `model` string names this model.
     ///
-    /// Exact match, or a match on the part before our `@context` suffix. The
-    /// tolerance is deliberate and asymmetric: the suffix is *our* invention
-    /// and changes whenever the context does, so a client holding
+    /// Exact match, the dynamic `default` alias, or a match on the part before
+    /// our `@context` suffix. The alias always means the one resident model; it
+    /// is resolved on each request rather than stored, so a model swap changes
+    /// the default atomically. Responses still name the real model id.
+    ///
+    /// Context tolerance is deliberate and asymmetric: the suffix is *our*
+    /// invention and changes whenever the context does, so a client holding
     /// `model@8k` while we now serve `model@4k` is our doing, not a mistake —
     /// while a different base name is the user naming a model we do not have,
     /// which they need to be told about.
     pub fn matches(&self, requested: &str) -> bool {
         let requested = requested.trim();
-        if requested.is_empty() {
-            // No model named at all: there is exactly one, so serve it. The
-            // response still reports the real id.
+        if requested.is_empty() || requested == "default" {
+            // No model named, or the conventional dynamic alias: there is
+            // exactly one resident model, so serve it. The response still
+            // reports the real id.
             return true;
         }
         if requested == self.id.as_str() {
@@ -172,6 +177,12 @@ mod tests {
     #[test]
     fn an_absent_model_field_is_served_by_the_only_model() {
         assert!(model().matches(""));
+    }
+
+    #[test]
+    fn default_is_an_alias_for_the_resident_model() {
+        assert!(model().matches("default"));
+        assert!(model().matches("  default  "));
     }
 
     #[tokio::test]

@@ -23,6 +23,12 @@ concurrency:
 permissions:
   contents: read
 
+# Hosted jobs do not reuse Cargo's per-function incremental graph. Avoid
+# spending runner disk and cache bandwidth on it; rust-cache still preserves
+# dependencies and final artifacts for subsequent runs.
+env:
+  CARGO_INCREMENTAL: '0'
+
 jobs:
   check:
     name: check (${{ matrix.label }})

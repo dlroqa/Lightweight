@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The loaded gateway model is the dynamic default.** OpenAI chat and text
+  completion requests may use `model: "default"`; the alias resolves to the
+  one resident model at request time and follows model swaps without changing
+  the truthful model ID returned in responses. Authenticated regression tests
+  cover streamed tool-call deltas and a complete Lightagent tool run over SSE;
+  `tool.requested` now reaches live subscribers as well as the buffered run log.
+
 ## [0.3.7] - 2026-09-10
 
 A patch release for Lightagent retrieval. It adds one-call realtime RAG tuned

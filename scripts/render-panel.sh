@@ -21,12 +21,14 @@
 # Environment:
 #   AGENT_PORT   agent API port           (default 8735)
 #   GATEWAY_PORT gateway/panel port       (default 11434)
+#   MODEL_PORT   deterministic model port  (default 11435)
 #   OUT_DIR      where screenshots land   (default e2e/screens)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 AGENT_PORT="${AGENT_PORT:-8735}"
 GATEWAY_PORT="${GATEWAY_PORT:-11434}"
+MODEL_PORT="${MODEL_PORT:-11435}"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -44,19 +46,23 @@ export LIGHTAGENT_HOME="$WORK/agent-home"
 export HERMES_GATEWAY_HOME="$WORK/gateway-home"
 AGENT_LOG="$WORK/agent.log"
 GATEWAY_LOG="$WORK/gateway.log"
+MODEL_LOG="$WORK/model.log"
 AGENT_PID=""
 GATEWAY_PID=""
+MODEL_PID=""
 
 cleanup() {
   local status=$?
   [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
   [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
+  [ -n "$MODEL_PID" ] && kill "$MODEL_PID" 2>/dev/null || true
   wait 2>/dev/null || true
   # On a failure, the server logs are usually where the answer is; print them
   # so a red CI run explains itself without a re-run.
   if [ "$status" -ne 0 ]; then
     echo "== agent server log ==";   [ -f "$AGENT_LOG" ]   && cat "$AGENT_LOG"   || echo "(none)"
     echo "== gateway server log =="; [ -f "$GATEWAY_LOG" ] && cat "$GATEWAY_LOG" || echo "(none)"
+    echo "== model gateway log ==";   [ -f "$MODEL_LOG" ]   && cat "$MODEL_LOG"   || echo "(none)"
   fi
   rm -rf "$WORK"
   exit "$status"
@@ -66,8 +72,12 @@ trap cleanup EXIT
 # Poll a URL until it answers 2xx/3xx or the budget runs out. A server that
 # never comes up is a failure with a clear message, not a hang to a timeout.
 wait_for() {
-  local url="$1" name="$2" tries=60
+  local url="$1" name="$2" pid="$3" tries=60
   while [ "$tries" -gt 0 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "error: $name exited before becoming ready at $url" >&2
+      return 1
+    fi
     if curl -fsS -o /dev/null "$url" 2>/dev/null; then return 0; fi
     tries=$((tries - 1))
     sleep 0.5
@@ -79,22 +89,57 @@ wait_for() {
 echo "== build =="
 # Debug binaries: this proves the wiring, and a release build would cost minutes
 # the render does not need. The frontend is built only if it has not been.
-cargo build -p lightagent --bin lightagent -p lightweight-cli --bin lightweight
+cargo build -p lightagent --bin lightagent -p lightweight-cli --bin lightweight \
+  -p lightweight-gateway --features mock --bin hermes-mock-gateway
 if [ ! -f frontend/dist/index.html ]; then
   ( cd frontend && npm run build )
 fi
 
+# The browser run needs deterministic model output, not a downloaded model whose
+# answer and resource cost vary by runner. This is the real gateway and wire
+# protocol over the test-only mock backend: one resident quantized model, a
+# required API key, a tool-call turn, then a final answer turn.
+export LIGHTAGENT_RENDER_GATEWAY_KEY="render-only-provider-key"
+MODEL_ORIGIN="http://127.0.0.1:$MODEL_PORT"
+echo "== start deterministic model gateway (port $MODEL_PORT) =="
+./target/debug/hermes-mock-gateway --port "$MODEL_PORT" \
+  --model "qwen3.5-9b-q4_k_m" --ctx 4096 \
+  --api-key "$LIGHTAGENT_RENDER_GATEWAY_KEY" >"$MODEL_LOG" 2>&1 &
+MODEL_PID=$!
+wait_for "$MODEL_ORIGIN/health" "model gateway" "$MODEL_PID"
+
+curl -fsS -X POST "$MODEL_ORIGIN/__test__/script" \
+  -H "Content-Type: application/json" \
+  --data '{"script":{"kind":"sequence","scripts":[{"kind":"tool_call","id":"render_call_1","name":"datetime.now","argument_fragments":["{\"tz\":\"utc\"}"]},{"kind":"content","fragments":["The local tool completed successfully."]}]}}' \
+  -o /dev/null
+
+# Prove the fixture has exactly one resident model and rejects missing keys. The
+# Lightagent profile deliberately keeps `default`; its provider must discover
+# this real ID and authenticate every model and generation request.
+if curl -fsS "$MODEL_ORIGIN/v1/models" -o /dev/null 2>/dev/null; then
+  echo "error: the model gateway accepted a request without its API key" >&2
+  exit 1
+fi
+if ! curl -fsS "$MODEL_ORIGIN/v1/models" \
+  -H "Authorization: Bearer $LIGHTAGENT_RENDER_GATEWAY_KEY" \
+  | grep -q '"id":"qwen3.5-9b-q4_k_m@4k"'; then
+  echo "error: the keyed model list did not report the resident model" >&2
+  exit 1
+fi
+
 # The agent server refuses to start without an active profile; a fresh
-# `LIGHTAGENT_HOME` has none, so scaffold one. `init` is non-interactive and
-# needs no model or network — it writes the config and a `default` profile.
+# `LIGHTAGENT_HOME` has none, so scaffold one. Keep the model automatic and
+# store only the environment-variable name that holds the provider key.
 echo "== init the agent home =="
-./target/debug/lightagent init >/dev/null
+./target/debug/lightagent init --base-url "$MODEL_ORIGIN" >/dev/null
+./target/debug/lightagent config set inference.api_key \
+  LIGHTAGENT_RENDER_GATEWAY_KEY >/dev/null
 
 echo "== start agent API (port $AGENT_PORT) =="
 ./target/debug/lightagent serve --host 127.0.0.1 --port "$AGENT_PORT" \
   >"$AGENT_LOG" 2>&1 &
 AGENT_PID=$!
-wait_for "http://127.0.0.1:$AGENT_PORT/api/lightagent/v1/tools" "agent API"
+wait_for "http://127.0.0.1:$AGENT_PORT/api/lightagent/v1/tools" "agent API" "$AGENT_PID"
 
 echo "== start gateway (port $GATEWAY_PORT), proxying the agent =="
 ./target/debug/lightweight serve --host 127.0.0.1 --port "$GATEWAY_PORT" \
@@ -102,7 +147,7 @@ echo "== start gateway (port $GATEWAY_PORT), proxying the agent =="
   --agent-upstream "http://127.0.0.1:$AGENT_PORT" \
   >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
-wait_for "http://127.0.0.1:$GATEWAY_PORT/health" "gateway"
+wait_for "http://127.0.0.1:$GATEWAY_PORT/health" "gateway" "$GATEWAY_PID"
 
 # The seam, asserted before the browser even opens: the panel's origin must
 # serve the agent's JSON, not the document. This is the one-line version of the
@@ -115,7 +160,8 @@ if ! curl -fsS "http://127.0.0.1:$GATEWAY_PORT/api/lightagent/v1/tools" \
 fi
 
 echo "== render the panel in a headless browser =="
-PANEL_BASE="http://127.0.0.1:$GATEWAY_PORT" OUT_DIR="$OUT_DIR" \
+PANEL_BASE="http://127.0.0.1:$GATEWAY_PORT" \
+  MODEL_GATEWAY_BASE="$MODEL_ORIGIN" OUT_DIR="$OUT_DIR" \
   node e2e/render.mjs
 
 # A separate isolated gateway starts with its agent stopped, so Settings must
