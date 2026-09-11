@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-10
+
+A patch release for the Lightagent harness. A run that reaches its time budget
+no longer discards tool results the model has not read yet, the `agent` limits
+in `config.json` now take effect, and a harness-engineering skills extension
+ships in the repository. Existing profiles and configuration load unchanged,
+except that `agent.wall_clock_secs` set to `0` is now rejected as invalid.
+
 ### Added
 
 - **A `harness-engineering` extension ships in `extensions/`.** Five
