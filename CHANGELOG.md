@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. The streamed reasoning
+panel can now be hidden behind an animated gold-and-cyan Lightagent star through
+a new Terminal UI setup section and the `tui.show_reasoning` config key, tool
+approvals gain a session-scoped "allow without restrictions" choice in a compact
+numbered prompt, and the startup banner adopts the gold-and-electric-blue mark
+with its welcome message pinned above the footer. The setting defaults preserve
+existing behavior, and redirected and non-interactive I/O is unchanged.
+
 ### Added
 
 - **Reasoning visibility in Terminal UI settings.** The new `Terminal UI`
