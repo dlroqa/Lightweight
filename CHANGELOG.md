@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The loaded gateway model is the dynamic default.** OpenAI chat and text
+  completion requests may use `model: "default"`; the alias resolves to the
+  one resident model at request time and follows model swaps without changing
+  the truthful model ID returned in responses. Authenticated regression tests
+  cover streamed tool-call deltas and a complete Lightagent tool run over SSE;
+  `tool.requested` now reaches live subscribers as well as the buffered run log.
+
 ## [0.3.8] - 2026-09-10
 
 A patch release for the Lightagent harness. A run that reaches its time budget
@@ -27,12 +36,6 @@ except that `agent.wall_clock_secs` set to `0` is now rejected as invalid.
 
 ### Changed
 
-- **The loaded gateway model is the dynamic default.** OpenAI chat and text
-  completion requests may use `model: "default"`; the alias resolves to the
-  one resident model at request time and follows model swaps without changing
-  the truthful model ID returned in responses. Authenticated regression tests
-  cover streamed tool-call deltas and a complete Lightagent tool run over SSE;
-  `tool.requested` now reaches live subscribers as well as the buffered run log.
 - **Running out of time no longer throws away fetched work.** The wall-clock
   budget is still checked between turns, but a run that reaches it with tool
   results the model has not read yet now takes one final turn with tools
