@@ -367,6 +367,10 @@ pub struct RagSemanticConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RagConfig {
+    /// Offer the one-call live web retriever when web search is configured.
+    /// Kept separately from `web.search` so operators can expose the lower-level
+    /// search/fetch pair without also declaring the composite tool.
+    pub realtime_enabled: bool,
     /// Default number of passages a search returns.
     pub top_k: usize,
     /// The most characters in one indexed chunk.
@@ -380,6 +384,7 @@ pub struct RagConfig {
 impl Default for RagConfig {
     fn default() -> Self {
         Self {
+            realtime_enabled: true,
             top_k: 5,
             max_chunk_chars: 1200,
             chunk_overlap_chars: 200,

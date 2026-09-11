@@ -85,11 +85,15 @@ connects to `http://127.0.0.1:11434`. Existing settings and the active profile
 are reused. `lightagent init` is optional for creating a saved initial profile
 or choosing a custom endpoint; `lightagent doctor` checks the connection.
 
-The interactive prompt streams provider-supplied reasoning in a separate panel
-and shows the active model, context usage, output tokens, token rate, and elapsed
-time after each response. Models that do not emit reasoning simply show the
-answer panel. Its startup dashboard places the Lightagent logo beside the
-release version and date, active profile and model, session, tools, and skills.
+The interactive prompt streams provider-supplied reasoning in a separate panel.
+A persistent four-row footer stays pinned to the bottom of an attended terminal while
+model and tool output scroll above it; it shows command tips plus the active
+model, context usage, output tokens, token rate, and elapsed time after each
+response. Models that do not emit reasoning simply show the answer panel. Its
+full-width startup dashboard places the modern Lightagent star-and-bolt mark
+beside the release version and date, active profile and model, session, tools,
+and skills. Approval requests use a separate high-contrast warning panel with
+their risk class, tool, argument preview, and safe-default `[y/N]` prompt.
 
 Run `lightagent setup` for a guided terminal menu. It shows current values and
 lets you select the gateway/model, local file and terminal tools, web
@@ -97,6 +101,10 @@ fetch/search, and approval behavior without editing `config.json`. A section can
 be opened directly with `lightagent setup provider`, `tools`, `web`, or
 `approvals`. The Tools screen is an interactive checklist: use ↑/↓ to navigate,
 Space to toggle capabilities, Enter to save, or Escape to cancel.
+
+The Tools screen exposes realtime RAG separately from its lower-level web
+search/fetch dependencies, and the startup dashboard reports the effective
+runtime registry after those settings are applied.
 
 The Gateway screen is also a keyboard-driven picker. It includes local
 Lightweight, named custom OpenAI-compatible endpoints, manual endpoint entry,

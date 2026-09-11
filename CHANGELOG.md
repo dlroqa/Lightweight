@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A persistent terminal prompt footer.** Interactive chat reserves the bottom
+  four terminal rows for the full-width status bar, command tips, editable input
+  row, and border while streamed model and tool output scrolls above it.
+- **High-contrast approval warnings.** Tool approvals now render in their own
+  full-width amber/red bordered panel with the risk class, tool name, wrapped
+  argument preview, and the existing safe-default `[y/N]` decision.
+- **Realtime RAG in the Tools picker.** `rag.realtime` has its own truthful
+  setup toggle and `rag.realtime_enabled` config key; selecting it also enables
+  its web search/fetch dependency.
+
+### Changed
+
+- **The startup dashboard now spans the detected terminal width.** Its former
+  180-column ceiling and the divider between the modern Lightagent mark and
+  live harness information are removed; narrow terminals use a stacked layout.
+- **`/tools` reports the session's effective registry.** Its output now matches
+  the tools shown at startup, including realtime RAG, memory, MCP, and extension
+  tools that were actually loaded.
+
 ## [0.3.9] - 2026-09-10
 
 A patch release for the Lightagent harness and the gateway it drives.

@@ -280,13 +280,17 @@ fn configure_tools_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<boo
     eprintln!("↑↓ navigate  SPACE toggle  ENTER confirm  ESC cancel\n");
     let items = [
         "🔎 Web Search & Page Fetch  (web.search, web.fetch)",
+        "⚡ Realtime RAG             (rag.realtime)",
         "📁 File Operations          (fs.read, fs.list, fs.write)",
         "⌨  Terminal & Processes     (terminal.run)",
         "🧩 Installed Extensions     (skills and capability bundles)",
         "🔌 MCP Servers              (tools from configured servers)",
     ];
+    let realtime_rag =
+        config.rag.realtime_enabled && config.web.enabled && config.web.search.endpoint.is_some();
     let defaults = [
         config.web.enabled,
+        realtime_rag,
         config.tools.enabled,
         config.tools.enabled && config.tools.allow_terminal,
         config.extensions.enabled,
@@ -302,12 +306,14 @@ fn configure_tools_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<boo
         return Ok(false);
     };
     let enabled = |index| selected.contains(&index);
-    let terminal = enabled(2);
-    config.web.enabled = enabled(0);
-    config.tools.enabled = enabled(1) || terminal;
+    let realtime_rag = enabled(1);
+    let terminal = enabled(3);
+    config.web.enabled = enabled(0) || realtime_rag;
+    config.rag.realtime_enabled = realtime_rag;
+    config.tools.enabled = enabled(2) || terminal;
     config.tools.allow_terminal = terminal;
-    config.extensions.enabled = enabled(3);
-    config.mcp.enabled = enabled(4);
+    config.extensions.enabled = enabled(4);
+    config.mcp.enabled = enabled(5);
 
     if config.web.enabled && config.web.search.endpoint.is_none() {
         use_duckduckgo(config);
@@ -321,7 +327,10 @@ fn configure_tools_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<boo
             .map_err(dialog_error)?;
         config.tools.workspace = nonempty(workspace);
     }
-    if terminal && !enabled(1) {
+    if realtime_rag && !enabled(0) {
+        eprintln!("Web Search & Page Fetch were also enabled because realtime RAG uses them.");
+    }
+    if terminal && !enabled(2) {
         eprintln!(
             "File Operations were also enabled because terminal access uses the same confined workspace."
         );
@@ -374,6 +383,7 @@ fn configure_web_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<bool,
     } else {
         config.web.search.endpoint = None;
     }
+    config.rag.realtime_enabled = selected >= 2;
     Ok(true)
 }
 
@@ -610,6 +620,7 @@ fn configure_web<R: BufRead, W: Write>(
     } else {
         config.web.search.endpoint = None;
     }
+    config.rag.realtime_enabled = selected >= 3;
     Ok(())
 }
 
@@ -671,11 +682,20 @@ fn summary(config: &Config, writer: &mut impl Write) -> Result<(), String> {
     } else {
         "fetch only".to_owned()
     };
+    let realtime_rag = if config.rag.realtime_enabled
+        && config.web.enabled
+        && config.web.search.endpoint.is_some()
+    {
+        "on"
+    } else {
+        "off"
+    };
     writeln!(writer, "Current settings:").map_err(io_error)?;
     writeln!(writer, "  Gateway: {}", config.inference.base_url).map_err(io_error)?;
     writeln!(writer, "  Model:   {model}").map_err(io_error)?;
     writeln!(writer, "  Tools:   {tools}").map_err(io_error)?;
-    writeln!(writer, "  Web:     {web}\n").map_err(io_error)
+    writeln!(writer, "  Web:     {web}").map_err(io_error)?;
+    writeln!(writer, "  RAG:     realtime {realtime_rag}\n").map_err(io_error)
 }
 
 fn uses_duckduckgo(config: &Config) -> bool {
@@ -785,6 +805,7 @@ mod tests {
         };
         configure_web(&mut config, &mut prompt).unwrap();
         assert!(config.web.enabled);
+        assert!(config.rag.realtime_enabled);
         assert_eq!(
             config.web.search.endpoint.as_deref(),
             Some("https://search.example/search?format=json")
@@ -801,6 +822,7 @@ mod tests {
         };
         configure_web(&mut config, &mut prompt).unwrap();
         assert!(config.web.enabled);
+        assert!(config.rag.realtime_enabled);
         assert!(uses_duckduckgo(&config));
         assert!(config.web.search.api_key.is_none());
     }

@@ -66,7 +66,7 @@ pub(crate) fn rag_tool(profile_dir: &Path, config: &Config) -> Option<Arc<dyn To
 
 /// The one-call realtime web retriever, available with a configured search backend.
 pub(crate) fn realtime_rag_tool(config: &Config) -> Option<Arc<dyn Tool>> {
-    if !config.web.enabled || config.web.search.endpoint.is_none() {
+    if !config.rag.realtime_enabled || !config.web.enabled || config.web.search.endpoint.is_none() {
         return None;
     }
     Some(Arc::new(RealtimeRag::new(

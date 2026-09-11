@@ -172,21 +172,34 @@ fn logo_lines(colour: bool) -> Vec<String> {
     lines
 }
 
-fn terminal_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
+/// The live terminal width, with `COLUMNS` retained as a fallback for previews
+/// and unusual terminals where the OS size probe is unavailable.
+pub(crate) fn terminal_width() -> usize {
+    dialoguer::console::Term::stdout()
+        .size_checked()
+        .map(|(_, columns)| usize::from(columns))
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+        })
         .unwrap_or(132)
-        .clamp(112, 180)
+        .max(64)
 }
 
 fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String {
     const LEFT_WIDTH: usize = 60;
-    let width = width.max(112);
-    let right_width = width.saturating_sub(LEFT_WIDTH + 7);
+    const SIDE_BY_SIDE_MIN: usize = 112;
+    let width = width.max(64);
     let logo = logo_lines(colour);
-    let details = startup_details(info, right_width);
-    let rows = logo.len().max(details.len());
+    let content_width = width.saturating_sub(4);
+    let side_by_side = width >= SIDE_BY_SIDE_MIN;
+    let detail_width = if side_by_side {
+        content_width.saturating_sub(LEFT_WIDTH + 1)
+    } else {
+        content_width
+    };
+    let details = startup_details(info, detail_width);
     let title = format!(" Lightagent v{} ({}) ", info.version, info.release_date);
     let mut out = String::from("\n");
     out.push_str(&paint_border(
@@ -195,31 +208,77 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
     ));
     out.push('\n');
 
-    for row in 0..rows {
-        let left = logo.get(row).map(String::as_str).unwrap_or("");
-        let left_visible = if row < logo.len() {
-            STAR_BOLT[0].len() + 2
-        } else {
-            0
-        };
-        let right = details.get(row).map(String::as_str).unwrap_or("");
-        out.push_str(&paint_border("│", colour));
-        out.push(' ');
-        out.push_str(left);
-        out.push_str(&" ".repeat(LEFT_WIDTH.saturating_sub(left_visible)));
-        out.push(' ');
-        out.push_str(&paint_border("│", colour));
-        out.push(' ');
-        out.push_str(&paint_detail(right, colour));
-        out.push_str(&" ".repeat(right_width.saturating_sub(right.chars().count())));
-        out.push(' ');
-        out.push_str(&paint_border("│", colour));
-        out.push('\n');
+    if side_by_side {
+        let rows = logo.len().max(details.len());
+        for row in 0..rows {
+            let left = logo.get(row).map(String::as_str).unwrap_or("");
+            let left_visible = if row < logo.len() {
+                STAR_BOLT[0].len() + 2
+            } else {
+                0
+            };
+            let right = details.get(row).map(String::as_str).unwrap_or("");
+            out.push_str(&paint_border("│", colour));
+            out.push(' ');
+            out.push_str(left);
+            out.push_str(&" ".repeat(LEFT_WIDTH.saturating_sub(left_visible)));
+            // Deliberately use whitespace rather than a divider: the modern
+            // mark and the live harness information share one open canvas.
+            out.push(' ');
+            out.push_str(&paint_detail(right, colour));
+            out.push_str(&" ".repeat(detail_width.saturating_sub(right.chars().count())));
+            out.push(' ');
+            out.push_str(&paint_border("│", colour));
+            out.push('\n');
+        }
+    } else {
+        for line in &logo {
+            push_startup_row(
+                &mut out,
+                line,
+                STAR_BOLT[0].len() + 2,
+                content_width,
+                colour,
+                false,
+            );
+        }
+        push_startup_row(&mut out, "", 0, content_width, colour, false);
+        for line in &details {
+            push_startup_row(
+                &mut out,
+                line,
+                line.chars().count(),
+                content_width,
+                colour,
+                true,
+            );
+        }
     }
 
     out.push_str(&paint_border(&labelled_border('└', '┘', "", width), colour));
     out.push_str("\n\n");
     out
+}
+
+fn push_startup_row(
+    out: &mut String,
+    text: &str,
+    visible_width: usize,
+    width: usize,
+    colour: bool,
+    detail: bool,
+) {
+    out.push_str(&paint_border("│", colour));
+    out.push(' ');
+    if detail {
+        out.push_str(&paint_detail(text, colour));
+    } else {
+        out.push_str(text);
+    }
+    out.push_str(&" ".repeat(width.saturating_sub(visible_width)));
+    out.push(' ');
+    out.push_str(&paint_border("│", colour));
+    out.push('\n');
 }
 
 fn startup_details(info: &StartupInfo<'_>, width: usize) -> Vec<String> {
@@ -427,5 +486,52 @@ mod tests {
         assert!(dashboard.contains("Model: minicpm5-1b@16k"));
         assert!(dashboard.contains("Session: session-1"));
         assert!(dashboard.lines().all(|line| line.chars().count() <= 132));
+        let tools_row = dashboard
+            .lines()
+            .find(|line| line.contains("Available Tools"))
+            .unwrap();
+        assert_eq!(tools_row.matches('│').count(), 2, "no center divider");
+    }
+
+    #[test]
+    fn startup_border_reaches_the_requested_terminal_edge() {
+        let tools = vec!["rag.realtime".to_owned()];
+        let dashboard = render_startup(
+            &StartupInfo {
+                version: "0.3.9",
+                release_date: "2026-09-10",
+                profile: "default",
+                model: "model",
+                session: "session",
+                tools: &tools,
+                skills: &[],
+            },
+            220,
+            false,
+        );
+        for line in dashboard.lines().filter(|line| !line.is_empty()) {
+            assert_eq!(line.chars().count(), 220, "wrong width: {line:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_startup_stacks_without_overflowing() {
+        let dashboard = render_startup(
+            &StartupInfo {
+                version: "0.3.9",
+                release_date: "2026-09-10",
+                profile: "default",
+                model: "model",
+                session: "session",
+                tools: &[],
+                skills: &[],
+            },
+            80,
+            false,
+        );
+        assert!(dashboard.contains("Available Tools"));
+        for line in dashboard.lines().filter(|line| !line.is_empty()) {
+            assert_eq!(line.chars().count(), 80, "wrong width: {line:?}");
+        }
     }
 }
