@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-09-10
+
+A patch release for the Lightagent harness and the gateway it drives.
+OpenAI-compatible chat and text-completion requests may now name
+`model: "default"` (or omit the model), which the gateway resolves to its one
+resident model at request time and keeps in step across model swaps, while
+responses still report the truthful model ID. A headless end-to-end test now
+drives a full streamed tool-using run through the real agent API and panel
+gateway. Requests that name a model explicitly are unaffected.
+
 ### Changed
 
 - **The loaded gateway model is the dynamic default.** OpenAI chat and text
