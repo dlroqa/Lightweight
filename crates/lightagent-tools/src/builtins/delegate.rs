@@ -153,6 +153,12 @@ impl Tool for AgentDelegate {
                 "worker '{}' paused awaiting approval, which delegation cannot grant",
                 args.profile
             )),
+            // Unreachable under the default wrap-up policy a worker runs with;
+            // handled so a pause could never be mistaken for an answer.
+            Ok(RunOutcome::OutOfTime { .. }) => ToolOutcome::error(format!(
+                "worker '{}' ran out of time before answering",
+                args.profile
+            )),
             Err(error) => ToolOutcome::error(format!("worker '{}' failed: {error}", args.profile)),
         }
     }

@@ -192,6 +192,15 @@ pub async fn drive<P: AgentProvider, I: ToolInvoker>(
     loop {
         match outcome {
             RunOutcome::Completed { events } => return status_from_events(&events),
+            // Only a `WallClockPolicy::Pause` run pauses out of time, and the API
+            // keeps the default wrap-up policy; should one arrive anyway, the
+            // time budget is spent and the run is over.
+            RunOutcome::OutOfTime { .. } => {
+                let _ = sink.send(AgentEvent::RunCompleted {
+                    reason: StopReason::WallClockExceeded,
+                });
+                return RunStatus::Completed;
+            }
             RunOutcome::AwaitingApproval { suspended, .. } => {
                 tokio::select! {
                     () = cancel.cancelled() => return RunStatus::Cancelled,
