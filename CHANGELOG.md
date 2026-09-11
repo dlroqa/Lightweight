@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. The startup dashboard
+now renders the latest supplied pixel-art logo — the gold star, cyan lightning
+and block-pixel `Lightagent` wordmark — completed agent answers are explicitly
+labelled `Lightagent`, the initialization notice appears only before the first
+model request, and the status row's background and separator end with the
+elapsed-time value instead of filling unused terminal columns. Redirected and
+non-interactive I/O is unchanged.
+
+### Changed
+
+- **The pixel-art logo replaces the modern mark as the terminal asset.** The
+  startup dashboard renders the pixel-art gold star, cyan lightning and
+  block-pixel `Lightagent` wordmark from an embedded true-colour RGBA
+  derivative, with a matching monochrome fallback.
+
+- **Agent answers are labelled and the status row is trimmed.** Each completed
+  agent answer is explicitly labelled `Lightagent` and boxed to its longest
+  rendered line, or to the label when that is longer. The initialization notice
+  appears only before the first model request, and the status row's background
+  and separator stop after the elapsed-time segment rather than filling unused
+  terminal columns.
+
 ## [0.3.12] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. The startup dashboard

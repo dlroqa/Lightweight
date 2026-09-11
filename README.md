@@ -90,15 +90,19 @@ panel or hide it behind an animated gold-and-cyan Lightagent star. The first
 prompt bar appears immediately below the startup dashboard; subsequent prompts
 follow each response in normal terminal flow and scroll naturally as the
 terminal fills. Its status row shows command tips plus the active model, context
-usage, output tokens, token rate, and elapsed time after each response. A
+usage, output tokens, token rate, and elapsed time after each response; the
+status background and separator end with that elapsed-time value rather than
+filling unused terminal columns. A
 submitted user message receives a compact lower border matching the exact
 display width of that prompt, so it remains easy to find in the transcript.
-Completed agent answers use a compact box sized to their longest rendered line,
-expanding only when a line must wrap at the terminal edge. Models that do not
-emit reasoning simply show the answer panel. The
-full-width startup dashboard places the modern Lightagent star-and-bolt image
+Completed agent answers use an explicitly labelled `Lightagent` box sized to
+their longest rendered line (or the label when it is longer), expanding only
+when a line must wrap at the terminal edge. The initialization notice appears
+only for the first model request. Models that do not emit reasoning simply show
+the answer panel. The
+full-width startup dashboard places the pixel-art Lightagent star-and-bolt image
 beside the release version and date, active profile and model, session, tools,
-and its updated rounded wordmark beside the session information. Approval
+and its updated block-pixel wordmark beside the session information. Approval
 requests use a compact high-contrast warning box with
 their risk class, tool, argument preview, and three numbered choices: allow
 once, deny, or allow without further restrictions for the current session.

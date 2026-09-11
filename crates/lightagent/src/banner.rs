@@ -1,7 +1,7 @@
 //! The `lightagent` welcome mark.
 //!
 //! Typing `lightagent` prints a true-colour terminal adaptation of the supplied
-//! modern logo: the faceted gold star, cyan lightning bolt and rounded
+//! latest pixel-art logo: the gold star, cyan lightning bolt and block-pixel
 //! `Lightagent` wordmark. An embedded RGBA derivative keeps the exact artwork
 //! portable without terminal-specific image protocols or runtime image decoding.
 //!
@@ -391,7 +391,10 @@ mod tests {
             .filter(|pixel| pixel[3] >= 12)
             .map(|pixel| (pixel[0], pixel[1], pixel[2]))
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(colours.len() > 256, "logo should retain smooth gradients");
+        assert!(
+            colours.len() > 256,
+            "logo should retain its detailed palette"
+        );
     }
 
     #[test]

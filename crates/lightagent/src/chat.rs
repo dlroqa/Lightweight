@@ -443,6 +443,7 @@ pub async fn run(
     let context_limit = configured_context_limit(config.runtime.n_ctx, &active_model);
     let mut last_turn = TurnStatus::default();
     let mut prompt = TerminalPrompt::new();
+    let mut initialization_shown = false;
     // A run that paused on its time budget and was not continued straight
     // away. It is kept whole — the conversation, including the tool results
     // the model has not read yet — so `continue` picks it up where it stopped.
@@ -508,7 +509,9 @@ pub async fn run(
             drop_paused(run, &mut session, &session_store);
         }
         session.push_message(StoredMessage::new("user", &line));
-        print_initializing();
+        if initialization_notice_due(&mut initialization_shown) {
+            print_initializing();
+        }
         let mut active = Duration::ZERO;
         let mut renderer = ModelRenderer::new(config.tui.show_reasoning);
         let (sink, mut stream) = tokio::sync::mpsc::unbounded_channel();
@@ -712,13 +715,13 @@ fn status_line(
         })
         .unwrap_or_else(|| "-- tok/s".to_owned());
     let elapsed = format_elapsed(status.elapsed);
-    fill_line(
+    fit_line(
         &format!(" ✦ {model} │ ctx {context} │ out {output} │ ↑ {speed} │ ◷ {elapsed} "),
         width,
     )
 }
 
-fn print_status_bar(model: &str, context_limit: Option<u32>, status: &TurnStatus) {
+fn print_status_bar(model: &str, context_limit: Option<u32>, status: &TurnStatus) -> usize {
     let line = status_line(
         model,
         context_limit,
@@ -731,6 +734,11 @@ fn print_status_bar(model: &str, context_limit: Option<u32>, status: &TurnStatus
     } else {
         println!("{line}");
     }
+    measure_text_width(&line)
+}
+
+fn status_edge(status_width: usize, terminal_width: usize) -> String {
+    "─".repeat(status_width.min(terminal_width))
 }
 
 /// A prompt that participates in normal terminal flow. Each render follows the
@@ -750,8 +758,8 @@ impl TerminalPrompt {
     }
 
     fn render(&mut self, model: &str, context_limit: Option<u32>, status: &TurnStatus) {
-        print_status_bar(model, context_limit, status);
-        print_prompt();
+        let status_width = print_status_bar(model, context_limit, status);
+        print_prompt(status_width);
         let _ = std::io::stdout().flush();
     }
 
@@ -846,9 +854,9 @@ fn input_window(line: &[char], cursor: usize, available: usize) -> (String, usiz
     (visible, cursor_offset)
 }
 
-fn print_prompt() {
+fn print_prompt(status_width: usize) {
     let width = crate::banner::terminal_width();
-    let edge = "─".repeat(width);
+    let edge = status_edge(status_width, width);
     let tips = fit_line(
         "  /help · /tools · /skills · /new · /continue · /stop · /exit · Ctrl+C exit",
         width,
@@ -888,6 +896,14 @@ fn print_initializing() {
         println!("Initializing agent…");
     }
     let _ = std::io::stdout().flush();
+}
+
+fn initialization_notice_due(shown: &mut bool) -> bool {
+    if *shown {
+        return false;
+    }
+    *shown = true;
+    true
 }
 
 fn colour_terminal() -> bool {
@@ -947,7 +963,7 @@ fn panel_edge(label: Option<&str>, top: bool) -> String {
     line
 }
 
-fn compact_text_panel(text: &str, terminal_width: usize, colour: bool) -> String {
+fn compact_text_panel(label: &str, text: &str, terminal_width: usize, colour: bool) -> String {
     const GOLD: &str = "\x1b[1;38;2;255;220;45m";
     const WARM_WHITE: &str = "\x1b[38;2;255;252;214m";
     const RESET: &str = "\x1b[0m";
@@ -959,9 +975,11 @@ fn compact_text_panel(text: &str, terminal_width: usize, colour: bool) -> String
         .map(|line| measure_text_width(line))
         .max()
         .unwrap_or(0);
-    let width = (content_width + 4).min(terminal_width);
+    let width = (content_width + 4)
+        .max(measure_text_width(label) + 5)
+        .min(terminal_width);
     let inner_width = width.saturating_sub(4);
-    let top = compact_panel_border('┌', '┐', None, width);
+    let top = compact_panel_border('┌', '┐', Some(label), width);
     let bottom = compact_panel_border('└', '┘', None, width);
     let mut out = String::from("\n");
     if colour {
@@ -1048,14 +1066,6 @@ fn fit_line(line: &str, width: usize) -> String {
     }
     let keep = width.saturating_sub(1);
     format!("{}…", line.chars().take(keep).collect::<String>())
-}
-
-fn fill_line(line: &str, width: usize) -> String {
-    let line = fit_line(line, width);
-    format!(
-        "{line}{}",
-        " ".repeat(width.saturating_sub(line.chars().count()))
-    )
 }
 
 struct ModelRenderer {
@@ -1196,7 +1206,12 @@ impl ModelRenderer {
             if !self.answer.is_empty() {
                 print!(
                     "{}",
-                    compact_text_panel(&self.answer, crate::banner::terminal_width(), self.colour,)
+                    compact_text_panel(
+                        "Lightagent",
+                        &self.answer,
+                        crate::banner::terminal_width(),
+                        self.colour,
+                    )
                 );
             }
             self.answer.clear();
@@ -1823,12 +1838,22 @@ mod model_tests {
         assert_eq!(compact_number(16_000), "16.0k");
         assert_eq!(format_elapsed(Duration::from_millis(2_450)), "2.5s");
         assert_eq!(format_elapsed(Duration::from_secs(125)), "2m 05s");
+        let status = status_line("model", Some(16_000), &TurnStatus::default(), 132);
+        let status_width = measure_text_width(&status);
+        assert!(status_width < 132);
+        assert!(status.ends_with("◷ 0s "));
         assert_eq!(
-            status_line("model", Some(16_000), &TurnStatus::default(), 132)
-                .chars()
-                .count(),
-            132
+            measure_text_width(&status_edge(status_width, 132)),
+            status_width
         );
+        assert_eq!(measure_text_width(&status_edge(status_width, 20)), 20);
+    }
+
+    #[test]
+    fn initialization_notice_is_emitted_only_once() {
+        let mut shown = false;
+        assert!(initialization_notice_due(&mut shown));
+        assert!(!initialization_notice_due(&mut shown));
     }
 
     #[test]
@@ -1850,7 +1875,12 @@ mod model_tests {
 
     #[test]
     fn agent_answer_panel_matches_its_longest_rendered_line() {
-        let panel = compact_text_panel("Short answer.\nA somewhat longer paragraph.", 120, false);
+        let panel = compact_text_panel(
+            "Lightagent",
+            "Short answer.\nA somewhat longer paragraph.",
+            120,
+            false,
+        );
         let lines = panel
             .lines()
             .filter(|line| !line.is_empty())
@@ -1862,15 +1892,17 @@ mod model_tests {
                 .all(|line| measure_text_width(line) == expected)
         );
         assert!(expected < 120);
+        assert!(panel.contains("┌─ Lightagent "));
 
-        let tiny = compact_text_panel("Hi", 120, false);
+        let tiny = compact_text_panel("Lightagent", "Hi", 120, false);
+        let labelled_width = measure_text_width("Lightagent") + 5;
         assert!(
             tiny.lines()
                 .filter(|line| !line.is_empty())
-                .all(|line| measure_text_width(line) == measure_text_width("Hi") + 4)
+                .all(|line| measure_text_width(line) == labelled_width)
         );
 
-        let wrapped = compact_text_panel(&"x".repeat(200), 80, false);
+        let wrapped = compact_text_panel("Lightagent", &"x".repeat(200), 80, false);
         assert!(
             wrapped
                 .lines()
