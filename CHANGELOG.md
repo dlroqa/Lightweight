@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-09-10
+
+A patch release for the Lightagent interactive terminal. The chat prompt is now
+a persistent four-row footer pinned to the bottom of an attended terminal while
+model and tool output scrolls above it, tool approvals appear in their own
+high-contrast bordered panel, and realtime RAG is a first-class, truthful choice
+in setup with its own `rag.realtime_enabled` config key. The startup dashboard
+spans the detected terminal width and `/tools` reports the session's effective
+registry. Redirected and non-interactive I/O behaves as before, and existing
+profiles and configuration load unchanged.
+
 ### Added
 
 - **A persistent terminal prompt footer.** Interactive chat reserves the bottom
