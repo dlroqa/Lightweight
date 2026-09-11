@@ -501,6 +501,26 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Presentation preferences for the attended terminal chat.
+///
+/// These affect only what the CLI renders. Provider events, session records,
+/// the HTTP API and ACP continue to receive the same underlying run data.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Stream the model's reasoning panel. When false, the terminal replaces
+    /// it with the animated Lightagent thinking mark.
+    pub show_reasoning: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            show_reasoning: true,
+        }
+    }
+}
+
 /// The whole typed configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -524,6 +544,8 @@ pub struct Config {
     pub extensions: ExtensionsConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub tui: TuiConfig,
     /// Top-level keys this build does not understand, preserved across a save.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -1028,6 +1050,19 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize");
         let back: Config = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn tui_reasoning_visibility_defaults_to_show_and_round_trips() {
+        let legacy: Config = serde_json::from_str("{}").expect("deserialize old config");
+        assert!(legacy.tui.show_reasoning);
+
+        let mut config = Config::default();
+        assert!(config.tui.show_reasoning);
+        config.tui.show_reasoning = false;
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.tui.show_reasoning);
     }
 
     #[test]

@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Reasoning visibility in Terminal UI settings.** The new `Terminal UI`
+  setup screen can show the streamed reasoning panel or hide it behind an
+  animated gold-and-cyan Lightagent star. The persisted
+  `tui.show_reasoning` setting defaults to `true` for compatibility and affects
+  attended CLI rendering only.
+- **A session-scoped "allow without restrictions" approval choice.** The
+  interactive approval prompt is now a compact numbered box offering allow once,
+  deny, or allow without further restrictions for the remainder of the session.
+  The session grant relaxes only the in-memory policy and is never persisted to
+  a profile or `config.json`.
+
+### Changed
+
+- **The startup banner follows the gold-and-electric-blue mark.** The banner's
+  former purple sparkle pixels now render as the electric-blue glow of the
+  modern Lightagent star/bolt mark, and the welcome message sits directly above
+  the pinned footer instead of being stranded above an empty prompt area.
+
 ## [0.3.10] - 2026-09-10
 
 A patch release for the Lightagent interactive terminal. The chat prompt is now

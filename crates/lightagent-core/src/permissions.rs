@@ -252,6 +252,9 @@ pub struct ApprovalDecision {
     /// When set, the grant is remembered for this long, so an identical call
     /// does not ask again until it expires.
     pub remember: Option<Duration>,
+    /// Relax the in-memory policy for the remainder of this session. This is
+    /// intentionally not persisted to the profile or global configuration.
+    pub unrestricted: bool,
 }
 
 impl ApprovalDecision {
@@ -261,6 +264,7 @@ impl ApprovalDecision {
             id,
             granted: true,
             remember: None,
+            unrestricted: false,
         }
     }
 
@@ -270,6 +274,18 @@ impl ApprovalDecision {
             id,
             granted: true,
             remember: Some(ttl),
+            unrestricted: false,
+        }
+    }
+
+    /// Grant this call and allow subsequent tools without approval prompts for
+    /// the remainder of the current session.
+    pub fn grant_unrestricted(id: ApprovalId) -> Self {
+        Self {
+            id,
+            granted: true,
+            remember: None,
+            unrestricted: true,
         }
     }
 
@@ -279,6 +295,7 @@ impl ApprovalDecision {
             id,
             granted: false,
             remember: None,
+            unrestricted: false,
         }
     }
 }
@@ -352,6 +369,12 @@ impl PolicyEngine {
     /// Remember a grant, so a matching request auto-approves until it expires.
     pub fn remember(&mut self, record: ApprovalRecord) {
         self.policy.grants.push(record);
+    }
+
+    /// Allow every risk class for this in-memory policy. Callers deliberately
+    /// decide whether to persist a broader coarse policy separately.
+    pub fn allow_without_restrictions(&mut self) {
+        self.policy = ApprovalPolicy::permissive();
     }
 
     /// Decide `request` as of `now`.
@@ -526,6 +549,26 @@ mod tests {
         assert!(record.covers(&req, base + Duration::from_secs(59)));
         assert!(!record.covers(&req, base + Duration::from_secs(60)));
         assert!(!record.covers(&req, base + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn unrestricted_decision_is_explicit_and_session_policy_can_relax() {
+        let request = request("terminal.run", RiskClass::Executable, vec![]);
+        let decision = ApprovalDecision::grant_unrestricted(request.id.clone());
+        assert!(decision.granted);
+        assert!(decision.unrestricted);
+        assert!(decision.remember.is_none());
+
+        let mut engine = PolicyEngine::new(ApprovalPolicy::strict());
+        assert!(matches!(
+            engine.evaluate(&request, SystemTime::now()),
+            ApprovalNeed::Require(_)
+        ));
+        engine.allow_without_restrictions();
+        assert_eq!(
+            engine.evaluate(&request, SystemTime::now()),
+            ApprovalNeed::AutoApprove
+        );
     }
 
     #[test]

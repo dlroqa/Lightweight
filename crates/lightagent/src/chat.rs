@@ -3,7 +3,7 @@
 //! Resolves the active profile, builds the Lightweight provider and the bounded
 //! tool executor, and drives the one core loop. Model output is printed as it is
 //! returned, tool activity is shown on stderr, and a tool call that needs
-//! approval pauses for a yes/no at the prompt before the run resumes.
+//! approval pauses for a numbered decision at the prompt before the run resumes.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -438,12 +438,14 @@ pub async fn run(
             active_model
         );
     }
-    println!("Type a message, or /help for commands. /exit to leave.");
 
     let stdin = std::io::stdin();
     let context_limit = configured_context_limit(config.runtime.n_ctx, &active_model);
     let mut last_turn = TurnStatus::default();
     let mut footer = TerminalFooter::new();
+    if !footer.is_pinned() {
+        println!("Type a message, or /help for commands. /exit to leave.");
+    }
     // A run that paused on its time budget and was not continued straight
     // away. It is kept whole — the conversation, including the tool results
     // the model has not read yet — so `continue` picks it up where it stopped.
@@ -469,7 +471,7 @@ pub async fn run(
             else {
                 continue;
             };
-            let mut renderer = ModelRenderer::new();
+            let mut renderer = ModelRenderer::new(config.tui.show_reasoning);
             let outcome = wait_for_outcome(
                 agent.continue_out_of_time(
                     suspended,
@@ -511,7 +513,7 @@ pub async fn run(
         session.push_message(StoredMessage::new("user", &line));
         print_initializing();
         let mut active = Duration::ZERO;
-        let mut renderer = ModelRenderer::new();
+        let mut renderer = ModelRenderer::new(config.tui.show_reasoning);
         let (sink, mut stream) = tokio::sync::mpsc::unbounded_channel();
         let outcome = wait_for_outcome(
             agent.run_streaming(line, CancellationToken::new(), sink),
@@ -744,6 +746,7 @@ struct TerminalFooter {
     term: Term,
     size: Option<(u16, u16)>,
     installed: bool,
+    welcome_shown: bool,
 }
 
 impl TerminalFooter {
@@ -770,7 +773,12 @@ impl TerminalFooter {
             term,
             size,
             installed: false,
+            welcome_shown: false,
         }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.size.is_some()
     }
 
     fn render(&mut self, model: &str, context_limit: Option<u32>, status: &TurnStatus) {
@@ -835,6 +843,18 @@ impl TerminalFooter {
                  \x1b[{input_row};1H\x1b[2Kyou › \
                  \x1b[{bottom_edge_row};1H\x1b[2K{edge}"
             );
+        }
+        if !self.welcome_shown {
+            let welcome = fit_line(
+                "Welcome to Lightagent · type a message or use /help for commands.",
+                width,
+            );
+            if colour_terminal() {
+                print!("\x1b[{content_bottom};1H\x1b[2K\x1b[38;2;255;252;214m{welcome}\x1b[0m");
+            } else {
+                print!("\x1b[{content_bottom};1H\x1b[2K{welcome}");
+            }
+            self.welcome_shown = true;
         }
         self.draw_input(&[], 0);
         let _ = std::io::stdout().flush();
@@ -1092,50 +1112,108 @@ struct ModelRenderer {
     section: ModelSection,
     line_open: bool,
     colour: bool,
+    show_reasoning: bool,
+    interactive: bool,
+    thinking_visible: bool,
+    thinking_frame: usize,
 }
 
 impl ModelRenderer {
-    fn new() -> Self {
+    fn new(show_reasoning: bool) -> Self {
         Self {
             section: ModelSection::None,
             line_open: false,
             colour: colour_terminal(),
+            show_reasoning,
+            interactive: std::io::stdout().is_terminal(),
+            thinking_visible: false,
+            thinking_frame: 0,
         }
     }
 
     fn event(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Reasoning { text } => {
+            AgentEvent::Reasoning { text } if self.show_reasoning => {
+                self.stop_thinking();
                 self.enter(ModelSection::Reasoning);
                 print!("{text}");
                 self.line_open = !text.ends_with('\n');
                 let _ = std::io::stdout().flush();
             }
+            AgentEvent::Reasoning { .. } => {
+                self.start_thinking();
+                self.tick_thinking();
+            }
             AgentEvent::Content { text } => {
+                self.stop_thinking();
                 self.enter(ModelSection::Answer);
                 print!("{text}");
                 self.line_open = !text.ends_with('\n');
                 let _ = std::io::stdout().flush();
             }
             AgentEvent::ToolCallStarted { name, .. } => {
+                self.stop_thinking();
                 self.finish_section();
                 eprintln!("· running {name}…");
             }
-            AgentEvent::ToolCallCompleted { outcome, .. } if outcome.is_error => {
+            AgentEvent::ToolCallCompleted { outcome, .. } => {
+                self.stop_thinking();
                 self.finish_section();
-                eprintln!("· tool error: {}", outcome.content);
+                if outcome.is_error {
+                    eprintln!("· tool error: {}", outcome.content);
+                }
+                self.start_thinking();
             }
             AgentEvent::Error { message } => {
+                self.stop_thinking();
                 self.finish_section();
                 eprintln!("· {message}");
             }
             AgentEvent::RunCompleted { reason } if !matches!(reason, StopReason::EndTurn) => {
+                self.stop_thinking();
                 self.finish_section();
                 eprintln!("(run ended: {reason:?})");
             }
-            AgentEvent::RunCompleted { .. } => self.finish_section(),
+            AgentEvent::RunCompleted { .. } => {
+                self.stop_thinking();
+                self.finish_section();
+            }
             _ => {}
         }
+    }
+
+    fn start_thinking(&mut self) {
+        if self.show_reasoning || !self.interactive || self.thinking_visible {
+            return;
+        }
+        self.thinking_visible = true;
+        self.draw_thinking();
+    }
+
+    fn tick_thinking(&mut self) {
+        if !self.thinking_visible {
+            return;
+        }
+        self.thinking_frame = (self.thinking_frame + 1) % THINKING_STARS.len();
+        self.draw_thinking();
+    }
+
+    fn draw_thinking(&self) {
+        print!(
+            "\r\x1b[2K{}",
+            thinking_indicator(self.thinking_frame, self.colour)
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn stop_thinking(&mut self) {
+        if !self.thinking_visible {
+            return;
+        }
+        print!("\r\x1b[2K");
+        let _ = std::io::stdout().flush();
+        self.thinking_visible = false;
+        self.thinking_frame = 0;
     }
 
     fn enter(&mut self, section: ModelSection) {
@@ -1194,7 +1272,26 @@ impl ModelRenderer {
     }
 
     fn finish(&mut self) {
+        self.stop_thinking();
         self.finish_section();
+    }
+}
+
+const THINKING_STARS: [&str; 8] = ["✦", "✧", "⋆", "✧", "✦", "★", "✦", "✧"];
+
+fn thinking_indicator(frame: usize, colour: bool) -> String {
+    let star = THINKING_STARS[frame % THINKING_STARS.len()];
+    if colour {
+        let star_colour = if frame.is_multiple_of(2) {
+            "\x1b[1;38;2;255;220;45m"
+        } else {
+            "\x1b[1;38;2;0;238;255m"
+        };
+        format!(
+            "{star_colour}{star}\x1b[0m \x1b[2;3;38;2;255;239;194mLightagent is thinking…\x1b[0m"
+        )
+    } else {
+        format!("{star} Lightagent is thinking…")
     }
 }
 
@@ -1366,16 +1463,13 @@ async fn drive(
                     &request.arguments_preview,
                 );
                 let _ = std::io::stderr().flush();
-                let mut answer = String::new();
-                stdin
-                    .lock()
-                    .read_line(&mut answer)
-                    .map_err(|error| error.to_string())?;
-                let granted = matches!(answer.trim(), "y" | "Y" | "yes");
-                let decision = if granted {
-                    ApprovalDecision::grant(request.id)
-                } else {
-                    ApprovalDecision::deny(request.id)
+                let choice = read_approval_choice(stdin)?;
+                let decision = match choice {
+                    ApprovalChoice::Grant => ApprovalDecision::grant(request.id),
+                    ApprovalChoice::Deny => ApprovalDecision::deny(request.id),
+                    ApprovalChoice::Unrestricted => {
+                        ApprovalDecision::grant_unrestricted(request.id)
+                    }
                 };
                 outcome = wait_for_outcome(
                     agent.resume(suspended, decision, CancellationToken::new()),
@@ -1386,6 +1480,44 @@ async fn drive(
                 .await?;
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalChoice {
+    Grant,
+    Deny,
+    Unrestricted,
+}
+
+fn parse_approval_choice(answer: &str) -> Option<ApprovalChoice> {
+    match answer.trim() {
+        "1" => Some(ApprovalChoice::Grant),
+        "" | "2" => Some(ApprovalChoice::Deny),
+        "3" => Some(ApprovalChoice::Unrestricted),
+        _ => None,
+    }
+}
+
+fn read_approval_choice(stdin: &std::io::Stdin) -> Result<ApprovalChoice, String> {
+    loop {
+        let mut answer = String::new();
+        let read = stdin
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(ApprovalChoice::Deny);
+        }
+        if let Some(choice) = parse_approval_choice(&answer) {
+            return Ok(choice);
+        }
+        if colour_terminal() {
+            eprint!("\x1b[1;38;2;255;84;72m  Choose 1, 2, or 3 [2]: \x1b[0m");
+        } else {
+            eprint!("  Choose 1, 2, or 3 [2]: ");
+        }
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -1409,13 +1541,18 @@ fn render_approval_warning(
     const ALERT: &str = "\x1b[1;38;2;255;84;72m";
     const RESET: &str = "\x1b[0m";
 
-    let width = width.max(40);
+    let width = width.clamp(40, 88);
     let inner_width = width.saturating_sub(4);
     let title = format!(" ⚠ APPROVAL REQUIRED · {risk} ");
     let top = labelled_warning_border('┌', '┐', &title, width);
     let bottom = labelled_warning_border('└', '┘', "", width);
     let mut body = vec![fit_line(&format!("tool: {tool}"), inner_width)];
     body.extend(wrap_labelled("arguments", arguments, inner_width));
+    body.push(String::new());
+    body.push("1. Yes".to_owned());
+    body.push("2. No".to_owned());
+    body.push("3. Allow without restrictions".to_owned());
+    body.push("   Applies to this session only.".to_owned());
 
     let mut out = String::from("\n");
     if colour {
@@ -1454,10 +1591,10 @@ fn render_approval_warning(
         out.push_str(RESET);
         out.push('\n');
         out.push_str(ALERT);
-        out.push_str("  ⚠ approve? [y/N] ");
+        out.push_str("  Select an option [2]: ");
         out.push_str(RESET);
     } else {
-        out.push_str("\n  ⚠ approve? [y/N] ");
+        out.push_str("\n  Select an option [2]: ");
     }
     out
 }
@@ -1523,6 +1660,9 @@ where
     F: Future<Output = Result<RunOutcome, AgentError>>,
 {
     tokio::pin!(future);
+    renderer.start_thinking();
+    let mut animation = tokio::time::interval(Duration::from_millis(140));
+    animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -1530,14 +1670,20 @@ where
                 if let Some(event) = event {
                     renderer.event(&event);
                 } else {
-                    return future.await.map_err(|error| error.to_string());
+                    let outcome = future.await.map_err(|error| error.to_string());
+                    renderer.stop_thinking();
+                    return outcome;
                 }
             }
             outcome = &mut future => {
                 while let Ok(event) = stream.try_recv() {
                     renderer.event(&event);
                 }
+                renderer.stop_thinking();
                 return outcome.map_err(|error| error.to_string());
+            }
+            _ = animation.tick(), if renderer.thinking_visible => {
+                renderer.tick_thinking();
             }
         }
     }
@@ -1740,7 +1886,16 @@ mod model_tests {
     }
 
     #[test]
-    fn approval_warning_has_its_own_full_width_border() {
+    fn hidden_reasoning_uses_an_animated_star_indicator() {
+        assert_eq!(thinking_indicator(0, false), "✦ Lightagent is thinking…");
+        assert_eq!(thinking_indicator(1, false), "✧ Lightagent is thinking…");
+        assert_ne!(thinking_indicator(0, true), thinking_indicator(1, true));
+        assert!(thinking_indicator(0, true).contains("255;220;45"));
+        assert!(thinking_indicator(1, true).contains("0;238;255"));
+    }
+
+    #[test]
+    fn approval_warning_has_its_own_bordered_box() {
         let warning = render_approval_warning(
             "rag.realtime",
             "external",
@@ -1751,13 +1906,39 @@ mod model_tests {
         assert!(warning.contains("⚠ APPROVAL REQUIRED · external"));
         assert!(warning.contains("tool: rag.realtime"));
         assert!(warning.contains("arguments:"));
-        assert!(warning.ends_with("⚠ approve? [y/N] "));
+        assert!(warning.contains("1. Yes"));
+        assert!(warning.contains("2. No"));
+        assert!(warning.contains("3. Allow without restrictions"));
+        assert!(warning.ends_with("Select an option [2]: "));
         for line in warning
             .lines()
             .filter(|line| matches!(line.chars().next(), Some('┌' | '│' | '└')))
         {
             assert_eq!(measure_text_width(line), 64, "wrong width: {line:?}");
         }
+    }
+
+    #[test]
+    fn approval_warning_is_bounded_in_a_compact_box() {
+        let warning = render_approval_warning("terminal.run", "executable", "{}", 220, false);
+        for line in warning
+            .lines()
+            .filter(|line| matches!(line.chars().next(), Some('┌' | '│' | '└')))
+        {
+            assert_eq!(measure_text_width(line), 88, "wrong width: {line:?}");
+        }
+    }
+
+    #[test]
+    fn approval_selector_is_numbered_and_defaults_to_no() {
+        assert_eq!(parse_approval_choice("1"), Some(ApprovalChoice::Grant));
+        assert_eq!(parse_approval_choice("2"), Some(ApprovalChoice::Deny));
+        assert_eq!(parse_approval_choice(""), Some(ApprovalChoice::Deny));
+        assert_eq!(
+            parse_approval_choice("3"),
+            Some(ApprovalChoice::Unrestricted)
+        );
+        assert_eq!(parse_approval_choice("yes"), None);
     }
 
     #[test]

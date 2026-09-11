@@ -103,7 +103,7 @@ fn rgb(pixel: u8) -> Option<(u8, u8, u8)> {
         b'O' => Some((255, 112, 0)),   // orange shading
         b'C' => Some((0, 238, 255)),   // cyan bolt and outline
         b'B' => Some((20, 24, 174)),   // deep blue edging
-        b'P' => Some((170, 0, 255)),   // purple sparkles
+        b'P' => Some((0, 86, 255)),    // electric-blue glow from the modern mark
         b'W' => Some((245, 255, 255)), // white highlights
         _ => None,
     }

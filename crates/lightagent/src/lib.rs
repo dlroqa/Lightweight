@@ -819,6 +819,7 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
         "web.max_fetch_bytes" => Some(config.web.max_fetch_bytes.to_string()),
         "web.timeout_secs" => Some(config.web.timeout_secs.to_string()),
         "rag.realtime_enabled" => Some(config.rag.realtime_enabled.to_string()),
+        "tui.show_reasoning" => Some(config.tui.show_reasoning.to_string()),
         "runtime.preferred_device" => Some(config.runtime.preferred_device.clone()),
         "runtime.allow_cpu_fallback" => Some(config.runtime.allow_cpu_fallback.to_string()),
         "runtime.n_ctx" => config.runtime.n_ctx.map(|v| v.to_string()),
@@ -870,6 +871,7 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
             config.web.timeout_secs = parse_u64(value, "web.timeout_secs")?;
         }
         "rag.realtime_enabled" => config.rag.realtime_enabled = parse_bool(value)?,
+        "tui.show_reasoning" => config.tui.show_reasoning = parse_bool(value)?,
         "runtime.preferred_device" => config.runtime.preferred_device = value.to_string(),
         "runtime.allow_cpu_fallback" => {
             config.runtime.allow_cpu_fallback = parse_bool(value)?;
@@ -1062,6 +1064,12 @@ mod tests {
         set_key(&mut config, "rag.realtime_enabled", "false").unwrap();
         assert_eq!(
             get_key(&config, "rag.realtime_enabled").as_deref(),
+            Some("false")
+        );
+
+        set_key(&mut config, "tui.show_reasoning", "false").unwrap();
+        assert_eq!(
+            get_key(&config, "tui.show_reasoning").as_deref(),
             Some("false")
         );
     }

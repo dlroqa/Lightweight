@@ -17,6 +17,8 @@ pub(crate) enum Section {
     Provider,
     Tools,
     Web,
+    #[value(alias = "terminal", alias = "display")]
+    Tui,
     Approvals,
 }
 
@@ -50,6 +52,7 @@ async fn run_tui(section: Option<Section>, paths: &LightagentPaths) -> Result<()
                     "Gateway and model",
                     "Tools for CLI",
                     "Web access and search",
+                    "Terminal UI",
                     "Approval prompts",
                     "Finish",
                 ];
@@ -63,8 +66,9 @@ async fn run_tui(section: Option<Section>, paths: &LightagentPaths) -> Result<()
                     Some(0) => Some(Section::Provider),
                     Some(1) => Some(Section::Tools),
                     Some(2) => Some(Section::Web),
-                    Some(3) => Some(Section::Approvals),
-                    Some(4) | None => None,
+                    Some(3) => Some(Section::Tui),
+                    Some(4) => Some(Section::Approvals),
+                    Some(5) | None => None,
                     Some(_) => return Err("invalid setup selection".to_owned()),
                 }
             }
@@ -97,6 +101,7 @@ async fn configure_tui(
         Section::Provider => configure_gateway_tui(config, paths, theme).await,
         Section::Tools => configure_tools_tui(config, theme),
         Section::Web => configure_web_tui(config, theme),
+        Section::Tui => configure_terminal_ui_tui(config, theme),
         Section::Approvals => configure_approvals_tui(config, paths, theme),
     }
 }
@@ -421,6 +426,26 @@ fn configure_approvals_tui(
     Ok(true)
 }
 
+fn configure_terminal_ui_tui(config: &mut Config, theme: &ColorfulTheme) -> Result<bool, String> {
+    eprintln!("\nTerminal UI");
+    eprintln!("↑↓ navigate  ENTER select  ESC cancel\n");
+    let default = usize::from(!config.tui.show_reasoning);
+    let Some(selected) = Select::with_theme(theme)
+        .with_prompt("Agent reasoning")
+        .items([
+            "Show reasoning — stream the reasoning panel",
+            "Hide reasoning — show the animated Lightagent star",
+        ])
+        .default(default)
+        .interact_opt()
+        .map_err(dialog_error)?
+    else {
+        return Ok(false);
+    };
+    config.tui.show_reasoning = selected == 0;
+    Ok(true)
+}
+
 fn dialog_error(error: dialoguer::Error) -> String {
     error.to_string()
 }
@@ -453,19 +478,21 @@ async fn run_with_io<R: BufRead, W: Write>(
                     "Gateway and model",
                     "Local file and terminal tools",
                     "Web access and search",
+                    "Terminal UI",
                     "Approval prompts",
                     "Save and exit",
                 ],
-                5,
+                6,
             )?;
-            if choice == 5 {
+            if choice == 6 {
                 break;
             }
             let section = match choice {
                 1 => Section::Provider,
                 2 => Section::Tools,
                 3 => Section::Web,
-                4 => Section::Approvals,
+                4 => Section::Tui,
+                5 => Section::Approvals,
                 _ => return Err("invalid setup selection".to_owned()),
             };
             configure(section, &mut config, paths, &mut prompt).await?;
@@ -491,6 +518,7 @@ async fn configure<R: BufRead, W: Write>(
         Section::Provider => configure_gateway(config, paths, prompt).await,
         Section::Tools => configure_tools(config, prompt),
         Section::Web => configure_web(config, prompt),
+        Section::Tui => configure_terminal_ui(config, prompt),
         Section::Approvals => configure_approvals(config, paths, prompt),
     }
 }
@@ -653,6 +681,23 @@ fn configure_approvals<R: BufRead, W: Write>(
     update_active_profile(paths, |profile| profile.approval_policy = policy)
 }
 
+fn configure_terminal_ui<R: BufRead, W: Write>(
+    config: &mut Config,
+    prompt: &mut Prompt<R, W>,
+) -> Result<(), String> {
+    let default = if config.tui.show_reasoning { 1 } else { 2 };
+    let selected = prompt.choose(
+        "Agent reasoning",
+        &[
+            "Show reasoning — stream the reasoning panel",
+            "Hide reasoning — show the animated Lightagent star",
+        ],
+        default,
+    )?;
+    config.tui.show_reasoning = selected == 1;
+    Ok(())
+}
+
 fn update_active_profile(
     paths: &LightagentPaths,
     update: impl FnOnce(&mut lightagent_core::AgentProfile),
@@ -695,7 +740,17 @@ fn summary(config: &Config, writer: &mut impl Write) -> Result<(), String> {
     writeln!(writer, "  Model:   {model}").map_err(io_error)?;
     writeln!(writer, "  Tools:   {tools}").map_err(io_error)?;
     writeln!(writer, "  Web:     {web}").map_err(io_error)?;
-    writeln!(writer, "  RAG:     realtime {realtime_rag}\n").map_err(io_error)
+    writeln!(writer, "  RAG:     realtime {realtime_rag}").map_err(io_error)?;
+    writeln!(
+        writer,
+        "  Reasoning: {}\n",
+        if config.tui.show_reasoning {
+            "show"
+        } else {
+            "hide (animated star)"
+        }
+    )
+    .map_err(io_error)
 }
 
 fn uses_duckduckgo(config: &Config) -> bool {
@@ -825,5 +880,28 @@ mod tests {
         assert!(config.rag.realtime_enabled);
         assert!(uses_duckduckgo(&config));
         assert!(config.web.search.api_key.is_none());
+    }
+
+    #[test]
+    fn terminal_ui_can_hide_reasoning() {
+        let mut config = Config::default();
+        let mut output = Vec::new();
+        let mut prompt = Prompt {
+            reader: Cursor::new("2\n"),
+            writer: &mut output,
+        };
+        configure_terminal_ui(&mut config, &mut prompt).unwrap();
+        assert!(!config.tui.show_reasoning);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Show reasoning"));
+        assert!(output.contains("Hide reasoning"));
+        assert!(output.contains("animated Lightagent star"));
+
+        let mut prompt = Prompt {
+            reader: Cursor::new("1\n"),
+            writer: Vec::new(),
+        };
+        configure_terminal_ui(&mut config, &mut prompt).unwrap();
+        assert!(config.tui.show_reasoning);
     }
 }

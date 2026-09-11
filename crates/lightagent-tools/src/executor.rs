@@ -199,11 +199,20 @@ impl ToolInvoker for BoundedExecutor {
         if !decision.granted {
             return;
         }
+        if decision.unrestricted {
+            if let Ok(mut policy) = self.policy.lock() {
+                policy.allow_without_restrictions();
+            }
+            return;
+        }
+        let Some(ttl) = decision.remember else {
+            return;
+        };
         let Some((risk, scopes)) = self.classify(call) else {
             return;
         };
         let request = self.request_for(call, risk, scopes);
-        let record = ApprovalRecord::from_request(&request, self.clock.now(), decision.remember);
+        let record = ApprovalRecord::from_request(&request, self.clock.now(), Some(ttl));
         if let Ok(mut policy) = self.policy.lock() {
             policy.remember(record);
         }
@@ -268,6 +277,14 @@ fn is_secret_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call-1".to_owned(),
+            name: name.to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
     #[test]
     fn empty_arguments_read_as_an_empty_object() {
         assert_eq!(
@@ -292,5 +309,34 @@ mod tests {
         assert!(out.contains("<redacted>"));
         assert!(!out.contains("sk-123"));
         assert!(out.contains("Paris"));
+    }
+
+    #[test]
+    fn one_time_and_unrestricted_approval_modes_are_distinct() {
+        let executor = BoundedExecutor::new(
+            ToolRegistry::builtin(),
+            PolicyEngine::new(lightagent_core::ApprovalPolicy::Strict.into()),
+            Duration::from_secs(1),
+            1024,
+        );
+        let write = call("fs.write");
+        let ApprovalNeed::Require(request) = executor.approval_for(&write) else {
+            panic!("strict policy should request approval");
+        };
+
+        executor.remember(&ApprovalDecision::grant(request.id), &write);
+        assert!(matches!(
+            executor.approval_for(&write),
+            ApprovalNeed::Require(_)
+        ));
+
+        let ApprovalNeed::Require(request) = executor.approval_for(&write) else {
+            panic!("one-time approval must not change policy");
+        };
+        executor.remember(&ApprovalDecision::grant_unrestricted(request.id), &write);
+        assert_eq!(
+            executor.approval_for(&call("terminal.run")),
+            ApprovalNeed::AutoApprove
+        );
     }
 }
