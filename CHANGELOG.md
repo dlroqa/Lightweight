@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. The startup
+dashboard's pixel-art logo now renders from a hand-crafted terminal-native
+asset that stays crisp instead of carrying a dark antialiased halo, and the
+approval prompt's numbered choices use action-oriented labels. Redirected and
+non-interactive I/O is unchanged.
+
+### Changed
+
+- **The terminal logo renders from a terminal-native pixel-art asset.** The
+  startup dashboard now embeds a hand-crafted 56×56 RGBA mark with binary
+  transparency and a compact, non-dithered palette. Nearest-neighbour sampling
+  maps every visible source pixel directly to one terminal pixel, so the gold
+  star, cyan lightning and block-pixel `Lightagent` wordmark keep crisp edges
+  instead of the dark antialiased halo left by the previous downsampled
+  derivative. The matching monochrome fallback remains available.
+
+- **Approval choices use action-oriented labels.** The numbered warning prompt
+  now displays `Allow`, `Don't allow`, and `Allow without restrictions`; option
+  2 remains the safe default and the underlying approval behavior is unchanged.
+
 ## [0.3.13] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. The startup dashboard

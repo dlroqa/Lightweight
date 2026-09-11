@@ -102,10 +102,13 @@ only for the first model request. Models that do not emit reasoning simply show
 the answer panel. The
 full-width startup dashboard places the pixel-art Lightagent star-and-bolt image
 beside the release version and date, active profile and model, session, tools,
-and its updated block-pixel wordmark beside the session information. Approval
+and its updated block-pixel wordmark beside the session information. Its
+terminal-native raster uses nearest-neighbour sampling, a compact non-dithered
+palette and binary transparency so the mark remains sharp at terminal scale.
+Approval
 requests use a compact high-contrast warning box with
-their risk class, tool, argument preview, and three numbered choices: allow
-once, deny, or allow without further restrictions for the current session.
+their risk class, tool, argument preview, and three numbered choices: `Allow`,
+`Don't allow`, or `Allow without restrictions` for the current session.
 
 Run `lightagent setup` for a guided terminal menu. It shows current values and
 lets you select the gateway/model, local file and terminal tools, web

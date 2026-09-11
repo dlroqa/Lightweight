@@ -91,23 +91,21 @@ fn logo_lines(colour: bool) -> Vec<String> {
     lines
 }
 
-/// Read one downsampled RGBA pixel. Partly transparent glow pixels are blended
-/// against the terminal's black canvas; effectively clear pixels stay clear so
-/// the logo does not become a square tile.
+/// Read one terminal-native RGBA pixel. The embedded mark uses binary alpha and
+/// a compact, non-dithered palette, so every visible source pixel maps directly
+/// to one sharply rendered terminal pixel without a blended halo.
 fn logo_pixel(row: usize, column: usize) -> Option<(u8, u8, u8)> {
     if row >= LOGO_HEIGHT || column >= LOGO_WIDTH {
         return None;
     }
     let offset = (row * LOGO_WIDTH + column) * 4;
-    let alpha = LOGO_RGBA[offset + 3];
-    if alpha < 12 {
+    if LOGO_RGBA[offset + 3] < 128 {
         return None;
     }
-    let blend = |channel: u8| ((u16::from(channel) * u16::from(alpha)) / 255) as u8;
     Some((
-        blend(LOGO_RGBA[offset]),
-        blend(LOGO_RGBA[offset + 1]),
-        blend(LOGO_RGBA[offset + 2]),
+        LOGO_RGBA[offset],
+        LOGO_RGBA[offset + 1],
+        LOGO_RGBA[offset + 2],
     ))
 }
 
@@ -386,14 +384,15 @@ mod tests {
         assert!(logo_pixel(LOGO_HEIGHT / 2, LOGO_WIDTH / 2).is_some());
         let (pixels, remainder) = LOGO_RGBA.as_chunks::<4>();
         assert!(remainder.is_empty());
+        assert!(pixels.iter().all(|pixel| matches!(pixel[3], 0 | 255)));
         let colours = pixels
             .iter()
-            .filter(|pixel| pixel[3] >= 12)
+            .filter(|pixel| pixel[3] == 255)
             .map(|pixel| (pixel[0], pixel[1], pixel[2]))
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
-            colours.len() > 256,
-            "logo should retain its detailed palette"
+            (8..=32).contains(&colours.len()),
+            "logo should retain a compact pixel-art palette"
         );
     }
 

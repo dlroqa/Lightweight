@@ -1519,8 +1519,8 @@ fn render_approval_warning(
     let mut body = vec![fit_line(&format!("tool: {tool}"), inner_width)];
     body.extend(wrap_labelled("arguments", arguments, inner_width));
     body.push(String::new());
-    body.push("1. Yes".to_owned());
-    body.push("2. No".to_owned());
+    body.push("1. Allow".to_owned());
+    body.push("2. Don't allow".to_owned());
     body.push("3. Allow without restrictions".to_owned());
     body.push("   Applies to this session only.".to_owned());
 
@@ -1932,8 +1932,8 @@ mod model_tests {
         assert!(warning.contains("⚠ APPROVAL REQUIRED · external"));
         assert!(warning.contains("tool: rag.realtime"));
         assert!(warning.contains("arguments:"));
-        assert!(warning.contains("1. Yes"));
-        assert!(warning.contains("2. No"));
+        assert!(warning.contains("1. Allow"));
+        assert!(warning.contains("2. Don't allow"));
         assert!(warning.contains("3. Allow without restrictions"));
         assert!(warning.ends_with("Select an option [2]: "));
         for line in warning
@@ -1956,7 +1956,7 @@ mod model_tests {
     }
 
     #[test]
-    fn approval_selector_is_numbered_and_defaults_to_no() {
+    fn approval_selector_is_numbered_and_defaults_to_dont_allow() {
         assert_eq!(parse_approval_choice("1"), Some(ApprovalChoice::Grant));
         assert_eq!(parse_approval_choice("2"), Some(ApprovalChoice::Deny));
         assert_eq!(parse_approval_choice(""), Some(ApprovalChoice::Deny));
