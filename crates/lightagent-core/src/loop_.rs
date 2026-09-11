@@ -658,9 +658,7 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                 _ => return BatchResult::Done,
             };
 
-            driver
-                .events
-                .push(AgentEvent::ToolCallRequested { call: call.clone() });
+            driver.emit(AgentEvent::ToolCallRequested { call: call.clone() });
 
             driver.tool_calls_made += 1;
             if driver.tool_calls_made > driver.limits.max_tool_calls {

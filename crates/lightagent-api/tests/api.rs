@@ -123,9 +123,48 @@ async fn http(
         .unwrap_or(0);
     let body = text
         .split_once("\r\n\r\n")
-        .map(|(_, rest)| rest.to_string())
+        .map(|(headers, rest)| {
+            if headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
+            {
+                decode_chunked(rest.as_bytes())
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_else(|| rest.to_owned())
+            } else {
+                rest.to_owned()
+            }
+        })
         .unwrap_or_default();
     (status, body)
+}
+
+/// Decode the HTTP/1.1 chunk framing used by axum's SSE response.
+///
+/// The test client intentionally stays smaller than a general HTTP client, but
+/// assertions must see the entity body rather than chunk-size lines inserted
+/// between arbitrary bytes of an event name.
+fn decode_chunked(mut encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded.windows(2).position(|part| part == b"\r\n")?;
+        let size = std::str::from_utf8(&encoded[..line_end])
+            .ok()?
+            .split(';')
+            .next()?
+            .trim();
+        let size = usize::from_str_radix(size, 16).ok()?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            return Some(decoded);
+        }
+        let end = size.checked_add(2)?;
+        if encoded.len() < end || &encoded[size..end] != b"\r\n" {
+            return None;
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[end..];
+    }
 }
 
 // --- run lifecycle (no HTTP) ------------------------------------------------
@@ -151,6 +190,8 @@ async fn a_run_drives_to_completion_and_buffers_its_events() {
     assert_eq!(status, RunStatus::Completed);
     let names: Vec<_> = events.iter().map(lightagent_api::sse::name).collect();
     assert!(names.contains(&"run.started"));
+    assert!(names.contains(&"tool.requested"));
+    assert!(names.contains(&"tool.started"));
     assert!(names.contains(&"tool.output"));
     assert!(names.contains(&"run.completed"));
 }
@@ -187,13 +228,14 @@ async fn health_and_tools_are_served() {
 
 #[tokio::test]
 async fn a_run_can_be_created_and_streamed_over_sse() {
-    let addr = spawn_server(app_state(AuthConfig::open())).await;
+    let addr = spawn_server(app_state(AuthConfig::keyed("agent-key", [Scope::Admin]))).await;
+    let auth = [("Authorization", "Bearer agent-key")];
 
     let (status, body) = http(
         &addr,
         "POST",
         "/api/lightagent/v1/runs",
-        &[],
+        &auth,
         Some(r#"{"message":"what time is it?"}"#),
     )
     .await;
@@ -211,12 +253,15 @@ async fn a_run_can_be_created_and_streamed_over_sse() {
         &addr,
         "GET",
         &format!("/api/lightagent/v1/runs/{id}/events"),
-        &[],
+        &auth,
         None,
     )
     .await;
     assert_eq!(status, 200);
     assert!(body.contains("run.started"));
+    assert!(body.contains("tool.requested"));
+    assert!(body.contains("tool.started"));
+    assert!(body.contains("tool.output"));
     assert!(body.contains("model.delta"));
     assert!(body.contains("run.completed"));
 }

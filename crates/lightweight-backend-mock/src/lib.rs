@@ -56,6 +56,13 @@ pub enum Script {
         /// Argument fragments, concatenated by the client in order.
         argument_fragments: Vec<String>,
     },
+    /// Use one script per generation, repeating the final script thereafter.
+    ///
+    /// Agent contract tests need a first model turn that requests a tool and a
+    /// second turn that consumes its result. Keeping that sequence in the mock
+    /// backend makes the test deterministic without teaching production code
+    /// about test-only responses.
+    Sequence(Vec<Script>),
     /// Produce nothing at all and finish.
     ///
     /// The case that makes a client raise `EmptyStreamError` and retry
@@ -150,6 +157,8 @@ pub struct MockBackend {
     /// Counts generations, so a test can assert that a request the gateway
     /// should have refused never reached an engine.
     generations: AtomicU64,
+    /// Position in a [`Script::Sequence`], reset whenever the script changes.
+    script_position: AtomicU64,
     /// Counts loads, which is how residency and unload behaviour is checked.
     loads: AtomicU64,
     /// The last request this backend was asked to generate.
@@ -186,6 +195,7 @@ impl MockBackend {
             config: Mutex::new(config),
             resident: Mutex::new(None),
             generations: AtomicU64::new(0),
+            script_position: AtomicU64::new(0),
             loads: AtomicU64::new(0),
             last_request: Mutex::new(None),
             in_flight: Arc::new(AtomicU32::new(0)),
@@ -205,10 +215,12 @@ impl MockBackend {
     /// Replace the script between requests.
     pub async fn set_script(&self, script: Script) {
         self.config.lock().await.script = script;
+        self.script_position.store(0, Ordering::Relaxed);
     }
 
     pub async fn set_config(&self, config: MockConfig) {
         *self.config.lock().await = config;
+        self.script_position.store(0, Ordering::Relaxed);
     }
 
     pub fn generation_count(&self) -> u64 {
@@ -330,7 +342,15 @@ impl InferenceBackend for MockBackend {
         self.generations.fetch_add(1, Ordering::Relaxed);
         *self.last_request.lock().await = Some(request);
 
-        let config = self.config.lock().await.clone();
+        let mut config = self.config.lock().await.clone();
+        if let Script::Sequence(scripts) = &config.script {
+            let position = self.script_position.fetch_add(1, Ordering::Relaxed) as usize;
+            config.script = scripts
+                .get(position)
+                .or_else(|| scripts.last())
+                .cloned()
+                .unwrap_or(Script::Empty);
+        }
         if let Script::Fail(detail) = &config.script {
             return Err(BackendError::GenerationFailed {
                 detail: detail.clone(),
@@ -488,6 +508,8 @@ fn script_stream(
                 }));
             }
         }
+        // Resolved to one concrete script before this stream is built.
+        Script::Sequence(_) => {}
         Script::Empty => {}
         Script::FailMidStream { content, error } => {
             push_content(&mut steps, content, &mut completion_tokens);
@@ -680,6 +702,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_sequence_advances_per_generation_and_repeats_its_final_script() {
+        let backend = MockBackend::new(MockConfig {
+            script: Script::Sequence(vec![
+                Script::ToolCall {
+                    id: "call_1".into(),
+                    name: "datetime.now".into(),
+                    argument_fragments: vec!["{}".into()],
+                },
+                Script::Content(vec!["Done.".into()]),
+            ]),
+            ..MockConfig::default()
+        });
+
+        let first = collect(&backend).await;
+        let second = collect(&backend).await;
+        let third = collect(&backend).await;
+
+        assert!(matches!(
+            first.last(),
+            Some(GenerationEvent::Finished {
+                finish_reason: FinishReason::ToolCalls,
+                ..
+            })
+        ));
+        for events in [&second, &third] {
+            assert!(events.iter().any(
+                |event| matches!(event, GenerationEvent::ContentDelta { text } if text == "Done.")
+            ));
+        }
     }
 
     #[tokio::test]

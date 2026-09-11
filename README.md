@@ -139,7 +139,9 @@ matching explicit profile model takes precedence over `inference.model`; when
 Lightweight advertises one resident model, Lightagent follows it even if a
 profile contains an older model ID. Switching models in the Models screen is
 therefore reflected in terminal chat and the Agent API without reconfiguration.
-When no model is loaded, Lightagent reports that directly.
+The gateway also resolves `model: "default"` (and an omitted model) to its one
+resident model on every request, while response objects continue to report the
+real model ID. When no model is loaded, Lightagent reports that directly.
 
 The terminal and API share `~/.lightagent` by default. Set `LIGHTAGENT_HOME` to
 use a separate home. For release archives and platform installation details,

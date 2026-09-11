@@ -5,10 +5,12 @@
 # `crates/lightweight-gateway/tests/agent_proxy_surface.rs`. This workflow is
 # the tier above that: it boots the *two real servers* the product runs — the
 # agent API (`lightagent serve`) and the gateway that proxies it (`lightweight
-# serve --web-root`) — loads the built panel in a real headless browser, and
+# serve --web-root`) — plus a deterministic gateway backend for model output.
+# It loads the built panel in a real headless browser and
 # asserts the agent screens render their data instead of the `<!doctype …>`
-# fallback that a missing proxy served. It lives in its own workflow, not as a
-# copy of the test gate, so the two never drift; the orchestration is in
+# fallback that a missing proxy served, then completes a streamed tool-using
+# run through the same processes. It lives in its own workflow, not as a copy
+# of the test gate, so the two never drift; the orchestration is in
 # `scripts/render-panel.sh` so it is identical locally and here.
 #
 # Every screen is screenshotted and uploaded — on failure too — so a human can
@@ -28,6 +30,12 @@ concurrency:
 
 permissions:
   contents: read
+
+# Incremental artifacts are valuable during an edit/compile loop, but not in a
+# one-shot CI process. Omitting them keeps the hosted runner and Rust cache
+# smaller while dependency and final build artifacts remain cached.
+env:
+  CARGO_INCREMENTAL: '0'
 
 jobs:
   render:
@@ -87,3 +95,4 @@ jobs:
           name: panel-screens
           path: e2e/screens/
           if-no-files-found: error
+          retention-days: 14
