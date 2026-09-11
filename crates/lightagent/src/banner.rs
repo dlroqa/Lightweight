@@ -1,9 +1,9 @@
 //! The `lightagent` welcome mark.
 //!
-//! Typing `lightagent` prints a terminal adaptation of the supplied pixel-art
-//! logo: a gold star, a white/cyan lightning bolt, sparkles and pixel lettering.
-//! The character grid keeps the artwork portable without image-protocol support
-//! or runtime image decoding.
+//! Typing `lightagent` prints a true-colour terminal adaptation of the supplied
+//! modern logo: the faceted gold star, cyan lightning bolt and rounded
+//! `Lightagent` wordmark. An embedded RGBA derivative keeps the exact artwork
+//! portable without terminal-specific image protocols or runtime image decoding.
 //!
 //! Three rules keep the decoration out of the way, matching the sibling binary:
 //!
@@ -12,76 +12,15 @@
 //!   * **`NO_COLOR` and `LIGHTAGENT_NO_BANNER`** — the first drops to a
 //!     monochrome silhouette, the second turns the mark off entirely.
 //!
-//! Each character is one pixel in the logo palette; `.` is transparent.
-//! Two pixel rows render into one terminal row with the upper-half block `▀`.
+//! Two image rows render into one terminal row with half-block characters.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 
-/// The 56-column logo fits comfortably in a standard 80-column terminal.
-const STAR_BOLT: &[&str] = &[
-    ".........................................CCC............",
-    "........................................CCBC............",
-    ".......................................CCBCC............",
-    ".........................CCCC.........CCBBC.............",
-    ".........................CBBC........CCBCCC.............",
-    "........................CCBBCC......CCBCBC..............",
-    "........................CBBBBC.....CCBWBCC..............",
-    "............Y.....PB...CCBYYBCC...CCBWCBC...............",
-    "...........YHY.........CBBWYBBC..CCBWWBCC....CC.........",
-    "..........YHWHY.......CCBBWYBBC.CCBCWCBC....CC..........",
-    ".....CC....YHY........CBBYWYYBCCCBCWCBCC...CC....Y......",
-    "......CC....Y.........CBBWWYYBCCBCWWCCC.........YHY.....",
-    ".......CC............CCBBWWYYBCBCWWCBC.........YHWHY....",
-    "........CC...........CBBWWWYCCBCWWCBCC..........YHY.....",
-    "....PB..............CCBBWWWCCBCCWWCBC............Y......",
-    "....................CBBBWWCCBCCWWCBCC...................",
-    "...................CCBBWWCCBCCWWWCBC.........PB.........",
-    "...CCCCCCCCCCCCCCCCCBBBWCCBCCWWWCBCCCCCCCCCCCCCCCC......",
-    "...CBBBBBBBBBBBBBBBBBBBCCBCCWWWCCBBBBBBBBBBBBBBBBC......",
-    "...CCBBBBBBBBBBBBBBBBBCCBCCWWWWCBCBBBBBBBBBBBBBBCC......",
-    "....CCBYYYHHHHHHHHHYYCCBCCCWWWCBBCYHHHHHHHHHYYBCC.......",
-    ".....CCBYYYHHHHHHHYYCCBCCCWWWWCBCCCCHHHHHHYYYBCC........",
-    "......CCBBYYHHHHHYYCCBCCCWWWWCBBBBBCHHHHYYYBBCC.........",
-    ".......CCBBYYYYYYYCCBCCCWWWWCCCCCBCCYYYYYYBBCC..........",
-    "........CCBBBAAAACCBCCCWWWWWWWWCBCCAAAAABBBCC...........",
-    ".........CCBBBAACCBCCCCCCCCWWWCBCCAAAAABBBCC............",
-    "..........CCBBBBCBBBBBBBBCWWWCBCCAAAABBBBCC.............",
-    "...........CCBBBCCCCCCCBCWWWCBCCAAAABBBBCC..............",
-    "............CCBBBBAACCBCWWWCBCCAAAABBBBCC...............",
-    ".............CCBBBAACBBWWWCBCCAAAAABBBCC................",
-    ".............CCBBAACCBCWWCBCCAAAAAAABBC.................",
-    ".............CBBBAYCBCWWCBCCAAAYYYAABBCC..........PB....",
-    ".............CBBBYCCBWWCBCCOOOOOYYYOBBBC................",
-    "..........PB.CBBBCCBWWCBCCBBOOOOOYYOBBBC................",
-    ".......CC....CBBOCBCWCBCCBBBBOOOOWYYBBBC................",
-    "......CC....CCBBCCCWCBCCBBBBBBOOOOYYOBBC................",
-    ".....CC.....CBBCCBWCBCCBBBCCBBBBOOWYOBBCC....CC.........",
-    ".....YHY....CBBCBWCBCCBBCCCCCCBBBOOWYBBBC.....CC........",
-    "....YHWHY...CBCCWCBCCBCCC....CCBBBBOOBBBC......CC.......",
-    ".....YHY....CBCBCBCCCCC.......CCCBBBOOBBC...............",
-    "......Y....CCBBCBCBCC...........CCCBBOBBC...............",
-    "...........CBBCBCCCC........Y.....CCCBBBCC..............",
-    "...........CCBBCCC.........YHY......CCBBBC..............",
-    "...........CCBCC..........YHWHY......CCCBC..............",
-    "..........CCBCC.........PB.YHY..PB.....CCC..............",
-    "..........CBCC..............Y...........................",
-    "..........CCC...........................................",
-    "........................................................",
-    ".......W....W......W.....W.......................W......",
-    ".......YB...BB.....YB....YB......................YB.....",
-    ".......YB...Y.YYYY.YYY..YYY.YYY..YYYY.YYYY.YYY..YYY.....",
-    ".......YB...YBYBBYBYBBY.BYBBBBBY.YBBYBYBBYBYBBY.BYBB....",
-    ".......YB...YBYYYYBYB.YB.YB.YYYYBYYYYBYYYYBYB.YB.YB.....",
-    ".......OB...OBBBBOBOB.OB.OB.OBBOBBBBOBOBBBBOB.OB.OB.....",
-    ".......OOOO.OBOOOOBOB.OB.OO.OOOOBOOOOBOOOO.OB.OB.OO.....",
-    ".......BBBBBBBBBBBBBB.BB.BBBBBBBBBBBBBBBBBBBB.BB.BBB....",
-    "............................Y...........................",
-    "...........................YHY..........................",
-    "........CCCCCCCCCCCCCCCCPCYHWHYCPCCCCCCCCCCCCCCCC.......",
-    "...........................YHY..........................",
-    "............................Y...........................",
-];
+const LOGO_WIDTH: usize = 56;
+const LOGO_HEIGHT: usize = 56;
+const LOGO_RGBA: &[u8; LOGO_WIDTH * LOGO_HEIGHT * 4] =
+    include_bytes!("../assets/lightagent-logo-56x56.rgba");
 
 /// Live chat metadata rendered beside the logo at startup.
 pub(crate) struct StartupInfo<'a> {
@@ -92,21 +31,6 @@ pub(crate) struct StartupInfo<'a> {
     pub(crate) session: &'a str,
     pub(crate) tools: &'a [String],
     pub(crate) skills: &'a [String],
-}
-
-/// RGB for a pixel role, or `None` for a clear pixel.
-fn rgb(pixel: u8) -> Option<(u8, u8, u8)> {
-    match pixel {
-        b'Y' => Some((255, 232, 0)),   // gold star and lettering
-        b'H' => Some((255, 255, 130)), // star glints
-        b'A' => Some((255, 163, 0)),   // amber
-        b'O' => Some((255, 112, 0)),   // orange shading
-        b'C' => Some((0, 238, 255)),   // cyan bolt and outline
-        b'B' => Some((20, 24, 174)),   // deep blue edging
-        b'P' => Some((0, 86, 255)),    // electric-blue glow from the modern mark
-        b'W' => Some((245, 255, 255)), // white highlights
-        _ => None,
-    }
 }
 
 /// Whether the welcome mark should be shown for this run.
@@ -151,18 +75,13 @@ pub fn render(version: &str, colour: bool) -> String {
 }
 
 fn logo_lines(colour: bool) -> Vec<String> {
-    let cols = STAR_BOLT.iter().map(|row| row.len()).max().unwrap_or(0);
-    let rows: Vec<&[u8]> = STAR_BOLT.iter().map(|row| row.as_bytes()).collect();
-    let mut lines = Vec::with_capacity(rows.len().div_ceil(2));
-
-    for pair in rows.chunks(2) {
+    let mut lines = Vec::with_capacity(LOGO_HEIGHT.div_ceil(2));
+    for top_row in (0..LOGO_HEIGHT).step_by(2) {
         let mut line = String::from("  ");
-        let top = pair[0];
-        let bottom = pair.get(1).copied().unwrap_or(b"");
-        for col in 0..cols {
-            let upper = top.get(col).copied().unwrap_or(b'.');
-            let lower = bottom.get(col).copied().unwrap_or(b'.');
-            line.push_str(&cell(upper, lower, colour));
+        for column in 0..LOGO_WIDTH {
+            let upper = logo_pixel(top_row, column);
+            let lower = logo_pixel(top_row + 1, column);
+            line.push_str(&image_cell(upper, lower, colour));
         }
         if colour {
             line.push_str("\x1b[0m");
@@ -170,6 +89,26 @@ fn logo_lines(colour: bool) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// Read one downsampled RGBA pixel. Partly transparent glow pixels are blended
+/// against the terminal's black canvas; effectively clear pixels stay clear so
+/// the logo does not become a square tile.
+fn logo_pixel(row: usize, column: usize) -> Option<(u8, u8, u8)> {
+    if row >= LOGO_HEIGHT || column >= LOGO_WIDTH {
+        return None;
+    }
+    let offset = (row * LOGO_WIDTH + column) * 4;
+    let alpha = LOGO_RGBA[offset + 3];
+    if alpha < 12 {
+        return None;
+    }
+    let blend = |channel: u8| ((u16::from(channel) * u16::from(alpha)) / 255) as u8;
+    Some((
+        blend(LOGO_RGBA[offset]),
+        blend(LOGO_RGBA[offset + 1]),
+        blend(LOGO_RGBA[offset + 2]),
+    ))
 }
 
 /// The live terminal width, with `COLUMNS` retained as a fallback for previews
@@ -212,11 +151,7 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
         let rows = logo.len().max(details.len());
         for row in 0..rows {
             let left = logo.get(row).map(String::as_str).unwrap_or("");
-            let left_visible = if row < logo.len() {
-                STAR_BOLT[0].len() + 2
-            } else {
-                0
-            };
+            let left_visible = if row < logo.len() { LOGO_WIDTH + 2 } else { 0 };
             let right = details.get(row).map(String::as_str).unwrap_or("");
             out.push_str(&paint_border("│", colour));
             out.push(' ');
@@ -233,14 +168,7 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
         }
     } else {
         for line in &logo {
-            push_startup_row(
-                &mut out,
-                line,
-                STAR_BOLT[0].len() + 2,
-                content_width,
-                colour,
-                false,
-            );
+            push_startup_row(&mut out, line, LOGO_WIDTH + 2, content_width, colour, false);
         }
         push_startup_row(&mut out, "", 0, content_width, colour, false);
         for line in &details {
@@ -256,7 +184,7 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
     }
 
     out.push_str(&paint_border(&labelled_border('└', '┘', "", width), colour));
-    out.push_str("\n\n");
+    out.push('\n');
     out
 }
 
@@ -377,9 +305,8 @@ fn paint_detail(text: &str, colour: bool) -> String {
     format!("\x1b[38;2;164;121;16m{text}\x1b[0m")
 }
 
-/// One rendered character for an upper/lower pixel pair.
-fn cell(upper: u8, lower: u8, colour: bool) -> String {
-    let (up, low) = (rgb(upper), rgb(lower));
+/// One rendered character for an upper/lower image-pixel pair.
+fn image_cell(up: Option<(u8, u8, u8)>, low: Option<(u8, u8, u8)>, colour: bool) -> String {
     if !colour {
         return match (up.is_some(), low.is_some()) {
             (true, true) => "\u{2588}".to_owned(),  // full block
@@ -453,11 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn every_grid_row_is_the_same_width() {
-        let width = STAR_BOLT[0].len();
-        for (index, row) in STAR_BOLT.iter().enumerate() {
-            assert_eq!(row.len(), width, "row {index} has the wrong width");
-        }
+    fn embedded_logo_has_the_expected_rgba_geometry() {
+        assert_eq!(LOGO_RGBA.len(), LOGO_WIDTH * LOGO_HEIGHT * 4);
+        assert_eq!(logo_lines(false).len(), LOGO_HEIGHT.div_ceil(2));
+        assert!(logo_pixel(LOGO_HEIGHT / 2, LOGO_WIDTH / 2).is_some());
+        let (pixels, remainder) = LOGO_RGBA.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let colours = pixels
+            .iter()
+            .filter(|pixel| pixel[3] >= 12)
+            .map(|pixel| (pixel[0], pixel[1], pixel[2]))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(colours.len() > 256, "logo should retain smooth gradients");
     }
 
     #[test]

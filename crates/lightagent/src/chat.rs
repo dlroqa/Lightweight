@@ -442,25 +442,22 @@ pub async fn run(
     let stdin = std::io::stdin();
     let context_limit = configured_context_limit(config.runtime.n_ctx, &active_model);
     let mut last_turn = TurnStatus::default();
-    let mut footer = TerminalFooter::new();
-    if !footer.is_pinned() {
-        println!("Type a message, or /help for commands. /exit to leave.");
-    }
+    let mut prompt = TerminalPrompt::new();
     // A run that paused on its time budget and was not continued straight
     // away. It is kept whole — the conversation, including the tool results
     // the model has not read yet — so `continue` picks it up where it stopped.
     let mut paused: Option<PausedRun> = None;
     loop {
-        footer.render(&active_model, context_limit, &last_turn);
-        let Some(line) = footer.read_line(&stdin)? else {
+        prompt.render(&active_model, context_limit, &last_turn);
+        let Some(line) = prompt.read_line(&stdin)? else {
             break; // end of input
         };
         let line = line.trim_end().to_string();
         if line.trim().is_empty() {
-            footer.dismiss_empty();
+            prompt.dismiss_empty();
             continue;
         }
-        footer.submit(&line);
+        prompt.submit(&line);
         if paused.is_some() && is_continue_request(&line) {
             let Some(PausedRun {
                 suspended,
@@ -736,235 +733,97 @@ fn print_status_bar(model: &str, context_limit: Option<u32>, status: &TurnStatus
     }
 }
 
-const FOOTER_ROWS: u16 = 4;
-
-/// A persistent prompt footer for an attended terminal. DECSTBM reserves a
-/// scrolling region above the final four rows, so streamed model/tool output
-/// can move independently without displacing the status and input controls.
-/// The plain stdin/stdout path remains unchanged for redirected I/O.
-struct TerminalFooter {
+/// A prompt that participates in normal terminal flow. Each render follows the
+/// content before it, so the startup prompt is adjacent to the dashboard and
+/// later prompts naturally move down as responses populate the screen.
+struct TerminalPrompt {
     term: Term,
-    size: Option<(u16, u16)>,
-    installed: bool,
-    welcome_shown: bool,
+    interactive: bool,
 }
 
-impl TerminalFooter {
+impl TerminalPrompt {
     fn new() -> Self {
-        let term = Term::stdout();
-        let size = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            term.size_checked()
-                .filter(|(rows, columns)| *rows > FOOTER_ROWS + 3 && *columns >= 40)
-        } else {
-            None
-        };
-        if size.is_some() {
-            // Tokio owns SIGINT while a run is active. Restore the terminal's
-            // normal scrolling region before honoring Ctrl+C in that phase.
-            tokio::spawn(async {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    print!("\x1b[r\x1b[999B\r\n\x1b[0m");
-                    let _ = std::io::stdout().flush();
-                    std::process::exit(130);
-                }
-            });
-        }
         Self {
-            term,
-            size,
-            installed: false,
-            welcome_shown: false,
+            term: Term::stdout(),
+            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         }
-    }
-
-    fn is_pinned(&self) -> bool {
-        self.size.is_some()
     }
 
     fn render(&mut self, model: &str, context_limit: Option<u32>, status: &TurnStatus) {
-        let detected = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            self.term
-                .size_checked()
-                .filter(|(rows, columns)| *rows > FOOTER_ROWS + 3 && *columns >= 40)
-        } else {
-            None
-        };
-        if detected != self.size {
-            if self.installed
-                && let Some((old_rows, _)) = self.size
-            {
-                let old_footer_start = old_rows - FOOTER_ROWS + 1;
-                print!("\x1b[r\x1b[{old_footer_start};1H\x1b[J");
-            }
-            self.size = detected;
-            self.installed = false;
-        }
-        let Some((rows, columns)) = self.size else {
-            print_status_bar(model, context_limit, status);
-            print_prompt();
-            let _ = std::io::stdout().flush();
-            return;
-        };
-        let width = usize::from(columns);
-        let content_bottom = rows - FOOTER_ROWS;
-        let status_row = content_bottom + 1;
-        let top_edge_row = content_bottom + 2;
-        let input_row = content_bottom + 3;
-        let bottom_edge_row = content_bottom + 4;
-        let edge = "─".repeat(width);
-        let status = status_line(model, context_limit, status, width);
-
-        if !self.installed {
-            // Make real room before painting the footer. Without this first
-            // scroll, a full startup dashboard could be overwritten by the
-            // absolute footer rows instead of remaining in scrollback.
-            print!("\x1b[r\x1b[999B");
-            for _ in 0..FOOTER_ROWS {
-                print!("\r\n");
-            }
-            self.installed = true;
-        }
-
-        // Reset any prior margins before applying the current geometry. DEC
-        // terminals home the cursor when margins change, so every subsequent
-        // write uses an absolute row.
-        print!("\x1b[r\x1b[1;{content_bottom}r");
-        if colour_terminal() {
-            print!(
-                "\x1b[{status_row};1H\x1b[2K\x1b[48;2;35;37;35m\x1b[38;2;255;220;45m\x1b[1m{status}\x1b[0m\
-                 \x1b[{top_edge_row};1H\x1b[2K\x1b[38;2;238;139;79m{edge}\x1b[0m\
-                 \x1b[{input_row};1H\x1b[2K\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m \
-                 \x1b[{bottom_edge_row};1H\x1b[2K\x1b[38;2;238;139;79m{edge}\x1b[0m"
-            );
-        } else {
-            print!(
-                "\x1b[{status_row};1H\x1b[2K{status}\
-                 \x1b[{top_edge_row};1H\x1b[2K{edge}\
-                 \x1b[{input_row};1H\x1b[2Kyou › \
-                 \x1b[{bottom_edge_row};1H\x1b[2K{edge}"
-            );
-        }
-        if !self.welcome_shown {
-            let welcome = fit_line(
-                "Welcome to Lightagent · type a message or use /help for commands.",
-                width,
-            );
-            if colour_terminal() {
-                print!("\x1b[{content_bottom};1H\x1b[2K\x1b[38;2;255;252;214m{welcome}\x1b[0m");
-            } else {
-                print!("\x1b[{content_bottom};1H\x1b[2K{welcome}");
-            }
-            self.welcome_shown = true;
-        }
-        self.draw_input(&[], 0);
+        print_status_bar(model, context_limit, status);
+        print_prompt();
         let _ = std::io::stdout().flush();
     }
 
     fn read_line(&mut self, stdin: &std::io::Stdin) -> Result<Option<String>, String> {
-        if self.size.is_none() {
-            let mut line = String::new();
-            let read = stdin
-                .lock()
-                .read_line(&mut line)
-                .map_err(|error| error.to_string())?;
-            return Ok((read != 0).then_some(line));
-        }
-
-        let mut line = Vec::new();
-        let mut cursor = 0;
-        loop {
-            match self.term.read_key().map_err(|error| error.to_string())? {
-                Key::Enter => return Ok(Some(line.into_iter().collect())),
-                Key::CtrlC => {
-                    self.content_cursor();
-                    return Ok(None);
+        if self.interactive {
+            let mut line = Vec::new();
+            let mut cursor = 0;
+            loop {
+                match self.term.read_key().map_err(|error| error.to_string())? {
+                    Key::Enter => return Ok(Some(line.into_iter().collect())),
+                    Key::CtrlC => return Ok(None),
+                    Key::Char(ch) if ch == '\u{4}' && line.is_empty() => return Ok(None),
+                    Key::Char(ch) if !ch.is_control() => {
+                        line.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                    Key::Backspace if cursor > 0 => {
+                        cursor -= 1;
+                        line.remove(cursor);
+                    }
+                    Key::Del if cursor < line.len() => {
+                        line.remove(cursor);
+                    }
+                    Key::ArrowLeft if cursor > 0 => cursor -= 1,
+                    Key::ArrowRight if cursor < line.len() => cursor += 1,
+                    Key::Home => cursor = 0,
+                    Key::End => cursor = line.len(),
+                    _ => continue,
                 }
-                Key::Char(ch) if ch == '\u{4}' && line.is_empty() => {
-                    self.content_cursor();
-                    return Ok(None);
-                }
-                Key::Char(ch) if !ch.is_control() => {
-                    line.insert(cursor, ch);
-                    cursor += 1;
-                }
-                Key::Backspace if cursor > 0 => {
-                    cursor -= 1;
-                    line.remove(cursor);
-                }
-                Key::Del if cursor < line.len() => {
-                    line.remove(cursor);
-                }
-                Key::ArrowLeft if cursor > 0 => cursor -= 1,
-                Key::ArrowRight if cursor < line.len() => cursor += 1,
-                Key::Home => cursor = 0,
-                Key::End => cursor = line.len(),
-                _ => continue,
-            }
-            self.draw_input(&line, cursor);
-            let _ = std::io::stdout().flush();
-        }
-    }
-
-    fn draw_input(&self, line: &[char], cursor: usize) {
-        let Some((rows, columns)) = self.size else {
-            return;
-        };
-        const PREFIX: &str = "you › ";
-        let width = usize::from(columns);
-        let prefix_width = measure_text_width(PREFIX);
-        let available = width.saturating_sub(prefix_width + 1).max(1);
-        let (visible, cursor_offset) = input_window(line, cursor, available);
-        let input_row = rows - 1;
-        let hint = line.is_empty().then(|| {
-            fit_line(
-                "/help · /tools · /skills · /new · /continue · /stop · /exit · Ctrl+C exit",
-                available,
-            )
-        });
-        if colour_terminal() {
-            print!(
-                "\x1b[{input_row};1H\x1b[2K\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {visible}"
-            );
-            if let Some(hint) = hint {
-                print!("\x1b[2;3;33m{hint}\x1b[0m");
-            }
-        } else {
-            print!("\x1b[{input_row};1H\x1b[2K{PREFIX}{visible}");
-            if let Some(hint) = hint {
-                print!("{hint}");
+                self.draw_input(&line, cursor);
             }
         }
-        let cursor_column = prefix_width + cursor_offset + 1;
-        print!("\x1b[{input_row};{cursor_column}H");
+        let mut line = String::new();
+        let read = stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        Ok((read != 0).then_some(line))
     }
 
     fn submit(&self, line: &str) {
-        let Some((rows, _)) = self.size else {
-            finish_prompt();
-            return;
-        };
-        let content_bottom = rows - FOOTER_ROWS;
-        print!("\x1b[{content_bottom};1H\x1b[2K");
-        if colour_terminal() {
-            println!("\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {line}");
+        if self.interactive {
+            print!("\r\x1b[2K");
+            if colour_terminal() {
+                println!("\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {line}");
+            } else {
+                println!("you › {line}");
+            }
         } else {
-            println!("you › {line}");
+            println!("{line}");
         }
-        let _ = std::io::stdout().flush();
+        finish_prompt(line);
     }
 
     fn dismiss_empty(&self) {
-        if self.size.is_none() {
-            finish_prompt();
-        }
+        self.submit("");
     }
 
-    fn content_cursor(&self) {
-        if let Some((rows, _)) = self.size {
-            let content_bottom = rows - FOOTER_ROWS;
-            print!("\x1b[{content_bottom};1H\x1b[2K");
-            let _ = std::io::stdout().flush();
+    fn draw_input(&self, line: &[char], cursor: usize) {
+        const PREFIX: &str = "you › ";
+        let width = crate::banner::terminal_width();
+        let prefix_width = measure_text_width(PREFIX);
+        let available = width.saturating_sub(prefix_width + 1).max(1);
+        let (visible, cursor_offset) = input_window(line, cursor, available);
+        print!("\r\x1b[2K");
+        if colour_terminal() {
+            print!("\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {visible}");
+        } else {
+            print!("{PREFIX}{visible}");
         }
+        print!("\r\x1b[{}C", prefix_width + cursor_offset);
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -987,18 +846,6 @@ fn input_window(line: &[char], cursor: usize, available: usize) -> (String, usiz
     (visible, cursor_offset)
 }
 
-impl Drop for TerminalFooter {
-    fn drop(&mut self) {
-        if self.installed
-            && let Some((rows, _)) = self.size
-        {
-            let footer_start = rows - FOOTER_ROWS + 1;
-            print!("\x1b[r\x1b[{footer_start};1H\x1b[J\x1b[999B\r\n\x1b[0m");
-            let _ = std::io::stdout().flush();
-        }
-    }
-}
-
 fn print_prompt() {
     let width = crate::banner::terminal_width();
     let edge = "─".repeat(width);
@@ -1017,13 +864,21 @@ fn print_prompt() {
     }
 }
 
-fn finish_prompt() {
-    let edge = "─".repeat(crate::banner::terminal_width());
+fn finish_prompt(line: &str) {
+    let edge = submitted_prompt_edge(line, crate::banner::terminal_width());
     if colour_terminal() {
         println!("\x1b[38;2;238;139;79m{edge}\x1b[0m");
     } else {
         println!("{edge}");
     }
+}
+
+fn submitted_prompt_edge(line: &str, terminal_width: usize) -> String {
+    const PREFIX: &str = "you › ";
+    let width = (measure_text_width(PREFIX) + measure_text_width(line))
+        .max(measure_text_width(PREFIX))
+        .min(terminal_width);
+    format!("└{}", "─".repeat(width.saturating_sub(1)))
 }
 
 fn print_initializing() {
@@ -1092,6 +947,101 @@ fn panel_edge(label: Option<&str>, top: bool) -> String {
     line
 }
 
+fn compact_text_panel(text: &str, terminal_width: usize, colour: bool) -> String {
+    const GOLD: &str = "\x1b[1;38;2;255;220;45m";
+    const WARM_WHITE: &str = "\x1b[38;2;255;252;214m";
+    const RESET: &str = "\x1b[0m";
+
+    let max_content_width = terminal_width.saturating_sub(4).max(1);
+    let lines = wrap_display_lines(text, max_content_width);
+    let content_width = lines
+        .iter()
+        .map(|line| measure_text_width(line))
+        .max()
+        .unwrap_or(0);
+    let width = (content_width + 4).min(terminal_width);
+    let inner_width = width.saturating_sub(4);
+    let top = compact_panel_border('┌', '┐', None, width);
+    let bottom = compact_panel_border('└', '┘', None, width);
+    let mut out = String::from("\n");
+    if colour {
+        out.push_str(GOLD);
+        out.push_str(&top);
+        out.push_str(RESET);
+    } else {
+        out.push_str(&top);
+    }
+    out.push('\n');
+    for line in lines {
+        let padding = " ".repeat(inner_width.saturating_sub(measure_text_width(&line)));
+        if colour {
+            out.push_str(GOLD);
+            out.push('│');
+            out.push_str(RESET);
+            out.push(' ');
+            out.push_str(WARM_WHITE);
+            out.push_str(&line);
+            out.push_str(RESET);
+            out.push_str(&padding);
+            out.push(' ');
+            out.push_str(GOLD);
+            out.push('│');
+            out.push_str(RESET);
+        } else {
+            out.push_str("│ ");
+            out.push_str(&line);
+            out.push_str(&padding);
+            out.push_str(" │");
+        }
+        out.push('\n');
+    }
+    if colour {
+        out.push_str(GOLD);
+        out.push_str(&bottom);
+        out.push_str(RESET);
+    } else {
+        out.push_str(&bottom);
+    }
+    out.push('\n');
+    out
+}
+
+fn compact_panel_border(left: char, right: char, label: Option<&str>, width: usize) -> String {
+    let mut line = format!("{left}─");
+    if let Some(label) = label {
+        line.push(' ');
+        line.push_str(label);
+        line.push(' ');
+    }
+    let remaining = width.saturating_sub(measure_text_width(&line) + 1);
+    line.push_str(&"─".repeat(remaining));
+    line.push(right);
+    line
+}
+
+fn wrap_display_lines(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        let mut line = String::new();
+        let mut line_width = 0;
+        for ch in source.chars() {
+            let ch_width = measure_text_width(&ch.to_string());
+            if line_width + ch_width > width && !line.is_empty() {
+                lines.push(line);
+                line = String::new();
+                line_width = 0;
+            }
+            line.push(ch);
+            line_width += ch_width;
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn fit_line(line: &str, width: usize) -> String {
     if line.chars().count() <= width {
         return line.to_owned();
@@ -1111,6 +1061,7 @@ fn fill_line(line: &str, width: usize) -> String {
 struct ModelRenderer {
     section: ModelSection,
     line_open: bool,
+    answer: String,
     colour: bool,
     show_reasoning: bool,
     interactive: bool,
@@ -1123,6 +1074,7 @@ impl ModelRenderer {
         Self {
             section: ModelSection::None,
             line_open: false,
+            answer: String::new(),
             colour: colour_terminal(),
             show_reasoning,
             interactive: std::io::stdout().is_terminal(),
@@ -1147,9 +1099,7 @@ impl ModelRenderer {
             AgentEvent::Content { text } => {
                 self.stop_thinking();
                 self.enter(ModelSection::Answer);
-                print!("{text}");
-                self.line_open = !text.ends_with('\n');
-                let _ = std::io::stdout().flush();
+                self.answer.push_str(text);
             }
             AgentEvent::ToolCallStarted { name, .. } => {
                 self.stop_thinking();
@@ -1231,15 +1181,7 @@ impl ModelRenderer {
             ModelSection::Reasoning => {
                 println!("\n{}", panel_edge(Some("Reasoning"), true))
             }
-            ModelSection::Answer if self.colour => {
-                print!(
-                    "\n\x1b[1;33m{}\x1b[0m\n\x1b[38;2;255;252;214m",
-                    panel_edge(Some("✦ Lightagent"), true)
-                )
-            }
-            ModelSection::Answer => {
-                println!("\n{}", panel_edge(Some("✦ Lightagent"), true))
-            }
+            ModelSection::Answer => self.answer.clear(),
             ModelSection::None => {}
         }
         self.section = section;
@@ -1250,6 +1192,19 @@ impl ModelRenderer {
         if self.section == ModelSection::None {
             return;
         }
+        if self.section == ModelSection::Answer {
+            if !self.answer.is_empty() {
+                print!(
+                    "{}",
+                    compact_text_panel(&self.answer, crate::banner::terminal_width(), self.colour,)
+                );
+            }
+            self.answer.clear();
+            self.section = ModelSection::None;
+            self.line_open = false;
+            let _ = std::io::stdout().flush();
+            return;
+        }
         if self.colour {
             print!("\x1b[0m");
         }
@@ -1258,7 +1213,7 @@ impl ModelRenderer {
         }
         let label_colour = match self.section {
             ModelSection::Reasoning => "\x1b[2;37m",
-            ModelSection::Answer => "\x1b[1;33m",
+            ModelSection::Answer => "",
             ModelSection::None => "",
         };
         if self.colour {
@@ -1877,12 +1832,51 @@ mod model_tests {
     }
 
     #[test]
-    fn pinned_input_window_keeps_wide_text_inside_the_footer() {
-        let line = "ab界cd".chars().collect::<Vec<_>>();
-        let (visible, cursor) = input_window(&line, line.len(), 4);
-        assert_eq!(visible, "界cd");
-        assert_eq!(measure_text_width(&visible), 4);
-        assert_eq!(cursor, 4);
+    fn submitted_prompt_border_matches_the_rendered_prompt_width() {
+        let short = submitted_prompt_edge("hello", 100);
+        assert_eq!(
+            measure_text_width(&short),
+            measure_text_width("you › hello")
+        );
+
+        let wide = submitted_prompt_edge("界界", 100);
+        assert_eq!(measure_text_width(&wide), measure_text_width("you › 界界"));
+
+        assert_eq!(
+            measure_text_width(&submitted_prompt_edge(&"x".repeat(200), 80)),
+            80
+        );
+    }
+
+    #[test]
+    fn agent_answer_panel_matches_its_longest_rendered_line() {
+        let panel = compact_text_panel("Short answer.\nA somewhat longer paragraph.", 120, false);
+        let lines = panel
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let expected = measure_text_width("A somewhat longer paragraph.") + 4;
+        assert!(
+            lines
+                .iter()
+                .all(|line| measure_text_width(line) == expected)
+        );
+        assert!(expected < 120);
+
+        let tiny = compact_text_panel("Hi", 120, false);
+        assert!(
+            tiny.lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| measure_text_width(line) == measure_text_width("Hi") + 4)
+        );
+
+        let wrapped = compact_text_panel(&"x".repeat(200), 80, false);
+        assert!(
+            wrapped
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| measure_text_width(line) == 80)
+        );
     }
 
     #[test]

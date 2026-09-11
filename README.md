@@ -86,14 +86,20 @@ are reused. `lightagent init` is optional for creating a saved initial profile
 or choosing a custom endpoint; `lightagent doctor` checks the connection.
 
 The interactive prompt can stream provider-supplied reasoning in a separate
-panel or hide it behind an animated gold-and-cyan Lightagent star. A persistent
-four-row footer stays pinned to the bottom of an attended terminal while model
-and tool output scroll above it; it shows command tips plus the active model,
-context usage, output tokens, token rate, and elapsed time after each response.
-Models that do not emit reasoning simply show the answer panel. Its
-full-width startup dashboard places the modern Lightagent star-and-bolt mark
+panel or hide it behind an animated gold-and-cyan Lightagent star. The first
+prompt bar appears immediately below the startup dashboard; subsequent prompts
+follow each response in normal terminal flow and scroll naturally as the
+terminal fills. Its status row shows command tips plus the active model, context
+usage, output tokens, token rate, and elapsed time after each response. A
+submitted user message receives a compact lower border matching the exact
+display width of that prompt, so it remains easy to find in the transcript.
+Completed agent answers use a compact box sized to their longest rendered line,
+expanding only when a line must wrap at the terminal edge. Models that do not
+emit reasoning simply show the answer panel. The
+full-width startup dashboard places the modern Lightagent star-and-bolt image
 beside the release version and date, active profile and model, session, tools,
-and skills. Approval requests use a compact high-contrast warning box with
+and its updated rounded wordmark beside the session information. Approval
+requests use a compact high-contrast warning box with
 their risk class, tool, argument preview, and three numbered choices: allow
 once, deny, or allow without further restrictions for the current session.
 

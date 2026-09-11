@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. The startup dashboard
+now renders the supplied modern logo — the faceted gold star, cyan lightning
+and rounded `Lightagent` wordmark — from an embedded true-colour RGBA
+derivative, and the interactive prompt follows terminal content instead of
+reserving bottom rows. Redirected and non-interactive I/O is unchanged.
+
+### Added
+
+- **The supplied modern logo is now the terminal asset.** The startup dashboard
+  renders the faceted gold star, cyan lightning and updated rounded
+  `Lightagent` wordmark from an embedded true-colour RGBA derivative, with a
+  matching monochrome fallback.
+
+### Changed
+
+- **Prompts now follow terminal content.** The first prompt bar sits directly
+  below the startup dashboard and later prompts move down after each response,
+  allowing the terminal to scroll naturally instead of reserving bottom rows.
+  Each submitted prompt has a compact border matching its rendered text width;
+  each completed agent answer is boxed to its longest rendered line and expands
+  only when terminal-width wrapping requires it.
+
 ## [0.3.11] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. The streamed reasoning
