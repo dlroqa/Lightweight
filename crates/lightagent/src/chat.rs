@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lightagent_core::{
     AgentError, AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config,
-    ConfigStore, LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine, ProfileId,
-    ProfileStore, ProviderError, ProviderFactory, RunId, RunOutcome, SkillStore, StopReason,
+    ConfigStore, Continuation, LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine,
+    ProfileId, ProfileStore, ProviderError, ProviderFactory, RunId, RunOutcome, SkillStore,
+    StopReason, Suspended, WallClockPolicy,
 };
 use lightagent_extensions::ExtensionStore;
 use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
@@ -372,6 +373,8 @@ pub async fn run(
     if let Some(workspace) = workspace_context(&config, workspace_dir) {
         executor = executor.with_workspace(workspace);
     }
+    // Kept for `/skills`, which lists what this session actually loaded.
+    let session_skills = Arc::clone(&skills);
     if !skills.is_empty() {
         profile
             .persona
@@ -394,7 +397,10 @@ pub async fn run(
     if !memory_catalog.is_empty() {
         profile.persona.push_str(&format!("\n\n{memory_catalog}"));
     }
-    let agent = AgentLoop::from_profile(provider, executor, &profile);
+    // The chat has someone to ask, so a run that runs out of time with unread
+    // tool results pauses for a decision instead of wrapping up on its own.
+    let agent = AgentLoop::from_profile(provider, executor, &profile)
+        .with_wall_clock_policy(WallClockPolicy::Pause);
 
     if crate::banner::should_show(json) {
         crate::banner::print_startup(&crate::banner::StartupInfo {
@@ -418,6 +424,10 @@ pub async fn run(
     let stdin = std::io::stdin();
     let context_limit = configured_context_limit(config.runtime.n_ctx, &active_model);
     let mut last_turn = TurnStatus::default();
+    // A run that paused on its time budget and was not continued straight
+    // away. It is kept whole — the conversation, including the tool results
+    // the model has not read yet — so `continue` picks it up where it stopped.
+    let mut paused: Option<PausedRun> = None;
     loop {
         print_status_bar(&active_model, context_limit, &last_turn);
         print_prompt();
@@ -436,35 +446,181 @@ pub async fn run(
         if line.trim().is_empty() {
             continue;
         }
+        if paused.is_some() && is_continue_request(&line) {
+            let Some(PausedRun {
+                suspended,
+                mut stream,
+                mut active,
+                ..
+            }) = paused.take()
+            else {
+                continue;
+            };
+            let mut renderer = ModelRenderer::new();
+            let outcome = wait_for_outcome(
+                agent.continue_out_of_time(
+                    suspended,
+                    Continuation::Extend,
+                    CancellationToken::new(),
+                ),
+                &mut stream,
+                &mut renderer,
+                &mut active,
+            )
+            .await?;
+            let driven = drive(
+                &agent,
+                outcome,
+                &stdin,
+                &mut stream,
+                &mut renderer,
+                &mut active,
+            )
+            .await?;
+            renderer.finish();
+            (last_turn, paused) = settle(driven, stream, active, &mut session, &session_store);
+            continue;
+        }
         if let Some(command) = slash::parse(&line) {
-            if handle_slash(command) {
+            if command == Slash::New
+                && let Some(run) = paused.take()
+            {
+                drop_paused(run, &mut session, &session_store);
+            }
+            if handle_slash(command, &session_skills) {
                 break;
             }
             continue;
         }
+        if let Some(run) = paused.take() {
+            drop_paused(run, &mut session, &session_store);
+        }
         session.push_message(StoredMessage::new("user", &line));
         print_initializing();
-        let started = Instant::now();
+        let mut active = Duration::ZERO;
         let mut renderer = ModelRenderer::new();
         let (sink, mut stream) = tokio::sync::mpsc::unbounded_channel();
         let outcome = wait_for_outcome(
             agent.run_streaming(line, CancellationToken::new(), sink),
             &mut stream,
             &mut renderer,
+            &mut active,
         )
         .await?;
-        let events = drive(&agent, outcome, &stdin, &mut stream, &mut renderer).await?;
+        let driven = drive(
+            &agent,
+            outcome,
+            &stdin,
+            &mut stream,
+            &mut renderer,
+            &mut active,
+        )
+        .await?;
         renderer.finish();
-        last_turn = TurnStatus::from_events(&events, started.elapsed());
-        record_turn(&mut session, &events);
-        if let Err(error) = session_store.save(&session) {
-            eprintln!("· could not save session: {error}");
-        }
+        (last_turn, paused) = settle(driven, stream, active, &mut session, &session_store);
+    }
+    // Leaving keeps what a still-paused run did in the session record.
+    if let Some(run) = paused.take() {
+        save_turn(&mut session, &session_store, &run.events);
     }
     if !session.runs.is_empty() {
         println!("\nSession saved as {}.", session.id.as_str());
     }
     Ok(())
+}
+
+/// A run that paused on its time budget, held until the user continues or
+/// drops it.
+struct PausedRun {
+    suspended: Box<Suspended>,
+    /// The run's live event stream; its sender rides inside `suspended`, so a
+    /// continuation keeps printing through the same channel.
+    stream: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    /// The log through the pause, recorded in the session if the run is dropped.
+    events: Vec<AgentEvent>,
+    /// Time spent running so far, excluding time waiting at a prompt.
+    active: Duration,
+}
+
+/// Where [`drive`] left a run.
+enum Driven {
+    Done(Vec<AgentEvent>),
+    Paused {
+        events: Vec<AgentEvent>,
+        suspended: Box<Suspended>,
+    },
+}
+
+/// Settle a driven run: record a finished one in the session, or keep a paused
+/// one for `continue`. Returns the status to show and the run now paused.
+fn settle(
+    driven: Driven,
+    stream: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    active: Duration,
+    session: &mut Session,
+    store: &SessionStore,
+) -> (TurnStatus, Option<PausedRun>) {
+    match driven {
+        Driven::Done(events) => {
+            save_turn(session, store, &events);
+            (TurnStatus::from_events(&events, active), None)
+        }
+        Driven::Paused { events, suspended } => {
+            eprintln!(
+                "  paused — type `continue` to pick it up where it stopped; a new message drops it."
+            );
+            let status = TurnStatus::from_events(&events, active);
+            let run = PausedRun {
+                suspended,
+                stream,
+                events,
+                active,
+            };
+            (status, Some(run))
+        }
+    }
+}
+
+/// Drop a paused run the user moved on from, keeping what it did on record.
+fn drop_paused(run: PausedRun, session: &mut Session, store: &SessionStore) {
+    eprintln!("(dropped the run that paused on its time budget)");
+    save_turn(session, store, &run.events);
+}
+
+fn save_turn(session: &mut Session, store: &SessionStore, events: &[AgentEvent]) {
+    record_turn(session, events);
+    if let Err(error) = store.save(session) {
+        eprintln!("· could not save session: {error}");
+    }
+}
+
+/// Whether a line typed while a run is paused asks to continue it. Only a bare
+/// continue-word counts, so a real follow-up message is never swallowed.
+fn is_continue_request(line: &str) -> bool {
+    if slash::parse(line) == Some(Slash::Continue) {
+        return true;
+    }
+    matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "continue" | "resume" | "go on" | "keep going" | "c" | "y" | "yes"
+    )
+}
+
+/// What the user chose when a run ran out of time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutOfTimeChoice {
+    Continue(Continuation),
+    Pause,
+}
+
+/// Read the answer to the out-of-time question. Enter continues, since that
+/// keeps the work; anything unrecognised pauses, which loses nothing either.
+fn parse_out_of_time_answer(answer: &str) -> OutOfTimeChoice {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" | "c" | "continue" => OutOfTimeChoice::Continue(Continuation::Extend),
+        "a" | "answer" => OutOfTimeChoice::Continue(Continuation::WrapUp),
+        _ => OutOfTimeChoice::Pause,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -769,6 +925,9 @@ fn record_turn(session: &mut Session, events: &[AgentEvent]) {
                 outcome: if outcome.is_error { "error" } else { "ok" }.to_string(),
                 duration_ms: None,
             }),
+            // A run dropped while paused never completes; a continued one's
+            // later `RunCompleted` overwrites this.
+            AgentEvent::WallClockPaused { .. } => stop_reason = Some("WallClockPaused".to_owned()),
             AgentEvent::RunCompleted { reason } => stop_reason = Some(format!("{reason:?}")),
             _ => {}
         }
@@ -797,19 +956,23 @@ fn preview(text: &str) -> String {
 }
 
 /// Handle a slash command; returns true when the session should end.
-fn handle_slash(command: Slash) -> bool {
+fn handle_slash(command: Slash, skills: &SkillStore) -> bool {
     match command {
         Slash::Exit => return true,
         Slash::Help => {
-            println!("Commands: /help  /tools  /new  /stop  /exit");
+            println!("Commands: /help  /tools  /skills  /new  /continue  /stop  /exit");
         }
         Slash::Tools => {
             for name in ToolRegistry::builtin().names() {
                 println!("  {name}");
             }
         }
+        Slash::Skills => print!("{}", skills_listing(skills)),
         Slash::New => println!("(new run)"),
         Slash::Stop => println!("(nothing running)"),
+        // A paused run is picked up before commands are handled, so reaching
+        // here means there is none.
+        Slash::Continue => println!("(no run is paused on its time budget)"),
         Slash::Approve | Slash::Reject => {
             println!("(no tool call is awaiting a decision)");
         }
@@ -818,17 +981,82 @@ fn handle_slash(command: Slash) -> bool {
     false
 }
 
-/// Drive a run to completion, prompting for approval each time it pauses.
+/// The `/skills` listing: each loaded skill with its description — global,
+/// extension and profile skills alike, since they share one store.
+fn skills_listing(skills: &SkillStore) -> String {
+    if skills.is_empty() {
+        return "(no skills loaded — add them under skills/ or install an extension)\n".to_owned();
+    }
+    let mut out = String::new();
+    for name in skills.names() {
+        match skills.get(&name).map(|skill| skill.description.as_str()) {
+            Some(description) if !description.is_empty() => {
+                out.push_str(&format!("  {name} — {description}\n"));
+            }
+            _ => out.push_str(&format!("  {name}\n")),
+        }
+    }
+    out
+}
+
+/// Drive a run to completion, prompting for approval each time it pauses, and
+/// asking whether to continue when it runs out of time. A run the user chose
+/// to pause comes back as [`Driven::Paused`], still resumable.
 async fn drive(
     agent: &AgentLoop<LightweightProvider, BoundedExecutor>,
     mut outcome: RunOutcome,
     stdin: &std::io::Stdin,
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
-) -> Result<Vec<AgentEvent>, String> {
+    active: &mut Duration,
+) -> Result<Driven, String> {
     loop {
         match outcome {
-            RunOutcome::Completed { events } => return Ok(events),
+            RunOutcome::Completed { events } => return Ok(Driven::Done(events)),
+            RunOutcome::OutOfTime {
+                events,
+                elapsed,
+                suspended,
+            } => {
+                renderer.finish();
+                let budget = agent
+                    .config()
+                    .limits
+                    .wall_clock()
+                    .map(format_elapsed)
+                    .unwrap_or_else(|| "the same budget".to_owned());
+                eprintln!(
+                    "\n⏱ time budget reached after {} — its tools returned results the model has not read yet.",
+                    format_elapsed(elapsed)
+                );
+                eprint!(
+                    "  continue? [Y]es, for another {budget} · [a]nswer now from what it has · [n]o, pause here "
+                );
+                let _ = std::io::stderr().flush();
+                let mut answer = String::new();
+                let read = stdin
+                    .lock()
+                    .read_line(&mut answer)
+                    .map_err(|error| error.to_string())?;
+                // End of input is not a yes: keep the run paused.
+                let choice = if read == 0 {
+                    OutOfTimeChoice::Pause
+                } else {
+                    parse_out_of_time_answer(&answer)
+                };
+                match choice {
+                    OutOfTimeChoice::Continue(how) => {
+                        outcome = wait_for_outcome(
+                            agent.continue_out_of_time(suspended, how, CancellationToken::new()),
+                            stream,
+                            renderer,
+                            active,
+                        )
+                        .await?;
+                    }
+                    OutOfTimeChoice::Pause => return Ok(Driven::Paused { events, suspended }),
+                }
+            }
             RunOutcome::AwaitingApproval {
                 request, suspended, ..
             } => {
@@ -856,6 +1084,7 @@ async fn drive(
                     agent.resume(suspended, decision, CancellationToken::new()),
                     stream,
                     renderer,
+                    active,
                 )
                 .await?;
             }
@@ -863,8 +1092,25 @@ async fn drive(
     }
 }
 
-/// Await one run segment while printing each event as soon as the provider emits it.
+/// Await one run segment while printing each event as soon as the provider
+/// emits it. The segment's duration is added to `active`, so the status bar's
+/// speed leaves out time spent waiting at a prompt.
 async fn wait_for_outcome<F>(
+    future: F,
+    stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    renderer: &mut ModelRenderer,
+    active: &mut Duration,
+) -> Result<RunOutcome, String>
+where
+    F: Future<Output = Result<RunOutcome, AgentError>>,
+{
+    let started = Instant::now();
+    let outcome = render_segment(future, stream, renderer).await;
+    *active += started.elapsed();
+    outcome
+}
+
+async fn render_segment<F>(
     future: F,
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
@@ -894,7 +1140,8 @@ where
 }
 
 /// Resolve the profile to run: the named one, else the active one, else a
-/// built-in default that needs no prior `init`.
+/// built-in default that needs no prior `init`. The configured `agent` limits
+/// fill whichever run limits the profile leaves at their defaults.
 pub(crate) fn resolve_profile(
     store: &ProfileStore,
     config: &Config,
@@ -904,10 +1151,12 @@ pub(crate) fn resolve_profile(
         Some(name) => Some(ProfileId::new(&name).map_err(|error| error.to_string())?),
         None => store.active().map_err(|error| error.to_string())?,
     };
-    match id {
-        Some(id) => store.load(&id).map_err(|error| error.to_string()),
-        None => default_profile(config),
-    }
+    let mut profile = match id {
+        Some(id) => store.load(&id).map_err(|error| error.to_string())?,
+        None => default_profile(config)?,
+    };
+    profile.limits = config.agent.apply_to(profile.limits);
+    Ok(profile)
 }
 
 fn default_profile(config: &Config) -> Result<AgentProfile, String> {
@@ -996,6 +1245,70 @@ mod model_tests {
                 output_tokens: Some(50),
                 elapsed: Duration::from_secs(2),
             }
+        );
+    }
+
+    #[test]
+    fn the_out_of_time_question_defaults_to_continuing() {
+        let extend = OutOfTimeChoice::Continue(Continuation::Extend);
+        assert_eq!(parse_out_of_time_answer("\n"), extend);
+        assert_eq!(parse_out_of_time_answer(" Y "), extend);
+        assert_eq!(parse_out_of_time_answer("continue"), extend);
+        assert_eq!(
+            parse_out_of_time_answer("a"),
+            OutOfTimeChoice::Continue(Continuation::WrapUp)
+        );
+        assert_eq!(parse_out_of_time_answer("n"), OutOfTimeChoice::Pause);
+        assert_eq!(parse_out_of_time_answer("later"), OutOfTimeChoice::Pause);
+    }
+
+    #[test]
+    fn only_a_bare_continue_word_resumes_a_paused_run() {
+        for line in [
+            "continue",
+            "  Continue ",
+            "/continue",
+            "/resume",
+            "go on",
+            "yes",
+        ] {
+            assert!(is_continue_request(line), "{line:?} should continue");
+        }
+        for line in [
+            "continue with the second source",
+            "what did you find?",
+            "/new",
+        ] {
+            assert!(!is_continue_request(line), "{line:?} is a new message");
+        }
+    }
+
+    #[test]
+    fn slash_skills_lists_the_bundled_harness_engineering_skills() {
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions");
+        let extensions = ExtensionStore::load(&[bundled]);
+        let config = Config::default();
+        let skills = SkillStore::load(&extensions.skill_dirs(&config.extensions));
+        let listing = skills_listing(&skills);
+        for name in ["harness-plan", "harness-review", "harness-resources"] {
+            assert!(
+                listing.contains(&format!("  {name} — ")),
+                "{name} missing from:\n{listing}"
+            );
+        }
+        assert!(skills_listing(&SkillStore::default()).contains("no skills loaded"));
+    }
+
+    #[test]
+    fn a_dropped_paused_run_is_recorded_as_paused() {
+        let mut session = Session::new("default", "test");
+        record_turn(
+            &mut session,
+            &[AgentEvent::WallClockPaused { elapsed_secs: 301 }],
+        );
+        assert_eq!(
+            session.runs[0].stop_reason.as_deref(),
+            Some("WallClockPaused")
         );
     }
 

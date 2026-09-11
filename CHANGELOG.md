@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A `harness-engineering` extension ships in `extensions/`.** Five
+  on-demand skills adapted from the CC0 ai-boost/awesome-harness-engineering
+  list: `harness-plan` (PLAN.md), `harness-log` (IMPLEMENT.md),
+  `harness-agents-md` (AGENTS.md), `harness-review` (the harness checklist) and
+  `harness-resources` (a curated reading index by topic). It contributes no
+  tools, MCP servers or persona text, so existing tools are untouched; install
+  it by copying the directory into `~/.lightagent/extensions/`, and switch it
+  off with `lightagent extensions disable harness-engineering`.
+- **`/skills` in the terminal chat** lists the skills the session loaded,
+  extension skills included.
+
+### Changed
+
+- **Running out of time no longer throws away fetched work.** The wall-clock
+  budget is still checked between turns, but a run that reaches it with tool
+  results the model has not read yet now takes one final turn with tools
+  withheld and answers from what it gathered, instead of ending with no answer.
+  The interactive chat pauses there instead and asks whether to continue: yes
+  runs for another budget from exactly where it stopped, `a` answers now from
+  what it has, and no keeps the paused run so typing `continue` (or
+  `/continue`) later picks it up. A new message drops the paused run.
+
+### Fixed
+
+- **The `agent` limits in `config.json` now apply.** `agent.max_turns`,
+  `agent.max_tool_calls` and `agent.wall_clock_secs` were validated but never
+  used; they now fill any run limit a profile leaves at its default, and can be
+  read and written with `lightagent config get/set`. A zero time budget is
+  rejected (`agent.wall_clock_secs` empty or `none` means no time limit).
+
 ## [0.3.7] - 2026-09-10
 
 A patch release for Lightagent retrieval. It adds one-call realtime RAG tuned

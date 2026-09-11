@@ -118,6 +118,40 @@ impl Default for AgentConfig {
     }
 }
 
+impl AgentConfig {
+    /// Resolve a profile's run limits against these configured defaults.
+    ///
+    /// A profile stores every limit, so "does not override" is read field by
+    /// field: a profile limit still at the built-in default takes the
+    /// configured value, and a profile limit set to anything else is the
+    /// profile's own choice and wins. Limits with no `agent` setting pass
+    /// through from the profile untouched.
+    pub fn apply_to(&self, profile: crate::limits::RunLimits) -> crate::limits::RunLimits {
+        fn pick<T: PartialEq>(profile: T, builtin: T, configured: T) -> T {
+            if profile == builtin {
+                configured
+            } else {
+                profile
+            }
+        }
+        let builtin = crate::limits::RunLimits::default();
+        crate::limits::RunLimits {
+            max_turns: pick(profile.max_turns, builtin.max_turns, self.max_turns),
+            max_tool_calls: pick(
+                profile.max_tool_calls,
+                builtin.max_tool_calls,
+                self.max_tool_calls,
+            ),
+            wall_clock_secs: pick(
+                profile.wall_clock_secs,
+                builtin.wall_clock_secs,
+                self.wall_clock_secs,
+            ),
+            ..profile
+        }
+    }
+}
+
 /// How aggressively tool calls are gated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -544,6 +578,11 @@ impl Config {
                 "agent.max_tool_calls must be at least 1".to_owned(),
             ));
         }
+        if self.agent.wall_clock_secs == Some(0) {
+            return Err(ConfigError::Invalid(
+                "agent.wall_clock_secs must be at least 1, or null for no time limit".to_owned(),
+            ));
+        }
         if self.web.enabled {
             if self.web.max_fetch_bytes == 0 {
                 return Err(ConfigError::Invalid(
@@ -862,6 +901,46 @@ mod tests {
         config.inference.base_url = "http://127.0.0.1:11434".to_owned();
         config.agent.max_turns = 0;
         assert!(config.validate().is_err());
+
+        config.agent.max_turns = 8;
+        config.agent.wall_clock_secs = Some(0);
+        assert!(config.validate().is_err(), "a zero time budget is rejected");
+        config.agent.wall_clock_secs = None;
+        config.validate().expect("no time limit is valid");
+    }
+
+    #[test]
+    fn agent_config_fills_the_limits_a_profile_leaves_at_default() {
+        use crate::limits::RunLimits;
+        let agent = AgentConfig {
+            max_turns: 12,
+            max_tool_calls: 48,
+            wall_clock_secs: Some(900),
+        };
+
+        // A profile at the built-in defaults takes every configured value, and
+        // keeps the limits `agent` has no setting for.
+        let untouched = RunLimits {
+            max_tool_output_bytes: 1024,
+            ..RunLimits::default()
+        };
+        let resolved = agent.apply_to(untouched);
+        assert_eq!(resolved.max_turns, 12);
+        assert_eq!(resolved.max_tool_calls, 48);
+        assert_eq!(resolved.wall_clock_secs, Some(900));
+        assert_eq!(resolved.max_tool_output_bytes, 1024);
+
+        // A limit the profile set itself wins, field by field.
+        let tuned = RunLimits {
+            wall_clock_secs: Some(60),
+            ..RunLimits::default()
+        };
+        let resolved = agent.apply_to(tuned);
+        assert_eq!(resolved.wall_clock_secs, Some(60));
+        assert_eq!(resolved.max_turns, 12);
+
+        // The default config changes nothing.
+        assert_eq!(AgentConfig::default().apply_to(tuned), tuned);
     }
 
     #[test]

@@ -53,6 +53,11 @@ pub enum AgentEvent {
     AwaitingApproval { id: String, name: String },
     /// One model turn completed, with its token accounting when known.
     TurnCompleted { usage: Option<Usage> },
+    /// The wall-clock budget ran out while tool results the model has not read
+    /// yet were waiting, and the run paused rather than ended (only under
+    /// [`WallClockPolicy::Pause`](crate::loop_::WallClockPolicy::Pause)). The
+    /// run is not over: a continuation picks it up where it stopped.
+    WallClockPaused { elapsed_secs: u64 },
     /// The run reached a terminal state.
     RunCompleted { reason: StopReason },
     /// Something went wrong. Followed by a terminal

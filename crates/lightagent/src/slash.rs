@@ -11,6 +11,8 @@ pub enum Slash {
     Help,
     /// `/tools` — list the enabled tools.
     Tools,
+    /// `/skills` — list the skills loaded for this session, extensions' included.
+    Skills,
     /// `/new` — start a fresh run in the same profile.
     New,
     /// `/approve` — approve the pending tool call.
@@ -19,6 +21,8 @@ pub enum Slash {
     Reject,
     /// `/stop` — cancel the current run.
     Stop,
+    /// `/continue` — pick up a run that paused on its time budget.
+    Continue,
     /// `/exit` or `/quit` — leave the session.
     Exit,
     /// A `/word` that is not a known command; carries the word.
@@ -36,10 +40,12 @@ pub fn parse(line: &str) -> Option<Slash> {
     let command = match word {
         "help" | "h" | "?" => Slash::Help,
         "tools" => Slash::Tools,
+        "skills" => Slash::Skills,
         "new" => Slash::New,
         "approve" | "y" | "yes" => Slash::Approve,
         "reject" | "n" | "no" => Slash::Reject,
         "stop" => Slash::Stop,
+        "continue" | "resume" => Slash::Continue,
         "exit" | "quit" | "q" => Slash::Exit,
         other => Slash::Unknown(other.to_string()),
     };
@@ -60,9 +66,12 @@ mod tests {
     fn known_commands_parse() {
         assert_eq!(parse("/help"), Some(Slash::Help));
         assert_eq!(parse("  /tools  "), Some(Slash::Tools));
+        assert_eq!(parse("/skills"), Some(Slash::Skills));
         assert_eq!(parse("/exit"), Some(Slash::Exit));
         assert_eq!(parse("/q"), Some(Slash::Exit));
         assert_eq!(parse("/approve now"), Some(Slash::Approve));
+        assert_eq!(parse("/continue"), Some(Slash::Continue));
+        assert_eq!(parse("/resume"), Some(Slash::Continue));
     }
 
     #[test]
