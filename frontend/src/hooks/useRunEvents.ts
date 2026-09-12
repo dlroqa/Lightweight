@@ -56,12 +56,19 @@ export function useRunEvents(runId: string | null): { events: RunEvent[]; done: 
     const source = new EventSource(agentApi.eventsUrl(runId));
     const listeners: Array<[string, EventListener]> = [];
     let closed = false;
+    let statusTimer: number | undefined;
+    const stopPolling = () => {
+      if (statusTimer !== undefined) {
+        window.clearInterval(statusTimer);
+        statusTimer = undefined;
+      }
+    };
     const finish = () => {
       if (closed) return;
       closed = true;
       setDone(true);
       source.close();
-      window.clearInterval(statusTimer);
+      stopPolling();
     };
     const checkStatus = async () => {
       if (closed) return;
@@ -94,12 +101,22 @@ export function useRunEvents(runId: string | null): { events: RunEvent[]; done: 
       listeners.push([name, handler as EventListener]);
     }
 
-    source.onerror = () => { void checkStatus(); };
-    const statusTimer = window.setInterval(() => void checkStatus(), 2000);
+    // The healthy path is SSE-driven, so a terminal event closes the stream and
+    // no polling ever runs. Only when the stream faults do we reconcile against
+    // the run endpoint: probe once now, then keep a fallback poll until the
+    // stream recovers (its terminal event closes this) or the run is seen
+    // terminal. A constant background poll would race the live stream and
+    // double-render the just-completed turn, so it starts only on error.
+    source.onerror = () => {
+      void checkStatus();
+      if (!closed && statusTimer === undefined) {
+        statusTimer = window.setInterval(() => void checkStatus(), 2000);
+      }
+    };
 
     return () => {
       closed = true;
-      window.clearInterval(statusTimer);
+      stopPolling();
       for (const [name, handler] of listeners) {
         source.removeEventListener(name, handler);
       }
