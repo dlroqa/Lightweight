@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. Isolated user profiles
+can now be created, switched, and deleted end to end — from a new Profiles
+screen in `lightagent setup` and from a singular `lightagent profile` command
+for scripts. The `default` profile is retained as the protected main account,
+deleting a profile asks for confirmation, and the previous plural `lightagent
+profiles` spelling stays available as an alias.
+
+### Added
+
+- **Profiles can be managed from terminal setup.** The new Profiles screen in
+  `lightagent setup` can create, activate, and delete isolated user profiles,
+  with confirmation before deleting a profile and `default` retained as the
+  protected main account. It is also available directly through `lightagent
+  setup profiles`.
+- **The singular `lightagent profile` command manages profiles from scripts.**
+  `profile create` (also `add`), `profile use <name>`, and `profile delete`
+  complement list/show operations. The previous plural `lightagent profiles`
+  spelling remains as a compatible alias.
+
 ## [0.3.14] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. The startup

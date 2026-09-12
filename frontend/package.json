@@ -1,7 +1,7 @@
 {
   "name": "hermes-panel",
   "private": true,
-  "version": "0.3.14",
+  "version": "0.3.15",
   "type": "module",
   "description": "The Lightweight control panel: a browser SPA served by the gateway itself.",
   "scripts": {

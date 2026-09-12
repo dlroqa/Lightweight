@@ -306,6 +306,16 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Create a new profile without replacing an existing identity.
+    pub fn create(&self, profile: &AgentProfile) -> Result<(), ProfileError> {
+        if self.handle(&profile.id).dir().exists() {
+            return Err(ProfileError::AlreadyExists {
+                id: profile.id.clone(),
+            });
+        }
+        self.save(profile)
+    }
+
     /// Load a profile: its manifest, with the persona read from `SOUL.md`.
     pub fn load(&self, id: &ProfileId) -> Result<AgentProfile, ProfileError> {
         let handle = self.handle(id);
@@ -339,7 +349,8 @@ impl ProfileStore {
                 if trimmed.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(ProfileId::new(trimmed)?))
+                    let id = ProfileId::new(trimmed)?;
+                    Ok(self.handle(&id).manifest_file().exists().then_some(id))
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -353,6 +364,25 @@ impl ProfileStore {
             return Err(ProfileError::NotFound { id: id.clone() });
         }
         paths::write_private(&self.active_file(), id.as_str().as_bytes()).map_err(io_std)
+    }
+
+    /// Delete one inactive profile and its isolated subtree.
+    ///
+    /// The `default` profile is the main account and cannot be removed. Callers
+    /// must also switch away from an active profile before deleting it, which
+    /// prevents the active selector from ever pointing at a removed identity.
+    pub fn delete(&self, id: &ProfileId) -> Result<(), ProfileError> {
+        if id.as_str() == "default" {
+            return Err(ProfileError::DefaultProfile);
+        }
+        let handle = self.handle(id);
+        if !handle.manifest_file().exists() {
+            return Err(ProfileError::NotFound { id: id.clone() });
+        }
+        if self.active()?.as_ref() == Some(id) {
+            return Err(ProfileError::ActiveProfile { id: id.clone() });
+        }
+        std::fs::remove_dir_all(handle.dir()).map_err(io_std)
     }
 
     /// Every profile that has a manifest, in sorted order.
@@ -401,8 +431,14 @@ pub enum ProfileError {
          (lowercase letters, digits, '_' and '-', no path separators)"
     )]
     InvalidId { id: String },
+    #[error("a profile named {id:?} already exists")]
+    AlreadyExists { id: ProfileId },
     #[error("no profile named {id:?}")]
     NotFound { id: ProfileId },
+    #[error("the default profile is the main account and cannot be deleted")]
+    DefaultProfile,
+    #[error("profile {id:?} is active; switch profiles before deleting it")]
+    ActiveProfile { id: ProfileId },
     #[error("the profile {id:?} manifest is corrupt: {reason}")]
     Corrupt { id: ProfileId, reason: String },
     #[error("a profile store operation failed: {reason}")]
@@ -481,6 +517,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_active_profile_selector_is_ignored() {
+        let home = scratch_home();
+        let store = ProfileStore::new(&home);
+        let id = ProfileId::new("aria").expect("id");
+        store.save(&sample("aria")).expect("save");
+        store.set_active(&id).expect("set active");
+        std::fs::remove_dir_all(store.handle(&id).dir()).expect("remove profile");
+
+        assert_eq!(store.active().expect("active"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn two_profiles_get_independent_subtrees() {
         let home = scratch_home();
         let store = ProfileStore::new(&home);
@@ -507,6 +556,50 @@ mod tests {
                 ProfileId::new("boris").expect("id")
             ]
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_refuses_to_replace_an_existing_profile() {
+        let home = scratch_home();
+        let store = ProfileStore::new(&home);
+        let original = sample("aria");
+        store.create(&original).expect("create");
+
+        let mut replacement = original.clone();
+        replacement.persona = "A replacement persona.".to_owned();
+        assert!(matches!(
+            store.create(&replacement),
+            Err(ProfileError::AlreadyExists { .. })
+        ));
+        assert_eq!(store.load(&original.id).expect("load"), original);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delete_removes_only_an_inactive_non_default_profile() {
+        let home = scratch_home();
+        let store = ProfileStore::new(&home);
+        let default = sample("default");
+        let aria = sample("aria");
+        store.create(&default).expect("default");
+        store.create(&aria).expect("aria");
+        store.set_active(&aria.id).expect("activate aria");
+
+        assert!(matches!(
+            store.delete(&default.id),
+            Err(ProfileError::DefaultProfile)
+        ));
+        assert!(matches!(
+            store.delete(&aria.id),
+            Err(ProfileError::ActiveProfile { .. })
+        ));
+
+        store.set_active(&default.id).expect("activate default");
+        store.delete(&aria.id).expect("delete aria");
+        assert!(!store.handle(&aria.id).dir().exists());
+        assert!(store.load(&default.id).is_ok());
+        assert_eq!(store.active().expect("active"), Some(default.id));
         std::fs::remove_dir_all(&home).ok();
     }
 }

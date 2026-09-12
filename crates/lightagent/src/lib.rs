@@ -28,7 +28,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use lightagent_core::{
-    AgentProfile, Config, ConfigStore, LightagentPaths, ProfileId, ProfileStore, SecretRef,
+    AgentProfile, Config, ConfigStore, LightagentPaths, ProfileError, ProfileId, ProfileStore,
+    SecretRef,
 };
 use lightagent_store::{SessionId, SessionStore};
 use lightagent_tools::ToolRegistry;
@@ -93,7 +94,8 @@ enum Command {
         #[command(subcommand)]
         action: Option<ToolsAction>,
     },
-    /// Manage agent profiles ("bots").
+    /// Manage user profiles (also available as `profiles`).
+    #[command(name = "profile", visible_alias = "profiles")]
     Profiles {
         #[command(subcommand)]
         action: Option<ProfilesAction>,
@@ -189,6 +191,7 @@ enum ProfilesAction {
     /// Show one profile.
     Show { id: String },
     /// Create a profile.
+    #[command(visible_alias = "add")]
     Create {
         id: String,
         #[arg(long)]
@@ -200,6 +203,8 @@ enum ProfilesAction {
     },
     /// Make a profile the active one.
     Use { id: String },
+    /// Delete a profile and all of its local data.
+    Delete { id: String },
 }
 
 #[derive(Subcommand)]
@@ -427,6 +432,44 @@ fn active_profile_id(store: &ProfileStore) -> Result<Option<ProfileId>, String> 
     store.active().map_err(|error| error.to_string())
 }
 
+/// The main account is always the protected `default` profile. Persist it on
+/// first use of profile management so switching away and back works even on an
+/// installation that previously relied on the built-in, unsaved fallback.
+pub(crate) fn ensure_default_profile(
+    store: &ProfileStore,
+    config: &Config,
+) -> Result<ProfileId, String> {
+    let id = ProfileId::new("default").map_err(|error| error.to_string())?;
+    match store.load(&id) {
+        Ok(_) => {}
+        Err(ProfileError::NotFound { .. }) => store
+            .create(&default_profile(config)?)
+            .map_err(|error| error.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    }
+    if store.active().map_err(|error| error.to_string())?.is_none() {
+        store.set_active(&id).map_err(|error| error.to_string())?;
+    }
+    Ok(id)
+}
+
+pub(crate) fn default_profile(config: &Config) -> Result<AgentProfile, String> {
+    let id = ProfileId::new("default").map_err(|error| error.to_string())?;
+    let model = config
+        .inference
+        .model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let mut profile = AgentProfile::new(
+        id,
+        "Default",
+        "You are Lightagent, a helpful local agent with live tools.",
+        model,
+    );
+    profile.approval_policy = config.security.approval_policy;
+    Ok(profile)
+}
+
 // --- doctor -----------------------------------------------------------------
 
 /// What a best-effort device probe found, when the gateway answered in time.
@@ -589,6 +632,8 @@ fn tools_list(json: bool) -> Result<(), String> {
 fn profiles_cmd(action: ProfilesAction, json: bool) -> Result<(), String> {
     let paths = paths()?;
     let store = ProfileStore::new(paths.root());
+    let config = load_config(&paths)?;
+    let default = ensure_default_profile(&store, &config)?;
     match action {
         ProfilesAction::List => {
             let active = active_profile_id(&store)?;
@@ -602,7 +647,7 @@ fn profiles_cmd(action: ProfilesAction, json: bool) -> Result<(), String> {
                 return Ok(());
             }
             if profiles.is_empty() {
-                println!("No profiles yet. Create one with `lightagent profiles create <id>`.");
+                println!("No profiles yet. Create one with `lightagent profile create <id>`.");
                 return Ok(());
             }
             for id in profiles {
@@ -644,14 +689,37 @@ fn profiles_cmd(action: ProfilesAction, json: bool) -> Result<(), String> {
                 persona.unwrap_or_else(|| "You are a helpful local agent.".to_string()),
                 model.unwrap_or_else(|| "default".to_string()),
             );
-            store.save(&profile).map_err(|error| error.to_string())?;
-            println!("Created profile '{}'.", id.as_str());
+            store.create(&profile).map_err(|error| error.to_string())?;
+            if json {
+                println!("{}", serde_json::json!({ "created": id.as_str() }));
+            } else {
+                println!("Created profile '{}'.", id.as_str());
+            }
             Ok(())
         }
         ProfilesAction::Use { id } => {
             let id = ProfileId::new(&id).map_err(|error| error.to_string())?;
             store.set_active(&id).map_err(|error| error.to_string())?;
-            println!("Active profile is now '{}'.", id.as_str());
+            if json {
+                println!("{}", serde_json::json!({ "active": id.as_str() }));
+            } else {
+                println!("Active profile is now '{}'.", id.as_str());
+            }
+            Ok(())
+        }
+        ProfilesAction::Delete { id } => {
+            let id = ProfileId::new(&id).map_err(|error| error.to_string())?;
+            if store.active().map_err(|error| error.to_string())?.as_ref() == Some(&id) {
+                store
+                    .set_active(&default)
+                    .map_err(|error| error.to_string())?;
+            }
+            store.delete(&id).map_err(|error| error.to_string())?;
+            if json {
+                println!("{}", serde_json::json!({ "deleted": id.as_str() }));
+            } else {
+                println!("Deleted profile '{}'.", id.as_str());
+            }
             Ok(())
         }
     }
@@ -973,14 +1041,21 @@ fn init(
     let profile_id = profile.unwrap_or_else(|| "default".to_string());
     let id = ProfileId::new(&profile_id).map_err(|error| error.to_string())?;
     let store = ProfileStore::new(paths.root());
-    if store.load(&id).is_err() {
-        let profile = AgentProfile::new(
-            id.clone(),
-            "Default",
-            "You are Lightagent, a helpful local agent with live tools.",
-            model.unwrap_or_else(|| "default".to_string()),
-        );
-        store.save(&profile).map_err(|error| error.to_string())?;
+    ensure_default_profile(&store, &config)?;
+    if id.as_str() != "default" {
+        match store.load(&id) {
+            Ok(_) => {}
+            Err(ProfileError::NotFound { .. }) => {
+                let profile = AgentProfile::new(
+                    id.clone(),
+                    id.as_str(),
+                    "You are a helpful local agent.",
+                    model.unwrap_or_else(|| "default".to_string()),
+                );
+                store.create(&profile).map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
     store.set_active(&id).map_err(|error| error.to_string())?;
 
@@ -1042,6 +1117,29 @@ async fn models(json: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn singular_profile_command_and_plural_alias_parse() {
+        for command in ["profile", "profiles"] {
+            let cli = Cli::try_parse_from(["lightagent", command, "use", "aria"])
+                .expect("profile command");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Profiles {
+                    action: Some(ProfilesAction::Use { id })
+                }) if id == "aria"
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["lightagent", "profile", "delete", "aria"])
+            .expect("profile delete");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Profiles {
+                action: Some(ProfilesAction::Delete { id })
+            }) if id == "aria"
+        ));
+    }
 
     #[test]
     fn known_config_keys_round_trip() {

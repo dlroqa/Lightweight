@@ -1673,26 +1673,9 @@ pub(crate) fn resolve_profile(
     };
     let mut profile = match id {
         Some(id) => store.load(&id).map_err(|error| error.to_string())?,
-        None => default_profile(config)?,
+        None => crate::default_profile(config)?,
     };
     profile.limits = config.agent.apply_to(profile.limits);
-    Ok(profile)
-}
-
-fn default_profile(config: &Config) -> Result<AgentProfile, String> {
-    let id = ProfileId::new("default").map_err(|error| error.to_string())?;
-    let model = config
-        .inference
-        .model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    let mut profile = AgentProfile::new(
-        id,
-        "Default",
-        "You are Lightagent, a helpful local agent with live tools.",
-        model,
-    );
-    profile.approval_policy = config.security.approval_policy;
     Ok(profile)
 }
 

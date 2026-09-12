@@ -5,7 +5,8 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use clap::ValueEnum;
 use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
 use lightagent_core::{
-    ApprovalPolicy, Config, ConfigStore, DUCKDUCKGO_SEARCH_ENDPOINT, LightagentPaths, ProfileStore,
+    AgentProfile, ApprovalPolicy, Config, ConfigStore, DUCKDUCKGO_SEARCH_ENDPOINT, LightagentPaths,
+    ProfileId, ProfileStore,
 };
 use lightagent_core::{SavedProvider, SecretRef};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
@@ -13,6 +14,8 @@ use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 /// A setup section that can also be opened directly from the command line.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum Section {
+    #[value(alias = "profile")]
+    Profiles,
     #[value(alias = "gateway", alias = "model")]
     Provider,
     Tools,
@@ -41,6 +44,8 @@ pub(crate) async fn run(section: Option<Section>, json: bool) -> Result<(), Stri
 async fn run_tui(section: Option<Section>, paths: &LightagentPaths) -> Result<(), String> {
     let store = ConfigStore::at(paths);
     let mut config = store.load().map_err(|error| error.to_string())?;
+    let profiles = ProfileStore::new(paths.root());
+    crate::ensure_default_profile(&profiles, &config)?;
     let theme = ColorfulTheme::default();
     eprintln!("\nLightagent setup");
 
@@ -49,6 +54,7 @@ async fn run_tui(section: Option<Section>, paths: &LightagentPaths) -> Result<()
             Some(section) => Some(section),
             None => {
                 let items = [
+                    "Profiles",
                     "Gateway and model",
                     "Tools for CLI",
                     "Web access and search",
@@ -63,12 +69,13 @@ async fn run_tui(section: Option<Section>, paths: &LightagentPaths) -> Result<()
                     .interact_opt()
                     .map_err(dialog_error)?;
                 match choice {
-                    Some(0) => Some(Section::Provider),
-                    Some(1) => Some(Section::Tools),
-                    Some(2) => Some(Section::Web),
-                    Some(3) => Some(Section::Tui),
-                    Some(4) => Some(Section::Approvals),
-                    Some(5) | None => None,
+                    Some(0) => Some(Section::Profiles),
+                    Some(1) => Some(Section::Provider),
+                    Some(2) => Some(Section::Tools),
+                    Some(3) => Some(Section::Web),
+                    Some(4) => Some(Section::Tui),
+                    Some(5) => Some(Section::Approvals),
+                    Some(6) | None => None,
                     Some(_) => return Err("invalid setup selection".to_owned()),
                 }
             }
@@ -98,11 +105,145 @@ async fn configure_tui(
     theme: &ColorfulTheme,
 ) -> Result<bool, String> {
     match section {
+        Section::Profiles => configure_profiles_tui(config, paths, theme),
         Section::Provider => configure_gateway_tui(config, paths, theme).await,
         Section::Tools => configure_tools_tui(config, theme),
         Section::Web => configure_web_tui(config, theme),
         Section::Tui => configure_terminal_ui_tui(config, theme),
         Section::Approvals => configure_approvals_tui(config, paths, theme),
+    }
+}
+
+fn configure_profiles_tui(
+    config: &Config,
+    paths: &LightagentPaths,
+    theme: &ColorfulTheme,
+) -> Result<bool, String> {
+    let store = ProfileStore::new(paths.root());
+    let default = crate::ensure_default_profile(&store, config)?;
+    let active = store.active().map_err(|error| error.to_string())?;
+    eprintln!("\nProfiles");
+    eprintln!(
+        "Active: {}  (`default` is the protected main account)\n",
+        active.as_ref().map(ProfileId::as_str).unwrap_or("default")
+    );
+
+    let Some(action) = Select::with_theme(theme)
+        .with_prompt("Manage profiles")
+        .items([
+            "Create a profile",
+            "Switch active profile",
+            "Delete a profile",
+            "Back",
+        ])
+        .default(0)
+        .interact_opt()
+        .map_err(dialog_error)?
+    else {
+        return Ok(false);
+    };
+
+    match action {
+        0 => {
+            let raw_id = Input::<String>::with_theme(theme)
+                .with_prompt("Profile id (lowercase letters, digits, _ or -)")
+                .validate_with(|value: &String| {
+                    ProfileId::new(value.trim())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+                .interact_text()
+                .map_err(dialog_error)?;
+            let id = ProfileId::new(raw_id.trim()).map_err(|error| error.to_string())?;
+            let name = Input::<String>::with_theme(theme)
+                .with_prompt("Display name")
+                .with_initial_text(id.as_str())
+                .interact_text()
+                .map_err(dialog_error)?;
+            let persona = Input::<String>::with_theme(theme)
+                .with_prompt("Persona")
+                .with_initial_text("You are a helpful local agent.")
+                .interact_text()
+                .map_err(dialog_error)?;
+            let model = Input::<String>::with_theme(theme)
+                .with_prompt("Model (`default` follows the configured model)")
+                .with_initial_text("default")
+                .interact_text()
+                .map_err(dialog_error)?;
+            create_profile(&store, id.clone(), name, persona, model, config)?;
+            let activate = Confirm::with_theme(theme)
+                .with_prompt(format!("Use '{}' now?", id.as_str()))
+                .default(true)
+                .interact_opt()
+                .map_err(dialog_error)?
+                .unwrap_or(false);
+            if activate {
+                store.set_active(&id).map_err(|error| error.to_string())?;
+            }
+            eprintln!("Created profile '{}'.", id.as_str());
+            Ok(true)
+        }
+        1 => {
+            let profiles = store.list().map_err(|error| error.to_string())?;
+            let selected = Select::with_theme(theme)
+                .with_prompt("Active profile")
+                .items(profiles.iter().map(ProfileId::as_str).collect::<Vec<_>>())
+                .default(
+                    active
+                        .as_ref()
+                        .and_then(|id| profiles.iter().position(|profile| profile == id))
+                        .unwrap_or(0),
+                )
+                .interact_opt()
+                .map_err(dialog_error)?;
+            let Some(selected) = selected else {
+                return Ok(false);
+            };
+            store
+                .set_active(&profiles[selected])
+                .map_err(|error| error.to_string())?;
+            eprintln!("Active profile is now '{}'.", profiles[selected].as_str());
+            Ok(true)
+        }
+        2 => {
+            let profiles = store
+                .list()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|id| id != &default)
+                .collect::<Vec<_>>();
+            if profiles.is_empty() {
+                eprintln!("There are no additional profiles to delete.");
+                return Ok(true);
+            }
+            let Some(selected) = Select::with_theme(theme)
+                .with_prompt("Delete profile")
+                .items(profiles.iter().map(ProfileId::as_str).collect::<Vec<_>>())
+                .default(0)
+                .interact_opt()
+                .map_err(dialog_error)?
+            else {
+                return Ok(false);
+            };
+            let id = &profiles[selected];
+            let confirmed = Confirm::with_theme(theme)
+                .with_prompt(format!(
+                    "Delete '{}' and all of its local data?",
+                    id.as_str()
+                ))
+                .default(false)
+                .interact_opt()
+                .map_err(dialog_error)?
+                .unwrap_or(false);
+            if !confirmed {
+                return Ok(false);
+            }
+            delete_profile(&store, id, &default)?;
+            eprintln!("Deleted profile '{}'.", id.as_str());
+            Ok(true)
+        }
+        3 => Ok(false),
+        _ => Err("invalid profile selection".to_owned()),
     }
 }
 
@@ -458,6 +599,8 @@ async fn run_with_io<R: BufRead, W: Write>(
 ) -> Result<(), String> {
     let store = ConfigStore::at(paths);
     let mut config = store.load().map_err(|error| error.to_string())?;
+    let profiles = ProfileStore::new(paths.root());
+    crate::ensure_default_profile(&profiles, &config)?;
     let mut prompt = Prompt { reader, writer };
 
     writeln!(prompt.writer, "\nLightagent setup").map_err(io_error)?;
@@ -475,6 +618,7 @@ async fn run_with_io<R: BufRead, W: Write>(
             let choice = prompt.choose(
                 "What would you like to configure?",
                 &[
+                    "Profiles",
                     "Gateway and model",
                     "Local file and terminal tools",
                     "Web access and search",
@@ -482,17 +626,18 @@ async fn run_with_io<R: BufRead, W: Write>(
                     "Approval prompts",
                     "Save and exit",
                 ],
-                6,
+                7,
             )?;
-            if choice == 6 {
+            if choice == 7 {
                 break;
             }
             let section = match choice {
-                1 => Section::Provider,
-                2 => Section::Tools,
-                3 => Section::Web,
-                4 => Section::Tui,
-                5 => Section::Approvals,
+                1 => Section::Profiles,
+                2 => Section::Provider,
+                3 => Section::Tools,
+                4 => Section::Web,
+                5 => Section::Tui,
+                6 => Section::Approvals,
                 _ => return Err("invalid setup selection".to_owned()),
             };
             configure(section, &mut config, paths, &mut prompt).await?;
@@ -515,12 +660,121 @@ async fn configure<R: BufRead, W: Write>(
     prompt: &mut Prompt<R, W>,
 ) -> Result<(), String> {
     match section {
+        Section::Profiles => configure_profiles(config, paths, prompt),
         Section::Provider => configure_gateway(config, paths, prompt).await,
         Section::Tools => configure_tools(config, prompt),
         Section::Web => configure_web(config, prompt),
         Section::Tui => configure_terminal_ui(config, prompt),
         Section::Approvals => configure_approvals(config, paths, prompt),
     }
+}
+
+fn configure_profiles<R: BufRead, W: Write>(
+    config: &Config,
+    paths: &LightagentPaths,
+    prompt: &mut Prompt<R, W>,
+) -> Result<(), String> {
+    let store = ProfileStore::new(paths.root());
+    let default = crate::ensure_default_profile(&store, config)?;
+    let active = store.active().map_err(|error| error.to_string())?;
+    writeln!(
+        prompt.writer,
+        "Active profile: {} (`default` is the protected main account)",
+        active.as_ref().map(ProfileId::as_str).unwrap_or("default")
+    )
+    .map_err(io_error)?;
+    let action = prompt.choose(
+        "Manage profiles",
+        &[
+            "Create a profile",
+            "Switch active profile",
+            "Delete a profile",
+            "Back",
+        ],
+        4,
+    )?;
+
+    match action {
+        1 => {
+            let raw_id = prompt.input("Profile id (lowercase letters, digits, _ or -)", "")?;
+            let id = ProfileId::new(raw_id.trim()).map_err(|error| error.to_string())?;
+            let name = prompt.input("Display name", id.as_str())?;
+            let persona = prompt.input("Persona", "You are a helpful local agent.")?;
+            let model =
+                prompt.input("Model (`default` follows the configured model)", "default")?;
+            create_profile(&store, id.clone(), name, persona, model, config)?;
+            let activate =
+                prompt.choose(&format!("Use '{}' now?", id.as_str()), &["Yes", "No"], 1)?;
+            if activate == 1 {
+                store.set_active(&id).map_err(|error| error.to_string())?;
+            }
+            writeln!(prompt.writer, "Created profile '{}'.", id.as_str()).map_err(io_error)
+        }
+        2 => {
+            let profiles = store.list().map_err(|error| error.to_string())?;
+            let labels = profiles.iter().map(ProfileId::as_str).collect::<Vec<_>>();
+            let selected = prompt.choose(
+                "Active profile",
+                &labels,
+                active
+                    .as_ref()
+                    .and_then(|id| profiles.iter().position(|profile| profile == id))
+                    .map_or(1, |index| index + 1),
+            )?;
+            let id = &profiles[selected - 1];
+            store.set_active(id).map_err(|error| error.to_string())?;
+            writeln!(prompt.writer, "Active profile is now '{}'.", id.as_str()).map_err(io_error)
+        }
+        3 => {
+            let profiles = store
+                .list()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|id| id != &default)
+                .collect::<Vec<_>>();
+            if profiles.is_empty() {
+                return writeln!(prompt.writer, "There are no additional profiles to delete.")
+                    .map_err(io_error);
+            }
+            let labels = profiles.iter().map(ProfileId::as_str).collect::<Vec<_>>();
+            let selected = prompt.choose("Delete profile", &labels, 1)?;
+            let id = &profiles[selected - 1];
+            let confirmed = prompt.choose(
+                &format!("Delete '{}' and all of its local data?", id.as_str()),
+                &["Delete", "Cancel"],
+                2,
+            )?;
+            if confirmed == 1 {
+                delete_profile(&store, id, &default)?;
+                writeln!(prompt.writer, "Deleted profile '{}'.", id.as_str()).map_err(io_error)?;
+            }
+            Ok(())
+        }
+        4 => Ok(()),
+        _ => Err("invalid profile selection".to_owned()),
+    }
+}
+
+fn create_profile(
+    store: &ProfileStore,
+    id: ProfileId,
+    name: String,
+    persona: String,
+    model: String,
+    config: &Config,
+) -> Result<(), String> {
+    let mut profile = AgentProfile::new(id, name, persona, model);
+    profile.approval_policy = config.security.approval_policy;
+    store.create(&profile).map_err(|error| error.to_string())
+}
+
+fn delete_profile(store: &ProfileStore, id: &ProfileId, default: &ProfileId) -> Result<(), String> {
+    if store.active().map_err(|error| error.to_string())?.as_ref() == Some(id) {
+        store
+            .set_active(default)
+            .map_err(|error| error.to_string())?;
+    }
+    store.delete(id).map_err(|error| error.to_string())
 }
 
 async fn configure_gateway<R: BufRead, W: Write>(
@@ -834,7 +1088,44 @@ impl<R: BufRead, W: Write> Prompt<R, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightagent_core::RunId;
     use std::io::Cursor;
+
+    fn scratch_paths() -> LightagentPaths {
+        LightagentPaths::rooted_at(
+            std::env::temp_dir().join(format!("lightagent-setup-{}", RunId::new().as_str())),
+        )
+    }
+
+    #[test]
+    fn profiles_can_be_created_activated_and_deleted_from_setup() {
+        let paths = scratch_paths();
+        paths.scaffold().unwrap();
+        let config = Config::default();
+        let mut output = Vec::new();
+        let mut create = Prompt {
+            reader: Cursor::new("1\naria\n\n\n\n1\n"),
+            writer: &mut output,
+        };
+        configure_profiles(&config, &paths, &mut create).unwrap();
+
+        let store = ProfileStore::new(paths.root());
+        let aria = ProfileId::new("aria").unwrap();
+        let default = ProfileId::new("default").unwrap();
+        assert!(store.load(&default).is_ok());
+        assert!(store.load(&aria).is_ok());
+        assert_eq!(store.active().unwrap(), Some(aria.clone()));
+
+        let mut delete = Prompt {
+            reader: Cursor::new("3\n\n1\n"),
+            writer: Vec::new(),
+        };
+        configure_profiles(&config, &paths, &mut delete).unwrap();
+        assert!(store.load(&aria).is_err());
+        assert!(store.load(&default).is_ok());
+        assert_eq!(store.active().unwrap(), Some(default));
+        std::fs::remove_dir_all(paths.root()).ok();
+    }
 
     #[test]
     fn tools_are_selected_without_config_keys() {

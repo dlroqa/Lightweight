@@ -111,13 +111,31 @@ their risk class, tool, argument preview, and three numbered choices: `Allow`,
 `Don't allow`, or `Allow without restrictions` for the current session.
 
 Run `lightagent setup` for a guided terminal menu. It shows current values and
-lets you select the gateway/model, local file and terminal tools, web
-fetch/search, reasoning visibility, and approval behavior without editing
-`config.json`. A section can be opened directly with `lightagent setup
-provider`, `tools`, `web`, `terminal`, or `approvals`. The Terminal UI screen
+lets you create, switch, and delete profiles; select the gateway/model, local
+file and terminal tools, web fetch/search, reasoning visibility, and approval
+behavior without editing `config.json`. A section can be opened directly with
+`lightagent setup profiles`, `provider`, `tools`, `web`, `terminal`, or
+`approvals`. The Profiles
+screen keeps the main account as the protected `default` profile and asks for
+confirmation before removing a secondary profile. The Terminal UI screen
 offers **Show reasoning** and **Hide reasoning**; hidden mode displays the
 animated star while the model works. The same preference can be changed with
 `lightagent config set tui.show_reasoning true|false`.
+
+Profiles can also be managed without opening setup:
+
+```sh
+lightagent profile list
+lightagent profile create research --name "Research" --persona "You are a careful researcher."
+lightagent profile use research
+lightagent profile delete research
+lightagent profile use default
+```
+
+`lightagent profile use <name>` changes the active user for future chats and
+served API runs. Deleting the active secondary profile switches back to
+`default`; the default profile itself cannot be deleted. The older plural form,
+`lightagent profiles ...`, remains available as an alias.
 
 The Tools screen is an interactive checklist: use ↑/↓ to navigate, Space to
 toggle capabilities, Enter to save, or Escape to cancel.
