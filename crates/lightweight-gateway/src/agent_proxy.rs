@@ -25,7 +25,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::state::GatewayState;
+use crate::{routes::authorize, state::GatewayState};
 
 /// The largest agent request body this gateway will buffer before forwarding.
 ///
@@ -45,6 +45,9 @@ const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
 ///
 /// [`GatewayConfig::agent_upstream`]: crate::state::GatewayConfig::agent_upstream
 pub async fn proxy(State(state): State<Arc<GatewayState>>, request: Request) -> Response {
+    if let Some(refusal) = authorize(&state, request.headers()) {
+        return refusal;
+    }
     let Some(upstream) = state.config.agent_upstream.as_deref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

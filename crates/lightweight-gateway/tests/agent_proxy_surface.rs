@@ -14,6 +14,7 @@ use axum::Router;
 use axum::extract::Request;
 use axum::routing::{get, post};
 use lightweight_backend_mock::MockBackend;
+use lightweight_gateway::auth::AuthPolicy;
 use lightweight_gateway::{GatewayConfig, GatewayState};
 use serde_json::{Value, json};
 
@@ -65,10 +66,15 @@ async fn start_agent_server() -> String {
 
 /// A gateway that forwards `/api/lightagent` to `upstream`, on its own port.
 async fn start_gateway(upstream: Option<String>) -> String {
+    start_gateway_with_auth(upstream, AuthPolicy::Disabled).await
+}
+
+async fn start_gateway_with_auth(upstream: Option<String>, auth: AuthPolicy) -> String {
     let state = Arc::new(GatewayState::new(
         Arc::new(MockBackend::default()),
         lightweight_gateway::catalog::shared(None),
         GatewayConfig {
+            auth,
             agent_upstream: upstream,
             ..GatewayConfig::default()
         },
@@ -82,6 +88,31 @@ async fn start_gateway(upstream: Option<String>) -> String {
         let _ = axum::serve(listener, lightweight_gateway::service(app)).await;
     });
     format!("http://127.0.0.1:{port}")
+}
+
+#[tokio::test]
+async fn a_keyed_gateway_protects_the_proxied_agent_api() {
+    ensure_provider();
+    let upstream = start_agent_server().await;
+    let gateway = start_gateway_with_auth(
+        Some(upstream),
+        AuthPolicy::with_static_key("agent-test-key".into()),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{gateway}/api/lightagent/v1/tools"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    let response = client
+        .get(format!("{gateway}/api/lightagent/v1/tools"))
+        .bearer_auth("agent-test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 }
 
 #[tokio::test]

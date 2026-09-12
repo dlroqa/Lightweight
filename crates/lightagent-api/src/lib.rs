@@ -27,9 +27,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
-use lightagent_core::AgentEvent;
+use lightagent_core::{AgentEvent, ApprovalPolicy, ConfigStore, ProfileId, ProfileStore};
 use lightagent_store::{Session, SessionId, SessionStore, StoredMessage, model_history};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -49,6 +49,9 @@ pub struct AppState {
     pub session_profile: String,
     /// Effective model context when configured; used to bound saved history.
     pub context_limit: usize,
+    /// The CLI's own config store. Present in the real server and optional in
+    /// embedders/tests that only expose run APIs.
+    pub config_store: Option<ConfigStore>,
     /// Prevent overlapping runs from overwriting one session transcript.
     pub busy_sessions: Arc<Mutex<HashSet<SessionId>>>,
     /// When set, the panel is served from this directory (same-origin), so the
@@ -61,6 +64,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/lightagent/v1/tools", get(list_tools))
+        .route(
+            "/api/lightagent/v1/settings",
+            get(get_settings).put(save_settings),
+        )
         .route("/api/lightagent/v1/runs", post(create_run))
         .route("/api/lightagent/v1/runs/{id}", get(get_run))
         .route("/api/lightagent/v1/runs/{id}/events", get(run_events))
@@ -87,6 +94,13 @@ pub fn router(state: AppState) -> Router {
 /// is answered with `index.html`, so a client-side route deep-links, while a
 /// missing asset is a 404 rather than the document.
 async fn serve_static(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    if uri.path() == "/api/lightagent" || uri.path().starts_with("/api/lightagent/") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown Lightagent API endpoint" })),
+        )
+            .into_response();
+    }
     let Some(root) = &state.web_root else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -176,6 +190,122 @@ async fn list_tools(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     Json(json!({ "tools": tools })).into_response()
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct UiSettings {
+    max_turns: u32,
+    max_tool_calls: u32,
+    wall_clock_secs: Option<u64>,
+    approval_policy: ApprovalPolicy,
+    web_enabled: bool,
+    filesystem_tools_enabled: bool,
+    terminal_enabled: bool,
+    memory_enabled: bool,
+    show_reasoning_in_tui: bool,
+}
+
+fn ui_settings(config: &lightagent_core::Config) -> UiSettings {
+    UiSettings {
+        max_turns: config.agent.max_turns,
+        max_tool_calls: config.agent.max_tool_calls,
+        wall_clock_secs: config.agent.wall_clock_secs,
+        approval_policy: config.security.approval_policy,
+        web_enabled: config.web.enabled,
+        filesystem_tools_enabled: config.tools.enabled,
+        terminal_enabled: config.tools.allow_terminal,
+        memory_enabled: config.memory.auto_capture,
+        show_reasoning_in_tui: config.tui.show_reasoning,
+    }
+}
+
+fn active_profile(
+    store: &ConfigStore,
+    name: &str,
+) -> Result<Option<(ProfileStore, lightagent_core::AgentProfile)>, String> {
+    let root = store
+        .path()
+        .parent()
+        .ok_or("Lightagent config has no parent directory")?;
+    let profiles = ProfileStore::new(root);
+    let id = ProfileId::new(name).map_err(|error| error.to_string())?;
+    match profiles.load(&id) {
+        Ok(profile) => Ok(Some((profiles, profile))),
+        Err(lightagent_core::ProfileError::NotFound { .. }) if name == "default" => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn get_settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = deny(&state, &headers, Scope::Admin) {
+        return rejection;
+    }
+    let Some(store) = &state.config_store else {
+        return internal("Lightagent settings are unavailable in this embedding");
+    };
+    let config = match store.load() {
+        Ok(config) => config,
+        Err(error) => return internal(&error.to_string()),
+    };
+    let mut settings = ui_settings(&config);
+    match active_profile(store, &state.session_profile) {
+        Ok(Some((_, profile))) => {
+            settings.approval_policy = profile.approval_policy;
+            let limits = config.agent.apply_to(profile.limits);
+            settings.max_turns = limits.max_turns;
+            settings.max_tool_calls = limits.max_tool_calls;
+            settings.wall_clock_secs = limits.wall_clock_secs;
+        }
+        Ok(None) => {}
+        Err(error) => return internal(&error),
+    }
+    Json(settings).into_response()
+}
+
+async fn save_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(settings): Json<UiSettings>,
+) -> Response {
+    if let Some(rejection) = deny(&state, &headers, Scope::Admin) {
+        return rejection;
+    }
+    let Some(store) = &state.config_store else {
+        return internal("Lightagent settings are unavailable in this embedding");
+    };
+    let mut config = match store.load() {
+        Ok(config) => config,
+        Err(error) => return internal(&error.to_string()),
+    };
+    config.agent.max_turns = settings.max_turns;
+    config.agent.max_tool_calls = settings.max_tool_calls;
+    config.agent.wall_clock_secs = settings.wall_clock_secs;
+    let profile = match active_profile(store, &state.session_profile) {
+        Ok(profile) => profile,
+        Err(error) => return internal(&error),
+    };
+    config.security.approval_policy = settings.approval_policy;
+    config.web.enabled = settings.web_enabled;
+    config.tools.enabled = settings.filesystem_tools_enabled;
+    config.tools.allow_terminal = settings.terminal_enabled;
+    config.memory.auto_capture = settings.memory_enabled;
+    config.tui.show_reasoning = settings.show_reasoning_in_tui;
+    if let Err(error) = config.validate() {
+        return bad_request(&error.to_string());
+    }
+    if let Some((profiles, mut profile)) = profile {
+        profile.approval_policy = settings.approval_policy;
+        profile.limits.max_turns = settings.max_turns;
+        profile.limits.max_tool_calls = settings.max_tool_calls;
+        profile.limits.wall_clock_secs = settings.wall_clock_secs;
+        if let Err(error) = profiles.save(&profile) {
+            return internal(&error.to_string());
+        }
+    }
+    match store.save(&config) {
+        Ok(()) => Json(ui_settings(&config)).into_response(),
+        Err(error) => internal(&error.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 struct CreateRunBody {
     message: String,
@@ -226,6 +356,9 @@ async fn create_run(
         }
         history = model_history(&session, &body.message, state.context_limit);
         profile = Some(session.profile.clone());
+        if session.messages.is_empty() && session.title == "agent session" {
+            session.title = session_title(&body.message);
+        }
         session.push_message(StoredMessage::new("user", &body.message));
         if let Err(error) = state.sessions.save(&session) {
             busy.remove(&id);
@@ -273,6 +406,20 @@ async fn create_run(
         Json(json!({ "id": run.id(), "status": run.status().await, "session_id": session_id })),
     )
         .into_response()
+}
+
+fn session_title(message: &str) -> String {
+    const LIMIT: usize = 60;
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let title: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        format!("{title}…")
+    } else if title.is_empty() {
+        "agent session".to_owned()
+    } else {
+        title
+    }
 }
 
 async fn get_run(
@@ -406,7 +553,17 @@ async fn delete_session(
                 .into_response();
         }
     };
-    match state.sessions.delete(&id) {
+    let busy = state.busy_sessions.lock().await;
+    if busy.contains(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "session has an active run" })),
+        )
+            .into_response();
+    }
+    let result = state.sessions.delete(&id);
+    drop(busy);
+    match result {
         Ok(removed) => Json(json!({ "deleted": removed })).into_response(),
         Err(error) => internal(&error.to_string()),
     }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { api } from "../api/client";
+import { agentApi, type LightagentSettings as LightagentSettingsValue } from "../api/agent";
 import { bytes } from "../api/format";
 import { wasRead } from "../api/types";
 import { Card } from "../components/Card";
@@ -63,6 +64,7 @@ export function SettingsScreen() {
           className="grid"
           style={{ gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))" }}
         >
+          <LightagentSettings />
           <Card title="Appearance">
             <div className="field" style={{ marginBottom: 16 }}>
               <label className="field__label" htmlFor="theme">
@@ -199,6 +201,143 @@ export function SettingsScreen() {
   );
 }
 
+function LightagentSettings() {
+  const settings = usePoll(agentApi.settings, 0);
+  const [current, setCurrent] = useState<LightagentSettingsValue | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  useEffect(() => {
+    if (settings.data) setCurrent(settings.data);
+  }, [settings.data]);
+
+  async function persist(patch: Partial<LightagentSettingsValue>) {
+    if (!current || saving) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      const saved = await agentApi.saveSettings({ ...current, ...patch });
+      setCurrent(saved);
+      settings.refresh();
+      setMessage("Saved. New runs use these settings.");
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const value = current ?? settings.data;
+  return (
+    <Card title="Lightagent">
+      <p className="card__note">
+        Controls the Lightagent CLI runtime used by Agent chat. Changes apply to
+        the next run and are shared with the terminal UI.
+      </p>
+      {settings.error && !value ? (
+        <div className="notice notice--warn">
+          <div>Could not load Lightagent settings: {settings.error.message}</div>
+          <button type="button" className="btn" style={{ marginTop: 8 }}
+            onClick={settings.refresh}>Retry</button>
+        </div>
+      ) : (
+        <>
+          <div className="field" style={{ marginBottom: 12 }}>
+            <label className="field__label" htmlFor="agent-approval">Approval policy</label>
+            <select id="agent-approval" className="select"
+              value={value?.approval_policy ?? "balanced"} disabled={!value || saving}
+              onChange={(event) => void persist({
+                approval_policy: event.target.value as LightagentSettingsValue["approval_policy"],
+              })}>
+              <option value="permissive">Permissive</option>
+              <option value="balanced">Balanced</option>
+              <option value="strict">Strict</option>
+            </select>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <NumberSetting label="Maximum turns" value={value?.max_turns}
+              disabled={!value || saving} onSave={(max_turns) => persist({ max_turns })} />
+            <NumberSetting label="Maximum tool calls" value={value?.max_tool_calls}
+              disabled={!value || saving}
+              onSave={(max_tool_calls) => persist({ max_tool_calls })} />
+          </div>
+          <OptionalNumberSetting label="Run time limit (seconds)"
+            value={value?.wall_clock_secs} disabled={!value || saving}
+            onSave={(wall_clock_secs) => persist({ wall_clock_secs })} />
+          <ToggleRow label="Web tools" hint="Allow configured web search and fetch tools."
+            checked={value?.web_enabled ?? false} disabled={!value || saving}
+            onChange={(web_enabled) => void persist({ web_enabled })} />
+          <ToggleRow label="Filesystem tools" hint="Allow confined file reads and writes."
+            checked={value?.filesystem_tools_enabled ?? false} disabled={!value || saving}
+            onChange={(filesystem_tools_enabled) => void persist({
+              filesystem_tools_enabled,
+              ...(!filesystem_tools_enabled ? { terminal_enabled: false } : {}),
+            })} />
+          <ToggleRow label="Terminal tool" hint="Allow approval-gated commands in the configured workspace."
+            checked={value?.terminal_enabled ?? false}
+            disabled={!value || saving || !value?.filesystem_tools_enabled}
+            onChange={(terminal_enabled) => void persist({ terminal_enabled })} />
+          <ToggleRow label="Durable memory" hint="Capture clear durable facts for future sessions."
+            checked={value?.memory_enabled ?? false} disabled={!value || saving}
+            onChange={(memory_enabled) => void persist({ memory_enabled })} />
+          <ToggleRow label="Show reasoning in terminal" hint="Shared presentation setting for the Lightagent TUI."
+            checked={value?.show_reasoning_in_tui ?? true} disabled={!value || saving}
+            onChange={(show_reasoning_in_tui) => void persist({ show_reasoning_in_tui })} />
+        </>
+      )}
+      {message && <div className="card__note" style={{ marginTop: 10 }}>{message}</div>}
+    </Card>
+  );
+}
+
+function NumberSetting({ label, value, disabled, onSave }: {
+  label: string;
+  value: number | undefined;
+  disabled: boolean;
+  onSave: (value: number) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState("");
+  useEffect(() => setDraft(value === undefined ? "" : String(value)), [value]);
+  return (
+    <div className="field">
+      <label className="field__label">{label}</label>
+      <input className="input tnum" type="number" min={1}
+        value={draft} disabled={disabled}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          const next = Number(draft);
+          if (Number.isInteger(next) && next > 0 && next !== value) void onSave(next);
+          else setDraft(value === undefined ? "" : String(value));
+        }} />
+    </div>
+  );
+}
+
+function OptionalNumberSetting({ label, value, disabled, onSave }: {
+  label: string;
+  value: number | null | undefined;
+  disabled: boolean;
+  onSave: (value: number | null) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState("");
+  useEffect(() => setDraft(value == null ? "" : String(value)), [value]);
+  return (
+    <div className="field" style={{ marginTop: 10 }}>
+      <label className="field__label">{label}</label>
+      <input className="input tnum" type="number" min={1}
+        placeholder="No limit" value={draft} disabled={disabled}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          const next = draft.trim() ? Number(draft) : null;
+          if ((next === null || Number.isInteger(next) && next > 0) && next !== value) {
+            void onSave(next);
+          } else {
+            setDraft(value == null ? "" : String(value));
+          }
+        }} />
+    </div>
+  );
+}
+
 function ToggleRow({
   label,
   hint,
@@ -259,7 +398,7 @@ function AgentServerSettings() {
   return (
     <Card title="Lightagent server">
       <p className="card__note">
-        Start the agent server to enable Agent, Agent Tools, and Chat.
+        Start the agent server to enable Agent chat and Agent Tools.
         A server started here runs until the gateway closes.
       </p>
       <Row label="Status">

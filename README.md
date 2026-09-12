@@ -142,7 +142,10 @@ follow each response in normal terminal flow and scroll naturally as the
 terminal fills. Its status row shows command tips plus the active model, context
 usage, output tokens, token rate, and elapsed time after each response; the
 status background and separator end with that elapsed-time value rather than
-filling unused terminal columns. A
+filling unused terminal columns. While Lightagent is working, type another
+message and press Enter to steer: the message is queued without interrupting
+the active run, then handled as the next turn. Multiple steering messages keep
+their arrival order. A
 submitted user message receives a compact lower border matching the exact
 display width of that prompt, so it remains easy to find in the transcript.
 Completed agent answers use an explicitly labelled `Lightagent` box sized to
@@ -327,6 +330,16 @@ returns a JSON setup error; an unreachable agent returns a connection error.
 After correcting the connection, click **Retry** in Agent Tools. If the panel
 reports a non-JSON response, check that the running gateway is a current build
 with the agent proxy enabled.
+
+The **Agent** screen has its own saved-session list: search, resume, start a
+fresh session, or delete one. Each session keeps its messages, runs and tool
+history; its first message becomes the list title. While a run is active,
+submitting another message queues a visible steer, handled in arrival order
+after the active turn ends. If the local agent server is
+stopped, Agent offers **Start agent server and retry**. The separate
+**Settings → Lightagent** card edits the same configuration used by the CLI and
+TUI, including approval policy, run limits, web/file/terminal tools, durable
+memory and terminal reasoning display. Changes apply to new runs.
 
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, and keeps serving

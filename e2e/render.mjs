@@ -31,6 +31,7 @@ const SETTLE_MS = Number(process.env.RENDER_SETTLE_MS ?? 15000);
 const FALLBACK_SIGNS = [
   "Could not reach the agent API",
   "is not valid JSON",
+  "does not expose the agent API",
   "<!doctype",
   "<!DOCTYPE",
 ];
@@ -41,7 +42,7 @@ const FALLBACK_SIGNS = [
 // the fallback signs above.
 const ROUTES = [
   { name: "dashboard", hash: "#/" },
-  { name: "agent", hash: "#/agent", agentBacked: true, mustContain: "No run yet" },
+  { name: "agent", hash: "#/agent", agentBacked: true, mustContain: "Start an agent session" },
   {
     name: "agent-tools",
     hash: "#/agent/tools",
@@ -83,7 +84,7 @@ async function checkToolsRecovery(context) {
       status: 200,
       contentType: "text/html",
       body: "<!doctype html><title>Panel</title>",
-      expected: "--agent-upstream",
+      expected: "current Lightweight build",
     },
     {
       status: 502,
@@ -126,6 +127,7 @@ async function checkToolUsingRun(context) {
   page.on("pageerror", (error) => errors.push(String(error)));
   try {
     await page.goto(`${BASE}/#/agent`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "New session" }).first().click();
     await page.getByLabel("Message").fill("What time is it in UTC?");
     await page.getByRole("button", { name: "Send", exact: true }).click();
 
@@ -139,7 +141,7 @@ async function checkToolUsingRun(context) {
     if (!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(text)) {
       throw new Error("datetime.now result was not rendered");
     }
-    if (!text.includes("Tool calls") || !text.includes("ok")) {
+    if (!text.includes("Current tool calls") || !text.includes("ok")) {
       throw new Error("the completed tool card was not rendered");
     }
     if (FALLBACK_SIGNS.some((sign) => text.includes(sign))) {
@@ -148,6 +150,13 @@ async function checkToolUsingRun(context) {
     if (errors.length) throw new Error(`uncaught page error — ${errors[0]}`);
 
     await page.screenshot({ path: `${OUT_DIR}/agent-run.png`, fullPage: true });
+
+    // A browser refresh must restore the selected persisted session, not just
+    // the last live EventSource's transient state.
+    await page.reload();
+    await page.getByText("The local tool completed successfully.", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Delete What time is it in UTC?" }).click();
+    await page.getByText("Start an agent session", { exact: true }).waitFor();
 
     if (MODEL_GATEWAY_BASE) {
       const response = await fetch(`${MODEL_GATEWAY_BASE}/__test__/last-request`);

@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.18"
+version = "0.3.19"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -74,11 +74,12 @@ directories = "6.0.0"
 # script, but that script only re-invokes `rustc` to probe for cfgs and declares
 # no build-dependencies of its own - no cc, no cmake, no libclang. On Linux the
 # `linux_raw` backend issues syscalls directly, so libc is not pulled in either.
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "termios"] }
 
 # --- command line ---
 clap = { version = "4.6.6", features = ["derive"] }
 dialoguer = { version = "0.12.0", default-features = false }
+crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"] }
 
 # --- async runtime and process supervision ---
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "net", "time", "io-util", "sync", "signal", "fs"] }

@@ -238,6 +238,7 @@ pub async fn run(
         sessions,
         session_profile: active.as_str().to_owned(),
         context_limit,
+        config_store: Some(ConfigStore::at(&paths)),
         busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: web_root.clone(),
     };

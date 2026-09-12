@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-09-12
+
+A patch release for the Lightagent panel and interactive terminal. The panel's
+Agent screen now works with persisted conversations directly: past agent
+sessions can be searched, resumed, and deleted, each with its saved transcript
+and tool history, and a message sent while a run is in flight queues as a
+visible FIFO steer rather than being dropped. When the local agent server is
+stopped, the screen can start it and retry, and a dedicated Lightagent settings
+panel edits the CLI/TUI configuration used by new runs. In the terminal, a
+prompt submitted while Lightagent is working no longer interrupts it: the
+message is queued behind the active run, shown with its place in line, and
+becomes an ordinary turn once the current work finishes. Existing runs and
+settings keep working unchanged.
+
+### Added
+
+- **Agent sessions in the panel.** Search, resume and delete persisted agent
+  conversations, with saved transcripts and tool history. Mid-run messages
+  queue as visible FIFO steers. The Agent screen can start a stopped local
+  agent server and retry; dedicated Lightagent settings edit the CLI/TUI
+  configuration used by new runs.
+
+- **Interactive turns can be steered without interruption.** Type and submit a
+  message while Lightagent is working to queue it behind the active run.
+  Queued messages are visibly numbered and become ordinary turns in arrival
+  order after the current work finishes; the prompt tip advertises `↵ steer`.
+
 ## [0.3.18] - 2026-09-12
 
 A patch release for the Lightagent interactive terminal. Tools can now be added

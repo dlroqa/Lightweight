@@ -39,8 +39,10 @@ const TERMINAL = new Set(["run.completed", "run.cancelled", "run.failed"]);
 export function useRunEvents(runId: string | null): { events: RunEvent[]; done: boolean } {
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [done, setDone] = useState(false);
+  const [observedId, setObservedId] = useState<string | null>(null);
 
   useEffect(() => {
+    setObservedId(runId);
     if (!runId) {
       setEvents([]);
       setDone(false);
@@ -85,5 +87,7 @@ export function useRunEvents(runId: string | null): { events: RunEvent[]; done: 
     };
   }, [runId]);
 
-  return { events, done };
+  // A new id can render before this effect has connected its EventSource.
+  // Never expose the previous run's terminal state or events in that gap.
+  return observedId === runId ? { events, done } : { events: [], done: false };
 }

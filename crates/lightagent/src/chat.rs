@@ -5,13 +5,16 @@
 //! returned, tool activity is shown on stderr, and a tool call that needs
 //! approval pauses for a numbered decision at the prompt before the run resumes.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dialoguer::console::{Key, Term, measure_text_width};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use dialoguer::console::measure_text_width;
 use lightagent_core::provider::ProviderMessage;
 use lightagent_core::{
     AgentError, AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config,
@@ -547,17 +550,27 @@ pub async fn run(
     // away. It is kept whole — the conversation, including the tool results
     // the model has not read yet — so `continue` picks it up where it stopped.
     let mut paused: Option<PausedRun> = None;
+    let mut steering = VecDeque::new();
     loop {
-        prompt.render(&active_model, context_limit, &last_turn);
-        let Some(line) = prompt.read_line(&stdin)? else {
-            break; // end of input
+        let (line, queued) = if let Some(line) = steering.pop_front() {
+            (line, true)
+        } else {
+            prompt.render(&active_model, context_limit, &last_turn);
+            let Some(line) = prompt.read_line(&stdin)? else {
+                break; // end of input
+            };
+            (line, false)
         };
         let mut line = line.trim_end().to_string();
         if line.trim().is_empty() {
-            prompt.dismiss_empty();
+            if !queued {
+                prompt.dismiss_empty();
+            }
             continue;
         }
-        prompt.submit(&line);
+        if !queued {
+            prompt.submit(&line);
+        }
         if paused.is_some() && is_continue_request(&line) {
             let Some(PausedRun {
                 suspended,
@@ -578,12 +591,16 @@ pub async fn run(
                 &mut stream,
                 &mut renderer,
                 &mut active,
+                &mut prompt,
+                &mut steering,
             )
             .await?;
             let driven = drive(
                 &agent,
                 outcome,
                 &stdin,
+                &mut prompt,
+                &mut steering,
                 &mut stream,
                 &mut renderer,
                 &mut active,
@@ -774,12 +791,16 @@ pub async fn run(
             &mut stream,
             &mut renderer,
             &mut active,
+            &mut prompt,
+            &mut steering,
         )
         .await?;
         let driven = drive(
             &agent,
             outcome,
             &stdin,
+            &mut prompt,
+            &mut steering,
             &mut stream,
             &mut renderer,
             &mut active,
@@ -1001,51 +1022,79 @@ fn status_edge(status_width: usize, terminal_width: usize) -> String {
 /// content before it, so the startup prompt is adjacent to the dashboard and
 /// later prompts naturally move down as responses populate the screen.
 struct TerminalPrompt {
-    term: Term,
     interactive: bool,
+    raw_mode: bool,
+    line: Vec<char>,
+    cursor: usize,
+}
+
+fn enable_prompt_raw_mode() -> bool {
+    if enable_raw_mode().is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use rustix::termios::{OptionalActions, OutputModes, tcgetattr, tcsetattr};
+
+        let stdin = std::io::stdin();
+        let Ok(mut state) = tcgetattr(&stdin) else {
+            let _ = disable_raw_mode();
+            return false;
+        };
+        state
+            .output_modes
+            .insert(OutputModes::OPOST | OutputModes::ONLCR);
+        if tcsetattr(&stdin, OptionalActions::Now, &state).is_err() {
+            let _ = disable_raw_mode();
+            return false;
+        }
+    }
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InputAction {
+    Pending,
+    Submitted(String),
+    End,
 }
 
 impl TerminalPrompt {
     fn new() -> Self {
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let raw_mode = interactive && enable_prompt_raw_mode();
         Self {
-            term: Term::stdout(),
-            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            interactive: interactive && raw_mode,
+            raw_mode,
+            line: Vec::new(),
+            cursor: 0,
         }
     }
 
     fn render(&mut self, model: &str, context_limit: Option<u32>, status: &TurnStatus) {
         let status_width = print_status_bar(model, context_limit, status);
         print_prompt(status_width);
+        if self.has_input() {
+            self.draw_input("you › ");
+        }
         let _ = std::io::stdout().flush();
+    }
+
+    fn has_input(&self) -> bool {
+        !self.line.is_empty()
     }
 
     fn read_line(&mut self, stdin: &std::io::Stdin) -> Result<Option<String>, String> {
         if self.interactive {
-            let mut line = Vec::new();
-            let mut cursor = 0;
             loop {
-                match self.term.read_key().map_err(|error| error.to_string())? {
-                    Key::Enter => return Ok(Some(line.into_iter().collect())),
-                    Key::CtrlC => return Ok(None),
-                    Key::Char(ch) if ch == '\u{4}' && line.is_empty() => return Ok(None),
-                    Key::Char(ch) if !ch.is_control() => {
-                        line.insert(cursor, ch);
-                        cursor += 1;
-                    }
-                    Key::Backspace if cursor > 0 => {
-                        cursor -= 1;
-                        line.remove(cursor);
-                    }
-                    Key::Del if cursor < line.len() => {
-                        line.remove(cursor);
-                    }
-                    Key::ArrowLeft if cursor > 0 => cursor -= 1,
-                    Key::ArrowRight if cursor < line.len() => cursor += 1,
-                    Key::Home => cursor = 0,
-                    Key::End => cursor = line.len(),
-                    _ => continue,
+                let Event::Key(key) = event::read().map_err(|error| error.to_string())? else {
+                    continue;
+                };
+                match self.edit(key, "you › ") {
+                    InputAction::Pending => {}
+                    InputAction::Submitted(line) => return Ok(Some(line)),
+                    InputAction::End => return Ok(None),
                 }
-                self.draw_input(&line, cursor);
             }
         }
         let mut line = String::new();
@@ -1054,6 +1103,122 @@ impl TerminalPrompt {
             .read_line(&mut line)
             .map_err(|error| error.to_string())?;
         Ok((read != 0).then_some(line))
+    }
+
+    fn poll_key(&self) -> Result<Option<KeyEvent>, String> {
+        if !self.interactive || !event::poll(Duration::ZERO).map_err(|error| error.to_string())? {
+            return Ok(None);
+        }
+        loop {
+            match event::read().map_err(|error| error.to_string())? {
+                Event::Key(key) => return Ok(Some(key)),
+                _ if !event::poll(Duration::ZERO).map_err(|error| error.to_string())? => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn edit(&mut self, key: KeyEvent, prefix: &str) -> InputAction {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return InputAction::Pending;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('c') => InputAction::End,
+                KeyCode::Char('d') if self.line.is_empty() => InputAction::End,
+                _ => InputAction::Pending,
+            };
+        }
+        match key.code {
+            KeyCode::Enter => {
+                self.cursor = 0;
+                InputAction::Submitted(self.line.drain(..).collect())
+            }
+            KeyCode::Char(ch) if !ch.is_control() => {
+                self.line.insert(self.cursor, ch);
+                self.cursor += 1;
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                self.line.remove(self.cursor);
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::Delete if self.cursor < self.line.len() => {
+                self.line.remove(self.cursor);
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::Left if self.cursor > 0 => {
+                self.cursor -= 1;
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::Right if self.cursor < self.line.len() => {
+                self.cursor += 1;
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            KeyCode::End => {
+                self.cursor = self.line.len();
+                self.draw_input(prefix);
+                InputAction::Pending
+            }
+            _ => InputAction::Pending,
+        }
+    }
+
+    fn read_response(&self, stdin: &std::io::Stdin) -> Result<Option<String>, String> {
+        if !self.interactive {
+            let mut answer = String::new();
+            let read = stdin
+                .lock()
+                .read_line(&mut answer)
+                .map_err(|error| error.to_string())?;
+            return Ok((read != 0).then_some(answer));
+        }
+        let mut answer = Vec::new();
+        loop {
+            let Event::Key(key) = event::read().map_err(|error| error.to_string())? else {
+                continue;
+            };
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+                    eprintln!();
+                    return Ok(None);
+                }
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    eprintln!();
+                    return Ok(Some(answer.into_iter().collect()));
+                }
+                KeyCode::Char(ch) if !ch.is_control() => {
+                    answer.push(ch);
+                    eprint!("{ch}");
+                    let _ = std::io::stderr().flush();
+                }
+                KeyCode::Backspace if !answer.is_empty() => {
+                    answer.pop();
+                    eprint!("\x08 \x08");
+                    let _ = std::io::stderr().flush();
+                }
+                _ => {}
+            }
+        }
     }
 
     fn submit(&self, line: &str) {
@@ -1074,20 +1239,60 @@ impl TerminalPrompt {
         self.submit("");
     }
 
-    fn draw_input(&self, line: &[char], cursor: usize) {
-        const PREFIX: &str = "you › ";
+    fn show_queued(&self, line: &str, position: usize) {
+        let prefix = format!("you (queued {position}) › ");
+        if self.interactive {
+            print!("\r\x1b[2K");
+            if colour_terminal() {
+                println!(
+                    "\x1b[1;37myou\x1b[0m \x1b[2;33m(queued {position})\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {line}"
+                );
+            } else {
+                println!("{prefix}{line}");
+            }
+        } else {
+            println!("{prefix}{line}");
+        }
+        finish_prompt_with_prefix(&prefix, line);
+    }
+
+    fn clear_input_display(&self) {
+        if self.interactive && self.has_input() {
+            print!("\r\x1b[2K");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    fn discard_input(&mut self) {
+        self.line.clear();
+        self.cursor = 0;
+    }
+
+    fn draw_input(&self, prefix: &str) {
+        if !self.interactive {
+            return;
+        }
         let width = crate::banner::terminal_width();
-        let prefix_width = measure_text_width(PREFIX);
+        let prefix_width = measure_text_width(prefix);
         let available = width.saturating_sub(prefix_width + 1).max(1);
-        let (visible, cursor_offset) = input_window(line, cursor, available);
+        let (visible, cursor_offset) = input_window(&self.line, self.cursor, available);
         print!("\r\x1b[2K");
         if colour_terminal() {
-            print!("\x1b[1;37myou\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {visible}");
+            let label = prefix.trim_end_matches("› ");
+            print!("\x1b[1;37m{label}\x1b[0m \x1b[38;2;238;139;79m›\x1b[0m {visible}");
         } else {
-            print!("{PREFIX}{visible}");
+            print!("{prefix}{visible}");
         }
         print!("\r\x1b[{}C", prefix_width + cursor_offset);
         let _ = std::io::stdout().flush();
+    }
+}
+
+impl Drop for TerminalPrompt {
+    fn drop(&mut self) {
+        if self.raw_mode {
+            let _ = disable_raw_mode();
+        }
     }
 }
 
@@ -1113,10 +1318,7 @@ fn input_window(line: &[char], cursor: usize, available: usize) -> (String, usiz
 fn print_prompt(status_width: usize) {
     let width = crate::banner::terminal_width();
     let edge = status_edge(status_width, width);
-    let tips = fit_line(
-        "  /help · /tools · /skills · /new · /continue · /stop · /exit · Ctrl+C exit",
-        width,
-    );
+    let tips = prompt_tips(width);
     if colour_terminal() {
         println!("\x1b[38;2;238;139;79m{edge}\x1b[0m");
         println!("\x1b[2;3;33m{tips}\x1b[0m");
@@ -1126,6 +1328,13 @@ fn print_prompt(status_width: usize) {
         println!("{tips}");
         print!("you › ");
     }
+}
+
+fn prompt_tips(width: usize) -> String {
+    fit_line(
+        "  ↵ steer · /help · /tools · /skills · /new · /continue · /stop · Ctrl+C exit",
+        width,
+    )
 }
 
 fn finish_prompt(line: &str) {
@@ -1138,11 +1347,23 @@ fn finish_prompt(line: &str) {
 }
 
 fn submitted_prompt_edge(line: &str, terminal_width: usize) -> String {
-    const PREFIX: &str = "you › ";
-    let width = (measure_text_width(PREFIX) + measure_text_width(line))
-        .max(measure_text_width(PREFIX))
+    submitted_prompt_edge_with_prefix("you › ", line, terminal_width)
+}
+
+fn submitted_prompt_edge_with_prefix(prefix: &str, line: &str, terminal_width: usize) -> String {
+    let width = (measure_text_width(prefix) + measure_text_width(line))
+        .max(measure_text_width(prefix))
         .min(terminal_width);
     format!("└{}", "─".repeat(width.saturating_sub(1)))
+}
+
+fn finish_prompt_with_prefix(prefix: &str, line: &str) {
+    let edge = submitted_prompt_edge_with_prefix(prefix, line, crate::banner::terminal_width());
+    if colour_terminal() {
+        println!("\x1b[38;2;238;139;79m{edge}\x1b[0m");
+    } else {
+        println!("{edge}");
+    }
 }
 
 fn print_initializing() {
@@ -1556,6 +1777,7 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
             println!(
                 "Commands: /help  /tools  /skills  /extensions  /onboard  /reload  /new  /continue  /stop  /exit"
             );
+            println!("During a run: type a message and press Enter to queue it as the next turn.");
         }
         Slash::Tools => {
             for name in tools {
@@ -1610,6 +1832,8 @@ async fn drive(
     agent: &AgentLoop<LightweightProvider, BoundedExecutor>,
     mut outcome: RunOutcome,
     stdin: &std::io::Stdin,
+    prompt: &mut TerminalPrompt,
+    steering: &mut VecDeque<String>,
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
     active: &mut Duration,
@@ -1639,17 +1863,12 @@ async fn drive(
                     "  continue? [Y]es, for another {budget} · [a]nswer now from what it has · [n]o, pause here "
                 );
                 let _ = std::io::stderr().flush();
-                let mut answer = String::new();
-                let read = stdin
-                    .lock()
-                    .read_line(&mut answer)
-                    .map_err(|error| error.to_string())?;
                 // End of input is not a yes: keep the run paused.
-                let choice = if read == 0 {
-                    OutOfTimeChoice::Pause
-                } else {
-                    parse_out_of_time_answer(&answer)
-                };
+                let choice = prompt
+                    .read_response(stdin)?
+                    .as_deref()
+                    .map(parse_out_of_time_answer)
+                    .unwrap_or(OutOfTimeChoice::Pause);
                 match choice {
                     OutOfTimeChoice::Continue(how) => {
                         outcome = wait_for_outcome(
@@ -1657,6 +1876,8 @@ async fn drive(
                             stream,
                             renderer,
                             active,
+                            prompt,
+                            steering,
                         )
                         .await?;
                     }
@@ -1673,7 +1894,7 @@ async fn drive(
                     &request.arguments_preview,
                 );
                 let _ = std::io::stderr().flush();
-                let choice = read_approval_choice(stdin)?;
+                let choice = read_approval_choice(prompt, stdin)?;
                 let decision = match choice {
                     ApprovalChoice::Grant => ApprovalDecision::grant(request.id),
                     ApprovalChoice::Deny => ApprovalDecision::deny(request.id),
@@ -1686,6 +1907,8 @@ async fn drive(
                     stream,
                     renderer,
                     active,
+                    prompt,
+                    steering,
                 )
                 .await?;
                 if choice == ApprovalChoice::Unrestricted {
@@ -1715,16 +1938,14 @@ fn parse_approval_choice(answer: &str) -> Option<ApprovalChoice> {
     }
 }
 
-fn read_approval_choice(stdin: &std::io::Stdin) -> Result<ApprovalChoice, String> {
+fn read_approval_choice(
+    prompt: &TerminalPrompt,
+    stdin: &std::io::Stdin,
+) -> Result<ApprovalChoice, String> {
     loop {
-        let mut answer = String::new();
-        let read = stdin
-            .lock()
-            .read_line(&mut answer)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
+        let Some(answer) = prompt.read_response(stdin)? else {
             return Ok(ApprovalChoice::Deny);
-        }
+        };
         if let Some(choice) = parse_approval_choice(&answer) {
             return Ok(choice);
         }
@@ -1857,12 +2078,14 @@ async fn wait_for_outcome<F>(
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
     active: &mut Duration,
+    prompt: &mut TerminalPrompt,
+    steering: &mut VecDeque<String>,
 ) -> Result<RunOutcome, String>
 where
     F: Future<Output = Result<RunOutcome, AgentError>>,
 {
     let started = Instant::now();
-    let outcome = render_segment(future, stream, renderer).await;
+    let outcome = render_segment(future, stream, renderer, prompt, steering).await;
     *active += started.elapsed();
     outcome
 }
@@ -1871,38 +2094,125 @@ async fn render_segment<F>(
     future: F,
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
+    prompt: &mut TerminalPrompt,
+    steering: &mut VecDeque<String>,
 ) -> Result<RunOutcome, String>
 where
     F: Future<Output = Result<RunOutcome, AgentError>>,
 {
     tokio::pin!(future);
     renderer.start_thinking();
+    if prompt.has_input() {
+        renderer.stop_thinking();
+        prompt.draw_input("steer › ");
+    }
     let mut animation = tokio::time::interval(Duration::from_millis(140));
     animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input = tokio::time::interval(Duration::from_millis(25));
+    input.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut deferred = Vec::new();
     loop {
         tokio::select! {
             biased;
+            _ = input.tick(), if prompt.interactive => {
+                while let Some(key) = prompt.poll_key()? {
+                    let begins_input = !prompt.has_input()
+                        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char(ch) if !ch.is_control());
+                    if begins_input {
+                        if renderer.section == ModelSection::Reasoning {
+                            renderer.finish();
+                        } else {
+                            renderer.stop_thinking();
+                        }
+                    }
+                    match prompt.edit(key, "steer › ") {
+                        InputAction::Pending => {}
+                        InputAction::Submitted(line) => {
+                            if let Some(position) = enqueue_steer(steering, line) {
+                                if let Some(line) = steering.back() {
+                                    prompt.show_queued(line, position);
+                                }
+                            } else {
+                                print!("\r\x1b[2K");
+                            }
+                            flush_deferred(renderer, &mut deferred);
+                            if renderer.section == ModelSection::None {
+                                renderer.start_thinking();
+                            }
+                        }
+                        InputAction::End => {
+                            renderer.stop_thinking();
+                            prompt.clear_input_display();
+                            prompt.discard_input();
+                            if !steering.iter().any(|line| line == "/exit") {
+                                steering.push_back("/exit".to_owned());
+                                eprintln!("(exit queued after the current response)");
+                            }
+                            flush_deferred(renderer, &mut deferred);
+                            if renderer.section == ModelSection::None {
+                                renderer.start_thinking();
+                            }
+                        }
+                    }
+                }
+            }
             event = stream.recv() => {
                 if let Some(event) = event {
-                    renderer.event(&event);
+                    if prompt.has_input() {
+                        deferred.push(event);
+                    } else {
+                        renderer.event(&event);
+                    }
                 } else {
                     let outcome = future.await.map_err(|error| error.to_string());
+                    finish_steering_input(prompt, renderer, &mut deferred);
                     renderer.stop_thinking();
                     return outcome;
                 }
             }
             outcome = &mut future => {
                 while let Ok(event) = stream.try_recv() {
-                    renderer.event(&event);
+                    if prompt.has_input() {
+                        deferred.push(event);
+                    } else {
+                        renderer.event(&event);
+                    }
                 }
+                finish_steering_input(prompt, renderer, &mut deferred);
                 renderer.stop_thinking();
                 return outcome.map_err(|error| error.to_string());
             }
-            _ = animation.tick(), if renderer.thinking_visible => {
+            _ = animation.tick(), if renderer.thinking_visible && !prompt.has_input() => {
                 renderer.tick_thinking();
             }
         }
     }
+}
+
+fn enqueue_steer(steering: &mut VecDeque<String>, line: String) -> Option<usize> {
+    let line = line.trim_end().to_owned();
+    if line.trim().is_empty() {
+        return None;
+    }
+    steering.push_back(line);
+    Some(steering.len())
+}
+
+fn flush_deferred(renderer: &mut ModelRenderer, deferred: &mut Vec<AgentEvent>) {
+    for event in deferred.drain(..) {
+        renderer.event(&event);
+    }
+}
+
+fn finish_steering_input(
+    prompt: &TerminalPrompt,
+    renderer: &mut ModelRenderer,
+    deferred: &mut Vec<AgentEvent>,
+) {
+    prompt.clear_input_display();
+    flush_deferred(renderer, deferred);
 }
 
 /// Resolve the profile to run: the named one, else the active one, else a
@@ -2106,6 +2416,55 @@ mod model_tests {
             status_width
         );
         assert_eq!(measure_text_width(&status_edge(status_width, 20)), 20);
+    }
+
+    #[test]
+    fn the_prompt_tips_keep_steering_visible() {
+        let tips = prompt_tips(80);
+        assert!(tips.contains("↵ steer"));
+        assert!(measure_text_width(&tips) <= 80);
+        assert!(prompt_tips(10).contains("steer"));
+    }
+
+    #[test]
+    fn steering_messages_stay_in_arrival_order() {
+        let mut steering = VecDeque::new();
+        assert_eq!(enqueue_steer(&mut steering, "first".into()), Some(1));
+        assert_eq!(enqueue_steer(&mut steering, "second".into()), Some(2));
+        assert_eq!(enqueue_steer(&mut steering, "  \n".into()), None);
+        assert_eq!(steering.pop_front().as_deref(), Some("first"));
+        assert_eq!(steering.pop_front().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn enter_submits_the_active_steering_line() {
+        let mut prompt = TerminalPrompt {
+            interactive: false,
+            raw_mode: false,
+            line: Vec::new(),
+            cursor: 0,
+        };
+        assert_eq!(
+            prompt.edit(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                "steer › "
+            ),
+            InputAction::Pending
+        );
+        assert_eq!(
+            prompt.edit(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                "steer › "
+            ),
+            InputAction::Submitted("a".into())
+        );
+        assert_eq!(
+            prompt.edit(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                "steer › "
+            ),
+            InputAction::End
+        );
     }
 
     #[test]

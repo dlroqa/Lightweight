@@ -9,8 +9,9 @@ use lightagent_api::{AppState, AuthConfig, Scope, router};
 use lightagent_core::permissions::ApprovalPolicy;
 use lightagent_core::provider::ProviderMessage;
 use lightagent_core::{
-    AgentEventSink, AgentLoop, ApprovalDecision, FinishReason, MockProvider, PolicyEngine,
-    ProviderEvent, RunConfig,
+    AgentEventSink, AgentLoop, AgentProfile, ApprovalDecision,
+    ApprovalPolicy as ConfigApprovalPolicy, ConfigStore, FinishReason, MockProvider, PolicyEngine,
+    ProfileId, ProfileStore, ProviderEvent, RunConfig,
 };
 use lightagent_store::SessionStore;
 use lightagent_tools::{BoundedExecutor, ToolRegistry};
@@ -129,6 +130,7 @@ fn app_state(auth: AuthConfig) -> AppState {
         sessions: SessionStore::new(dir),
         session_profile: "default".into(),
         context_limit: 4_096,
+        config_store: None,
         busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: None,
     }
@@ -375,6 +377,7 @@ async fn a_saved_session_is_reused_by_follow_up_runs_and_new_sessions_are_empty(
                 if saved.runs.len() == index + 1 {
                     assert_eq!(saved.messages.len(), (index + 1) * 2);
                     assert_eq!(saved.messages[index * 2].content, message);
+                    assert_eq!(saved.title, "hello");
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -410,9 +413,150 @@ async fn a_saved_session_is_reused_by_follow_up_runs_and_new_sessions_are_empty(
                 .messages
                 .is_empty()
         );
+
+        let (status, body) = http(
+            &addr,
+            "GET",
+            &format!("/api/lightagent/v1/sessions/{id}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["title"], "hello");
+        assert_eq!(saved["messages"].as_array().unwrap().len(), 4);
+        assert_eq!(saved["runs"].as_array().unwrap().len(), 2);
+
+        let (status, body) = http(&addr, "GET", "/api/lightagent/v1/sessions", &[], None).await;
+        assert_eq!(status, 200);
+        let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == id)
+        );
+
+        let (status, body) = http(
+            &addr,
+            "DELETE",
+            &format!("/api/lightagent/v1/sessions/{id}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["deleted"],
+            true
+        );
+        let (status, _) = http(
+            &addr,
+            "GET",
+            &format!("/api/lightagent/v1/sessions/{id}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, 404);
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn ui_settings_update_the_cli_config_and_active_profile() {
+    let root = std::env::temp_dir().join(format!(
+        "lightagent-ui-settings-{}",
+        lightagent_core::RunId::new().as_str()
+    ));
+    let config_store = ConfigStore::new(root.join("config.json"));
+    let profiles = ProfileStore::new(&root);
+    let profile_id = ProfileId::new("default").unwrap();
+    let profile = AgentProfile::new(profile_id.clone(), "Default", "Be helpful.", "default");
+    profiles.save(&profile).unwrap();
+    config_store.save(&Default::default()).unwrap();
+
+    let mut state = app_state(AuthConfig::open());
+    state.config_store = Some(config_store.clone());
+    let addr = spawn_server(state).await;
+    let (status, body) = http(&addr, "GET", "/api/lightagent/v1/settings", &[], None).await;
+    assert_eq!(status, 200, "{body}");
+    let mut settings: serde_json::Value = serde_json::from_str(&body).unwrap();
+    settings["approval_policy"] = "strict".into();
+    settings["max_turns"] = 12.into();
+    settings["max_tool_calls"] = 7.into();
+    settings["web_enabled"] = true.into();
+    settings["filesystem_tools_enabled"] = true.into();
+    settings["terminal_enabled"] = true.into();
+    settings["memory_enabled"] = false.into();
+    let payload = settings.to_string();
+    let (status, body) = http(
+        &addr,
+        "PUT",
+        "/api/lightagent/v1/settings",
+        &[],
+        Some(&payload),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let loaded = config_store.load().unwrap();
+    assert_eq!(
+        loaded.security.approval_policy,
+        ConfigApprovalPolicy::Strict
+    );
+    assert_eq!(loaded.agent.max_turns, 12);
+    assert!(loaded.web.enabled);
+    assert!(loaded.tools.enabled && loaded.tools.allow_terminal);
+    assert!(!loaded.memory.auto_capture);
+    let profile = profiles.load(&profile_id).unwrap();
+    assert_eq!(profile.approval_policy, ConfigApprovalPolicy::Strict);
+    assert_eq!(profile.limits.max_turns, 12);
+    assert_eq!(profile.limits.max_tool_calls, 7);
+
+    settings["max_turns"] = 0.into();
+    let (status, _) = http(
+        &addr,
+        "PUT",
+        "/api/lightagent/v1/settings",
+        &[],
+        Some(&settings.to_string()),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(config_store.load().unwrap().agent.max_turns, 12);
+    assert_eq!(profiles.load(&profile_id).unwrap().limits.max_turns, 12);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_busy_session_is_refused_until_its_run_finishes() {
+    let state = app_state(AuthConfig::open());
+    let session = lightagent_store::Session::new("default", "Busy");
+    state.sessions.save(&session).unwrap();
+    state.busy_sessions.lock().await.insert(session.id.clone());
+    let addr = spawn_server(state).await;
+    let (status, body) = http(
+        &addr,
+        "DELETE",
+        &format!("/api/lightagent/v1/sessions/{}", session.id.as_str()),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert!(body.contains("active run"));
+}
+
+#[tokio::test]
+async fn unknown_agent_api_paths_return_json_not_the_panel_document() {
+    let addr = spawn_server(app_state(AuthConfig::open())).await;
+    let (status, body) = http(&addr, "GET", "/api/lightagent/v1/not-a-route", &[], None).await;
+    assert_eq!(status, 404);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "unknown Lightagent API endpoint");
 }
 
 #[tokio::test]
