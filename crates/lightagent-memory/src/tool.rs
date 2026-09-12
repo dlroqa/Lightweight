@@ -12,11 +12,13 @@
 //! approval-gated, so this is acceptable; a lock would be the fix if it mattered.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use lightagent_core::{RiskClass, Scope, ToolOutcome};
-use lightagent_rag::HashingEmbedder;
+use lightagent_rag::{HashingEmbedder, SemanticEmbedder};
+use lightagent_store::{SessionId, SessionStore};
 use lightagent_tools::{Tool, ToolCtx, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -107,6 +109,99 @@ pub struct MemorySearch {
     definition: ToolDefinition,
     path: PathBuf,
     top_k: usize,
+    semantic: Option<Arc<dyn SemanticEmbedder>>,
+}
+
+/// Read an exact saved session message or bounded tool result by reference.
+pub struct SessionLookup {
+    definition: ToolDefinition,
+    sessions: SessionStore,
+}
+
+impl SessionLookup {
+    pub const NAME: &'static str = "session.lookup";
+
+    pub fn new(sessions: SessionStore) -> Self {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "The saved session id from a memory source." },
+                "message": { "type": "integer", "minimum": 1, "description": "One-based message number." },
+                "tool_call_id": { "type": "string", "description": "A saved tool-call id." },
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset for a long message." }
+            },
+            "required": ["session_id"],
+            "additionalProperties": false
+        });
+        Self {
+            definition: ToolDefinition::new(
+                Self::NAME,
+                "Read a cited message or tool result from a saved session in this profile.",
+                parameters,
+                RiskClass::Observe,
+                vec![Scope::new("sessions:read")],
+            ),
+            sessions,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LookupArgs {
+    session_id: String,
+    message: Option<usize>,
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    offset: usize,
+}
+
+#[async_trait]
+impl Tool for SessionLookup {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn call(&self, args: &Value, _ctx: &ToolCtx) -> ToolOutcome {
+        let Ok(args) = serde_json::from_value::<LookupArgs>(args.clone()) else {
+            return ToolOutcome::error("could not read session.lookup arguments");
+        };
+        let Ok(id) = SessionId::parse(&args.session_id) else {
+            return ToolOutcome::error("invalid session id");
+        };
+        let Ok(session) = self.sessions.load(&id) else {
+            return ToolOutcome::error("saved session was not found or could not be read");
+        };
+        let (label, content) = match (args.message, args.tool_call_id) {
+            (Some(number), None) if number > 0 => match session.messages.get(number - 1) {
+                Some(message) => (
+                    format!("message {number} ({})", message.role),
+                    message.content.as_str(),
+                ),
+                None => return ToolOutcome::error("message number is outside this session"),
+            },
+            (None, Some(call_id)) => match session
+                .runs
+                .iter()
+                .flat_map(|run| &run.tools)
+                .find(|tool| tool.id == call_id)
+            {
+                Some(tool) => (
+                    format!("tool {} ({})", call_id, tool.tool),
+                    tool.result_excerpt.as_str(),
+                ),
+                None => return ToolOutcome::error("tool call was not found in this session"),
+            },
+            _ => return ToolOutcome::error("specify exactly one of message or tool_call_id"),
+        };
+        let total = content.chars().count();
+        let start = args.offset.min(total);
+        let end = start.saturating_add(2_000).min(total);
+        let excerpt: String = content.chars().skip(start).take(end - start).collect();
+        ToolOutcome::ok(format!(
+            "session {} {label}, chars {start}..{end}/{total}:\n{excerpt}",
+            id.as_str()
+        ))
+    }
 }
 
 impl MemorySearch {
@@ -132,7 +227,13 @@ impl MemorySearch {
             ),
             path,
             top_k: top_k.max(1),
+            semantic: None,
         }
+    }
+
+    pub fn with_semantic(mut self, semantic: Arc<dyn SemanticEmbedder>) -> Self {
+        self.semantic = Some(semantic);
+        self
     }
 }
 
@@ -158,13 +259,28 @@ impl Tool for MemorySearch {
             Err(error) => return ToolOutcome::error(format!("could not open memory: {error}")),
         };
         let k = args.top_k.unwrap_or(self.top_k).clamp(1, 50);
-        let hits = store.search(&args.query, &HashingEmbedder, k);
+        let hits = store
+            .search_hybrid(&args.query, &HashingEmbedder, self.semantic.as_deref(), k)
+            .await;
         if hits.is_empty() {
             return ToolOutcome::ok("No relevant memories.");
         }
         let mut out = String::new();
         for memory in hits {
-            out.push_str(&format!("- ({}) {}\n", memory.kind, memory.text));
+            let source = memory
+                .source
+                .as_ref()
+                .map(|source| {
+                    format!(
+                        " from session {} message {}",
+                        source.session_id, source.message_index
+                    )
+                })
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- [{}] ({}) {}{source}\n",
+                memory.id, memory.kind, memory.text
+            ));
         }
         ToolOutcome::ok(out.trim_end().to_owned())
     }
@@ -173,6 +289,7 @@ impl Tool for MemorySearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightagent_store::{Session, StoredMessage};
     use tokio_util::sync::CancellationToken;
 
     fn scratch() -> PathBuf {
@@ -207,6 +324,28 @@ mod tests {
         assert!(!found.is_error);
         assert!(found.content.contains("vault"));
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn session_lookup_reads_a_promoted_memory_source() {
+        let path = scratch();
+        let sessions = SessionStore::new(path.parent().unwrap().join("sessions"));
+        let mut session = Session::new("default", "chat");
+        session.push_message(StoredMessage::new("user", "I prefer concise answers."));
+        sessions.save(&session).unwrap();
+        let tool = SessionLookup::new(sessions);
+        let ctx = ToolCtx::new(CancellationToken::new());
+        let result = tool
+            .call(
+                &json!({
+                    "session_id": session.id.as_str(), "message": 1
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("I prefer concise answers."));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

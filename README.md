@@ -57,6 +57,31 @@ Follow-up prompts in the same chat include prior user and assistant turns in
 the model context. The transcript is saved after each prompt; to resume it
 after closing the terminal, use `lightagent sessions` to find its ID and run
 `lightagent chat --session <id>` (add `--profile <id>` for another profile).
+Long chats now keep recent turns verbatim and pack selected older excerpts and
+bounded tool-result evidence into a share of the model's context. The saved
+session remains complete. `lightagent sessions show <id>` numbers its messages
+and shows each stored tool excerpt and source. The `ctx` status is still the
+last provider prompt's token use, not a cumulative session size.
+
+Durable memory is separate from session history. Each request selects up to
+three relevant memories for its prompt; memory written during a terminal chat
+can be recalled on the next prompt without restarting. To review and promote a
+saved user statement, run:
+
+```sh
+lightagent memory candidates <session-id>
+lightagent memory promote <session-id> <message-number> --kind preference
+lightagent memory search "what should I remember?"
+```
+
+`promote` saves the reviewed text with its session and message number; use
+`--text` to edit the fact before saving. `lightagent memory update <id> <text>`
+corrects an outdated fact, and `lightagent memory forget <id>` removes one.
+The read-only `session.lookup` tool can retrieve a cited saved message or tool
+excerpt by id later, within the same profile.
+Memory search uses lexical ranking by default and combines it with semantic
+ranking when `rag.semantic` is configured. A malformed memory record now reports
+its line instead of being silently discarded, and writes are atomic and locked.
 `/new` starts a separate conversation with an empty context and resets
 session-only approval choices. The ACP editor integration likewise reuses one
 history per `sessionId`, persists it, and supports `session/load` on reconnect.

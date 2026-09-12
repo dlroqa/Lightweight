@@ -4,6 +4,57 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-09-12
+
+A patch release for the Lightagent interactive terminal. Durable memory and
+session history grow up together. A long chat now keeps its recent turns
+verbatim and packs selected older excerpts and bounded tool-result evidence
+into a share of the model's context, while the saved transcript stays complete;
+the same packing reaches the ACP editor integration and the HTTP API. Durable
+memory recall is query-aware rather than a fixed recent snapshot, remembers
+where each fact came from, and can fuse lexical ranking with a semantic
+endpoint when one is configured. Runs that pass no session, and profiles with
+no configured embeddings endpoint, keep working exactly as before.
+
+### Added
+
+- **Reviewed facts can be promoted from a saved session.** `lightagent memory
+  candidates <session>` lists user statements that look durable and `lightagent
+  memory promote <session> <message-number>` saves one of them — optionally
+  edited with `--text` — recording the session and message it came from.
+  `lightagent memory update <id> <text>` corrects an existing fact in place, and
+  a memory carries an optional `updated_at` and `source` in its listing.
+- **A run can read a cited source.** The read-only `session.lookup` tool
+  retrieves an exact saved message or a bounded tool-result excerpt by id from
+  the active profile's sessions, so a recalled memory can be traced back to what
+  was actually said.
+- **Optional semantic recall.** When `rag.semantic` is configured, `memory
+  search` and per-request recall fuse the offline lexical ranking with the
+  semantic ranking; a failed or absent embeddings endpoint leaves the lexical
+  path fully usable.
+- **Saved sessions keep tool evidence.** Each recorded tool call now stores its
+  call id, a bounded result excerpt, and any file or URL it was given.
+  `lightagent sessions show <id>` numbers every message and prints each tool's
+  excerpt and source.
+
+### Changed
+
+- **Long chats are packed into the model context instead of replayed whole.**
+  Recent turns are kept verbatim; older material is compacted into brief
+  excerpts and the most relevant saved tool evidence, bounded to a share of the
+  configured context so the system prompt, tools, and answer keep their room.
+  The durable transcript is never modified.
+- **Durable memory is injected per request, not as a recent snapshot.** Each
+  prompt receives up to three memories selected for the current message rather
+  than the most recently written ones; memory written during a terminal chat is
+  recallable on the next prompt without restarting. Recall now ranks with a
+  BM25-style lexical score with a phrase-match bonus.
+- **Memory writes are atomic, locked, and validated.** Writing takes a file
+  lock and re-reads before it saves, so concurrent writers merge instead of
+  clobbering; an identical fact is merged rather than duplicated; and a
+  malformed record is reported with its line number instead of being silently
+  discarded.
+
 ## [0.3.16] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. Conversations now keep

@@ -22,9 +22,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod context;
 mod error;
 mod session;
 
+pub use context::model_history;
 pub use error::StoreError;
 pub use session::{
     RunRecord, Session, SessionId, SessionStore, SessionSummary, StoredMessage, ToolHistoryEntry,

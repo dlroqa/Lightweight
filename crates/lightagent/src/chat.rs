@@ -5,12 +5,11 @@
 //! returned, tool activity is shown on stderr, and a tool call that needs
 //! approval pauses for a numbered decision at the prompt before the run resumes.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use dialoguer::console::{Key, Term, measure_text_width};
 use lightagent_core::provider::ProviderMessage;
@@ -24,7 +23,7 @@ use lightagent_extensions::ExtensionStore;
 use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::{
-    RunRecord, Session, SessionId, SessionStore, StoredMessage, ToolHistoryEntry,
+    Session, SessionId, SessionStore, StoredMessage, model_history as build_model_history,
 };
 use lightagent_tools::{
     BoundedExecutor, Delegation, SkillContext, Tool, ToolRegistry, WebContext, WebPolicy,
@@ -431,10 +430,6 @@ pub async fn run(
         profile.persona.push_str(&format!("\n\n{instructions}"));
     }
 
-    let memory_catalog = crate::memory::recent_catalog(&profile_dir, &config);
-    if !memory_catalog.is_empty() {
-        profile.persona.push_str(&format!("\n\n{memory_catalog}"));
-    }
     // The chat has someone to ask, so a run that runs out of time with unread
     // tool results pauses for a decision instead of wrapping up on its own.
     let agent = AgentLoop::from_profile(provider, executor, &profile)
@@ -539,7 +534,14 @@ pub async fn run(
         if let Some(run) = paused.take() {
             drop_paused(run, &mut session, &session_store);
         }
-        let history = model_history(&session);
+        let mut history = model_history(&session, &line, context_limit);
+        match crate::memory::relevant_catalog(&profile_dir, &config, &line).await {
+            Ok(catalog) if !catalog.is_empty() => {
+                history.insert(0, ProviderMessage::system(catalog));
+            }
+            Err(error) => eprintln!("· could not load durable memory: {error}"),
+            _ => {}
+        }
         session.push_message(StoredMessage::new("user", &line));
         session_store
             .save(&session)
@@ -1305,44 +1307,20 @@ fn thinking_indicator(frame: usize, colour: bool) -> String {
 /// Convert the durable transcript into the model context for the next turn.
 /// Stored run/tool metadata remains audit history; only conversational roles
 /// belong in a fresh provider request.
-fn model_history(session: &Session) -> Vec<ProviderMessage> {
-    session
-        .messages
-        .iter()
-        .filter_map(|message| match message.role.as_str() {
-            "user" => Some(ProviderMessage::user(message.content.clone())),
-            "assistant" => Some(ProviderMessage::assistant(message.content.clone())),
-            _ => None,
-        })
-        .collect()
+fn model_history(
+    session: &Session,
+    current: &str,
+    context_limit: Option<u32>,
+) -> Vec<ProviderMessage> {
+    build_model_history(session, current, context_limit.unwrap_or(4_096) as usize)
 }
 
 /// Fold one completed run's events into the session: the assistant's answer as a
 /// message, and a run record with its tool history.
 fn record_turn(session: &mut Session, events: &[AgentEvent]) {
-    let mut run_id = String::new();
-    let mut content = String::new();
     let mut stop_reason = None;
-    let mut names: HashMap<String, String> = HashMap::new();
-    let mut arguments: HashMap<String, String> = HashMap::new();
-    let mut tools = Vec::new();
-
     for event in events {
         match event {
-            AgentEvent::RunStarted { run, .. } => run_id = run.as_str().to_string(),
-            AgentEvent::Content { text } => content.push_str(text),
-            AgentEvent::ToolCallRequested { call } => {
-                arguments.insert(call.id.clone(), call.arguments.clone());
-            }
-            AgentEvent::ToolCallStarted { id, name } => {
-                names.insert(id.clone(), name.clone());
-            }
-            AgentEvent::ToolCallCompleted { id, outcome } => tools.push(ToolHistoryEntry {
-                tool: names.get(id).cloned().unwrap_or_else(|| id.clone()),
-                arguments_preview: preview(arguments.get(id).map(String::as_str).unwrap_or("")),
-                outcome: if outcome.is_error { "error" } else { "ok" }.to_string(),
-                duration_ms: None,
-            }),
             // A run dropped while paused never completes; a continued one's
             // later `RunCompleted` overwrites this.
             AgentEvent::WallClockPaused { .. } => stop_reason = Some("WallClockPaused".to_owned()),
@@ -1350,27 +1328,7 @@ fn record_turn(session: &mut Session, events: &[AgentEvent]) {
             _ => {}
         }
     }
-
-    if !content.is_empty() {
-        session.push_message(StoredMessage::new("assistant", content));
-    }
-    let now = SystemTime::now();
-    session.push_run(RunRecord {
-        run_id,
-        started_at: now,
-        ended_at: Some(now),
-        stop_reason,
-        tools,
-    });
-}
-
-fn preview(text: &str) -> String {
-    const MAX: usize = 120;
-    if text.chars().count() <= MAX {
-        text.to_string()
-    } else {
-        text.chars().take(MAX).collect()
-    }
+    session.record_run_events(events, stop_reason.as_deref().unwrap_or("Unknown"));
 }
 
 /// Handle a slash command; returns true when the session should end.
@@ -1762,6 +1720,8 @@ pub(crate) fn configured_model(profile_model: &str, config: &Config) -> String {
 #[cfg(test)]
 mod model_tests {
     use super::*;
+    use lightagent_store::RunRecord;
+    use std::time::SystemTime;
 
     #[test]
     fn model_history_contains_previous_turns_but_not_run_metadata() {
@@ -1776,13 +1736,13 @@ mod model_tests {
             tools: Vec::new(),
         });
         assert_eq!(
-            model_history(&session),
+            model_history(&session, "second", Some(4_096)),
             vec![
                 ProviderMessage::user("first"),
                 ProviderMessage::assistant("answer")
             ]
         );
-        assert!(model_history(&Session::new("default", "new")).is_empty());
+        assert!(model_history(&Session::new("default", "new"), "hi", Some(4_096)).is_empty());
     }
 
     #[test]

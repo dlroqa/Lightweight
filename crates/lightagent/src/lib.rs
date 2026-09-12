@@ -254,6 +254,23 @@ enum MemoryAction {
         #[arg(long)]
         top_k: Option<usize>,
     },
+    /// Show likely durable facts from a saved session for review.
+    Candidates { session: String },
+    /// Save one reviewed session message as a durable memory.
+    Promote {
+        session: String,
+        /// One-based message number from `sessions show` or `memory candidates`.
+        message: usize,
+        /// Optionally edit the fact before saving it.
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Correct an existing fact by id.
+    Update { id: String, text: String },
     /// Forget one memory by id.
     Forget { id: String },
     /// Forget everything.
@@ -399,7 +416,16 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Memory { action }) => match action {
             MemoryAction::Add { text, kind, tags } => memory::add(text, kind, tags, cli.json),
             MemoryAction::List => memory::list(cli.json),
-            MemoryAction::Search { query, top_k } => memory::search(query, top_k, cli.json),
+            MemoryAction::Search { query, top_k } => memory::search(query, top_k, cli.json).await,
+            MemoryAction::Candidates { session } => memory::candidates(session, cli.json),
+            MemoryAction::Promote {
+                session,
+                message,
+                text,
+                kind,
+                tags,
+            } => memory::promote(session, message, text, kind, tags, cli.json),
+            MemoryAction::Update { id, text } => memory::update(id, text, cli.json),
             MemoryAction::Forget { id } => memory::forget(id, cli.json),
             MemoryAction::Clear => memory::clear(cli.json),
         },
@@ -798,8 +824,13 @@ fn sessions_cmd(action: SessionsAction, json: bool) -> Result<(), String> {
                 session.profile
             );
             println!("title: {}", session.title);
-            for message in &session.messages {
-                println!("  [{}] {}", message.role, first_line(&message.content));
+            for (index, message) in session.messages.iter().enumerate() {
+                println!(
+                    "  {} [{}] {}",
+                    index + 1,
+                    message.role,
+                    first_line(&message.content)
+                );
             }
             for run in &session.runs {
                 println!(
@@ -808,6 +839,24 @@ fn sessions_cmd(action: SessionsAction, json: bool) -> Result<(), String> {
                     run.stop_reason.as_deref().unwrap_or("?"),
                     run.tools.len()
                 );
+                for tool in &run.tools {
+                    println!(
+                        "    {} {} ({}){}",
+                        tool.id,
+                        tool.tool,
+                        tool.outcome,
+                        tool.source
+                            .as_ref()
+                            .map(|source| format!("  {source}"))
+                            .unwrap_or_default()
+                    );
+                    if !tool.result_excerpt.is_empty() {
+                        println!(
+                            "      {}",
+                            truncate(&tool.result_excerpt.replace('\n', " "), 300)
+                        );
+                    }
+                }
             }
             Ok(())
         }

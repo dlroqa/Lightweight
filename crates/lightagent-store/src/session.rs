@@ -80,9 +80,20 @@ impl StoredMessage {
 /// A record of one tool call within a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolHistoryEntry {
+    /// Stable call id, linking the request to its result.
+    #[serde(default)]
+    pub id: String,
     pub tool: String,
     #[serde(default)]
     pub arguments_preview: String,
+    /// A bounded excerpt of the result for later context and inspection.
+    #[serde(default)]
+    pub result_excerpt: String,
+    /// File path or URL supplied to the tool, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
     /// `"ok"` or `"error"`.
     pub outcome: String,
     #[serde(default)]
@@ -171,11 +182,17 @@ impl Session {
                     names.insert(id.clone(), name.clone());
                 }
                 AgentEvent::ToolCallCompleted { id, outcome } => tools.push(ToolHistoryEntry {
+                    id: id.clone(),
                     tool: names.get(id).cloned().unwrap_or_else(|| id.clone()),
                     arguments_preview: arguments
                         .get(id)
                         .map(|value| value.chars().take(120).collect())
                         .unwrap_or_default(),
+                    result_excerpt: outcome.content.chars().take(2_000).collect(),
+                    source: arguments
+                        .get(id)
+                        .and_then(|value| source_from_arguments(value)),
+                    truncated: outcome.content.chars().count() > 2_000,
                     outcome: if outcome.is_error { "error" } else { "ok" }.to_owned(),
                     duration_ms: None,
                 }),
@@ -195,6 +212,14 @@ impl Session {
             tools,
         });
     }
+}
+
+fn source_from_arguments(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    ["path", "file", "url", "source"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
 }
 
 /// A light view of a session for a listing, without its transcript.
@@ -362,6 +387,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightagent_core::{ToolCall, ToolOutcome};
 
     fn scratch_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -398,8 +424,12 @@ mod tests {
             ended_at: Some(SystemTime::now()),
             stop_reason: Some("end_turn".into()),
             tools: vec![ToolHistoryEntry {
+                id: "call-1".into(),
                 tool: "datetime.now".into(),
                 arguments_preview: "{}".into(),
+                result_excerpt: "2026-09-12".into(),
+                source: None,
+                truncated: false,
                 outcome: "ok".into(),
                 duration_ms: Some(2),
             }],
@@ -412,6 +442,47 @@ mod tests {
         assert_eq!(loaded, session);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_result_and_source_are_saved_with_the_session() {
+        let mut session = Session::new("default", "evidence");
+        session.record_run_events(
+            &[
+                AgentEvent::ToolCallRequested {
+                    call: ToolCall {
+                        id: "call-1".into(),
+                        name: "fs.read".into(),
+                        arguments: r#"{"path":"notes.md"}"#.into(),
+                    },
+                },
+                AgentEvent::ToolCallStarted {
+                    id: "call-1".into(),
+                    name: "fs.read".into(),
+                },
+                AgentEvent::ToolCallCompleted {
+                    id: "call-1".into(),
+                    outcome: ToolOutcome::ok("The deployment checklist is here."),
+                },
+            ],
+            "EndTurn",
+        );
+        let tool = &session.runs[0].tools[0];
+        assert_eq!(tool.id, "call-1");
+        assert_eq!(tool.source.as_deref(), Some("notes.md"));
+        assert_eq!(tool.result_excerpt, "The deployment checklist is here.");
+        assert!(!tool.truncated);
+    }
+
+    #[test]
+    fn older_tool_records_remain_readable() {
+        let tool: ToolHistoryEntry = serde_json::from_str(
+            r#"{"tool":"fs.read","arguments_preview":"notes.md","outcome":"ok"}"#,
+        )
+        .unwrap();
+        assert!(tool.id.is_empty());
+        assert!(tool.result_excerpt.is_empty());
+        assert_eq!(tool.source, None);
     }
 
     #[test]

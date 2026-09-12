@@ -322,12 +322,13 @@ impl Default for McpConfig {
 /// Durable memory configuration.
 ///
 /// Always available (writing is agent-initiated and approval-gated); these tune
-/// how much is surfaced. `inject_recent` recent memories are added to the system
-/// prompt each run (0 disables the snapshot), and `top_k` bounds a recall.
+/// how much is surfaced. `inject_recent` is a compatibility name for the maximum
+/// query-relevant memories added to each prompt (0 disables injection), and
+/// `top_k` bounds a recall.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
-    /// Recent memories injected into the system prompt (0 to disable).
+    /// Maximum relevant memories injected into a prompt (0 to disable).
     pub inject_recent: usize,
     /// Default number of memories a search returns.
     pub top_k: usize,

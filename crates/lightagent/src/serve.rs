@@ -141,9 +141,15 @@ impl RunFactory for LightweightRunFactory {
             profile.persona.push_str(&format!("\n\n{instructions}"));
         }
 
-        let memory_catalog = crate::memory::recent_catalog(&profile_dir, &self.config);
-        if !memory_catalog.is_empty() {
-            profile.persona.push_str(&format!("\n\n{memory_catalog}"));
+        match crate::memory::relevant_catalog(&profile_dir, &self.config, &request.message).await {
+            Ok(catalog) if !catalog.is_empty() => {
+                profile.persona.push_str(&format!("\n\n{catalog}"))
+            }
+            Err(error) => {
+                fail(&sink, &format!("could not load durable memory: {error}"));
+                return RunStatus::Failed;
+            }
+            _ => {}
         }
         let agent = AgentLoop::from_profile(provider, executor, &profile);
         manager::drive(
@@ -218,6 +224,7 @@ pub async fn run(
 
     let extensions = load_global_extensions(paths.root());
     let mcp = mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await;
+    let context_limit = config.runtime.n_ctx.unwrap_or(4_096) as usize;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
         config,
@@ -228,6 +235,7 @@ pub async fn run(
         auth,
         sessions,
         session_profile: active.as_str().to_owned(),
+        context_limit,
         busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: web_root.clone(),
     };

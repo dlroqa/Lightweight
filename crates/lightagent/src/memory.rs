@@ -1,38 +1,71 @@
 //! `lightagent memory` — write, recall and manage durable memories, and the
-//! `memory.write`/`memory.search` tools and prompt snapshot wired into a run.
+//! `memory.write`/`memory.search` tools and per-request recall wired into a run.
 //!
 //! Memory is per-profile: the active profile's memories live at
 //! `<profile>/memory/memories.jsonl`. The CLI edits them directly; a run is given
-//! the two tools over the same file and, unless disabled, a snapshot of the most
-//! recent memories appended to the system prompt.
+//! the tools over the same file and, unless disabled, a small relevant-memory
+//! selection is added to each request.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore};
-use lightagent_memory::{MemorySearch, MemoryStore, MemoryWrite, memory_path};
+use lightagent_memory::{
+    MemorySearch, MemorySource, MemoryStore, MemoryWrite, SessionLookup, memory_path,
+};
 use lightagent_rag::HashingEmbedder;
+use lightagent_store::{Session, SessionId, SessionStore};
 use lightagent_tools::Tool;
 
-/// The memory tools for a run: `memory.write` and `memory.search`.
+/// Durable recall and source lookup tools for a run.
 pub(crate) fn memory_tools(profile_dir: &Path, config: &Config) -> Vec<Arc<dyn Tool>> {
     let path = memory_path(profile_dir);
+    let search = MemorySearch::new(path.clone(), config.memory.top_k);
+    let search = match crate::rag::semantic_embedder(config) {
+        Some(semantic) => search.with_semantic(semantic),
+        None => search,
+    };
     vec![
         Arc::new(MemoryWrite::new(path.clone())),
-        Arc::new(MemorySearch::new(path, config.memory.top_k)),
+        Arc::new(search),
+        Arc::new(SessionLookup::new(SessionStore::new(
+            profile_dir.join("sessions"),
+        ))),
     ]
 }
 
-/// The recent-memory snapshot for the system prompt, or empty.
-pub(crate) fn recent_catalog(profile_dir: &Path, config: &Config) -> String {
+/// Select a small set of memories for this request's prompt.
+pub(crate) async fn relevant_catalog(
+    profile_dir: &Path,
+    config: &Config,
+    query: &str,
+) -> Result<String, String> {
     if config.memory.inject_recent == 0 {
-        return String::new();
+        return Ok(String::new());
     }
-    match MemoryStore::open(memory_path(profile_dir)) {
-        Ok(store) => store.recent_catalog(config.memory.inject_recent),
-        Err(_) => String::new(),
+    let store = MemoryStore::open(memory_path(profile_dir)).map_err(|error| error.to_string())?;
+    let count = config.memory.inject_recent.min(config.memory.top_k).min(3);
+    let semantic = crate::rag::semantic_embedder(config);
+    let relevant = store
+        .relevant_catalog_hybrid(query, count, 600, semantic.as_deref())
+        .await;
+    if !relevant.is_empty() {
+        return Ok(relevant);
     }
+    let fallback = store
+        .recent(store.len())
+        .into_iter()
+        .find(|memory| memory.kind == "preference");
+    Ok(fallback
+        .map(|memory| {
+            format!(
+                "Recent durable memory [{}]: {}",
+                memory.id,
+                memory.text.chars().take(350).collect::<String>()
+            )
+        })
+        .unwrap_or_default())
 }
 
 fn active_memory() -> Result<(PathBuf, Config), String> {
@@ -47,6 +80,116 @@ fn active_memory() -> Result<(PathBuf, Config), String> {
         .ok_or_else(|| "no active profile — run `lightagent init` first".to_owned())?;
     let dir = store.handle(&active).dir().to_path_buf();
     Ok((memory_path(&dir), config))
+}
+
+fn saved_session(raw_id: &str) -> Result<Session, String> {
+    let paths = LightagentPaths::resolve().map_err(|error| error.to_string())?;
+    let profiles = ProfileStore::new(paths.root());
+    let active = profiles
+        .active()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no active profile".to_owned())?;
+    let id = SessionId::parse(raw_id).map_err(|error| error.to_string())?;
+    SessionStore::at_profile(&profiles.handle(&active))
+        .load(&id)
+        .map_err(|error| error.to_string())
+}
+
+/// Show user statements that look durable; nothing is saved until `promote`.
+pub fn candidates(session_id: String, json: bool) -> Result<(), String> {
+    let session = saved_session(&session_id)?;
+    let candidates: Vec<_> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            if message.role != "user" {
+                return false;
+            }
+            let text = message.content.to_lowercase();
+            [
+                "prefer",
+                "remember",
+                "we decided",
+                "always",
+                "never",
+                "my ",
+                "our project",
+                "uses ",
+            ]
+            .iter()
+            .any(|marker| text.contains(marker))
+        })
+        .map(|(index, message)| (index + 1, message.content.as_str()))
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"session_id": session_id, "candidates": candidates.iter().map(|(index, text)| serde_json::json!({"message": index, "text": text})).collect::<Vec<_>>()})
+        );
+    } else if candidates.is_empty() {
+        println!("No suggested facts. Any user message can still be promoted by its number.");
+    } else {
+        for (index, text) in candidates {
+            println!("{index}: {}", text.replace('\n', " "));
+        }
+    }
+    Ok(())
+}
+
+/// Save exactly one user-selected message, optionally edited, with provenance.
+pub fn promote(
+    session_id: String,
+    message_number: usize,
+    text: Option<String>,
+    kind: Option<String>,
+    tags: Vec<String>,
+    json: bool,
+) -> Result<(), String> {
+    let session = saved_session(&session_id)?;
+    let message = session
+        .messages
+        .get(message_number.saturating_sub(1))
+        .filter(|message| message_number > 0 && message.role == "user")
+        .ok_or_else(|| "choose a user message number from the saved session".to_owned())?;
+    let fact = text.as_deref().unwrap_or(&message.content);
+    let (path, _) = active_memory()?;
+    let mut store = MemoryStore::open(&path).map_err(|error| error.to_string())?;
+    let id = store
+        .write_sourced(
+            fact,
+            kind.as_deref().unwrap_or("fact"),
+            tags,
+            Some(MemorySource {
+                session_id,
+                message_index: message_number,
+            }),
+            &HashingEmbedder,
+            now_secs(),
+        )
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!("{}", serde_json::json!({"id": id}));
+    } else {
+        println!("remembered ({id})");
+    }
+    Ok(())
+}
+
+pub fn update(id: String, text: String, json: bool) -> Result<(), String> {
+    let (path, _) = active_memory()?;
+    let mut store = MemoryStore::open(&path).map_err(|error| error.to_string())?;
+    let updated = store
+        .update(&id, &text, &HashingEmbedder, now_secs())
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!("{}", serde_json::json!({"updated": updated}));
+    } else if updated {
+        println!("updated {id}");
+    } else {
+        println!("no memory with id {id}");
+    }
+    Ok(())
 }
 
 fn now_secs() -> u64 {
@@ -89,7 +232,8 @@ pub fn list(json: bool) -> Result<(), String> {
     if json {
         let value = serde_json::json!({
             "memories": store.all().iter().map(|m| serde_json::json!({
-                "id": m.id, "kind": m.kind, "tags": m.tags, "created_at": m.created_at, "text": m.text,
+                "id": m.id, "kind": m.kind, "tags": m.tags, "created_at": m.created_at,
+                "updated_at": m.updated_at, "source": m.source, "text": m.text,
             })).collect::<Vec<_>>(),
         });
         println!("{value:#}");
@@ -100,22 +244,30 @@ pub fn list(json: bool) -> Result<(), String> {
         return Ok(());
     }
     for memory in store.all() {
-        println!("{}  ({})  {}", memory.id, memory.kind, memory.text);
+        let source = memory
+            .source
+            .as_ref()
+            .map(|source| format!("  from {}#{}", source.session_id, source.message_index))
+            .unwrap_or_default();
+        println!("{}  ({})  {}{source}", memory.id, memory.kind, memory.text);
     }
     Ok(())
 }
 
 /// `memory search <query>` — the most relevant memories.
-pub fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), String> {
+pub async fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), String> {
     let (path, config) = active_memory()?;
     let store = MemoryStore::open(&path).map_err(|error| error.to_string())?;
     let k = top_k.unwrap_or(config.memory.top_k).max(1);
-    let hits = store.search(&query, &HashingEmbedder, k);
+    let semantic = crate::rag::semantic_embedder(&config);
+    let hits = store
+        .search_hybrid(&query, &HashingEmbedder, semantic.as_deref(), k)
+        .await;
     if json {
         let value = serde_json::json!({
             "query": query,
             "memories": hits.iter().map(|m| serde_json::json!({
-                "id": m.id, "kind": m.kind, "text": m.text,
+                "id": m.id, "kind": m.kind, "source": m.source, "text": m.text,
             })).collect::<Vec<_>>(),
         });
         println!("{value:#}");
@@ -126,7 +278,12 @@ pub fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), Str
         return Ok(());
     }
     for memory in hits {
-        println!("({}) {}", memory.kind, memory.text);
+        let source = memory
+            .source
+            .as_ref()
+            .map(|source| format!(" [from {}#{}]", source.session_id, source.message_index))
+            .unwrap_or_default();
+        println!("({}) {}{source}", memory.kind, memory.text);
     }
     Ok(())
 }

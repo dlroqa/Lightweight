@@ -28,8 +28,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use lightagent_core::AgentEvent;
-use lightagent_core::provider::ProviderMessage;
-use lightagent_store::{Session, SessionId, SessionStore, StoredMessage};
+use lightagent_store::{Session, SessionId, SessionStore, StoredMessage, model_history};
 use lightagent_tools::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
@@ -49,6 +48,8 @@ pub struct AppState {
     pub sessions: SessionStore,
     /// The profile whose sessions are served by `sessions`.
     pub session_profile: String,
+    /// Effective model context when configured; used to bound saved history.
+    pub context_limit: usize,
     /// Prevent overlapping runs from overwriting one session transcript.
     pub busy_sessions: Arc<Mutex<HashSet<SessionId>>>,
     /// When set, the panel is served from this directory (same-origin), so the
@@ -217,15 +218,7 @@ async fn create_run(
             busy.remove(&id);
             return bad_request("session profile does not match");
         }
-        history = session
-            .messages
-            .iter()
-            .filter_map(|message| match message.role.as_str() {
-                "user" => Some(ProviderMessage::user(message.content.clone())),
-                "assistant" => Some(ProviderMessage::assistant(message.content.clone())),
-                _ => None,
-            })
-            .collect();
+        history = model_history(&session, &body.message, state.context_limit);
         profile = Some(session.profile.clone());
         session.push_message(StoredMessage::new("user", &body.message));
         if let Err(error) = state.sessions.save(&session) {

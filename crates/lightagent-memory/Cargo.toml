@@ -10,6 +10,7 @@ license.workspace = true
 lightagent-core.workspace = true
 lightagent-tools.workspace = true
 lightagent-rag.workspace = true
+lightagent-store.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 async-trait.workspace = true

@@ -57,6 +57,7 @@ pub struct AcpServer {
     store: Option<SessionStore>,
     profiles: Option<ProfileStore>,
     default_profile: String,
+    context_limit: usize,
 }
 
 impl AcpServer {
@@ -67,7 +68,14 @@ impl AcpServer {
             store: None,
             profiles: None,
             default_profile: "default".to_owned(),
+            context_limit: 4_096,
         }
+    }
+
+    /// Bound recalled session history to the configured model context.
+    pub fn with_context_limit(mut self, context_limit: usize) -> Self {
+        self.context_limit = context_limit;
+        self
     }
 
     /// Persist ACP sessions in `store` and make `session/load` available.
@@ -361,7 +369,7 @@ impl AcpServer {
                         return;
                     }
                     Some(session) => {
-                        let history = model_history(&session.stored);
+                        let history = model_history(&session.stored, &text, self.context_limit);
                         let mut updated = session.stored.clone();
                         updated.push_message(StoredMessage::new("user", &text));
                         if let Some(store) = &session.store
@@ -409,16 +417,12 @@ impl AcpServer {
     }
 }
 
-fn model_history(session: &StoredSession) -> Vec<ProviderMessage> {
-    session
-        .messages
-        .iter()
-        .filter_map(|message| match message.role.as_str() {
-            "user" => Some(ProviderMessage::user(message.content.clone())),
-            "assistant" => Some(ProviderMessage::assistant(message.content.clone())),
-            _ => None,
-        })
-        .collect()
+fn model_history(
+    session: &StoredSession,
+    current: &str,
+    context_limit: usize,
+) -> Vec<ProviderMessage> {
+    lightagent_store::model_history(session, current, context_limit)
 }
 
 /// The state a spawned `session/prompt` handler carries.

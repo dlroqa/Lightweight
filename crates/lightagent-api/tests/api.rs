@@ -104,6 +104,7 @@ fn app_state(auth: AuthConfig) -> AppState {
         auth,
         sessions: SessionStore::new(dir),
         session_profile: "default".into(),
+        context_limit: 4_096,
         busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: None,
     }
