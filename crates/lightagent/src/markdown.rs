@@ -230,15 +230,26 @@ mod tests {
             dropped_path(&format!("'{}'", file.display())),
             Some(file.clone())
         );
+        // Backslash escaping and `file://` drops are terminal conventions of
+        // Unix shells. On Windows a backslash is the separator, so the path is
+        // taken literally and neither form is synthesized by the terminal.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                dropped_path(&file.display().to_string().replace(' ', "\\ ")),
+                Some(file.clone())
+            );
+            assert_eq!(
+                dropped_path(&format!(
+                    "file://{}",
+                    file.display().to_string().replace(' ', "%20")
+                )),
+                Some(file.clone())
+            );
+        }
+        #[cfg(windows)]
         assert_eq!(
-            dropped_path(&file.display().to_string().replace(' ', "\\ ")),
-            Some(file.clone())
-        );
-        assert_eq!(
-            dropped_path(&format!(
-                "file://{}",
-                file.display().to_string().replace(' ', "%20")
-            )),
+            dropped_path(&file.display().to_string()),
             Some(file.clone())
         );
         assert_eq!(dropped_path("Can you read README.md?"), None);

@@ -614,24 +614,35 @@ pub async fn run(
                     println!("Finish or discard the paused run before reloading tools.");
                     continue;
                 }
-                let operation = match &command {
+                // Report a usage mistake before anything is torn down.
+                match &command {
                     Slash::ExtensionInstall(source) if source.is_empty() => {
                         println!("Usage: /extensions install <directory>");
                         continue;
-                    }
-                    Slash::ExtensionInstall(source) => {
-                        crate::extensions::install(Path::new(source), false, false)
                     }
                     Slash::ExtensionUninstall(name) if name.is_empty() => {
                         println!("Usage: /extensions uninstall <name>");
                         continue;
                     }
-                    Slash::ExtensionUninstall(name) => {
-                        crate::extensions::uninstall(name, false, false)
-                    }
                     Slash::Onboard(source) if source.is_empty() => {
                         println!("Usage: /onboard <file.md>  (drop the file after the command)");
                         continue;
+                    }
+                    _ => {}
+                }
+                // Release the current tools before the installed files move.
+                // A connected MCP server runs from its extension's directory
+                // and holds it open, so removing the bundle underneath a live
+                // server fails outright on Windows and orphans a connection to
+                // deleted files elsewhere. Every path below rebuilds the
+                // runtime, so a failed operation still leaves a usable chat.
+                drop(agent);
+                let operation = match &command {
+                    Slash::ExtensionInstall(source) => {
+                        crate::extensions::install(Path::new(source), false, false)
+                    }
+                    Slash::ExtensionUninstall(name) => {
+                        crate::extensions::uninstall(name, false, false)
                     }
                     Slash::Onboard(source) => {
                         let result = crate::markdown::parse_path(source).and_then(|path| {
@@ -661,10 +672,6 @@ pub async fn run(
                     }
                     _ => Ok(()),
                 };
-                if let Err(error) = operation {
-                    eprintln!("· {error}");
-                    continue;
-                }
                 let new_config = ConfigStore::at(&paths).load().map_err(|e| e.to_string())?;
                 let new_profile =
                     resolve_profile(&store, &new_config, Some(profile.id.as_str().to_owned()))?;
@@ -686,6 +693,10 @@ pub async fn run(
                 tool_permissions = runtime.tool_permissions;
                 config = new_config;
                 profile = new_profile;
+                if let Err(error) = operation {
+                    eprintln!("· {error}");
+                    continue;
+                }
                 println!(
                     "Reloaded {} tools and {} skills. Use /tools to inspect them.",
                     startup_tools.len(),
@@ -2342,7 +2353,25 @@ for line in sys.stdin:
             .await;
         assert!(!outcome.is_error, "{}", outcome.content);
         assert_eq!(outcome.content, "installed directory");
-        lightagent_extensions::uninstall("fixture", &root).unwrap();
+
+        // The registry owns the server connection, so release it before the
+        // bundle is removed, exactly as the chat does for `/extensions
+        // uninstall`. The server is killed when its connection drops, but the
+        // process exits on its own schedule and runs from the very directory
+        // being removed, so give it a moment to let go.
+        drop(registry);
+        let mut attempts = 0;
+        loop {
+            match lightagent_extensions::uninstall("fixture", &root) {
+                Ok(()) => break,
+                Err(error) => {
+                    attempts += 1;
+                    assert!(attempts < 50, "could not uninstall: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        assert!(!root.join("fixture").exists());
         let removed = ExtensionStore::load(std::slice::from_ref(&root));
         assert!(
             !configured_registry(&config, &scratch, &removed, false)

@@ -391,14 +391,15 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A directory of this test's own. Tests in this module run in parallel
+    /// threads of one process, so the name cannot rest on the clock alone: a
+    /// coarse timer hands two threads the same nanoseconds and they then load
+    /// each other's extensions.
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "lightagent-ext-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            lightagent_core::RunId::new().as_str()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
