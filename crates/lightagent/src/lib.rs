@@ -60,6 +60,9 @@ enum Command {
         /// The profile ("bot") to run; defaults to the active one.
         #[arg(long)]
         profile: Option<String>,
+        /// Resume a saved session by id instead of starting a new one.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Set up the isolated home, a first profile and the configuration.
     Init {
@@ -330,7 +333,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
     match cli.command {
         None => {
             if std::io::stdin().is_terminal() {
-                chat::run(None, cli.json, VERSION, RELEASE_DATE).await
+                chat::run(None, None, cli.json, VERSION, RELEASE_DATE).await
             } else {
                 println!(
                     "Run `lightagent --help` for the available commands, or `lightagent chat` to start."
@@ -338,8 +341,8 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
                 Ok(())
             }
         }
-        Some(Command::Chat { profile }) => {
-            chat::run(profile, cli.json, VERSION, RELEASE_DATE).await
+        Some(Command::Chat { profile, session }) => {
+            chat::run(profile, session, cli.json, VERSION, RELEASE_DATE).await
         }
         Some(Command::Init {
             force,
@@ -442,9 +445,22 @@ pub(crate) fn ensure_default_profile(
     let id = ProfileId::new("default").map_err(|error| error.to_string())?;
     match store.load(&id) {
         Ok(_) => {}
-        Err(ProfileError::NotFound { .. }) => store
-            .create(&default_profile(config)?)
-            .map_err(|error| error.to_string())?,
+        Err(ProfileError::NotFound { .. }) => {
+            let mut profile = default_profile(config)?;
+            let handle = store.handle(&id);
+            if handle.dir().exists() {
+                // An earlier chat may have created sessions or a persona before
+                // profile management wrote the manifest. Keep those files.
+                match std::fs::read_to_string(handle.soul_file()) {
+                    Ok(persona) => profile.persona = persona,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+                store.save(&profile).map_err(|error| error.to_string())?;
+            } else {
+                store.create(&profile).map_err(|error| error.to_string())?;
+            }
+        }
         Err(error) => return Err(error.to_string()),
     }
     if store.active().map_err(|error| error.to_string())?.is_none() {
@@ -735,7 +751,9 @@ fn sessions_cmd(action: SessionsAction, json: bool) -> Result<(), String> {
     let paths = paths()?;
     let store = ProfileStore::new(paths.root());
     let active = active_profile_id(&store)?
-        .ok_or_else(|| "no active profile — run `lightagent init` first".to_string())?;
+        .map(Ok)
+        .unwrap_or_else(|| ProfileId::new("default"))
+        .map_err(|error| error.to_string())?;
     let handle = store.handle(&active);
     let sessions = SessionStore::at_profile(&handle);
 
@@ -1117,6 +1135,28 @@ async fn models(json: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_recovers_default_directory_without_manifest() {
+        let home = std::env::temp_dir().join(format!(
+            "lightagent-default-profile-{}",
+            lightagent_core::RunId::new().as_str()
+        ));
+        let store = ProfileStore::new(&home);
+        let id = ProfileId::new("default").unwrap();
+        let handle = store.scaffold(&id).unwrap();
+        std::fs::write(handle.soul_file(), "My existing persona").unwrap();
+        std::fs::write(handle.sessions_dir().join("keep.txt"), "existing session").unwrap();
+
+        assert_eq!(ensure_default_profile(&store, &Config::default()).unwrap(), id);
+        assert_eq!(store.load(&id).unwrap().persona, "My existing persona");
+        assert_eq!(store.active().unwrap(), Some(id));
+        assert_eq!(
+            std::fs::read_to_string(handle.sessions_dir().join("keep.txt")).unwrap(),
+            "existing session"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn singular_profile_command_and_plural_alias_parse() {

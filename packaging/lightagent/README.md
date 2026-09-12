@@ -53,6 +53,10 @@ commands, `/tools` lists tools, and `/exit` closes the session. Tool calls that
 require approval prompt in the terminal; conversations are saved under the
 active profile in `~/.lightagent`.
 
+Follow-up prompts keep the previous turns in context. Use `lightagent sessions`
+to find a saved ID and `lightagent chat --session <id>` to reopen it after
+closing the terminal; `/new` starts a fresh, independent conversation.
+
 The prompt streams provider-supplied reasoning in a separate panel and reports
 context usage, output tokens, token rate, and elapsed response time. Its startup
 dashboard shows the release version and date, active profile and model, session,

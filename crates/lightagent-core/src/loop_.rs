@@ -301,6 +301,11 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         &self.config
     }
 
+    /// The bound tool invoker, for session-scoped policy changes by a caller.
+    pub fn invoker(&self) -> &I {
+        &self.invoker
+    }
+
     /// Run until the first terminal state or the first pause.
     ///
     /// The terminal event of a [`RunOutcome::Completed`] is always a
@@ -311,7 +316,23 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         user_input: impl Into<String>,
         cancel: CancellationToken,
     ) -> Result<RunOutcome, AgentError> {
-        let driver = self.new_driver(user_input, None);
+        let driver = self.new_driver(Vec::new(), user_input, None);
+        self.drive(driver, cancel).await
+    }
+
+    /// Run a new turn with the preceding conversation restored.
+    ///
+    /// `history` contains user and assistant messages from earlier completed
+    /// turns. The configured system prompt is still owned by the loop and is
+    /// prepended exactly once; `user_input` is appended as the new final user
+    /// message. This is the entry point for session-aware callers.
+    pub async fn run_with_history(
+        &self,
+        history: Vec<ProviderMessage>,
+        user_input: impl Into<String>,
+        cancel: CancellationToken,
+    ) -> Result<RunOutcome, AgentError> {
+        let driver = self.new_driver(history, user_input, None);
         self.drive(driver, cancel).await
     }
 
@@ -326,17 +347,35 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         cancel: CancellationToken,
         sink: AgentEventSink,
     ) -> Result<RunOutcome, AgentError> {
-        let driver = self.new_driver(user_input, Some(sink));
+        let driver = self.new_driver(Vec::new(), user_input, Some(sink));
+        self.drive(driver, cancel).await
+    }
+
+    /// Streaming counterpart to [`run_with_history`](Self::run_with_history).
+    pub async fn run_streaming_with_history(
+        &self,
+        history: Vec<ProviderMessage>,
+        user_input: impl Into<String>,
+        cancel: CancellationToken,
+        sink: AgentEventSink,
+    ) -> Result<RunOutcome, AgentError> {
+        let driver = self.new_driver(history, user_input, Some(sink));
         self.drive(driver, cancel).await
     }
 
     /// Build the initial driver, emitting the opening `RunStarted`.
-    fn new_driver(&self, user_input: impl Into<String>, sink: Option<AgentEventSink>) -> Driver {
+    fn new_driver(
+        &self,
+        history: Vec<ProviderMessage>,
+        user_input: impl Into<String>,
+        sink: Option<AgentEventSink>,
+    ) -> Driver {
         let run = RunId::new();
         let mut messages = Vec::new();
         if let Some(system) = &self.config.system {
             messages.push(ProviderMessage::system(system.clone()));
         }
+        messages.extend(history);
         messages.push(ProviderMessage::user(user_input));
 
         let mut driver = Driver {
@@ -757,6 +796,40 @@ mod tests {
         ));
         // The live stream and the recorded log are the same events, in order.
         assert_eq!(streamed, outcome.into_events());
+    }
+
+    #[tokio::test]
+    async fn new_run_replays_only_the_given_session_history() {
+        let mock = MockProvider::new(vec![stop_turn("reply"), stop_turn("fresh")]);
+        let agent = AgentLoop::new(mock.clone(), NullInvoker, RunConfig::new("m"));
+        agent
+            .run_with_history(
+                vec![
+                    ProviderMessage::user("first"),
+                    ProviderMessage::assistant("answer"),
+                ],
+                "second",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        agent
+            .run("new session", CancellationToken::new())
+            .await
+            .unwrap();
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].messages.len(), 3);
+        assert_eq!(requests[0].messages[0], ProviderMessage::user("first"));
+        assert_eq!(
+            requests[0].messages[1],
+            ProviderMessage::assistant("answer")
+        );
+        assert_eq!(requests[0].messages[2], ProviderMessage::user("second"));
+        assert_eq!(
+            requests[1].messages,
+            vec![ProviderMessage::user("new session")]
+        );
     }
 
     fn stop_turn(content: &str) -> Vec<ProviderEvent> {

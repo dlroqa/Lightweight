@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use lightagent_api::manager::{self, RunFactory, RunManager, RunStatus, StartRun};
 use lightagent_api::{AppState, AuthConfig, Scope, router};
 use lightagent_core::permissions::ApprovalPolicy;
+use lightagent_core::provider::ProviderMessage;
 use lightagent_core::{
     AgentEventSink, AgentLoop, ApprovalDecision, FinishReason, MockProvider, PolicyEngine,
     ProviderEvent, RunConfig,
@@ -63,7 +64,33 @@ impl RunFactory for MockFactory {
             262_144,
         );
         let agent = AgentLoop::new(provider, executor, RunConfig::new("mock"));
-        manager::drive(agent, request.message, sink, cancel, decisions).await
+        manager::drive(
+            agent,
+            request.history,
+            request.message,
+            sink,
+            cancel,
+            decisions,
+        )
+        .await
+    }
+}
+
+struct HistoryFactory {
+    requests: Arc<tokio::sync::Mutex<Vec<Vec<ProviderMessage>>>>,
+}
+
+#[async_trait]
+impl RunFactory for HistoryFactory {
+    async fn run(
+        &self,
+        request: StartRun,
+        sink: AgentEventSink,
+        cancel: tokio_util::sync::CancellationToken,
+        decisions: UnboundedReceiver<ApprovalDecision>,
+    ) -> RunStatus {
+        self.requests.lock().await.push(request.history.clone());
+        MockFactory.run(request, sink, cancel, decisions).await
     }
 }
 
@@ -76,6 +103,8 @@ fn app_state(auth: AuthConfig) -> AppState {
         manager: RunManager::new(Arc::new(MockFactory)),
         auth,
         sessions: SessionStore::new(dir),
+        session_profile: "default".into(),
+        busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: None,
     }
 }
@@ -175,6 +204,7 @@ async fn a_run_drives_to_completion_and_buffers_its_events() {
     let run = manager
         .start(StartRun {
             message: "what time is it?".into(),
+            history: Vec::new(),
             profile: None,
             cwd: None,
         })
@@ -264,6 +294,89 @@ async fn a_run_can_be_created_and_streamed_over_sse() {
     assert!(body.contains("tool.output"));
     assert!(body.contains("model.delta"));
     assert!(body.contains("run.completed"));
+}
+
+#[tokio::test]
+async fn a_saved_session_is_reused_by_follow_up_runs_and_new_sessions_are_empty() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut state = app_state(AuthConfig::open());
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        state.manager = RunManager::new(Arc::new(HistoryFactory {
+            requests: Arc::clone(&requests),
+        }));
+        let store = state.sessions.clone();
+        let addr = spawn_server(state).await;
+        let (status, body) = http(
+            &addr,
+            "POST",
+            "/api/lightagent/v1/sessions",
+            &[],
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        for (index, message) in ["hello", "follow up"].into_iter().enumerate() {
+            let payload = serde_json::json!({ "message": message, "session_id": id }).to_string();
+            let (status, body) = http(
+                &addr,
+                "POST",
+                "/api/lightagent/v1/runs",
+                &[],
+                Some(&payload),
+            )
+            .await;
+            assert_eq!(status, 202, "{body}");
+            let run = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+            assert_eq!(run["session_id"], id);
+            let id_parsed = lightagent_store::SessionId::parse(&id).unwrap();
+            loop {
+                let saved = store.load(&id_parsed).unwrap();
+                if saved.runs.len() == index + 1 {
+                    assert_eq!(saved.messages.len(), (index + 1) * 2);
+                    assert_eq!(saved.messages[index * 2].content, message);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(requests.lock().await[0].is_empty());
+        assert_eq!(
+            requests.lock().await[1],
+            vec![
+                ProviderMessage::user("hello"),
+                ProviderMessage::assistant("The time is now."),
+            ]
+        );
+
+        let (status, body) = http(
+            &addr,
+            "POST",
+            "/api/lightagent/v1/sessions",
+            &[],
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, 201);
+        let new_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(id, new_id);
+        assert!(
+            store
+                .load(&lightagent_store::SessionId::parse(&new_id).unwrap())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

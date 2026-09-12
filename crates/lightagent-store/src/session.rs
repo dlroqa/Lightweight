@@ -1,10 +1,11 @@
 //! The session model and its store.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use lightagent_core::ProfileHandle;
 use lightagent_core::paths;
+use lightagent_core::{AgentEvent, ProfileHandle};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -106,12 +107,18 @@ pub struct RunRecord {
 pub struct Session {
     pub id: SessionId,
     pub profile: String,
+    /// ACP workspace root, when this session was opened by an editor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default)]
     pub title: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     #[serde(default)]
     pub messages: Vec<StoredMessage>,
+    /// An explicit terminal-chat choice to relax approvals for this session.
+    #[serde(default)]
+    pub approvals_unrestricted: bool,
     #[serde(default)]
     pub runs: Vec<RunRecord>,
 }
@@ -123,10 +130,12 @@ impl Session {
         Self {
             id: SessionId::generate(),
             profile: profile.into(),
+            cwd: None,
             title: title.into(),
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            approvals_unrestricted: false,
             runs: Vec::new(),
         }
     }
@@ -141,6 +150,50 @@ impl Session {
     pub fn push_run(&mut self, run: RunRecord) {
         self.runs.push(run);
         self.updated_at = SystemTime::now();
+    }
+
+    /// Record a managed run's assistant answer and tool history.
+    pub fn record_run_events(&mut self, events: &[AgentEvent], stop_reason: &str) {
+        let mut run_id = String::new();
+        let mut content = String::new();
+        let mut names: HashMap<String, String> = HashMap::new();
+        let mut arguments: HashMap<String, String> = HashMap::new();
+        let mut tools = Vec::new();
+
+        for event in events {
+            match event {
+                AgentEvent::RunStarted { run, .. } => run_id = run.as_str().to_owned(),
+                AgentEvent::Content { text } => content.push_str(text),
+                AgentEvent::ToolCallRequested { call } => {
+                    arguments.insert(call.id.clone(), call.arguments.clone());
+                }
+                AgentEvent::ToolCallStarted { id, name } => {
+                    names.insert(id.clone(), name.clone());
+                }
+                AgentEvent::ToolCallCompleted { id, outcome } => tools.push(ToolHistoryEntry {
+                    tool: names.get(id).cloned().unwrap_or_else(|| id.clone()),
+                    arguments_preview: arguments
+                        .get(id)
+                        .map(|value| value.chars().take(120).collect())
+                        .unwrap_or_default(),
+                    outcome: if outcome.is_error { "error" } else { "ok" }.to_owned(),
+                    duration_ms: None,
+                }),
+                _ => {}
+            }
+        }
+
+        if !content.is_empty() {
+            self.push_message(StoredMessage::new("assistant", content));
+        }
+        let now = SystemTime::now();
+        self.push_run(RunRecord {
+            run_id,
+            started_at: now,
+            ended_at: Some(now),
+            stop_reason: Some(stop_reason.to_owned()),
+            tools,
+        });
     }
 }
 
@@ -338,6 +391,7 @@ mod tests {
         let store = SessionStore::new(&dir);
         let mut session = Session::new("default", "First chat");
         session.push_message(StoredMessage::new("user", "hi"));
+        session.approvals_unrestricted = true;
         session.push_run(RunRecord {
             run_id: "run-1".into(),
             started_at: SystemTime::now(),

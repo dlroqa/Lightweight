@@ -18,9 +18,8 @@
 //! with a `kind` and object `rawInput`), the `stopReason` values, and
 //! `session/request_permission` with `allow_once`/`reject_once` options. It is
 //! exercised by an in-process client in the tests but has not been run against a
-//! live editor build; `session/load` and client-provided fs/terminal remain out
-//! of scope, and each prompt is an independent run (in-session history is not yet
-//! threaded).
+//! live editor build. `session/load` restores and replays persisted transcripts;
+//! client-provided fs/terminal remain out of scope.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

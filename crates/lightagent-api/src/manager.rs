@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lightagent_core::provider::ProviderMessage;
 use lightagent_core::{
     AgentEvent, AgentEventSink, AgentLoop, AgentProvider, ApprovalDecision, RunId, RunOutcome,
     StopReason, ToolInvoker,
@@ -49,6 +50,9 @@ impl RunStatus {
 #[derive(Clone, Debug)]
 pub struct StartRun {
     pub message: String,
+    /// Completed user/assistant turns that precede `message` in the same
+    /// session. Empty for a genuinely new session or a stateless API call.
+    pub history: Vec<ProviderMessage>,
     pub profile: Option<String>,
     /// The working directory for this run (an ACP session's `cwd`); when set it
     /// becomes the confined workspace root instead of the profile's default.
@@ -168,13 +172,14 @@ pub trait RunFactory: Send + Sync + 'static {
 /// terminal `RunCompleted` so a stream always ends cleanly.
 pub async fn drive<P: AgentProvider, I: ToolInvoker>(
     agent: AgentLoop<P, I>,
+    history: Vec<ProviderMessage>,
     message: String,
     sink: AgentEventSink,
     cancel: CancellationToken,
     mut decisions: UnboundedReceiver<ApprovalDecision>,
 ) -> RunStatus {
     let mut outcome = match agent
-        .run_streaming(message, cancel.clone(), sink.clone())
+        .run_streaming_with_history(history, message, cancel.clone(), sink.clone())
         .await
     {
         Ok(outcome) => outcome,

@@ -13,16 +13,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use dialoguer::console::{Key, Term, measure_text_width};
+use lightagent_core::provider::ProviderMessage;
 use lightagent_core::{
     AgentError, AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, Config,
     ConfigStore, Continuation, LightagentPaths, McpServerEntry, ModelRouting, PolicyEngine,
-    ProfileId, ProfileStore, ProviderError, ProviderFactory, RunId, RunOutcome, SkillStore,
-    StopReason, Suspended, WallClockPolicy,
+    ProfileError, ProfileId, ProfileStore, ProviderError, ProviderFactory, RunId, RunOutcome,
+    SkillStore, StopReason, Suspended, WallClockPolicy,
 };
 use lightagent_extensions::ExtensionStore;
 use lightagent_mcp::{McpHub, McpServerSpec, McpTransportSpec};
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
-use lightagent_store::{RunRecord, Session, SessionStore, StoredMessage, ToolHistoryEntry};
+use lightagent_store::{
+    RunRecord, Session, SessionId, SessionStore, StoredMessage, ToolHistoryEntry,
+};
 use lightagent_tools::{
     BoundedExecutor, Delegation, SkillContext, Tool, ToolRegistry, WebContext, WebPolicy,
     Workspace, WorkspaceContext, WorkspacePolicy,
@@ -316,6 +319,7 @@ impl ProviderFactory for LightweightFactory {
 /// Run the interactive session until end-of-input or `/exit`.
 pub async fn run(
     profile: Option<String>,
+    session_id: Option<String>,
     json: bool,
     version: &str,
     release_date: &str,
@@ -328,7 +332,22 @@ pub async fn run(
     let mut profile = resolve_profile(&store, &config, profile)?;
 
     let session_store = SessionStore::at_profile(&store.handle(&profile.id));
-    let mut session = Session::new(profile.id.as_str(), "chat session");
+    let mut session = match session_id {
+        Some(id) => {
+            let id = SessionId::parse(&id).map_err(|error| error.to_string())?;
+            let loaded = session_store.load(&id).map_err(|error| error.to_string())?;
+            if loaded.profile != profile.id.as_str() {
+                return Err(format!(
+                    "session {} belongs to profile '{}', not '{}'",
+                    loaded.id.as_str(),
+                    loaded.profile,
+                    profile.id.as_str()
+                ));
+            }
+            loaded
+        }
+        None => Session::new(profile.id.as_str(), "chat session"),
+    };
     let workspace_dir = store.handle(&profile.id).workspace_dir();
     let profile_dir = store.handle(&profile.id).dir().to_path_buf();
     let extensions = load_extensions(paths.root(), &profile_dir);
@@ -420,6 +439,9 @@ pub async fn run(
     // tool results pauses for a decision instead of wrapping up on its own.
     let agent = AgentLoop::from_profile(provider, executor, &profile)
         .with_wall_clock_policy(WallClockPolicy::Pause);
+    if session.approvals_unrestricted {
+        agent.invoker().allow_without_restrictions();
+    }
 
     if crate::banner::should_show(json) {
         crate::banner::print_startup(&crate::banner::StartupInfo {
@@ -488,6 +510,8 @@ pub async fn run(
                 &mut stream,
                 &mut renderer,
                 &mut active,
+                &mut session,
+                &session_store,
             )
             .await?;
             renderer.finish();
@@ -495,10 +519,17 @@ pub async fn run(
             continue;
         }
         if let Some(command) = slash::parse(&line) {
-            if command == Slash::New
-                && let Some(run) = paused.take()
-            {
-                drop_paused(run, &mut session, &session_store);
+            if command == Slash::New {
+                if let Some(run) = paused.take() {
+                    drop_paused(run, &mut session, &session_store);
+                }
+                session = Session::new(profile.id.as_str(), "chat session");
+                agent
+                    .invoker()
+                    .reset_session_policy(PolicyEngine::new(profile.approval_policy.into()));
+                last_turn = TurnStatus::default();
+                println!("New session {}.", session.id.as_str());
+                continue;
             }
             if handle_slash(command, &session_skills, &startup_tools) {
                 break;
@@ -508,7 +539,11 @@ pub async fn run(
         if let Some(run) = paused.take() {
             drop_paused(run, &mut session, &session_store);
         }
+        let history = model_history(&session);
         session.push_message(StoredMessage::new("user", &line));
+        session_store
+            .save(&session)
+            .map_err(|error| format!("could not save session: {error}"))?;
         if initialization_notice_due(&mut initialization_shown) {
             print_initializing();
         }
@@ -516,7 +551,7 @@ pub async fn run(
         let mut renderer = ModelRenderer::new(config.tui.show_reasoning);
         let (sink, mut stream) = tokio::sync::mpsc::unbounded_channel();
         let outcome = wait_for_outcome(
-            agent.run_streaming(line, CancellationToken::new(), sink),
+            agent.run_streaming_with_history(history, line, CancellationToken::new(), sink),
             &mut stream,
             &mut renderer,
             &mut active,
@@ -529,6 +564,8 @@ pub async fn run(
             &mut stream,
             &mut renderer,
             &mut active,
+            &mut session,
+            &session_store,
         )
         .await?;
         renderer.finish();
@@ -1265,6 +1302,21 @@ fn thinking_indicator(frame: usize, colour: bool) -> String {
     }
 }
 
+/// Convert the durable transcript into the model context for the next turn.
+/// Stored run/tool metadata remains audit history; only conversational roles
+/// belong in a fresh provider request.
+fn model_history(session: &Session) -> Vec<ProviderMessage> {
+    session
+        .messages
+        .iter()
+        .filter_map(|message| match message.role.as_str() {
+            "user" => Some(ProviderMessage::user(message.content.clone())),
+            "assistant" => Some(ProviderMessage::assistant(message.content.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Fold one completed run's events into the session: the assistant's answer as a
 /// message, and a run record with its tool history.
 fn record_turn(session: &mut Session, events: &[AgentEvent]) {
@@ -1334,7 +1386,7 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
             }
         }
         Slash::Skills => print!("{}", skills_listing(skills)),
-        Slash::New => println!("(new run)"),
+        Slash::New => println!("(new session)"),
         Slash::Stop => println!("(nothing running)"),
         // A paused run is picked up before commands are handled, so reaching
         // here means there is none.
@@ -1368,6 +1420,7 @@ fn skills_listing(skills: &SkillStore) -> String {
 /// Drive a run to completion, prompting for approval each time it pauses, and
 /// asking whether to continue when it runs out of time. A run the user chose
 /// to pause comes back as [`Driven::Paused`], still resumable.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     agent: &AgentLoop<LightweightProvider, BoundedExecutor>,
     mut outcome: RunOutcome,
@@ -1375,6 +1428,8 @@ async fn drive(
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     renderer: &mut ModelRenderer,
     active: &mut Duration,
+    session: &mut Session,
+    store: &SessionStore,
 ) -> Result<Driven, String> {
     loop {
         match outcome {
@@ -1448,6 +1503,12 @@ async fn drive(
                     active,
                 )
                 .await?;
+                if choice == ApprovalChoice::Unrestricted {
+                    session.approvals_unrestricted = true;
+                    store
+                        .save(session)
+                        .map_err(|error| format!("could not save session approval: {error}"))?;
+                }
             }
         }
     }
@@ -1672,7 +1733,13 @@ pub(crate) fn resolve_profile(
         None => store.active().map_err(|error| error.to_string())?,
     };
     let mut profile = match id {
-        Some(id) => store.load(&id).map_err(|error| error.to_string())?,
+        Some(id) => match store.load(&id) {
+            Ok(profile) => profile,
+            Err(ProfileError::NotFound { .. }) if id.as_str() == "default" => {
+                crate::default_profile(config)?
+            }
+            Err(error) => return Err(error.to_string()),
+        },
         None => crate::default_profile(config)?,
     };
     profile.limits = config.agent.apply_to(profile.limits);
@@ -1695,6 +1762,28 @@ pub(crate) fn configured_model(profile_model: &str, config: &Config) -> String {
 #[cfg(test)]
 mod model_tests {
     use super::*;
+
+    #[test]
+    fn model_history_contains_previous_turns_but_not_run_metadata() {
+        let mut session = Session::new("default", "chat");
+        session.push_message(StoredMessage::new("user", "first"));
+        session.push_message(StoredMessage::new("assistant", "answer"));
+        session.push_run(RunRecord {
+            run_id: "r1".into(),
+            started_at: SystemTime::now(),
+            ended_at: None,
+            stop_reason: None,
+            tools: Vec::new(),
+        });
+        assert_eq!(
+            model_history(&session),
+            vec![
+                ProviderMessage::user("first"),
+                ProviderMessage::assistant("answer")
+            ]
+        );
+        assert!(model_history(&Session::new("default", "new")).is_empty());
+    }
 
     #[test]
     fn a_default_profile_inherits_the_configured_model() {

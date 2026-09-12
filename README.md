@@ -53,6 +53,20 @@ Lightagent also runs directly in a terminal. Launch `lightagent` (or
 saved sessions. The desktop app and `lightagent serve` are optional; terminal
 chat connects directly to the configured inference gateway.
 
+Follow-up prompts in the same chat include prior user and assistant turns in
+the model context. The transcript is saved after each prompt; to resume it
+after closing the terminal, use `lightagent sessions` to find its ID and run
+`lightagent chat --session <id>` (add `--profile <id>` for another profile).
+`/new` starts a separate conversation with an empty context and resets
+session-only approval choices. The ACP editor integration likewise reuses one
+history per `sessionId`, persists it, and supports `session/load` on reconnect.
+The browser Agent screen keeps its session ID across reloads and has an explicit
+New session button; API callers can create one with `POST /api/lightagent/v1/sessions`
+and pass its `id` as `session_id` to later `POST /api/lightagent/v1/runs` calls.
+Runs without a `session_id` remain stateless for backwards compatibility.
+If the process stops mid-run, the saved conversation can be reopened, but an
+in-flight model or tool invocation is not resumed automatically.
+
 To install the current source build on Linux or macOS:
 
 ```sh

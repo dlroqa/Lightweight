@@ -70,6 +70,21 @@ impl BoundedExecutor {
         self
     }
 
+    /// Reset the in-memory approval policy when an interactive caller starts a
+    /// genuinely new session. No unrelated workspace or tool state is changed.
+    pub fn reset_session_policy(&self, policy: PolicyEngine) {
+        if let Ok(mut current) = self.policy.lock() {
+            *current = policy;
+        }
+    }
+
+    /// Restore a session's explicit unrestricted approval on resume.
+    pub fn allow_without_restrictions(&self) {
+        if let Ok(mut policy) = self.policy.lock() {
+            policy.allow_without_restrictions();
+        }
+    }
+
     /// Set the clock time-reading tools observe.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;

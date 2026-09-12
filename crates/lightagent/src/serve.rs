@@ -146,7 +146,15 @@ impl RunFactory for LightweightRunFactory {
             profile.persona.push_str(&format!("\n\n{memory_catalog}"));
         }
         let agent = AgentLoop::from_profile(provider, executor, &profile);
-        manager::drive(agent, request.message, sink, cancel, decisions).await
+        manager::drive(
+            agent,
+            request.history,
+            request.message,
+            sink,
+            cancel,
+            decisions,
+        )
+        .await
     }
 }
 
@@ -219,6 +227,8 @@ pub async fn run(
         manager: RunManager::new(factory),
         auth,
         sessions,
+        session_profile: active.as_str().to_owned(),
+        busy_sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         web_root: web_root.clone(),
     };
 

@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 lightagent-core.workspace = true
 lightagent-api.workspace = true
+lightagent-store.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 async-trait.workspace = true

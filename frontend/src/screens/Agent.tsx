@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Ban, Send, Wrench } from "lucide-react";
+import { Ban, Plus, Send, Wrench } from "lucide-react";
 
 import { agentApi } from "../api/agent";
 import { useRunEvents, type RunEvent } from "../hooks/useRunEvents";
@@ -49,7 +49,11 @@ function foldTools(events: RunEvent[]): ToolCall[] {
 
 export function Agent() {
   const [draft, setDraft] = useState("");
+  const [sessionId, setSessionId] = useState<string | null>(() =>
+    window.localStorage.getItem("lightagent.agent.session"),
+  );
   const [runId, setRunId] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { events, done } = useRunEvents(runId);
 
@@ -99,19 +103,36 @@ export function Agent() {
     () => events.some((event) => event.type === "run.cancelled"),
     [events],
   );
-  const running = runId !== null && !done;
+  const running = sending || (runId !== null && !done);
 
   async function send() {
     const message = draft.trim();
     if (!message || running) return;
     setError(null);
     setDraft("");
+    setSending(true);
     try {
-      const created = await agentApi.createRun(message);
+      let current = sessionId;
+      if (!current) {
+        current = (await agentApi.createSession()).id;
+        window.localStorage.setItem("lightagent.agent.session", current);
+        setSessionId(current);
+      }
+      const created = await agentApi.createRun(message, undefined, current);
       setRunId(created.id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSending(false);
     }
+  }
+
+  function newSession() {
+    if (running) return;
+    window.localStorage.removeItem("lightagent.agent.session");
+    setSessionId(null);
+    setRunId(null);
+    setError(null);
   }
 
   async function cancel() {
@@ -136,13 +157,17 @@ export function Agent() {
     <>
       <TopBar
         title="Agent"
-        subtitle="A tool-using run over the local runtime"
+        subtitle={sessionId ? `Session ${sessionId}` : "A new conversation"}
         actions={
           running ? (
             <button type="button" className="btn" onClick={cancel}>
               <Ban size={15} /> Stop
             </button>
-          ) : undefined
+          ) : (
+            <button type="button" className="btn" onClick={newSession}>
+              <Plus size={15} /> New session
+            </button>
+          )
         }
       />
 

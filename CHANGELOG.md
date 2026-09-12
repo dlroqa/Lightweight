@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-09-11
+
+A patch release for the Lightagent interactive terminal. Conversations now keep
+their history: a follow-up prompt sees the earlier turns of the same session,
+transcripts are saved as the chat proceeds, and a closed session can be
+reopened later by id. The same session continuity reaches the ACP editor
+integration through `session/load`, the HTTP API through explicit session
+handles, and the browser Agent screen, which now remembers its conversation
+across reloads. Runs that pass no session stay stateless for backwards
+compatibility.
+
+### Added
+
+- **Terminal chat threads a conversation across turns.** Follow-up prompts
+  include the previous user and assistant turns in the model context, and the
+  transcript is saved after each prompt. `lightagent chat --session <id>`
+  reopens a saved session (find its id with `lightagent sessions`), and `/new`
+  starts a separate conversation with an empty context, resetting session-only
+  approval choices. An explicit "allow without restrictions" approval choice is
+  remembered for the resumed session.
+- **The ACP integration restores sessions with `session/load`.** The agent now
+  advertises the `loadSession` capability, replays a persisted transcript back
+  to the editor on reconnect, and threads completed turns through the containing
+  session; each prompt remains a distinct managed run.
+- **The HTTP API exposes session handles.** `POST
+  /api/lightagent/v1/sessions` creates a session whose `id` can be passed as
+  `session_id` to `POST /api/lightagent/v1/runs`; such a run restores the prior
+  turns and persists the new one, while a second run against a busy session is
+  rejected. Runs without a `session_id` stay stateless.
+- **The browser Agent screen keeps its conversation.** It retains the session
+  across reloads and adds a New session button to start a fresh one.
+
 ## [0.3.15] - 2026-09-11
 
 A patch release for the Lightagent interactive terminal. Isolated user profiles

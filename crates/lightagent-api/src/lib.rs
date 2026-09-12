@@ -14,6 +14,7 @@ pub mod auth;
 pub mod manager;
 pub mod sse;
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -27,10 +28,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use lightagent_core::AgentEvent;
-use lightagent_store::{SessionId, SessionStore};
+use lightagent_core::provider::ProviderMessage;
+use lightagent_store::{Session, SessionId, SessionStore, StoredMessage};
 use lightagent_tools::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 pub use auth::{AuthConfig, Scope};
 pub use manager::{RunFactory, RunManager, RunState, RunStatus, StartRun};
@@ -44,6 +47,10 @@ pub struct AppState {
     pub auth: AuthConfig,
     /// The session store for the active profile.
     pub sessions: SessionStore,
+    /// The profile whose sessions are served by `sessions`.
+    pub session_profile: String,
+    /// Prevent overlapping runs from overwriting one session transcript.
+    pub busy_sessions: Arc<Mutex<HashSet<SessionId>>>,
     /// When set, the panel is served from this directory (same-origin), so the
     /// WebUI and the API it calls share one origin and need no CORS.
     pub web_root: Option<PathBuf>,
@@ -58,7 +65,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/lightagent/v1/runs/{id}", get(get_run))
         .route("/api/lightagent/v1/runs/{id}/events", get(run_events))
         .route("/api/lightagent/v1/runs/{id}/cancel", post(cancel_run))
-        .route("/api/lightagent/v1/sessions", get(list_sessions))
+        .route(
+            "/api/lightagent/v1/sessions",
+            get(list_sessions).post(create_session),
+        )
         .route(
             "/api/lightagent/v1/sessions/{id}",
             get(get_session).delete(delete_session),
@@ -164,6 +174,8 @@ struct CreateRunBody {
     message: String,
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 async fn create_run(
@@ -174,17 +186,92 @@ async fn create_run(
     if let Some(rejection) = deny(&state, &headers, Scope::RunsWrite) {
         return rejection;
     }
+    let mut history = Vec::new();
+    let mut profile = body.profile;
+    let mut session_id = None;
+    if let Some(raw) = body.session_id {
+        let id = match SessionId::parse(&raw) {
+            Ok(id) => id,
+            Err(error) => return bad_request(&error.to_string()),
+        };
+        let mut busy = state.busy_sessions.lock().await;
+        if !busy.insert(id.clone()) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "session already has an active run"})),
+            )
+                .into_response();
+        }
+        let mut session = match state.sessions.load(&id) {
+            Ok(session) => session,
+            Err(error) => {
+                busy.remove(&id);
+                return not_found(&error.to_string());
+            }
+        };
+        if session.profile != state.session_profile
+            || profile
+                .as_ref()
+                .is_some_and(|value| value != &session.profile)
+        {
+            busy.remove(&id);
+            return bad_request("session profile does not match");
+        }
+        history = session
+            .messages
+            .iter()
+            .filter_map(|message| match message.role.as_str() {
+                "user" => Some(ProviderMessage::user(message.content.clone())),
+                "assistant" => Some(ProviderMessage::assistant(message.content.clone())),
+                _ => None,
+            })
+            .collect();
+        profile = Some(session.profile.clone());
+        session.push_message(StoredMessage::new("user", &body.message));
+        if let Err(error) = state.sessions.save(&session) {
+            busy.remove(&id);
+            return internal(&error.to_string());
+        }
+        session_id = Some(id);
+    }
     let run = state
         .manager
         .start(StartRun {
             message: body.message,
-            profile: body.profile,
+            history,
+            profile,
             cwd: None,
         })
         .await;
+    if let Some(id) = &session_id {
+        let state = Arc::clone(&state);
+        let run = Arc::clone(&run);
+        let id = id.clone();
+        tokio::spawn(async move {
+            let mut seen = 0;
+            loop {
+                let (events, status) = run.wait_from(seen).await;
+                seen += events.len();
+                if status.is_terminal() {
+                    match state.sessions.load(&id) {
+                        Ok(mut session) => {
+                            let events = run.events().await;
+                            session.record_run_events(&events, &format!("{status:?}"));
+                            if let Err(error) = state.sessions.save(&session) {
+                                eprintln!("could not save agent session {id:?}: {error}");
+                            }
+                        }
+                        Err(error) => eprintln!("could not read agent session {id:?}: {error}"),
+                    }
+                    state.busy_sessions.lock().await.remove(&id);
+                    break;
+                }
+            }
+        });
+    }
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "id": run.id(), "status": run.status().await })),
+        Json(json!({ "id": run.id(), "status": run.status().await, "session_id": session_id })),
     )
         .into_response()
 }
@@ -250,6 +337,28 @@ async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         Ok(list) => Json(json!({ "sessions": list })).into_response(),
         Err(error) => internal(&error.to_string()),
     }
+}
+
+async fn create_session(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = deny(&state, &headers, Scope::SessionsWrite) {
+        return rejection;
+    }
+    if !state.sessions.is_history_kept() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "session history is disabled" })),
+        )
+            .into_response();
+    }
+    let session = Session::new(&state.session_profile, "agent session");
+    match state.sessions.save(&session) {
+        Ok(()) => (StatusCode::CREATED, Json(json!({ "id": session.id }))).into_response(),
+        Err(error) => internal(&error.to_string()),
+    }
+}
+
+fn bad_request(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
 }
 
 async fn get_session(

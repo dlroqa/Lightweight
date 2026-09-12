@@ -63,11 +63,12 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const agentApi = {
   tools: () => jsonRequest<{ tools: ToolInfo[] }>("/tools"),
-  createRun: (message: string, profile?: string) =>
-    jsonRequest<{ id: string; status: string }>("/runs", {
+  createRun: (message: string, profile?: string, sessionId?: string) =>
+    jsonRequest<{ id: string; status: string; session_id: string | null }>("/runs", {
       method: "POST",
-      body: JSON.stringify({ message, profile }),
+      body: JSON.stringify({ message, profile, session_id: sessionId }),
     }),
+  createSession: () => jsonRequest<{ id: string }>("/sessions", { method: "POST", body: "{}" }),
   run: (id: string) => jsonRequest<RunView>(`/runs/${id}`),
   cancelRun: (id: string) =>
     jsonRequest<{ id: string; cancelled: boolean }>(`/runs/${id}/cancel`, {
