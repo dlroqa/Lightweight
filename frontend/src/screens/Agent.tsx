@@ -330,7 +330,9 @@ export function Agent() {
           ? { tone: "danger" as const, label: "failed" }
           : cancelled
             ? { tone: "warn" as const, label: "stopped" }
-            : { tone: "ok" as const, label: "ready" };
+            : done
+              ? { tone: "ok" as const, label: "done" }
+              : { tone: "neutral" as const, label: "ready" };
   return (
     <>
       <TopBar

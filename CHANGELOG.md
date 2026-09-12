@@ -14,7 +14,8 @@ remains. A gateway that answers a health check but does not yet expose the
 agent API is verified before use rather than misread as ready, and a run whose
 event stream drops mid-flight is reconciled against the run endpoint so a still
 working model is no longer shown as idle. A single status badge reports the
-service state — ready, starting, running, offline, failed, or stopped — and the
+service and run state — ready, starting, running, done, offline, failed, or
+stopped — and the
 non-JSON API error now names the status, content type, and URL so an outdated
 or misrouted gateway is diagnosable. Existing sessions, runs, and settings keep
 working unchanged.
@@ -25,8 +26,8 @@ working unchanged.
   stopped local agent server that can be started is started and retried without
   a click, with a *starting* status and the message box disabled until the API
   answers; the *Start agent server and retry* button stays as a fallback. A
-  status badge reports the service state (ready, starting, running, offline,
-  failed, stopped).
+  status badge reports the service and run state (ready, starting, running,
+  done, offline, failed, stopped).
 
 ### Fixed
 
