@@ -1148,7 +1148,10 @@ mod tests {
         std::fs::write(handle.soul_file(), "My existing persona").unwrap();
         std::fs::write(handle.sessions_dir().join("keep.txt"), "existing session").unwrap();
 
-        assert_eq!(ensure_default_profile(&store, &Config::default()).unwrap(), id);
+        assert_eq!(
+            ensure_default_profile(&store, &Config::default()).unwrap(),
+            id
+        );
         assert_eq!(store.load(&id).unwrap().persona, "My existing persona");
         assert_eq!(store.active().unwrap(), Some(id));
         assert_eq!(
