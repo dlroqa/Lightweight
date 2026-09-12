@@ -335,8 +335,13 @@ The **Agent** screen has its own saved-session list: search, resume, start a
 fresh session, or delete one. Each session keeps its messages, runs and tool
 history; its first message becomes the list title. While a run is active,
 submitting another message queues a visible steer, handled in arrival order
-after the active turn ends. If the local agent server is
-stopped, Agent offers **Start agent server and retry**. The separate
+after the active turn ends. If the local agent server is stopped, Agent starts
+it and retries on its own, showing a **starting** status while it comes up, and
+still offers **Start agent server and retry** if a start is needed again; a
+gateway that answers a health check but does not yet expose the agent API is
+caught before use rather than misread as ready, and a run whose event stream
+drops mid-flight is reconciled against the run endpoint instead of looking
+idle. The separate
 **Settings → Lightagent** card edits the same configuration used by the CLI and
 TUI, including approval policy, run limits, web/file/terminal tools, durable
 memory and terminal reasoning display. Changes apply to new runs.

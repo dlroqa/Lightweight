@@ -69,6 +69,7 @@ export function Agent() {
   const [error, setError] = useState<string | null>(null);
   const end = useRef<HTMLDivElement | null>(null);
   const dispatching = useRef(false);
+  const autoStartAttempted = useRef(false);
   const selected = useRef(activeId);
   const loadGeneration = useRef(0);
   selected.current = activeId;
@@ -272,7 +273,7 @@ export function Agent() {
     }
   }
 
-  async function recover() {
+  const recover = useCallback(async () => {
     setRecovering(true);
     setError(null);
     try {
@@ -280,6 +281,8 @@ export function Agent() {
       for (let attempt = 0; attempt < 60; attempt += 1) {
         const status = await api.agentServer();
         if (status.status === "running") {
+          // Health alone does not prove this version exposes the API the page needs.
+          await agentApi.sessions();
           server.refresh();
           sessions.refresh();
           if (activeId) await load(activeId);
@@ -294,7 +297,13 @@ export function Agent() {
     } finally {
       setRecovering(false);
     }
-  }
+  }, [activeId, load, server.refresh, sessions.refresh]);
+
+  useEffect(() => {
+    if (server.data?.status !== "stopped" || !server.data.can_start || autoStartAttempted.current) return;
+    autoStartAttempted.current = true;
+    void recover();
+  }, [recover, server.data]);
 
   async function cancel() {
     if (runId) await agentApi.cancelRun(runId).catch((cause) =>
@@ -306,7 +315,22 @@ export function Agent() {
       setError(cause instanceof Error ? cause.message : String(cause)));
   }
 
-  const shownError = error ?? sessions.error?.message;
+  const serviceStatus = server.data?.status;
+  const serviceUnavailable = serviceStatus === "stopped" || serviceStatus === "failed" || serviceStatus === "unavailable";
+  const shownError = error ?? (!recovering && serviceUnavailable
+    ? server.data?.message ?? "The Lightagent server is not running."
+    : null) ?? (!recovering ? sessions.error?.message : null);
+  const badge = running
+    ? { tone: "accent" as const, label: "running" }
+    : recovering || serviceStatus === "starting"
+      ? { tone: "accent" as const, label: "starting" }
+      : serviceUnavailable
+        ? { tone: "danger" as const, label: "offline" }
+        : failure
+          ? { tone: "danger" as const, label: "failed" }
+          : cancelled
+            ? { tone: "warn" as const, label: "stopped" }
+            : { tone: "ok" as const, label: "ready" };
   return (
     <>
       <TopBar
@@ -352,6 +376,7 @@ export function Agent() {
           </div>
         </aside>
         <section className="card" style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
+          {recovering && <div className="notice notice--info" role="status">Starting the local Lightagent server…</div>}
           {shownError && (
             <div className="notice notice--danger" role="alert">
               <div>{shownError}</div>
@@ -428,7 +453,7 @@ export function Agent() {
               <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
                 <textarea className="input" rows={2} style={{ resize: "none" }}
                   value={draft} placeholder={running ? "Type a steer to queue…" : "Ask the agent…"}
-                  disabled={busy}
+                  disabled={busy || recovering || serviceUnavailable}
                   onChange={(event) => setDraft(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
@@ -437,7 +462,7 @@ export function Agent() {
                     }
                   }} aria-label="Message" />
                 <button type="button" className="btn btn--primary"
-                  disabled={!draft.trim() || busy} onClick={() => void send()}>
+                  disabled={!draft.trim() || busy || recovering || serviceUnavailable} onClick={() => void send()}>
                   <Send size={15} /> {running || steering.length > 0 ? "Queue steer" : "Send"}
                 </button>
               </div>
@@ -445,9 +470,7 @@ export function Agent() {
                 <span>{session.messages.length} messages</span>
                 <span>{session.runs.length} runs</span>
                 <span style={{ flex: 1 }} />
-                <Pill tone={running ? "accent" : failure ? "danger" : cancelled ? "warn" : done ? "ok" : "neutral"} dot>
-                  {running ? "running" : failure ? "failed" : cancelled ? "stopped" : done ? "done" : "idle"}
-                </Pill>
+                <Pill tone={badge.tone} dot>{badge.label}</Pill>
               </div>
             </>
           )}

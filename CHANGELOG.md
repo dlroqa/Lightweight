@@ -4,6 +4,41 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-09-12
+
+A patch release that hardens the panel's Agent screen against a slow or
+outdated local server. When the agent server is stopped, the screen now starts
+it and retries on its own instead of waiting for a click, showing a *starting*
+status while it comes up; the manual *Start agent server and retry* action
+remains. A gateway that answers a health check but does not yet expose the
+agent API is verified before use rather than misread as ready, and a run whose
+event stream drops mid-flight is reconciled against the run endpoint so a still
+working model is no longer shown as idle. A single status badge reports the
+service state — ready, starting, running, offline, failed, or stopped — and the
+non-JSON API error now names the status, content type, and URL so an outdated
+or misrouted gateway is diagnosable. Existing sessions, runs, and settings keep
+working unchanged.
+
+### Changed
+
+- **The Agent screen recovers a stopped server automatically.** On open, a
+  stopped local agent server that can be started is started and retried without
+  a click, with a *starting* status and the message box disabled until the API
+  answers; the *Start agent server and retry* button stays as a fallback. A
+  status badge reports the service state (ready, starting, running, offline,
+  failed, stopped).
+
+### Fixed
+
+- **A dropped event stream no longer looks like a finished run.** A transient
+  SSE error reconciles against the run endpoint instead of marking the run
+  done, so a still working model keeps streaming; the transcript closes only on
+  a real terminal state.
+- **A running-but-outdated gateway is caught before use.** After the server
+  reports healthy, the Agent screen confirms the agent API responds before
+  proceeding, and the non-JSON API error names the response status, content
+  type, and URL.
+
 ## [0.3.19] - 2026-09-12
 
 A patch release for the Lightagent panel and interactive terminal. The panel's

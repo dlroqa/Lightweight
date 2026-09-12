@@ -104,7 +104,8 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     throw new Error(
-      "This gateway does not expose the agent API. Restart it with the current Lightweight build, then try again.",
+      `Agent API returned ${response.status} ${contentType || "without a content type"} for ${BASE}${path}. ` +
+      "The gateway may be outdated or routed to the wrong service. Restart it with the current Lightweight build, then try again.",
     );
   }
   const body = await response.json();

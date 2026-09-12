@@ -34,7 +34,9 @@ const TERMINAL = new Set(["run.completed", "run.cancelled", "run.failed"]);
 /**
  * Stream a run's events over SSE. Returns the events so far and whether the run
  * has reached a terminal state. Passing a new `runId` starts fresh; `null` is
- * idle. `EventSource` reconnects on its own, and a terminal event closes it.
+ * idle. `EventSource` reconnects on its own. A transient stream error must
+ * not make a still-running model look idle; the run endpoint is the fallback
+ * source of truth when a terminal event is missed.
  */
 export function useRunEvents(runId: string | null): { events: RunEvent[]; done: boolean } {
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -53,6 +55,27 @@ export function useRunEvents(runId: string | null): { events: RunEvent[]; done: 
 
     const source = new EventSource(agentApi.eventsUrl(runId));
     const listeners: Array<[string, EventListener]> = [];
+    let closed = false;
+    const finish = () => {
+      if (closed) return;
+      closed = true;
+      setDone(true);
+      source.close();
+      window.clearInterval(statusTimer);
+    };
+    const checkStatus = async () => {
+      if (closed) return;
+      try {
+        const run = await agentApi.run(runId);
+        if (closed || !TERMINAL.has(`run.${run.status}`)) return;
+        setEvents((current) => current.some((event) => TERMINAL.has(event.type))
+          ? current
+          : [...current, { type: `run.${run.status}`, data: {} }]);
+        finish();
+      } catch {
+        // Let EventSource reconnect; a failed status probe is not completion.
+      }
+    };
 
     for (const name of EVENT_NAMES) {
       const handler = (event: MessageEvent) => {
@@ -64,22 +87,19 @@ export function useRunEvents(runId: string | null): { events: RunEvent[]; done: 
         }
         setEvents((current) => [...current, { type: name, data }]);
         if (TERMINAL.has(name)) {
-          setDone(true);
-          source.close();
+          finish();
         }
       };
       source.addEventListener(name, handler as EventListener);
       listeners.push([name, handler as EventListener]);
     }
 
-    source.onerror = () => {
-      // The stream closed (the run ended and the server hung up, or a network
-      // fault). Either way there is no more to read.
-      setDone(true);
-      source.close();
-    };
+    source.onerror = () => { void checkStatus(); };
+    const statusTimer = window.setInterval(() => void checkStatus(), 2000);
 
     return () => {
+      closed = true;
+      window.clearInterval(statusTimer);
       for (const [name, handler] of listeners) {
         source.removeEventListener(name, handler);
       }

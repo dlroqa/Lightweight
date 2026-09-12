@@ -32,6 +32,7 @@ const FALLBACK_SIGNS = [
   "Could not reach the agent API",
   "is not valid JSON",
   "does not expose the agent API",
+  "Agent API returned",
   "<!doctype",
   "<!DOCTYPE",
 ];
