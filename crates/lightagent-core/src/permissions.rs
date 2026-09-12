@@ -138,7 +138,8 @@ fn fallback() -> String {
 ///
 /// A call is auto-approved when its risk is at or below `auto_approve_max` (or a
 /// remembered grant covers it), denied when its risk is in `deny`, and requires
-/// a human decision otherwise. `deny` wins over everything.
+/// a human decision otherwise. Privileged calls are blocked and mutations and
+/// executable calls always ask, regardless of this policy's grants or ceiling.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPolicy {
     /// The highest risk that runs without asking.
@@ -160,7 +161,7 @@ impl Default for ApprovalPolicy {
 }
 
 impl ApprovalPolicy {
-    /// Approve everything; deny nothing. For trusted, unattended runs.
+    /// Auto-approve lower-risk calls. Mandatory asks and blocks still apply.
     pub fn permissive() -> Self {
         Self {
             auto_approve_max: RiskClass::Privileged,
@@ -371,8 +372,8 @@ impl PolicyEngine {
         self.policy.grants.push(record);
     }
 
-    /// Allow every risk class for this in-memory policy. Callers deliberately
-    /// decide whether to persist a broader coarse policy separately.
+    /// Relax lower-risk calls for this session. Mandatory asks and blocks still
+    /// apply, regardless of this in-memory setting.
     pub fn allow_without_restrictions(&mut self) {
         self.policy = ApprovalPolicy::permissive();
     }
@@ -383,12 +384,26 @@ impl PolicyEngine {
     /// consulted, so a remembered grant can never resurrect a class the policy
     /// forbids.
     pub fn evaluate(&self, request: &ApprovalRequest, now: SystemTime) -> ApprovalNeed {
+        if request.risk == RiskClass::Privileged {
+            return ApprovalNeed::Deny(format!(
+                "the tool '{}' is blocked (privileged operation)",
+                request.tool
+            ));
+        }
         if self.policy.deny.contains(&request.risk) {
             return ApprovalNeed::Deny(format!(
                 "the tool '{}' is denied by policy (risk class '{}')",
                 request.tool,
                 request.risk.as_str()
             ));
+        }
+        if matches!(request.risk, RiskClass::Mutating | RiskClass::Executable)
+            || request
+                .scopes
+                .iter()
+                .any(|scope| matches!(scope.as_str(), "fs:write" | "terminal:exec"))
+        {
+            return ApprovalNeed::Require(request.clone());
         }
         if self
             .policy
@@ -553,20 +568,27 @@ mod tests {
 
     #[test]
     fn unrestricted_decision_is_explicit_and_session_policy_can_relax() {
-        let request = request("terminal.run", RiskClass::Executable, vec![]);
-        let decision = ApprovalDecision::grant_unrestricted(request.id.clone());
+        let terminal_request = request("terminal.run", RiskClass::Executable, vec![]);
+        let decision = ApprovalDecision::grant_unrestricted(terminal_request.id.clone());
         assert!(decision.granted);
         assert!(decision.unrestricted);
         assert!(decision.remember.is_none());
 
         let mut engine = PolicyEngine::new(ApprovalPolicy::strict());
         assert!(matches!(
-            engine.evaluate(&request, SystemTime::now()),
+            engine.evaluate(&terminal_request, SystemTime::now()),
             ApprovalNeed::Require(_)
         ));
         engine.allow_without_restrictions();
+        assert!(matches!(
+            engine.evaluate(&terminal_request, SystemTime::now()),
+            ApprovalNeed::Require(_)
+        ));
         assert_eq!(
-            engine.evaluate(&request, SystemTime::now()),
+            engine.evaluate(
+                &request("private.read", RiskClass::Sensitive, vec![]),
+                SystemTime::now()
+            ),
             ApprovalNeed::AutoApprove
         );
     }
@@ -574,7 +596,7 @@ mod tests {
     #[test]
     fn remembered_grant_covers_next_call() {
         let mut engine = PolicyEngine::new(ApprovalPolicy::strict());
-        let req = request("fs.write", RiskClass::Mutating, vec![]);
+        let req = request("private.read", RiskClass::Sensitive, vec![]);
         let now = SystemTime::now();
         // Strict requires this call...
         assert!(matches!(
@@ -588,6 +610,39 @@ mod tests {
             Some(Duration::from_secs(300)),
         ));
         assert_eq!(engine.evaluate(&req, now), ApprovalNeed::AutoApprove);
+    }
+
+    #[test]
+    fn mandatory_asks_and_blocks_survive_permissive_policy_and_grants() {
+        let now = SystemTime::now();
+        let mut engine = PolicyEngine::new(ApprovalPolicy::permissive());
+        for req in [
+            request(
+                "fs.write",
+                RiskClass::Mutating,
+                vec![Scope::new("fs:write")],
+            ),
+            request(
+                "terminal.run",
+                RiskClass::Executable,
+                vec![Scope::new("terminal:exec")],
+            ),
+            request(
+                "api.mutate",
+                RiskClass::External,
+                vec![Scope::new("fs:write")],
+            ),
+        ] {
+            engine.remember(ApprovalRecord::from_request(&req, now, None));
+            assert!(matches!(
+                engine.evaluate(&req, now),
+                ApprovalNeed::Require(_)
+            ));
+        }
+        assert!(matches!(
+            engine.evaluate(&request("sudo.run", RiskClass::Privileged, vec![]), now),
+            ApprovalNeed::Deny(_)
+        ));
     }
 
     #[test]

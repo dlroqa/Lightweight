@@ -15,6 +15,7 @@ mod banner;
 mod chat;
 mod extensions;
 mod import;
+mod markdown;
 mod memory;
 mod rag;
 mod runtime;
@@ -183,7 +184,7 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum ToolsAction {
-    /// List the tools, their risk class and description.
+    /// List tools available to the active profile, including connected extensions.
     List,
 }
 
@@ -220,6 +221,20 @@ enum ExtensionsAction {
     Enable { name: String },
     /// Keep an extension installed but inactive.
     Disable { name: String },
+    /// Install an extension from a local directory or an HTTPS Git repository.
+    Install {
+        source: std::path::PathBuf,
+        /// Install for the active profile only.
+        #[arg(long)]
+        profile: bool,
+    },
+    /// Uninstall an extension from the global or active-profile store.
+    Uninstall {
+        name: String,
+        /// Remove the active profile's copy instead of the global one.
+        #[arg(long)]
+        profile: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +263,8 @@ enum MemoryAction {
     },
     /// List every memory.
     List,
+    /// Show structured working knowledge, optionally focused on a topic.
+    Reflect { topic: Option<String> },
     /// Recall the memories most relevant to a query.
     Search {
         query: String,
@@ -374,7 +391,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Models) => models(cli.json).await,
         Some(Command::Tools { action }) => {
             let _ = action.unwrap_or(ToolsAction::List);
-            tools_list(cli.json)
+            tools_list(cli.json).await
         }
         Some(Command::Profiles { action }) => {
             profiles_cmd(action.unwrap_or(ProfilesAction::List), cli.json)
@@ -384,6 +401,12 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             ExtensionsAction::Show { name } => extensions::show(&name, cli.json),
             ExtensionsAction::Enable { name } => extensions::enable(&name, cli.json),
             ExtensionsAction::Disable { name } => extensions::disable(&name, cli.json),
+            ExtensionsAction::Install { source, profile } => {
+                extensions::install(&source, profile, cli.json)
+            }
+            ExtensionsAction::Uninstall { name, profile } => {
+                extensions::uninstall(&name, profile, cli.json)
+            }
         },
         Some(Command::Sessions { action }) => {
             sessions_cmd(action.unwrap_or(SessionsAction::List), cli.json)
@@ -416,6 +439,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Memory { action }) => match action {
             MemoryAction::Add { text, kind, tags } => memory::add(text, kind, tags, cli.json),
             MemoryAction::List => memory::list(cli.json),
+            MemoryAction::Reflect { topic } => memory::reflect(topic, cli.json),
             MemoryAction::Search { query, top_k } => memory::search(query, top_k, cli.json).await,
             MemoryAction::Candidates { session } => memory::candidates(session, cli.json),
             MemoryAction::Promote {
@@ -636,15 +660,36 @@ async fn doctor(json: bool) -> Result<(), String> {
 
 // --- tools ------------------------------------------------------------------
 
-fn tools_list(json: bool) -> Result<(), String> {
-    let registry = ToolRegistry::builtin();
+async fn tools_list(json: bool) -> Result<(), String> {
+    let paths = paths()?;
+    let config = load_config(&paths)?;
+    let profiles = ProfileStore::new(paths.root());
+    let profile = chat::resolve_profile(&profiles, &config, None)?;
+    let profile_dir = profiles.handle(&profile.id).dir().to_path_buf();
+    let extensions = chat::load_extensions(paths.root(), &profile_dir);
+    let skills = chat::load_skills(paths.root(), &profile_dir, &extensions, &config);
+    let registry =
+        chat::configured_registry(&config, &profile_dir, &extensions, !skills.is_empty()).await;
+    let policy = lightagent_core::PolicyEngine::new(profile.approval_policy.into());
     let mut rows = Vec::new();
     for name in registry.names() {
         if let Some(tool) = registry.get(&name) {
             let definition = tool.definition();
+            let request = lightagent_core::ApprovalRequest::new(
+                &definition.name,
+                definition.risk,
+                definition.scopes.clone(),
+                "{}",
+            );
+            let permission = match policy.evaluate(&request, std::time::SystemTime::now()) {
+                lightagent_core::ApprovalNeed::AutoApprove => "auto",
+                lightagent_core::ApprovalNeed::Require(_) => "ask",
+                lightagent_core::ApprovalNeed::Deny(_) => "block",
+            };
             rows.push((
                 definition.name.clone(),
                 definition.risk.as_str().to_string(),
+                permission,
                 definition.description.clone(),
             ));
         }
@@ -653,8 +698,8 @@ fn tools_list(json: bool) -> Result<(), String> {
     if json {
         let value: Vec<_> = rows
             .iter()
-            .map(|(name, risk, description)| {
-                serde_json::json!({ "name": name, "risk": risk, "description": description })
+            .map(|(name, risk, permission, description)| {
+                serde_json::json!({ "name": name, "risk": risk, "permission": permission, "description": description })
             })
             .collect();
         println!("{}", serde_json::Value::Array(value));
@@ -662,8 +707,10 @@ fn tools_list(json: bool) -> Result<(), String> {
     }
 
     let mut out = String::from("Tools:\n");
-    for (name, risk, description) in rows {
-        out.push_str(&format!("  {name:<16} [{risk}]  {description}\n"));
+    for (name, risk, permission, description) in rows {
+        out.push_str(&format!(
+            "  {name:<16} [{permission}, {risk}]  {description}\n"
+        ));
     }
     print!("{out}");
     Ok(())
@@ -947,6 +994,9 @@ fn get_key(config: &Config, key: &str) -> Option<String> {
                 .unwrap_or_default(),
         ),
         "extensions.enabled" => Some(config.extensions.enabled.to_string()),
+        "memory.auto_capture" => Some(config.memory.auto_capture.to_string()),
+        "memory.inject_recent" => Some(config.memory.inject_recent.to_string()),
+        "memory.top_k" => Some(config.memory.top_k.to_string()),
         "web.enabled" => Some(config.web.enabled.to_string()),
         "web.search.endpoint" => Some(config.web.search.endpoint.clone().unwrap_or_default()),
         "web.search.query_param" => Some(config.web.search.query_param.clone()),
@@ -992,6 +1042,17 @@ fn set_key(config: &mut Config, key: &str, value: &str) -> Result<(), String> {
         }
         "extensions.enabled" => {
             config.extensions.enabled = parse_bool(value)?;
+        }
+        "memory.auto_capture" => config.memory.auto_capture = parse_bool(value)?,
+        "memory.inject_recent" => {
+            config.memory.inject_recent = parse_usize(value, "memory.inject_recent")?;
+        }
+        "memory.top_k" => {
+            let top_k = parse_usize(value, "memory.top_k")?;
+            if top_k == 0 {
+                return Err("memory.top_k must be at least 1".to_owned());
+            }
+            config.memory.top_k = top_k;
         }
         "web.enabled" => config.web.enabled = parse_bool(value)?,
         "web.search.endpoint" => config.web.search.endpoint = parse_opt_string(value),
@@ -1262,6 +1323,18 @@ mod tests {
             get_key(&config, "tui.show_reasoning").as_deref(),
             Some("false")
         );
+
+        set_key(&mut config, "memory.auto_capture", "false").unwrap();
+        set_key(&mut config, "memory.inject_recent", "0").unwrap();
+        assert_eq!(
+            get_key(&config, "memory.auto_capture").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            get_key(&config, "memory.inject_recent").as_deref(),
+            Some("0")
+        );
+        assert!(set_key(&mut config, "memory.top_k", "0").is_err());
     }
 
     #[test]

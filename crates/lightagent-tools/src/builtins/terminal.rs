@@ -11,6 +11,7 @@
 //! that runs can still reach whatever the user can — execution is a real grant,
 //! which is why it is approval-gated and separately enabled (`allow_terminal`).
 
+use std::path::Path;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -75,6 +76,44 @@ struct RunArgs {
     cwd: Option<String>,
 }
 
+/// Refuse programs that are primarily destructive or can hide another command
+/// behind a shell. The working-directory boundary is not an OS sandbox, so
+/// every other program still needs a fresh human approval.
+pub(crate) fn blocked_command(command: &str) -> Option<&'static str> {
+    let name = Path::new(command)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "rm" | "rmdir"
+            | "unlink"
+            | "shred"
+            | "dd"
+            | "wipefs"
+            | "sudo"
+            | "doas"
+            | "shutdown"
+            | "reboot"
+            | "poweroff"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "pwsh"
+            | "busybox"
+    ) || name.starts_with("mkfs")
+    {
+        Some("program is blocked by the terminal deny-list")
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 impl Tool for TerminalRun {
     fn definition(&self) -> &ToolDefinition {
@@ -91,6 +130,18 @@ impl Tool for TerminalRun {
         let Ok(args) = serde_json::from_value::<RunArgs>(args.clone()) else {
             return ToolOutcome::error("could not read terminal.run arguments");
         };
+        if serde_json::to_string(&json!({
+            "command": &args.command,
+            "args": &args.args,
+            "cwd": &args.cwd,
+        }))
+        .is_ok_and(|rendered| rendered.len() > 512)
+        {
+            return ToolOutcome::error("terminal arguments exceed the review limit");
+        }
+        if let Some(reason) = blocked_command(&args.command) {
+            return ToolOutcome::error(reason);
+        }
         if !ws.policy.terminal_allowlist.is_empty()
             && !ws
                 .policy
@@ -238,5 +289,18 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("allowlist"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn destructive_program_is_blocked_even_when_terminal_is_enabled() {
+        let root = scratch();
+        let ctx = ctx_for(&root, true, Vec::new());
+        let out = TerminalRun::new()
+            .call(&json!({"command":"/bin/rm","args":["-rf","."]}), &ctx)
+            .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("deny-list"));
+        assert!(root.is_dir());
+        std::fs::remove_dir_all(root).ok();
     }
 }

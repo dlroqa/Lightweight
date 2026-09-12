@@ -5,6 +5,7 @@
 //! down. Each connected server's tools become [`McpTool`]s sharing that server's
 //! client, so the connections live exactly as long as the tools do.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ pub enum McpTransportSpec {
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
+        /// Extension-local servers run from their installed directory.
+        cwd: Option<PathBuf>,
     },
     /// Reach a streamable-HTTP endpoint.
     Http {
@@ -84,8 +87,13 @@ async fn connect_one(
     http_client: &reqwest::Client,
 ) -> Result<(McpClient, Vec<McpToolDef>), McpError> {
     let connection: Box<dyn Connection> = match &spec.transport {
-        McpTransportSpec::Stdio { command, args, env } => {
-            Box::new(StdioConnection::spawn(command, args, env, timeout).await?)
+        McpTransportSpec::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            Box::new(StdioConnection::spawn_in(command, args, env, cwd.as_deref(), timeout).await?)
         }
         McpTransportSpec::Http {
             url,

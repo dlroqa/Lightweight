@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use lightagent_core::permissions::ApprovalPolicy;
 use lightagent_core::{
-    AgentEvent, AgentLoop, AgentProfile, AgentProvider, FinishReason, MockProvider, ModelRouting,
-    PolicyEngine, ProfileId, ProfileStore, ProviderError, ProviderEvent, ProviderRequest,
-    RiskClass, Role, RunConfig, RunId, RunOutcome,
+    AgentEvent, AgentLoop, AgentProfile, AgentProvider, ApprovalDecision, FinishReason,
+    MockProvider, ModelRouting, PolicyEngine, ProfileId, ProfileStore, ProviderError,
+    ProviderEvent, ProviderRequest, RiskClass, Role, RunConfig, RunId, RunOutcome,
 };
 use lightagent_tools::{BoundedExecutor, Delegation, ToolRegistry};
 use tokio_util::sync::CancellationToken;
@@ -112,8 +112,22 @@ async fn delegate_runs_a_worker_with_fresh_context_and_returns_its_answer() {
     .with_delegation(delegation(store, worker_provider.clone()));
 
     let agent = AgentLoop::new(orchestrator, executor, RunConfig::new("orchestrator-model"));
-    let outcome = agent
+    let paused = agent
         .run("delegate please", CancellationToken::new())
+        .await
+        .unwrap();
+    let RunOutcome::AwaitingApproval {
+        request, suspended, ..
+    } = paused
+    else {
+        panic!("delegation must ask even under a permissive policy");
+    };
+    let outcome = agent
+        .resume(
+            suspended,
+            ApprovalDecision::grant(request.id),
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let events = outcome.into_events();
@@ -202,8 +216,22 @@ async fn delegate_errors_when_delegation_is_not_enabled() {
         262_144,
     );
     let agent = AgentLoop::new(orchestrator, executor, RunConfig::new("orchestrator-model"));
-    let events = agent
+    let paused = agent
         .run("delegate please", CancellationToken::new())
+        .await
+        .unwrap();
+    let RunOutcome::AwaitingApproval {
+        request, suspended, ..
+    } = paused
+    else {
+        panic!("delegation must ask even under a permissive policy");
+    };
+    let events = agent
+        .resume(
+            suspended,
+            ApprovalDecision::grant(request.id),
+            CancellationToken::new(),
+        )
         .await
         .unwrap()
         .into_events();

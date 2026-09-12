@@ -29,7 +29,6 @@ use axum::{Json, Router};
 use futures_util::stream::{self, Stream};
 use lightagent_core::AgentEvent;
 use lightagent_store::{Session, SessionId, SessionStore, StoredMessage, model_history};
-use lightagent_tools::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -154,11 +153,18 @@ async fn list_tools(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     if let Some(rejection) = deny(&state, &headers, Scope::ToolsRead) {
         return rejection;
     }
-    let registry = ToolRegistry::builtin();
-    let tools: Vec<_> = registry
-        .names()
+    let definitions = match state.manager.tools().await {
+        Ok(tools) => tools,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let tools: Vec<_> = definitions
         .into_iter()
-        .filter_map(|name| registry.get(&name).map(|tool| tool.definition().clone()))
         .map(|definition| {
             json!({
                 "name": definition.name,

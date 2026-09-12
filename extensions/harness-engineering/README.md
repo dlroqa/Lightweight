@@ -15,12 +15,13 @@ only when a task calls for it, so the bundle costs little context until used.
 
 ## Install
 
-An extension is a directory; installing is copying it into place.
+An extension is a directory; the CLI copies it into Lightagent's managed store.
 
 ```bash
-cp -r extensions/harness-engineering ~/.lightagent/extensions/
+lightagent extensions install extensions/harness-engineering
 lightagent extensions list          # shows harness-engineering as active
 lightagent extensions disable harness-engineering   # switch it off
+lightagent extensions uninstall harness-engineering # remove its installed copy
 ```
 
 It loads into `lightagent chat` (the terminal UI, where `/skills` lists it),

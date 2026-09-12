@@ -112,6 +112,51 @@ pub struct MemorySearch {
     semantic: Option<Arc<dyn SemanticEmbedder>>,
 }
 
+/// Query the structured working knowledge derived from the memory bank.
+pub struct MemoryReflect {
+    definition: ToolDefinition,
+    path: PathBuf,
+}
+
+impl MemoryReflect {
+    pub const NAME: &'static str = "memory.reflect";
+
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            definition: ToolDefinition::new(
+                Self::NAME,
+                "Read a structured knowledge page of established preferences, decisions, conventions and fixes.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "topic": { "type": "string", "description": "Optional topic or category to focus on." }
+                    },
+                    "additionalProperties": false
+                }),
+                RiskClass::Observe,
+                vec![Scope::new("memory:read")],
+            ),
+            path,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryReflect {
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    async fn call(&self, args: &Value, _ctx: &ToolCtx) -> ToolOutcome {
+        let topic = args.get("topic").and_then(Value::as_str);
+        let store = match MemoryStore::open(&self.path) {
+            Ok(store) => store,
+            Err(error) => return ToolOutcome::error(format!("could not open memory: {error}")),
+        };
+        ToolOutcome::ok(store.knowledge_page(topic, 8_000))
+    }
+}
+
 /// Read an exact saved session message or bounded tool result by reference.
 pub struct SessionLookup {
     definition: ToolDefinition,
@@ -324,6 +369,31 @@ mod tests {
         assert!(!found.is_error);
         assert!(found.content.contains("vault"));
 
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn reflect_tool_returns_grouped_knowledge() {
+        let path = scratch();
+        MemoryStore::open(&path)
+            .unwrap()
+            .write(
+                "I prefer concise answers",
+                "preference",
+                vec![],
+                &HashingEmbedder,
+                1,
+            )
+            .unwrap();
+        let result = MemoryReflect::new(path.clone())
+            .call(
+                &json!({"topic":"preference"}),
+                &ToolCtx::new(CancellationToken::new()),
+            )
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.contains("## Preferences"));
+        assert!(result.content.contains("I prefer concise answers"));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

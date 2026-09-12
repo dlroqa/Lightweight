@@ -63,15 +63,21 @@ session remains complete. `lightagent sessions show <id>` numbers its messages
 and shows each stored tool excerpt and source. The `ctx` status is still the
 last provider prompt's token use, not a cumulative session size.
 
-Durable memory is separate from session history. Each request selects up to
-three relevant memories for its prompt; memory written during a terminal chat
-can be recalled on the next prompt without restarting. To review and promote a
-saved user statement, run:
+Durable memory is separate from session history. Clear user statements such as
+"I prefer concise answers," "We decided to use SQLite," and "The issue was
+resolved by changing the parser" are retained automatically for the active
+profile. Questions, temporary requests, code blocks, and likely secrets are
+skipped. Each request selects up to three relevant memories for its prompt, so
+a new session can use established context immediately. `memory.reflect` lets
+the agent read grouped working knowledge; `lightagent memory reflect` shows the
+same view in the terminal. To review and promote a statement the automatic
+filter skipped, run:
 
 ```sh
 lightagent memory candidates <session-id>
 lightagent memory promote <session-id> <message-number> --kind preference
 lightagent memory search "what should I remember?"
+lightagent memory reflect preference
 ```
 
 `promote` saves the reviewed text with its session and message number; use
@@ -79,6 +85,11 @@ lightagent memory search "what should I remember?"
 corrects an outdated fact, and `lightagent memory forget <id>` removes one.
 The read-only `session.lookup` tool can retrieve a cited saved message or tool
 excerpt by id later, within the same profile.
+Use `lightagent config set memory.auto_capture false` to stop automatic
+retention, or `lightagent config set memory.inject_recent 0` to stop prompt
+injection. `memory list`, `update`, `forget`, and `clear` remain available for
+review and correction. See [long-term memory](docs/memory.md) for the full
+retention, recall, and reflection flow.
 Memory search uses lexical ranking by default and combines it with semantic
 ranking when `rag.semantic` is configured. A malformed memory record now reports
 its line instead of being silently discarded, and writes are atomic and locked.
@@ -147,7 +158,11 @@ palette and binary transparency so the mark remains sharp at terminal scale.
 Approval
 requests use a compact high-contrast warning box with
 their risk class, tool, argument preview, and three numbered choices: `Allow`,
-`Don't allow`, or `Allow without restrictions` for the current session.
+`Don't allow`, or `Allow this call; relax lower-risk tools` for the current
+session. File mutations and terminal calls still require approval each time.
+`lightagent tools list` shows each available tool's effective `auto`, `ask`, or
+`block` permission. See [tool permissions](docs/permissions.md) for the rules and
+workspace limits.
 
 Run `lightagent setup` for a guided terminal menu. It shows current values and
 lets you create, switch, and delete profiles; select the gateway/model, local
@@ -217,7 +232,33 @@ Keep an inference gateway running with a model loaded. Use the gateway's origin
 as the base URL, without `/v1`; Lightagent adds the API path itself. For an
 existing installation, `lightagent config set inference.base_url <origin>`
 changes the endpoint without reinitializing profiles. In chat, `/help` lists
-commands, `/tools` lists available tools, and `/exit` leaves the harness.
+commands, `/tools` lists callable tools, `/extensions` manages installed bundles,
+`/reload` picks up changes made in another terminal between turns, and `/exit`
+leaves the harness. Drop a `.md` file into the terminal prompt and press Enter
+to have Lightagent read it for that turn. Type `/onboard ` before dropping the
+file to save it as profile guidance; `/onboard remove` withdraws that guidance.
+
+Tools can be added without rebuilding Lightagent by installing an extension
+containing an `extension.json` manifest. An extension can supply MCP tools,
+skills, and optional Markdown instructions. The CLI copies a local extension
+directory into Lightagent's managed store; an extension with MCP servers enables
+MCP when installed. Its server starts in the installed directory, so relative
+script and asset paths work. For example:
+
+```sh
+lightagent extensions install ./my-tool
+lightagent extensions install 'https://example.org/tools.git#my-tool'
+lightagent tools list                  # lists tools the active profile can call
+lightagent extensions list
+lightagent extensions uninstall my-tool
+```
+
+Use `--profile` with install or uninstall to manage the active profile's copy
+instead of the global copy. In an open TUI, `/extensions install <directory>`
+and `/extensions uninstall <name>` update the tool registry immediately. Run
+`/reload` after changing extensions in another terminal. See
+[extension authoring and onboarding](docs/extensions.md) for the manifest,
+verification steps, and how to customize a profile.
 
 Lightagent checks the gateway's current model before every generation. A
 matching explicit profile model takes precedence over `inference.model`; when

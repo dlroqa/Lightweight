@@ -548,7 +548,7 @@ fn configure_approvals_tui(
         .items([
             "Balanced — prompt before changes or commands",
             "Strict — prompt for everything beyond basic reads",
-            "Permissive — approve tools automatically",
+            "Permissive — auto-approve lower-risk tools",
         ])
         .default(default)
         .interact_opt()
@@ -921,7 +921,7 @@ fn configure_approvals<R: BufRead, W: Write>(
         &[
             "Balanced — prompt before changes or commands",
             "Strict — prompt for everything beyond basic reads",
-            "Permissive — approve tools automatically",
+            "Permissive — auto-approve lower-risk tools",
         ],
         default,
     )?;

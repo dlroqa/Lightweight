@@ -13,6 +13,18 @@ pub enum Slash {
     Tools,
     /// `/skills` — list the skills loaded for this session, extensions' included.
     Skills,
+    /// `/reload` — reload installed extensions and tool settings between turns.
+    Reload,
+    /// `/extensions` — list installed extensions.
+    Extensions,
+    /// `/extensions install <directory>` — install a local bundle.
+    ExtensionInstall(String),
+    /// `/extensions uninstall <name>` — remove a global bundle.
+    ExtensionUninstall(String),
+    /// `/onboard <file.md>` — install dropped Markdown as profile guidance.
+    Onboard(String),
+    /// `/onboard remove` — withdraw profile guidance.
+    OnboardRemove,
     /// `/new` — start a fresh run in the same profile.
     New,
     /// `/approve` — approve the pending tool call.
@@ -35,12 +47,36 @@ pub enum Slash {
 /// message, so a mistyped slash is reported rather than sent to the model.
 pub fn parse(line: &str) -> Option<Slash> {
     let trimmed = line.trim_start();
-    let rest = trimmed.strip_prefix('/')?;
+    let rest = trimmed.strip_prefix('/')?.trim_start();
     let word = rest.split_whitespace().next().unwrap_or("");
+    let args = rest.get(word.len()..).unwrap_or("").trim();
     let command = match word {
         "help" | "h" | "?" => Slash::Help,
         "tools" => Slash::Tools,
         "skills" => Slash::Skills,
+        "reload" => Slash::Reload,
+        "extensions" => {
+            if args.is_empty() || args == "list" {
+                Slash::Extensions
+            } else if args == "install" {
+                Slash::ExtensionInstall(String::new())
+            } else if let Some(source) = args.strip_prefix("install ") {
+                Slash::ExtensionInstall(source.trim().to_owned())
+            } else if args == "uninstall" {
+                Slash::ExtensionUninstall(String::new())
+            } else if let Some(name) = args.strip_prefix("uninstall ") {
+                Slash::ExtensionUninstall(name.trim().to_owned())
+            } else {
+                Slash::Unknown("extensions".to_owned())
+            }
+        }
+        "onboard" => {
+            if args == "remove" {
+                Slash::OnboardRemove
+            } else {
+                Slash::Onboard(args.to_owned())
+            }
+        }
         "new" => Slash::New,
         "approve" | "y" | "yes" => Slash::Approve,
         "reject" | "n" | "no" => Slash::Reject,
@@ -67,6 +103,22 @@ mod tests {
         assert_eq!(parse("/help"), Some(Slash::Help));
         assert_eq!(parse("  /tools  "), Some(Slash::Tools));
         assert_eq!(parse("/skills"), Some(Slash::Skills));
+        assert_eq!(parse("/reload"), Some(Slash::Reload));
+        assert_eq!(parse("/extensions"), Some(Slash::Extensions));
+        assert_eq!(parse("/extensions list"), Some(Slash::Extensions));
+        assert_eq!(
+            parse("/extensions install ./my tool"),
+            Some(Slash::ExtensionInstall("./my tool".into()))
+        );
+        assert_eq!(
+            parse("/extensions uninstall my-tool"),
+            Some(Slash::ExtensionUninstall("my-tool".into()))
+        );
+        assert_eq!(
+            parse("/onboard '/tmp/My Notes.md'"),
+            Some(Slash::Onboard("'/tmp/My Notes.md'".into()))
+        );
+        assert_eq!(parse("/onboard remove"), Some(Slash::OnboardRemove));
         assert_eq!(parse("/exit"), Some(Slash::Exit));
         assert_eq!(parse("/q"), Some(Slash::Exit));
         assert_eq!(parse("/approve now"), Some(Slash::Approve));

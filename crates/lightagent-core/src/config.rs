@@ -156,7 +156,7 @@ impl AgentConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalPolicy {
-    /// Never prompt; approve everything. For trusted, unattended runs.
+    /// Auto-approve lower-risk tools; mandatory write/execute prompts remain.
     Permissive,
     /// The default: prompt for anything that changes state or runs code.
     #[default]
@@ -328,6 +328,8 @@ impl Default for McpConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryConfig {
+    /// Retain clearly stated durable user facts between sessions.
+    pub auto_capture: bool,
     /// Maximum relevant memories injected into a prompt (0 to disable).
     pub inject_recent: usize,
     /// Default number of memories a search returns.
@@ -337,9 +339,23 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            auto_capture: true,
             inject_recent: 10,
             top_k: 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_config_tests {
+    use super::MemoryConfig;
+
+    #[test]
+    fn older_memory_settings_keep_automatic_capture_default() {
+        let config: MemoryConfig =
+            serde_json::from_str(r#"{"inject_recent":3,"top_k":5}"#).unwrap();
+        assert!(config.auto_capture);
+        assert_eq!(config.inject_recent, 3);
     }
 }
 

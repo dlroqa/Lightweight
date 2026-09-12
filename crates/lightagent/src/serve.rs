@@ -13,31 +13,45 @@ use async_trait::async_trait;
 use lightagent_api::manager::{self, RunFactory, RunManager, RunStatus, StartRun};
 use lightagent_api::{AppState, AuthConfig, Scope, router};
 use lightagent_core::{
-    AgentEvent, AgentEventSink, AgentLoop, ApprovalDecision, Config, ConfigStore, LightagentPaths,
+    AgentEvent, AgentEventSink, AgentLoop, ApprovalDecision, ConfigStore, LightagentPaths,
     PolicyEngine, ProfileStore, RunId, StopReason,
 };
 use lightagent_provider_lightweight::{LightweightProvider, ProviderConfig};
 use lightagent_store::SessionStore;
-use lightagent_tools::{BoundedExecutor, Delegation, SkillContext, Tool, ToolRegistry};
+use lightagent_tools::{BoundedExecutor, Delegation, SkillContext, ToolDefinition, ToolRegistry};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::{
-    LightweightFactory, configured_builtin_registry, configured_model, load_extensions,
-    load_global_extensions, load_skills, mcp_tools, resolve_profile, web_context,
-    web_research_instructions, workspace_context,
+    LightweightFactory, configured_model, configured_registry, load_extensions, load_skills,
+    resolve_profile, web_context, web_research_instructions, workspace_context,
 };
 
 /// Builds and drives a real run with the Lightweight provider per request.
 struct LightweightRunFactory {
     root: PathBuf,
-    config: Config,
-    mcp_tools: Vec<Arc<dyn Tool>>,
 }
 
 #[async_trait]
 impl RunFactory for LightweightRunFactory {
+    async fn tools(&self) -> Result<Vec<ToolDefinition>, String> {
+        let paths = LightagentPaths::rooted_at(&self.root);
+        let config = ConfigStore::at(&paths).load().map_err(|e| e.to_string())?;
+        let profiles = ProfileStore::new(&self.root);
+        let profile = resolve_profile(&profiles, &config, None)?;
+        let profile_dir = profiles.handle(&profile.id).dir().to_path_buf();
+        let extensions = load_extensions(&self.root, &profile_dir);
+        let skills = load_skills(&self.root, &profile_dir, &extensions, &config);
+        let registry =
+            configured_registry(&config, &profile_dir, &extensions, !skills.is_empty()).await;
+        Ok(registry
+            .names()
+            .iter()
+            .filter_map(|name| registry.get(name).map(|tool| tool.definition().clone()))
+            .collect())
+    }
+
     async fn run(
         &self,
         request: StartRun,
@@ -45,8 +59,16 @@ impl RunFactory for LightweightRunFactory {
         cancel: CancellationToken,
         decisions: UnboundedReceiver<ApprovalDecision>,
     ) -> RunStatus {
+        let paths = LightagentPaths::rooted_at(&self.root);
+        let config = match ConfigStore::at(&paths).load() {
+            Ok(config) => config,
+            Err(error) => {
+                fail(&sink, &format!("could not reload settings: {error}"));
+                return RunStatus::Failed;
+            }
+        };
         let store = ProfileStore::new(&self.root);
-        let mut profile = match resolve_profile(&store, &self.config, request.profile) {
+        let mut profile = match resolve_profile(&store, &config, request.profile) {
             Ok(profile) => profile,
             Err(error) => {
                 fail(&sink, &error);
@@ -58,10 +80,9 @@ impl RunFactory for LightweightRunFactory {
             .routing
             .base_url
             .clone()
-            .unwrap_or_else(|| self.config.inference.base_url.clone());
-        let model = configured_model(&profile.routing.model, &self.config);
-        let api_key = self
-            .config
+            .unwrap_or_else(|| config.inference.base_url.clone());
+        let model = configured_model(&profile.routing.model, &config);
+        let api_key = config
             .inference
             .api_key
             .as_ref()
@@ -88,7 +109,7 @@ impl RunFactory for LightweightRunFactory {
             .unwrap_or_else(|| store.handle(&profile.id).workspace_dir());
         let profile_dir = store.handle(&profile.id).dir().to_path_buf();
         let extensions = load_extensions(&self.root, &profile_dir);
-        let skills = load_skills(&self.root, &profile_dir, &extensions, &self.config);
+        let skills = load_skills(&self.root, &profile_dir, &extensions, &config);
         let delegation = Delegation {
             profiles: Arc::new(store),
             factory: Arc::new(LightweightFactory { base_url, api_key }),
@@ -96,19 +117,8 @@ impl RunFactory for LightweightRunFactory {
             worker_per_call: Duration::from_secs(60),
             worker_max_output_bytes: 262_144,
         };
-        let mut registry = configured_builtin_registry(&self.config, !skills.is_empty());
-        for tool in &self.mcp_tools {
-            registry.insert(Arc::clone(tool));
-        }
-        if let Some(tool) = crate::rag::rag_tool(&profile_dir, &self.config) {
-            registry.insert(tool);
-        }
-        if let Some(tool) = crate::rag::realtime_rag_tool(&self.config) {
-            registry.insert(tool);
-        }
-        for tool in crate::memory::memory_tools(&profile_dir, &self.config) {
-            registry.insert(tool);
-        }
+        let registry =
+            configured_registry(&config, &profile_dir, &extensions, !skills.is_empty()).await;
         let mut executor = BoundedExecutor::new(
             registry,
             PolicyEngine::new(profile.approval_policy.into()),
@@ -117,10 +127,10 @@ impl RunFactory for LightweightRunFactory {
         )
         .with_run(RunId::new())
         .with_delegation(delegation);
-        if let Some(web) = web_context(&self.config) {
+        if let Some(web) = web_context(&config) {
             executor = executor.with_web(web);
         }
-        if let Some(workspace) = workspace_context(&self.config, workspace_dir) {
+        if let Some(workspace) = workspace_context(&config, workspace_dir) {
             executor = executor.with_workspace(workspace);
         }
         if !skills.is_empty() {
@@ -130,18 +140,18 @@ impl RunFactory for LightweightRunFactory {
             executor = executor.with_skills(SkillContext { skills });
         }
 
-        let extension_instructions = extensions.instructions(&self.config.extensions);
+        let extension_instructions = extensions.instructions(&config.extensions);
         if !extension_instructions.is_empty() {
             profile
                 .persona
                 .push_str(&format!("\n\n{extension_instructions}"));
         }
 
-        if let Some(instructions) = web_research_instructions(&self.config) {
+        if let Some(instructions) = web_research_instructions(&config) {
             profile.persona.push_str(&format!("\n\n{instructions}"));
         }
 
-        match crate::memory::relevant_catalog(&profile_dir, &self.config, &request.message).await {
+        match crate::memory::relevant_catalog(&profile_dir, &config, &request.message).await {
             Ok(catalog) if !catalog.is_empty() => {
                 profile.persona.push_str(&format!("\n\n{catalog}"))
             }
@@ -150,6 +160,9 @@ impl RunFactory for LightweightRunFactory {
                 return RunStatus::Failed;
             }
             _ => {}
+        }
+        if let Err(error) = crate::memory::capture(&profile_dir, &config, &request.message, None) {
+            eprintln!("could not retain durable memory: {error}");
         }
         let agent = AgentLoop::from_profile(provider, executor, &profile);
         manager::drive(
@@ -173,19 +186,12 @@ fn fail(sink: &AgentEventSink, message: &str) {
     });
 }
 
-/// Build a run manager wired to the Lightweight provider and the configured MCP
-/// servers — shared by `serve` and `acp`.
+/// Build a run manager that resolves extensions and settings for each run —
+/// shared by `serve` and `acp`.
 pub(crate) async fn build_run_manager() -> Result<RunManager, String> {
     let paths = LightagentPaths::resolve().map_err(|error| error.to_string())?;
-    let config = ConfigStore::at(&paths)
-        .load()
-        .map_err(|error| error.to_string())?;
-    let extensions = load_global_extensions(paths.root());
-    let mcp = mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
-        config,
-        mcp_tools: mcp,
     });
     Ok(RunManager::new(factory))
 }
@@ -222,13 +228,9 @@ pub async fn run(
         }
     };
 
-    let extensions = load_global_extensions(paths.root());
-    let mcp = mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await;
     let context_limit = config.runtime.n_ctx.unwrap_or(4_096) as usize;
     let factory = Arc::new(LightweightRunFactory {
         root: paths.root().to_path_buf(),
-        config,
-        mcp_tools: mcp,
     });
     let state = AppState {
         manager: RunManager::new(factory),

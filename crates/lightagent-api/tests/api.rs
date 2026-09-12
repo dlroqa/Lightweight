@@ -21,6 +21,30 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// A factory that scripts a datetime.now tool call then a final answer.
 struct MockFactory;
 
+/// Reports a deliberately smaller registry than the default factory.
+struct LimitedFactory;
+
+#[async_trait]
+impl RunFactory for LimitedFactory {
+    async fn tools(&self) -> Result<Vec<lightagent_tools::ToolDefinition>, String> {
+        let registry = ToolRegistry::builtin();
+        Ok(registry
+            .get("datetime.now")
+            .map(|tool| vec![tool.definition().clone()])
+            .unwrap_or_default())
+    }
+
+    async fn run(
+        &self,
+        request: StartRun,
+        sink: AgentEventSink,
+        cancel: tokio_util::sync::CancellationToken,
+        decisions: UnboundedReceiver<ApprovalDecision>,
+    ) -> RunStatus {
+        MockFactory.run(request, sink, cancel, decisions).await
+    }
+}
+
 fn tool_turn() -> Vec<ProviderEvent> {
     vec![
         ProviderEvent::RoleStarted,
@@ -255,6 +279,17 @@ async fn health_and_tools_are_served() {
     assert_eq!(status, 200);
     assert!(body.contains("datetime.now"));
     assert!(body.contains("agent.delegate"));
+}
+
+#[tokio::test]
+async fn tools_endpoint_uses_the_factory_registry() {
+    let mut state = app_state(AuthConfig::open());
+    state.manager = RunManager::new(Arc::new(LimitedFactory));
+    let addr = spawn_server(state).await;
+    let (status, body) = http(&addr, "GET", "/api/lightagent/v1/tools", &[], None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("datetime.now"));
+    assert!(!body.contains("agent.delegate"));
 }
 
 #[tokio::test]

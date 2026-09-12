@@ -135,6 +135,30 @@ pub(crate) fn configured_builtin_registry(config: &Config, has_skills: bool) -> 
     registry
 }
 
+/// Assemble the tools actually available to an active profile, including
+/// discovered MCP tools. Shared by the TUI and `lightagent tools list`.
+pub(crate) async fn configured_registry(
+    config: &Config,
+    profile_dir: &Path,
+    extensions: &ExtensionStore,
+    has_skills: bool,
+) -> ToolRegistry {
+    let mut registry = configured_builtin_registry(config, has_skills);
+    for tool in mcp_tools(config, extensions).await {
+        registry.insert(tool);
+    }
+    if let Some(tool) = crate::rag::rag_tool(profile_dir, config) {
+        registry.insert(tool);
+    }
+    if let Some(tool) = crate::rag::realtime_rag_tool(config) {
+        registry.insert(tool);
+    }
+    for tool in crate::memory::memory_tools(profile_dir, config) {
+        registry.insert(tool);
+    }
+    registry
+}
+
 /// Teach a tool-capable model to research iteratively when web access is active.
 pub(crate) fn web_research_instructions(config: &Config) -> Option<&'static str> {
     if !config.web.enabled {
@@ -195,24 +219,28 @@ pub(crate) fn web_research_instructions(config: &Config) -> Option<&'static str>
 /// Shared by `chat` and `serve`. A server that cannot be reached is logged and
 /// skipped, never fatal. The returned tools each hold their server's client, so
 /// the connections live exactly as long as the tools are kept (in the registry).
-/// `extra_servers` are MCP servers contributed by active extensions; they are
+/// Active extensions contribute MCP servers; they are
 /// merged with the configured servers but, like them, are only contacted when the
 /// MCP subsystem is enabled — an extension widens what is available, not what is
 /// permitted.
-pub(crate) async fn mcp_tools(
-    config: &Config,
-    extra_servers: &[McpServerEntry],
-) -> Vec<Arc<dyn Tool>> {
-    if !config.mcp.enabled || (config.mcp.servers.is_empty() && extra_servers.is_empty()) {
+pub(crate) async fn mcp_tools(config: &Config, extensions: &ExtensionStore) -> Vec<Arc<dyn Tool>> {
+    if !config.mcp.enabled {
         return Vec::new();
     }
     let specs: Vec<McpServerSpec> = config
         .mcp
         .servers
         .iter()
-        .chain(extra_servers.iter())
-        .map(to_mcp_spec)
+        .map(|entry| to_mcp_spec(entry, None))
+        .chain(extensions.active(&config.extensions).flat_map(|ext| {
+            ext.mcp_servers
+                .iter()
+                .map(move |entry| to_mcp_spec(entry, Some(&ext.dir)))
+        }))
         .collect();
+    if specs.is_empty() {
+        return Vec::new();
+    }
     let timeout = Duration::from_secs(config.mcp.timeout_secs.max(1));
     lightagent_provider_lightweight::ensure_provider();
     let client = match reqwest::Client::builder().timeout(timeout).build() {
@@ -232,7 +260,7 @@ pub(crate) async fn mcp_tools(
     hub.tools
 }
 
-fn to_mcp_spec(entry: &McpServerEntry) -> McpServerSpec {
+fn to_mcp_spec(entry: &McpServerEntry, cwd: Option<&Path>) -> McpServerSpec {
     match entry {
         McpServerEntry::Stdio {
             name,
@@ -245,6 +273,7 @@ fn to_mcp_spec(entry: &McpServerEntry) -> McpServerSpec {
                 command: command.clone(),
                 args: args.clone(),
                 env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                cwd: cwd.map(Path::to_path_buf),
             },
         },
         McpServerEntry::Http {
@@ -271,14 +300,6 @@ pub(crate) fn load_extensions(home: &Path, profile_dir: &Path) -> ExtensionStore
     ExtensionStore::load(&lightagent_extensions::extension_dirs(home, profile_dir))
 }
 
-/// Load only the global extensions. `serve` shares one set of MCP connections
-/// across every profile, built once at startup before any profile is chosen, so
-/// only the global extensions' MCP servers can join that shared set; a profile's
-/// own extension skills and instructions are still applied per run.
-pub(crate) fn load_global_extensions(home: &Path) -> ExtensionStore {
-    ExtensionStore::load(&[home.join("extensions")])
-}
-
 /// Load the skills for a run: the global set, then the active extensions' skills,
 /// then the profile's own. Ordering makes precedence follow ownership — an
 /// extension's skill overrides a global default, and a profile's overrides an
@@ -299,6 +320,114 @@ pub(crate) fn load_skills(
 pub(crate) struct LightweightFactory {
     pub(crate) base_url: String,
     pub(crate) api_key: Option<String>,
+}
+
+struct ChatRuntime {
+    agent: AgentLoop<LightweightProvider, BoundedExecutor>,
+    skills: Arc<SkillStore>,
+    tools: Vec<String>,
+    tool_permissions: Vec<String>,
+    extensions: Vec<String>,
+}
+
+/// Build a fresh runtime from the installed extension set. The same path is
+/// used at startup and by `/reload`, so a newly installed tool is callable on
+/// the next turn without restarting the TUI.
+async fn build_chat_runtime(
+    provider: &LightweightProvider,
+    profile: &AgentProfile,
+    config: &Config,
+    home: &Path,
+    profile_dir: &Path,
+    workspace_dir: PathBuf,
+) -> ChatRuntime {
+    let extensions = load_extensions(home, profile_dir);
+    let active_extensions = extensions
+        .active(&config.extensions)
+        .map(|ext| ext.name.clone())
+        .collect();
+    let skills = load_skills(home, profile_dir, &extensions, config);
+    let base_url = profile
+        .routing
+        .base_url
+        .clone()
+        .unwrap_or_else(|| config.inference.base_url.clone());
+    let api_key = config
+        .inference
+        .api_key
+        .as_ref()
+        .and_then(|secret| secret.resolve());
+    let delegation = Delegation {
+        profiles: Arc::new(ProfileStore::new(home)),
+        factory: Arc::new(LightweightFactory { base_url, api_key }),
+        worker_registry: ToolRegistry::worker_default(),
+        worker_per_call: Duration::from_secs(60),
+        worker_max_output_bytes: 262_144,
+    };
+    let registry = configured_registry(config, profile_dir, &extensions, !skills.is_empty()).await;
+    let tools = registry.names();
+    let permission_policy = PolicyEngine::new(profile.approval_policy.into());
+    let tool_permissions = tools
+        .iter()
+        .filter_map(|name| registry.get(name))
+        .map(|tool| {
+            let definition = tool.definition();
+            let request = lightagent_core::ApprovalRequest::new(
+                &definition.name,
+                definition.risk,
+                definition.scopes.clone(),
+                "{}",
+            );
+            let permission =
+                match permission_policy.evaluate(&request, std::time::SystemTime::now()) {
+                    lightagent_core::ApprovalNeed::AutoApprove => "auto",
+                    lightagent_core::ApprovalNeed::Require(_) => "ask",
+                    lightagent_core::ApprovalNeed::Deny(_) => "block",
+                };
+            format!("{} [{permission}]", definition.name)
+        })
+        .collect();
+    let mut executor = BoundedExecutor::new(
+        registry,
+        PolicyEngine::new(profile.approval_policy.into()),
+        Duration::from_secs(60),
+        262_144,
+    )
+    .with_run(RunId::new())
+    .with_delegation(delegation);
+    if let Some(web) = web_context(config) {
+        executor = executor.with_web(web);
+    }
+    if let Some(workspace) = workspace_context(config, workspace_dir) {
+        executor = executor.with_workspace(workspace);
+    }
+    let mut run_profile = profile.clone();
+    if !skills.is_empty() {
+        run_profile
+            .persona
+            .push_str(&format!("\n\n{}", skills.catalog()));
+        executor = executor.with_skills(SkillContext {
+            skills: Arc::clone(&skills),
+        });
+    }
+    let extension_instructions = extensions.instructions(&config.extensions);
+    if !extension_instructions.is_empty() {
+        run_profile
+            .persona
+            .push_str(&format!("\n\n{extension_instructions}"));
+    }
+    if let Some(instructions) = web_research_instructions(config) {
+        run_profile.persona.push_str(&format!("\n\n{instructions}"));
+    }
+    let agent = AgentLoop::from_profile(provider.clone(), executor, &run_profile)
+        .with_wall_clock_policy(WallClockPolicy::Pause);
+    ChatRuntime {
+        agent,
+        skills,
+        tools,
+        tool_permissions,
+        extensions: active_extensions,
+    }
 }
 
 impl ProviderFactory for LightweightFactory {
@@ -324,7 +453,7 @@ pub async fn run(
     release_date: &str,
 ) -> Result<(), String> {
     let paths = LightagentPaths::resolve().map_err(|error| error.to_string())?;
-    let config = ConfigStore::at(&paths)
+    let mut config = ConfigStore::at(&paths)
         .load()
         .map_err(|error| error.to_string())?;
     let store = ProfileStore::new(paths.root());
@@ -349,9 +478,6 @@ pub async fn run(
     };
     let workspace_dir = store.handle(&profile.id).workspace_dir();
     let profile_dir = store.handle(&profile.id).dir().to_path_buf();
-    let extensions = load_extensions(paths.root(), &profile_dir);
-    let skills = load_skills(paths.root(), &profile_dir, &extensions, &config);
-
     let base_url = profile
         .routing
         .base_url
@@ -374,66 +500,21 @@ pub async fn run(
         .await
         .map_err(|error| error.to_string())?;
 
-    let delegation = Delegation {
-        profiles: Arc::new(store),
-        factory: Arc::new(LightweightFactory { base_url, api_key }),
-        worker_registry: ToolRegistry::worker_default(),
-        worker_per_call: Duration::from_secs(60),
-        worker_max_output_bytes: 262_144,
-    };
-    let mut registry = configured_builtin_registry(&config, !skills.is_empty());
-    for tool in mcp_tools(&config, &extensions.mcp_servers(&config.extensions)).await {
-        registry.insert(tool);
-    }
-    if let Some(tool) = crate::rag::rag_tool(&profile_dir, &config) {
-        registry.insert(tool);
-    }
-    if let Some(tool) = crate::rag::realtime_rag_tool(&config) {
-        registry.insert(tool);
-    }
-    for tool in crate::memory::memory_tools(&profile_dir, &config) {
-        registry.insert(tool);
-    }
-    let startup_tools = registry.names();
-    let startup_skills = skills.names();
-    let mut executor = BoundedExecutor::new(
-        registry,
-        PolicyEngine::new(profile.approval_policy.into()),
-        Duration::from_secs(60),
-        262_144,
+    let runtime = build_chat_runtime(
+        &provider,
+        &profile,
+        &config,
+        paths.root(),
+        &profile_dir,
+        workspace_dir.clone(),
     )
-    .with_run(RunId::new())
-    .with_delegation(delegation);
-    if let Some(web) = web_context(&config) {
-        executor = executor.with_web(web);
-    }
-    if let Some(workspace) = workspace_context(&config, workspace_dir) {
-        executor = executor.with_workspace(workspace);
-    }
-    // Kept for `/skills`, which lists what this session actually loaded.
-    let session_skills = Arc::clone(&skills);
-    if !skills.is_empty() {
-        profile
-            .persona
-            .push_str(&format!("\n\n{}", skills.catalog()));
-        executor = executor.with_skills(SkillContext { skills });
-    }
-
-    let extension_instructions = extensions.instructions(&config.extensions);
-    if !extension_instructions.is_empty() {
-        profile
-            .persona
-            .push_str(&format!("\n\n{extension_instructions}"));
-    }
-
-    if let Some(instructions) = web_research_instructions(&config) {
-        profile.persona.push_str(&format!("\n\n{instructions}"));
-    }
-
-    // The chat has someone to ask, so a run that runs out of time with unread
-    // tool results pauses for a decision instead of wrapping up on its own.
-    let agent = AgentLoop::from_profile(provider, executor, &profile)
-        .with_wall_clock_policy(WallClockPolicy::Pause);
+    .await;
+    let mut agent = runtime.agent;
+    let mut session_skills = runtime.skills;
+    let mut startup_tools = runtime.tools;
+    let mut tool_permissions = runtime.tool_permissions;
+    let startup_skills = session_skills.names();
+    let startup_extensions = runtime.extensions;
     if session.approvals_unrestricted {
         agent.invoker().allow_without_restrictions();
     }
@@ -447,6 +528,7 @@ pub async fn run(
             session: session.id.as_str(),
             tools: &startup_tools,
             skills: &startup_skills,
+            extensions: &startup_extensions,
         });
     } else {
         println!(
@@ -470,7 +552,7 @@ pub async fn run(
         let Some(line) = prompt.read_line(&stdin)? else {
             break; // end of input
         };
-        let line = line.trim_end().to_string();
+        let mut line = line.trim_end().to_string();
         if line.trim().is_empty() {
             prompt.dismiss_empty();
             continue;
@@ -514,6 +596,103 @@ pub async fn run(
             continue;
         }
         if let Some(command) = slash::parse(&line) {
+            if command == Slash::Extensions {
+                if let Err(error) = crate::extensions::list(false) {
+                    eprintln!("· {error}");
+                }
+                continue;
+            }
+            if matches!(
+                command,
+                Slash::Reload
+                    | Slash::ExtensionInstall(_)
+                    | Slash::ExtensionUninstall(_)
+                    | Slash::Onboard(_)
+                    | Slash::OnboardRemove
+            ) {
+                if paused.is_some() {
+                    println!("Finish or discard the paused run before reloading tools.");
+                    continue;
+                }
+                let operation = match &command {
+                    Slash::ExtensionInstall(source) if source.is_empty() => {
+                        println!("Usage: /extensions install <directory>");
+                        continue;
+                    }
+                    Slash::ExtensionInstall(source) => {
+                        crate::extensions::install(Path::new(source), false, false)
+                    }
+                    Slash::ExtensionUninstall(name) if name.is_empty() => {
+                        println!("Usage: /extensions uninstall <name>");
+                        continue;
+                    }
+                    Slash::ExtensionUninstall(name) => {
+                        crate::extensions::uninstall(name, false, false)
+                    }
+                    Slash::Onboard(source) if source.is_empty() => {
+                        println!("Usage: /onboard <file.md>  (drop the file after the command)");
+                        continue;
+                    }
+                    Slash::Onboard(source) => {
+                        let result = crate::markdown::parse_path(source).and_then(|path| {
+                            crate::markdown::install_onboarding(&path, &profile_dir)
+                        });
+                        if result.is_ok() {
+                            let config_store = ConfigStore::at(&paths);
+                            let mut updated = config_store.load().map_err(|e| e.to_string())?;
+                            updated.extensions.enabled = true;
+                            updated
+                                .extensions
+                                .disabled
+                                .retain(|name| name != "user-onboarding");
+                            config_store.save(&updated).map_err(|e| e.to_string())?;
+                            println!(
+                                "Installed profile onboarding from the dropped Markdown file."
+                            );
+                        }
+                        result
+                    }
+                    Slash::OnboardRemove => {
+                        let result = crate::markdown::remove_onboarding(&profile_dir);
+                        if result.is_ok() {
+                            println!("Removed profile onboarding.");
+                        }
+                        result
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(error) = operation {
+                    eprintln!("· {error}");
+                    continue;
+                }
+                let new_config = ConfigStore::at(&paths).load().map_err(|e| e.to_string())?;
+                let new_profile =
+                    resolve_profile(&store, &new_config, Some(profile.id.as_str().to_owned()))?;
+                let runtime = build_chat_runtime(
+                    &provider,
+                    &new_profile,
+                    &new_config,
+                    paths.root(),
+                    &profile_dir,
+                    workspace_dir.clone(),
+                )
+                .await;
+                agent = runtime.agent;
+                if session.approvals_unrestricted {
+                    agent.invoker().allow_without_restrictions();
+                }
+                session_skills = runtime.skills;
+                startup_tools = runtime.tools;
+                tool_permissions = runtime.tool_permissions;
+                config = new_config;
+                profile = new_profile;
+                println!(
+                    "Reloaded {} tools and {} skills. Use /tools to inspect them.",
+                    startup_tools.len(),
+                    session_skills.len()
+                );
+                continue;
+            }
             if command == Slash::New {
                 if let Some(run) = paused.take() {
                     drop_paused(run, &mut session, &session_store);
@@ -526,10 +705,26 @@ pub async fn run(
                 println!("New session {}.", session.id.as_str());
                 continue;
             }
-            if handle_slash(command, &session_skills, &startup_tools) {
+            if handle_slash(command, &session_skills, &tool_permissions) {
                 break;
             }
             continue;
+        }
+        if let Some(path) = crate::markdown::dropped_path(&line) {
+            match crate::markdown::read(&path) {
+                Ok(contents) => {
+                    println!("Read Markdown file {}.", path.display());
+                    line = format!(
+                        "I dropped this Markdown file into the terminal. Read it and respond to its contents.\n\nFile: {}\n\n{}",
+                        path.display(),
+                        contents
+                    );
+                }
+                Err(error) => {
+                    eprintln!("· {error}");
+                    continue;
+                }
+            }
         }
         if let Some(run) = paused.take() {
             drop_paused(run, &mut session, &session_store);
@@ -546,6 +741,17 @@ pub async fn run(
         session_store
             .save(&session)
             .map_err(|error| format!("could not save session: {error}"))?;
+        if let Err(error) = crate::memory::capture(
+            &profile_dir,
+            &config,
+            &line,
+            Some(lightagent_memory::MemorySource {
+                session_id: session.id.as_str().to_owned(),
+                message_index: session.messages.len(),
+            }),
+        ) {
+            eprintln!("· could not retain durable memory: {error}");
+        }
         if initialization_notice_due(&mut initialization_shown) {
             print_initializing();
         }
@@ -1336,7 +1542,9 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
     match command {
         Slash::Exit => return true,
         Slash::Help => {
-            println!("Commands: /help  /tools  /skills  /new  /continue  /stop  /exit");
+            println!(
+                "Commands: /help  /tools  /skills  /extensions  /onboard  /reload  /new  /continue  /stop  /exit"
+            );
         }
         Slash::Tools => {
             for name in tools {
@@ -1344,6 +1552,14 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
             }
         }
         Slash::Skills => print!("{}", skills_listing(skills)),
+        Slash::Reload => println!("(reload is handled by the chat runtime)"),
+        Slash::Extensions
+        | Slash::ExtensionInstall(_)
+        | Slash::ExtensionUninstall(_)
+        | Slash::Onboard(_)
+        | Slash::OnboardRemove => {
+            println!("(extension management is handled by the chat runtime)");
+        }
         Slash::New => println!("(new session)"),
         Slash::Stop => println!("(nothing running)"),
         // A paused run is picked up before commands are handled, so reaching
@@ -1540,7 +1756,7 @@ fn render_approval_warning(
     body.push(String::new());
     body.push("1. Allow".to_owned());
     body.push("2. Don't allow".to_owned());
-    body.push("3. Allow without restrictions".to_owned());
+    body.push("3. Allow this call; relax lower-risk tools this session".to_owned());
     body.push("   Applies to this session only.".to_owned());
 
     let mut out = String::from("\n");
@@ -1966,7 +2182,7 @@ mod model_tests {
         assert!(warning.contains("arguments:"));
         assert!(warning.contains("1. Allow"));
         assert!(warning.contains("2. Don't allow"));
-        assert!(warning.contains("3. Allow without restrictions"));
+        assert!(warning.contains("3. Allow this call; relax lower-risk tools"));
         assert!(warning.ends_with("Select an option [2]: "));
         for line in warning
             .lines()
@@ -2064,5 +2280,149 @@ mod model_tests {
         }
         assert!(instructions.contains("untrusted evidence"));
         assert!(instructions.contains("Sources list"));
+    }
+
+    #[tokio::test]
+    async fn installed_mcp_tool_is_listed_callable_and_removed() {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let scratch = std::env::temp_dir().join(format!(
+            "lightagent-extension-tool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = scratch.join("source");
+        let root = scratch.join("extensions");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("extension.json"),
+            r#"{"name":"fixture","mcp_servers":[{"transport":"stdio","name":"fixture","command":"python3","args":["server.py"]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("marker.txt"), "installed directory").unwrap();
+        std::fs::write(source.join("server.py"), r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
+    elif method == "tools/list":
+        result = {"tools":[{"name":"where","description":"Read extension asset","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True}}]}
+    elif method == "tools/call":
+        result = {"content":[{"type":"text","text":open("marker.txt").read()}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":result}), flush=True)
+"#).unwrap();
+        lightagent_extensions::install(&source, &root).unwrap();
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        let extensions = ExtensionStore::load(std::slice::from_ref(&root));
+        let registry = configured_registry(&config, &scratch, &extensions, false).await;
+        let tool = registry
+            .get("mcp.fixture.where")
+            .expect("MCP tool in live registry");
+        let outcome = tool
+            .call(
+                &serde_json::json!({}),
+                &lightagent_tools::ToolCtx::new(CancellationToken::new()),
+            )
+            .await;
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert_eq!(outcome.content, "installed directory");
+        lightagent_extensions::uninstall("fixture", &root).unwrap();
+        let removed = ExtensionStore::load(std::slice::from_ref(&root));
+        assert!(
+            !configured_registry(&config, &scratch, &removed, false)
+                .await
+                .contains("mcp.fixture.where")
+        );
+        std::fs::remove_dir_all(scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn onboarding_markdown_enters_the_persona_only_while_enabled() {
+        let scratch = std::env::temp_dir().join(format!(
+            "lightagent-onboarding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = scratch.join("source");
+        let profile_dir = scratch.join("profiles/default");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("extension.json"),
+            r#"{
+            "name":"onboarding", "instructions_file":"ONBOARDING.md"
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("ONBOARDING.md"),
+            "Choose tools from the active catalog.",
+        )
+        .unwrap();
+        lightagent_extensions::install(&source, &profile_dir.join("extensions")).unwrap();
+
+        let provider =
+            LightweightProvider::new(ProviderConfig::new("http://127.0.0.1:1", "mock")).unwrap();
+        let config = Config::default();
+        let profile = crate::default_profile(&config).unwrap();
+        let active = build_chat_runtime(
+            &provider,
+            &profile,
+            &config,
+            &scratch,
+            &profile_dir,
+            profile_dir.join("workspace"),
+        )
+        .await;
+        assert!(
+            active
+                .agent
+                .config()
+                .system
+                .as_deref()
+                .unwrap_or("")
+                .contains("Choose tools from the active catalog.")
+        );
+        assert_eq!(active.extensions, vec!["onboarding"]);
+
+        let mut disabled = config;
+        disabled.extensions.disabled.push("onboarding".into());
+        let inactive = build_chat_runtime(
+            &provider,
+            &profile,
+            &disabled,
+            &scratch,
+            &profile_dir,
+            profile_dir.join("workspace"),
+        )
+        .await;
+        assert!(
+            !inactive
+                .agent
+                .config()
+                .system
+                .as_deref()
+                .unwrap_or("")
+                .contains("Choose tools from the active catalog.")
+        );
+        std::fs::remove_dir_all(scratch).ok();
     }
 }

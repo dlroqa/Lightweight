@@ -115,6 +115,9 @@ pub enum AgentError {
     /// The provider could not start or complete a turn.
     #[error(transparent)]
     Provider(#[from] crate::provider::ProviderError),
+    /// A decision was not for the approval this run is waiting on.
+    #[error("approval decision does not match the pending tool call")]
+    InvalidApproval,
 }
 
 /// The result of driving a run until it either finished or paused.
@@ -189,6 +192,7 @@ impl RunOutcome {
 #[derive(Debug)]
 pub struct Suspended {
     driver: Driver,
+    approval: Option<ApprovalRequest>,
 }
 
 /// The tools a single model turn asked for, and how far through them the loop
@@ -410,6 +414,13 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
         decision: ApprovalDecision,
         cancel: CancellationToken,
     ) -> Result<RunOutcome, AgentError> {
+        if suspended
+            .approval
+            .as_ref()
+            .is_none_or(|request| request.id != decision.id)
+        {
+            return Err(AgentError::InvalidApproval);
+        }
         let mut driver = suspended.driver;
 
         // The awaited call is the one the pending batch stopped on.
@@ -485,7 +496,10 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                         return Ok(RunOutcome::OutOfTime {
                             events: driver.events.clone(),
                             elapsed,
-                            suspended: Box::new(Suspended { driver }),
+                            suspended: Box::new(Suspended {
+                                driver,
+                                approval: None,
+                            }),
                         });
                     }
                 }
@@ -512,8 +526,11 @@ impl<P: AgentProvider, I: ToolInvoker> AgentLoop<P, I> {
                 BatchResult::Suspended(request) => {
                     return Ok(RunOutcome::AwaitingApproval {
                         events: driver.events.clone(),
+                        suspended: Box::new(Suspended {
+                            driver,
+                            approval: Some(request.clone()),
+                        }),
                         request,
-                        suspended: Box::new(Suspended { driver }),
                     });
                 }
             }
@@ -1026,6 +1043,32 @@ mod tests {
             Some(AgentEvent::RunCompleted {
                 reason: StopReason::EndTurn
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_decision_for_another_request_cannot_resume_a_tool() {
+        let mock = MockProvider::new(vec![tool_turn()]);
+        let request = ApprovalRequest::new("datetime.now", RiskClass::Mutating, vec![], "{}");
+        let agent = AgentLoop::new(
+            mock,
+            ScriptedInvoker {
+                need: ApprovalNeed::Require(request),
+            },
+            RunConfig::new("m@8k"),
+        );
+        let paused = agent.run("go", CancellationToken::new()).await.unwrap();
+        let RunOutcome::AwaitingApproval { suspended, .. } = paused else {
+            panic!("expected approval pause");
+        };
+        let wrong = ApprovalDecision::grant(
+            ApprovalRequest::new("other", RiskClass::Mutating, vec![], "{}").id,
+        );
+        assert!(matches!(
+            agent
+                .resume(suspended, wrong, CancellationToken::new())
+                .await,
+            Err(AgentError::InvalidApproval)
         ));
     }
 

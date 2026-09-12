@@ -1,13 +1,135 @@
-//! `lightagent extensions` — list installed capability bundles and toggle which
-//! are active.
+//! `lightagent extensions` — install, remove, list and toggle capability bundles.
 //!
 //! An extension is discovered under the global `<home>/extensions/` directory and
 //! the active profile's own; installing one is dropping its directory in place.
-//! These commands only inspect the installed set and edit which are active — the
-//! `enabled`/`disabled` fields of the `extensions` config — never the files.
+//! Installation copies a local bundle into the selected store; uninstall removes
+//! exactly that installed copy.
 
-use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+
+use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore, SkillStore};
 use lightagent_extensions::{Extension, ExtensionStore, extension_dirs};
+
+fn selected_root(paths: &LightagentPaths, profile: bool) -> Result<PathBuf, String> {
+    if !profile {
+        return Ok(paths.extensions_dir());
+    }
+    let profiles = ProfileStore::new(paths.root());
+    let active = profiles
+        .active()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no active profile — run `lightagent init` first".to_owned())?;
+    Ok(profiles.handle(&active).dir().join("extensions"))
+}
+
+/// Install a local bundle and activate the extension system it needs.
+pub fn install(source: &Path, profile: bool, json: bool) -> Result<(), String> {
+    let paths = LightagentPaths::resolve().map_err(|e| e.to_string())?;
+    let root = selected_root(&paths, profile)?;
+    let ext = install_from_source(source, &root)?;
+    let config_store = ConfigStore::at(&paths);
+    let mut config = config_store.load().map_err(|e| e.to_string())?;
+    config.extensions.enabled = true;
+    config.extensions.disabled.retain(|name| name != &ext.name);
+    if !ext.mcp_servers.is_empty() {
+        config.mcp.enabled = true;
+    }
+    if let Err(error) = config_store.save(&config) {
+        let _ = lightagent_extensions::uninstall(&ext.name, &root);
+        return Err(format!("could not save extension settings: {error}"));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": ext.name, "dir": ext.dir, "mcp_servers": ext.mcp_servers.len(),
+                "active": true
+            })
+        );
+    } else {
+        println!("Installed '{}' in {}.", ext.name, ext.dir.display());
+        if !ext.mcp_servers.is_empty() {
+            println!(
+                "MCP enabled; run `lightagent tools list` to verify the server and its tools."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve either a local directory or a reviewed HTTPS Git repository. A
+/// `#subdir` fragment selects an extension below the repository root.
+fn install_from_source(source: &Path, root: &Path) -> Result<Extension, String> {
+    let Some((url, subdir)) = git_source(source)? else {
+        return lightagent_extensions::install(source, root);
+    };
+    let checkout = std::env::temp_dir().join(format!(
+        "lightagent-extension-fetch-{}",
+        lightagent_core::RunId::new().as_str()
+    ));
+    let result = (|| {
+        let output = Command::new("git")
+            .args(["clone", "--depth", "1", "--"])
+            .arg(&url)
+            .arg(&checkout)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|e| format!("could not start git: {e}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git clone failed: {}", detail.trim()));
+        }
+        lightagent_extensions::install(&checkout.join(subdir), root)
+    })();
+    let _ = std::fs::remove_dir_all(&checkout);
+    result
+}
+
+fn git_source(source: &Path) -> Result<Option<(String, PathBuf)>, String> {
+    let text = source.to_string_lossy();
+    let raw = text.strip_prefix("git+").unwrap_or(&text);
+    if !raw.starts_with("https://") {
+        return Ok(None);
+    }
+    let (url, subdir) = raw.split_once('#').unwrap_or((raw, ""));
+    if url.len() <= "https://".len() {
+        return Err("Git URL needs a host and repository path".to_owned());
+    }
+    let authority = url
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err("Git URL must not contain credentials; use a Git credential helper".to_owned());
+    }
+    let subdir = PathBuf::from(subdir);
+    if !subdir.as_os_str().is_empty()
+        && !subdir
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err("Git extension subdirectory must stay within the repository".to_owned());
+    }
+    Ok(Some((url.to_owned(), subdir)))
+}
+
+/// Remove an installed bundle from the selected store.
+pub fn uninstall(name: &str, profile: bool, json: bool) -> Result<(), String> {
+    let paths = LightagentPaths::resolve().map_err(|e| e.to_string())?;
+    let root = selected_root(&paths, profile)?;
+    lightagent_extensions::uninstall(name, &root)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "name": name, "removed_from": root })
+        );
+    } else {
+        println!("Uninstalled '{name}' from {}.", root.display());
+    }
+    Ok(())
+}
 
 /// Resolve the config and the extension store for the active profile (global
 /// extensions plus the profile's own).
@@ -51,7 +173,7 @@ pub fn list(json: bool) -> Result<(), String> {
     }
     if store.is_empty() {
         println!(
-            "No extensions installed. Drop one under {} to install it.",
+            "No extensions installed. Use `lightagent extensions install <directory>` or add one under {}.",
             LightagentPaths::resolve()
                 .map(|p| p.extensions_dir().display().to_string())
                 .unwrap_or_else(|_| "<home>/extensions".to_owned())
@@ -79,6 +201,7 @@ pub fn show(name: &str, json: bool) -> Result<(), String> {
         .get(name)
         .ok_or_else(|| format!("no installed extension named '{name}'"))?;
     let active = store.is_active(name, &config.extensions);
+    let skills = SkillStore::load(&[ext.skills_dir()]).names();
     if json {
         let value = serde_json::json!({
             "name": ext.name,
@@ -88,6 +211,7 @@ pub fn show(name: &str, json: bool) -> Result<(), String> {
             "dir": ext.dir,
             "instructions": ext.instructions,
             "mcp_servers": ext.mcp_servers.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            "skills": skills,
         });
         println!("{value:#}");
         return Ok(());
@@ -104,6 +228,9 @@ pub fn show(name: &str, json: bool) -> Result<(), String> {
     if !ext.mcp_servers.is_empty() {
         let names: Vec<&str> = ext.mcp_servers.iter().map(|s| s.name()).collect();
         println!("  mcp:     {}", names.join(", "));
+    }
+    if !skills.is_empty() {
+        println!("  skills:  {}", skills.join(", "));
     }
     if !ext.instructions.trim().is_empty() {
         println!("  instructions:\n{}", indent(ext.instructions.trim()));
@@ -170,4 +297,26 @@ fn toggle(name: &str, disable: bool, json: bool) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_sources_accept_a_relative_extension_subdirectory() {
+        assert_eq!(git_source(Path::new("./my-tool")).unwrap(), None);
+        assert_eq!(
+            git_source(Path::new(
+                "git+https://example.org/tools.git#extensions/my-tool"
+            ))
+            .unwrap(),
+            Some((
+                "https://example.org/tools.git".to_owned(),
+                PathBuf::from("extensions/my-tool")
+            ))
+        );
+        assert!(git_source(Path::new("https://example.org/tools.git#../other")).is_err());
+        assert!(git_source(Path::new("https://token@example.org/tools.git")).is_err());
+    }
 }

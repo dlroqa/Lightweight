@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-acp"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "lightagent-api",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-api"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-core"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "directories",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-extensions"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightagent-core",
  "serde",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-mcp"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "lightagent-core",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-memory"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "lightagent-core",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-provider-lightweight"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-rag"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-runtime"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightagent-core",
  "reqwest",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-store"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "getrandom 0.4.3",
  "lightagent-core",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "lightagent-tools"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "lightagent-core",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-api"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightweight-core",
  "lightweight-inference",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-backend-llamacpp"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-backend-mock"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-bench"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "futures-util",
  "lightweight-backend-mock",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-catalog"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "hex",
  "lightweight-core",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-cli"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "axum",
  "clap",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-core"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "serde",
  "serde_json",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-download"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "futures-util",
  "hex",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-gateway"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "axum",
  "futures-util",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-gguf"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightweight-core",
  "serde",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-inference"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-memory"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightweight-core",
  "lightweight-gguf",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-observability"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "lightweight-core",
  "lightweight-system-info",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-store"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "getrandom 0.4.3",
  "lightweight-core",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-sys"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "lightweight-system-info"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "directories",
  "lightweight-core",

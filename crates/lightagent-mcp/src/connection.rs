@@ -9,6 +9,7 @@
 //! [`McpError`]; neither knows any MCP method.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -58,7 +59,21 @@ impl StdioConnection {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, McpError> {
+        Self::spawn_in(command, args, env, None, timeout).await
+    }
+
+    /// Spawn a server with an optional working directory for extension-local assets.
+    pub async fn spawn_in(
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<Self, McpError> {
         let mut cmd = tokio::process::Command::new(command);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         cmd.args(args)
             .envs(env.iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdin(std::process::Stdio::piped())

@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! <ext>/
-//! ├── extension.json     # manifest (name, version, description, instructions?, mcp_servers?)
+//! ├── extension.json     # manifest (name, version, instructions_file?, mcp_servers?)
+//! ├── ONBOARDING.md      # optional Markdown referenced by instructions_file
 //! └── skills/            # optional: SKILL.md dirs the extension contributes
 //!     └── <skill>/SKILL.md
 //! ```
@@ -38,6 +39,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use lightagent_core::paths::create_private_dir;
 use lightagent_core::{ExtensionsConfig, McpServerEntry};
 use serde::Deserialize;
 
@@ -79,6 +81,8 @@ struct ExtensionManifest {
     description: String,
     #[serde(default)]
     instructions: String,
+    /// Optional Markdown file inside the extension, appended to instructions.
+    instructions_file: Option<String>,
     #[serde(default)]
     mcp_servers: Vec<McpServerEntry>,
 }
@@ -200,6 +204,27 @@ impl ExtensionStore {
 /// name when the manifest omits `name`.
 fn parse_extension(text: &str, fallback_name: &str, dir: &Path) -> Option<Extension> {
     let manifest: ExtensionManifest = serde_json::from_str(text).ok()?;
+    let mut instructions = manifest.instructions;
+    if let Some(file) = manifest.instructions_file {
+        let relative = Path::new(&file);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let root = dir.canonicalize().ok()?;
+        let full = dir.join(relative).canonicalize().ok()?;
+        if !full.starts_with(root) || std::fs::metadata(&full).ok()?.len() > 65_536 {
+            return None;
+        }
+        let file_text = std::fs::read_to_string(full).ok()?;
+        if !instructions.trim().is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&file_text);
+    }
     let name = manifest
         .name
         .filter(|value| !value.trim().is_empty())
@@ -211,7 +236,7 @@ fn parse_extension(text: &str, fallback_name: &str, dir: &Path) -> Option<Extens
         name,
         version: manifest.version,
         description: manifest.description,
-        instructions: manifest.instructions,
+        instructions,
         mcp_servers: manifest.mcp_servers,
         dir: dir.to_path_buf(),
     })
@@ -222,6 +247,144 @@ fn parse_extension(text: &str, fallback_name: &str, dir: &Path) -> Option<Extens
 /// `lightagent_core::skill_dirs`.
 pub fn extension_dirs(home: &Path, profile_dir: &Path) -> Vec<PathBuf> {
     vec![home.join("extensions"), profile_dir.join("extensions")]
+}
+
+/// Install a local extension directory atomically into an extension root.
+/// Symlinks are refused so a package cannot copy files outside its source.
+pub fn install(source: &Path, root: &Path) -> Result<Extension, String> {
+    let source = source.canonicalize().map_err(|e| format!("source: {e}"))?;
+    if !source.is_dir() {
+        return Err("extension source must be a directory".to_owned());
+    }
+    let manifest = std::fs::read_to_string(source.join("extension.json"))
+        .map_err(|e| format!("extension.json: {e}"))?;
+    let fallback = source.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = parse_extension(&manifest, fallback, &source)
+        .ok_or_else(|| "invalid extension.json".to_owned())?;
+    if !valid_name(&ext.name) {
+        return Err(
+            "extension name must contain only ASCII letters, numbers, '-' or '_'".to_owned(),
+        );
+    }
+    for server in &ext.mcp_servers {
+        if server.name().trim().is_empty() {
+            return Err("an MCP server has an empty name".to_owned());
+        }
+        match server {
+            McpServerEntry::Stdio { command, .. } if command.trim().is_empty() => {
+                return Err(format!(
+                    "MCP server '{}' has an empty command",
+                    server.name()
+                ));
+            }
+            McpServerEntry::Http { url, .. }
+                if !(url.starts_with("http://") || url.starts_with("https://")) =>
+            {
+                return Err(format!(
+                    "MCP server '{}' needs an http(s) URL",
+                    server.name()
+                ));
+            }
+            _ => {}
+        }
+    }
+    create_private_dir(root).map_err(|e| format!("extension root: {e}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("extension root: {e}"))?;
+    if root.starts_with(&source) {
+        return Err("extension root cannot be inside its source directory".to_owned());
+    }
+    let destination = root.join(&ext.name);
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return Err(format!(
+            "extension '{}' is already installed in {}",
+            ext.name,
+            root.display()
+        ));
+    }
+    let staging = root.join(format!(".{}.install-{}", ext.name, std::process::id()));
+    if staging.exists() {
+        return Err(format!(
+            "staging directory {} already exists",
+            staging.display()
+        ));
+    }
+    let result = (|| {
+        copy_tree(&source, &staging)?;
+        std::fs::rename(&staging, &destination)
+            .map_err(|e| format!("could not finish installation: {e}"))
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok(Extension {
+        dir: destination,
+        ..ext
+    })
+}
+
+/// Remove exactly one installed extension from a selected root.
+pub fn uninstall(name: &str, root: &Path) -> Result<(), String> {
+    if !valid_name(name) {
+        return Err("invalid extension name".to_owned());
+    }
+    let destination = root.join(name);
+    let metadata = std::fs::symlink_metadata(&destination)
+        .map_err(|e| format!("extension '{name}' is not installed: {e}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("extension '{name}' is not a regular directory"));
+    }
+    let manifest = std::fs::read_to_string(destination.join("extension.json"))
+        .map_err(|e| format!("extension.json: {e}"))?;
+    let ext = parse_extension(&manifest, name, &destination)
+        .ok_or_else(|| "invalid extension.json".to_owned())?;
+    if ext.name != name {
+        return Err(format!(
+            "extension directory '{name}' declares name '{}'",
+            ext.name
+        ));
+    }
+    std::fs::remove_dir_all(&destination).map_err(|e| format!("could not uninstall '{name}': {e}"))
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    create_private_dir(destination)
+        .map_err(|e| format!("could not create {}: {e}", destination.display()))?;
+    for entry in std::fs::read_dir(source).map_err(|e| format!("{}: {e}", source.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_name().to_string_lossy() == ".git" {
+            continue;
+        }
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        let target = destination.join(entry.file_name());
+        if kind.is_symlink() {
+            return Err(format!(
+                "extension contains a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target)
+                .map_err(|e| format!("could not copy {}: {e}", entry.path().display()))?;
+        } else {
+            return Err(format!(
+                "extension contains an unsupported file: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,5 +522,106 @@ mod tests {
         let dirs = extension_dirs(Path::new("/root-x"), Path::new("/root-x/profiles/p"));
         assert_eq!(dirs[0], Path::new("/root-x/extensions"));
         assert_eq!(dirs[1], Path::new("/root-x/profiles/p/extensions"));
+    }
+
+    #[test]
+    fn a_markdown_instructions_file_is_loaded_and_removable() {
+        let scratch = scratch();
+        let source = scratch.join("source");
+        let root = scratch.join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("extension.json"),
+            r#"{
+            "name":"onboarding", "instructions_file":"ONBOARDING.md"
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("ONBOARDING.md"),
+            "Use the available tools wisely.",
+        )
+        .unwrap();
+        install(&source, &root).unwrap();
+        let store = ExtensionStore::load(std::slice::from_ref(&root));
+        assert!(
+            store
+                .instructions(&ExtensionsConfig::default())
+                .contains("Use the available tools wisely.")
+        );
+        uninstall("onboarding", &root).unwrap();
+        assert!(ExtensionStore::load(std::slice::from_ref(&root)).is_empty());
+        std::fs::remove_dir_all(scratch).ok();
+    }
+
+    #[test]
+    fn instructions_file_cannot_escape_the_extension() {
+        let scratch = scratch();
+        std::fs::write(
+            scratch.join("extension.json"),
+            r#"{"name":"bad","instructions_file":"../outside.md"}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_extension(
+                &std::fs::read_to_string(scratch.join("extension.json")).unwrap(),
+                "bad",
+                &scratch
+            )
+            .is_none()
+        );
+        std::fs::remove_dir_all(scratch).ok();
+    }
+
+    #[test]
+    fn install_discover_and_uninstall_a_bundle() {
+        let scratch = scratch();
+        let source = scratch.join("source");
+        let root = scratch.join("installed");
+        std::fs::create_dir_all(source.join("skills/echo")).unwrap();
+        std::fs::write(
+            source.join("extension.json"),
+            r#"{
+            "name":"echo", "mcp_servers":[
+                {"transport":"stdio","name":"echo","command":"python3","args":["server.py"]}
+            ]
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("server.py"), "print('hello')").unwrap();
+        std::fs::write(source.join("skills/echo/SKILL.md"), "# Echo").unwrap();
+
+        let installed = install(&source, &root).unwrap();
+        assert_eq!(installed.name, "echo");
+        assert!(installed.dir.join("server.py").is_file());
+        assert_eq!(ExtensionStore::load(std::slice::from_ref(&root)).len(), 1);
+        assert!(
+            install(&source, &root)
+                .unwrap_err()
+                .contains("already installed")
+        );
+        uninstall("echo", &root).unwrap();
+        assert!(ExtensionStore::load(std::slice::from_ref(&root)).is_empty());
+        assert!(source.join("server.py").is_file());
+        std::fs::remove_dir_all(scratch).ok();
+    }
+
+    #[test]
+    fn rejects_path_names_and_symlinked_package_content() {
+        let scratch = scratch();
+        let source = scratch.join("source");
+        let root = scratch.join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("extension.json"), r#"{"name":"../escape"}"#).unwrap();
+        assert!(install(&source, &root).unwrap_err().contains("name must"));
+        assert!(uninstall("../escape", &root).is_err());
+        std::fs::write(source.join("extension.json"), r#"{"name":"safe"}"#).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", source.join("outside")).unwrap();
+            assert!(install(&source, &root).unwrap_err().contains("symlink"));
+            assert!(!root.join("safe").exists());
+        }
+        std::fs::remove_dir_all(scratch).ok();
     }
 }

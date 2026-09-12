@@ -8,6 +8,7 @@
 //! before a tool ever sees them, so a malformed call becomes a result the model
 //! is shown, never a panic.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ const PREVIEW_MAX_BYTES: usize = 200;
 pub struct BoundedExecutor {
     registry: ToolRegistry,
     policy: Mutex<PolicyEngine>,
+    pending: Mutex<HashMap<String, (ApprovalRequest, String)>>,
+    approved: Mutex<HashMap<String, String>>,
     per_call: Duration,
     max_output_bytes: usize,
     run: Option<RunId>,
@@ -53,6 +56,8 @@ impl BoundedExecutor {
         Self {
             registry,
             policy: Mutex::new(policy),
+            pending: Mutex::new(HashMap::new()),
+            approved: Mutex::new(HashMap::new()),
             per_call,
             max_output_bytes,
             run: None,
@@ -75,6 +80,12 @@ impl BoundedExecutor {
     pub fn reset_session_policy(&self, policy: PolicyEngine) {
         if let Ok(mut current) = self.policy.lock() {
             *current = policy;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+        if let Ok(mut approved) = self.approved.lock() {
+            approved.clear();
         }
     }
 
@@ -124,7 +135,46 @@ impl BoundedExecutor {
 
     /// Build the approval request for a known call.
     fn request_for(&self, call: &ToolCall, risk: RiskClass, scopes: Vec<Scope>) -> ApprovalRequest {
-        ApprovalRequest::new(call.name.clone(), risk, scopes, preview(&call.arguments))
+        let arguments_preview = match call.name.as_str() {
+            "fs.write" => serde_json::from_str::<Value>(&call.arguments)
+                .ok()
+                .map(|args| {
+                    let path = args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    let bytes = args
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    let mode = if args.get("append").and_then(Value::as_bool) == Some(true) {
+                        "append"
+                    } else {
+                        "write"
+                    };
+                    format!("path={path:?}, mode={mode}, content_bytes={bytes}")
+                })
+                .unwrap_or_else(|| preview(&call.arguments)),
+            "terminal.run" => serde_json::from_str::<Value>(&call.arguments)
+                .ok()
+                .map(|args| redact(args).to_string())
+                .unwrap_or_else(|| preview(&call.arguments)),
+            _ => preview(&call.arguments),
+        };
+        ApprovalRequest::new(call.name.clone(), risk, scopes, arguments_preview)
+    }
+
+    fn blocked_terminal_call(&self, call: &ToolCall) -> Option<String> {
+        if call.name != "terminal.run" {
+            return None;
+        }
+        let args = serde_json::from_str::<Value>(&call.arguments).ok()?;
+        let command = args.get("command")?.as_str()?;
+        if redact(args.clone()).to_string().len() > 512 {
+            return Some("terminal arguments exceed the review limit".to_owned());
+        }
+        crate::builtins::terminal::blocked_command(command).map(str::to_owned)
     }
 
     fn ctx(&self, cancel: CancellationToken) -> ToolCtx {
@@ -160,11 +210,28 @@ impl ToolInvoker for BoundedExecutor {
         let Some((risk, scopes)) = self.classify(call) else {
             return ApprovalNeed::AutoApprove;
         };
+        if let Some(reason) = self.blocked_terminal_call(call) {
+            return ApprovalNeed::Deny(reason);
+        }
         let request = self.request_for(call, risk, scopes);
-        match self.policy.lock() {
+        let need = match self.policy.lock() {
             Ok(policy) => policy.evaluate(&request, self.clock.now()),
             Err(_) => ApprovalNeed::Deny("the approval policy is unavailable".into()),
+        };
+        if let ApprovalNeed::Require(request) = &need {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.insert(
+                    call.id.clone(),
+                    (
+                        request.clone(),
+                        format!("{}\0{}", call.name, call.arguments),
+                    ),
+                );
+            } else {
+                return ApprovalNeed::Deny("the approval tracker is unavailable".into());
+            }
         }
+        need
     }
 
     async fn invoke(&self, call: &ToolCall, cancel: CancellationToken) -> ToolOutcome {
@@ -187,6 +254,42 @@ impl ToolInvoker for BoundedExecutor {
                 "arguments for '{}' are invalid: {detail}",
                 call.name
             ));
+        }
+
+        if let Some(reason) = self.blocked_terminal_call(call) {
+            return ToolOutcome::error(reason);
+        }
+        let request = self.request_for(
+            call,
+            tool.definition().risk,
+            tool.definition().scopes.clone(),
+        );
+        let need = match self.policy.lock() {
+            Ok(policy) => policy.evaluate(&request, self.clock.now()),
+            Err(_) => return ToolOutcome::error("the approval policy is unavailable"),
+        };
+        match need {
+            ApprovalNeed::Deny(reason) => return ToolOutcome::error(reason),
+            ApprovalNeed::Require(_) => {
+                let key = format!("{}\0{}", call.name, call.arguments);
+                let allowed = self
+                    .approved
+                    .lock()
+                    .ok()
+                    .and_then(|mut approved| approved.remove(&call.id))
+                    .is_some_and(|approved| approved == key);
+                if !allowed {
+                    return ToolOutcome::error(format!(
+                        "the tool '{}' requires approval for this call",
+                        call.name
+                    ));
+                }
+            }
+            ApprovalNeed::AutoApprove => {
+                if let Ok(mut approved) = self.approved.lock() {
+                    approved.remove(&call.id);
+                }
+            }
         }
 
         let ctx = self.ctx(cancel.clone());
@@ -214,6 +317,22 @@ impl ToolInvoker for BoundedExecutor {
         if !decision.granted {
             return;
         }
+        let pending = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&call.id));
+        let key = format!("{}\0{}", call.name, call.arguments);
+        let Some((request, _)) = pending.filter(|(request, pending_key)| {
+            request.id == decision.id && request.tool == call.name && pending_key == &key
+        }) else {
+            return;
+        };
+        if let Ok(mut approved) = self.approved.lock() {
+            approved.insert(call.id.clone(), key);
+        } else {
+            return;
+        }
         if decision.unrestricted {
             if let Ok(mut policy) = self.policy.lock() {
                 policy.allow_without_restrictions();
@@ -223,10 +342,16 @@ impl ToolInvoker for BoundedExecutor {
         let Some(ttl) = decision.remember else {
             return;
         };
-        let Some((risk, scopes)) = self.classify(call) else {
+        if matches!(
+            request.risk,
+            RiskClass::Mutating | RiskClass::Executable | RiskClass::Privileged
+        ) || request
+            .scopes
+            .iter()
+            .any(|scope| matches!(scope.as_str(), "fs:write" | "terminal:exec"))
+        {
             return;
-        };
-        let request = self.request_for(call, risk, scopes);
+        }
         let record = ApprovalRecord::from_request(&request, self.clock.now(), Some(ttl));
         if let Ok(mut policy) = self.policy.lock() {
             policy.remember(record);
@@ -349,9 +474,103 @@ mod tests {
             panic!("one-time approval must not change policy");
         };
         executor.remember(&ApprovalDecision::grant_unrestricted(request.id), &write);
-        assert_eq!(
+        assert!(matches!(
             executor.approval_for(&call("terminal.run")),
+            ApprovalNeed::Require(_)
+        ));
+        assert_eq!(
+            executor.approval_for(&call("datetime.now")),
             ApprovalNeed::AutoApprove
         );
+    }
+
+    #[tokio::test]
+    async fn execution_boundary_requires_a_matching_one_time_approval() {
+        let root = std::env::temp_dir().join(format!(
+            "lightagent-approval-{}",
+            lightagent_core::RunId::new().as_str()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executor = BoundedExecutor::new(
+            ToolRegistry::builtin(),
+            PolicyEngine::new(lightagent_core::permissions::ApprovalPolicy::permissive()),
+            Duration::from_secs(1),
+            1024,
+        )
+        .with_workspace(WorkspaceContext {
+            workspace: std::sync::Arc::new(crate::Workspace::new(&root).unwrap()),
+            policy: std::sync::Arc::new(crate::WorkspacePolicy {
+                max_file_bytes: 1024,
+                allow_terminal: true,
+                terminal_timeout: Duration::from_secs(1),
+                terminal_allowlist: Vec::new(),
+            }),
+        });
+        let write = ToolCall {
+            id: "write-1".to_owned(),
+            name: "fs.write".to_owned(),
+            arguments: r#"{"path":"note.txt","content":"hello"}"#.to_owned(),
+        };
+        let cancel = CancellationToken::new();
+        assert!(
+            executor
+                .invoke(&write, cancel.clone())
+                .await
+                .content
+                .contains("requires approval")
+        );
+        assert!(!root.join("note.txt").exists());
+        let ApprovalNeed::Require(_request) = executor.approval_for(&write) else {
+            panic!("write must ask even under permissive policy");
+        };
+        executor.remember(
+            &ApprovalDecision::grant(
+                ApprovalRequest::new("other", RiskClass::Mutating, vec![], "{}").id,
+            ),
+            &write,
+        );
+        assert!(
+            executor
+                .invoke(&write, cancel.clone())
+                .await
+                .content
+                .contains("requires approval")
+        );
+        let ApprovalNeed::Require(request) = executor.approval_for(&write) else {
+            panic!("write must ask again");
+        };
+        executor.remember(&ApprovalDecision::grant(request.id), &write);
+        assert!(!executor.invoke(&write, cancel.clone()).await.is_error);
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "hello"
+        );
+        assert!(
+            executor
+                .invoke(&write, cancel)
+                .await
+                .content
+                .contains("requires approval")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn destructive_terminal_command_is_blocked_before_prompting() {
+        let executor = BoundedExecutor::new(
+            ToolRegistry::builtin(),
+            PolicyEngine::new(lightagent_core::permissions::ApprovalPolicy::permissive()),
+            Duration::from_secs(1),
+            1024,
+        );
+        let destructive = ToolCall {
+            id: "remove-1".to_owned(),
+            name: "terminal.run".to_owned(),
+            arguments: r#"{"command":"rm","args":["-rf","."]}"#.to_owned(),
+        };
+        assert!(matches!(
+            executor.approval_for(&destructive),
+            ApprovalNeed::Deny(_)
+        ));
     }
 }

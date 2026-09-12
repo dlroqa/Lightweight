@@ -31,6 +31,7 @@ pub(crate) struct StartupInfo<'a> {
     pub(crate) session: &'a str,
     pub(crate) tools: &'a [String],
     pub(crate) skills: &'a [String],
+    pub(crate) extensions: &'a [String],
 }
 
 /// Whether the welcome mark should be shown for this run.
@@ -218,12 +219,22 @@ fn startup_details(info: &StartupInfo<'_>, width: usize) -> Vec<String> {
         lines.push("(none enabled)".to_owned());
     } else {
         for (group, actions) in groups {
-            lines.push(fit_line(&format!("{group}: {}", actions.join(", ")), width));
+            lines.extend(wrap_line(
+                &format!("{group}: {}", actions.join(", ")),
+                width,
+            ));
         }
     }
     lines.push(String::new());
     lines.push("Available Skills".to_owned());
     lines.extend(wrap_names(info.skills, width));
+    lines.push(String::new());
+    lines.push("Active Extensions".to_owned());
+    if info.extensions.is_empty() {
+        lines.push("(none active)".to_owned());
+    } else {
+        lines.extend(wrap_names(info.extensions, width));
+    }
     lines.push(String::new());
     lines.push(fit_line(&format!("Profile: {}", info.profile), width));
     lines.push(fit_line(&format!("Model: {}", info.model), width));
@@ -250,7 +261,7 @@ fn wrap_names(names: &[String], width: usize) -> Vec<String> {
         let separator = if line.is_empty() { "" } else { ", " };
         if !line.is_empty() && line.chars().count() + separator.len() + name.chars().count() > width
         {
-            lines.push(line);
+            lines.extend(wrap_line(&line, width));
             line = String::new();
         }
         if !line.is_empty() {
@@ -259,9 +270,17 @@ fn wrap_names(names: &[String], width: usize) -> Vec<String> {
         line.push_str(name);
     }
     if !line.is_empty() {
-        lines.push(fit_line(&line, width));
+        lines.extend(wrap_line(&line, width));
     }
     lines
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(width.max(1))
+        .map(|part| part.iter().copied().collect())
+        .collect()
 }
 
 fn fit_line(line: &str, width: usize) -> String {
@@ -400,6 +419,7 @@ mod tests {
     fn startup_places_live_metadata_beside_the_logo() {
         let tools = vec!["fs.read".to_owned(), "web.search".to_owned()];
         let skills = vec!["research".to_owned(), "notes".to_owned()];
+        let extensions = vec!["my-tool".to_owned()];
         let dashboard = render_startup(
             &StartupInfo {
                 version: "0.3.5",
@@ -409,6 +429,7 @@ mod tests {
                 session: "session-1",
                 tools: &tools,
                 skills: &skills,
+                extensions: &extensions,
             },
             132,
             false,
@@ -418,6 +439,8 @@ mod tests {
         assert!(dashboard.contains("fs: read"));
         assert!(dashboard.contains("Available Skills"));
         assert!(dashboard.contains("research, notes"));
+        assert!(dashboard.contains("Active Extensions"));
+        assert!(dashboard.contains("my-tool"));
         assert!(dashboard.contains("Profile: default"));
         assert!(dashboard.contains("Model: minicpm5-1b@16k"));
         assert!(dashboard.contains("Session: session-1"));
@@ -441,6 +464,7 @@ mod tests {
                 session: "session",
                 tools: &tools,
                 skills: &[],
+                extensions: &[],
             },
             220,
             false,
@@ -461,6 +485,7 @@ mod tests {
                 session: "session",
                 tools: &[],
                 skills: &[],
+                extensions: &[],
             },
             80,
             false,
@@ -469,5 +494,33 @@ mod tests {
         for line in dashboard.lines().filter(|line| !line.is_empty()) {
             assert_eq!(line.chars().count(), 80, "wrong width: {line:?}");
         }
+    }
+
+    #[test]
+    fn startup_keeps_late_tools_visible_when_a_group_is_long() {
+        let tools = (0..30)
+            .map(|i| format!("mcp.server.tool{i:02}"))
+            .collect::<Vec<_>>();
+        let dashboard = render_startup(
+            &StartupInfo {
+                version: "test",
+                release_date: "today",
+                profile: "default",
+                model: "model",
+                session: "session",
+                tools: &tools,
+                skills: &[],
+                extensions: &[],
+            },
+            80,
+            false,
+        );
+        assert!(dashboard.contains("tool29"));
+        assert!(
+            dashboard
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| line.chars().count() == 80)
+        );
     }
 }

@@ -74,6 +74,18 @@ impl Workspace {
     /// while the leaf and any missing directories stay under the checked anchor.
     pub fn resolve_new(&self, relative: &str) -> Result<PathBuf, String> {
         let candidate = self.join_checked(relative)?;
+        // A leaf symlink would make fs.write follow a target outside the root,
+        // even when its parent is safe. Refuse it, including dangling links.
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{relative:?} is a symlink; writes require a regular path"
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{relative:?}: {error}")),
+        }
         let mut anchor = candidate.as_path();
         let existing = loop {
             match anchor.parent() {
@@ -111,6 +123,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leaf_symlink_cannot_redirect_a_write_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_root();
+        let outside = root.with_extension("outside");
+        std::fs::write(&outside, "original").unwrap();
+        symlink(&outside, root.join("linked.txt")).unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+        assert!(
+            workspace
+                .resolve_new("linked.txt")
+                .unwrap_err()
+                .contains("symlink")
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_file(outside).ok();
     }
 
     #[test]

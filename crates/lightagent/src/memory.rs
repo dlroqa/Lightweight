@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lightagent_core::{Config, ConfigStore, LightagentPaths, ProfileStore};
 use lightagent_memory::{
-    MemorySearch, MemorySource, MemoryStore, MemoryWrite, SessionLookup, memory_path,
+    MemoryReflect, MemorySearch, MemorySource, MemoryStore, MemoryWrite, SessionLookup,
+    memory_path, retain,
 };
 use lightagent_rag::HashingEmbedder;
 use lightagent_store::{Session, SessionId, SessionStore};
@@ -29,10 +30,26 @@ pub(crate) fn memory_tools(profile_dir: &Path, config: &Config) -> Vec<Arc<dyn T
     vec![
         Arc::new(MemoryWrite::new(path.clone())),
         Arc::new(search),
+        Arc::new(MemoryReflect::new(path)),
         Arc::new(SessionLookup::new(SessionStore::new(
             profile_dir.join("sessions"),
         ))),
     ]
+}
+
+/// Retain only explicit, durable user statements. The source points back to
+/// the saved transcript when one exists; unclear statements remain there.
+pub(crate) fn capture(
+    profile_dir: &Path,
+    config: &Config,
+    message: &str,
+    source: Option<MemorySource>,
+) -> Result<usize, String> {
+    if !config.memory.auto_capture {
+        return Ok(0);
+    }
+    let mut store = MemoryStore::open(memory_path(profile_dir)).map_err(|e| e.to_string())?;
+    retain(&mut store, message, source, now_secs()).map_err(|e| e.to_string())
 }
 
 /// Select a small set of memories for this request's prompt.
@@ -254,6 +271,22 @@ pub fn list(json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Render the structured working knowledge derived from the bank.
+pub fn reflect(topic: Option<String>, json: bool) -> Result<(), String> {
+    let (path, _) = active_memory()?;
+    let store = MemoryStore::open(&path).map_err(|e| e.to_string())?;
+    let page = store.knowledge_page(topic.as_deref(), 32_000);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "topic": topic, "knowledge": page })
+        );
+    } else {
+        println!("{page}");
+    }
+    Ok(())
+}
+
 /// `memory search <query>` — the most relevant memories.
 pub async fn search(query: String, top_k: Option<usize>, json: bool) -> Result<(), String> {
     let (path, config) = active_memory()?;
@@ -314,4 +347,46 @@ pub fn clear(json: bool) -> Result<(), String> {
         println!("Memory cleared.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn automatic_fact_is_recalled_in_a_later_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "lightagent-memory-cycle-{}",
+            lightagent_core::RunId::new().as_str()
+        ));
+        let config = Config::default();
+        capture(
+            &dir,
+            &config,
+            "I prefer concise answers.",
+            Some(MemorySource {
+                session_id: "first-session".to_owned(),
+                message_index: 1,
+            }),
+        )
+        .unwrap();
+        let recalled = relevant_catalog(&dir, &config, "How long should your answers be?")
+            .await
+            .unwrap();
+        assert!(recalled.contains("I prefer concise answers"));
+        let page = MemoryStore::open(memory_path(&dir))
+            .unwrap()
+            .knowledge_page(Some("preference"), 8_000);
+        assert!(page.contains("## Preferences"));
+        assert!(page.contains("first-session#1"));
+
+        let mut disabled = config;
+        disabled.memory.auto_capture = false;
+        assert_eq!(
+            capture(&dir, &disabled, "We decided to use SQLite.", None).unwrap(),
+            0
+        );
+        assert_eq!(MemoryStore::open(memory_path(&dir)).unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

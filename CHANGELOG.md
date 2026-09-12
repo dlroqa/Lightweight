@@ -4,6 +4,96 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-09-12
+
+A patch release for the Lightagent interactive terminal. Tools can now be added
+without rebuilding: an extension directory is installed by the CLI or from an
+open chat, and its MCP server runs from its own installed directory so
+relative scripts and assets resolve. A dropped Markdown file can be read for a
+single turn or kept as profile guidance. Durable memory retains clearly stated
+user facts on its own and can present them as a grouped knowledge page. The
+approval boundary is tightened: file mutations and command execution ask on
+every call and are checked again at the point of execution, so no policy,
+remembered grant, or session-wide relaxation can let one through unattended.
+Existing profiles, extensions, and settings keep working; automatic retention
+and the new prompts can each be turned off.
+
+### Added
+
+- **Extensions are installable.** `lightagent extensions install <directory>`
+  copies a bundle into Lightagent's managed store — staged then renamed, with
+  symlinks, path-like names, and malformed MCP entries refused — and
+  `lightagent extensions uninstall <name>` removes exactly that copy. `--profile`
+  selects the active profile's store instead of the global one, an HTTPS Git URL
+  with an optional `#subdir` is fetched into a temporary checkout first, and
+  installing a bundle with MCP servers enables MCP. `lightagent extensions show`
+  now also lists the skills a bundle contributes.
+- **Extensions can be managed from an open chat.** `/extensions`,
+  `/extensions install <directory>`, and `/extensions uninstall <name>` update
+  the tool registry between turns, and `/reload` picks up changes made in
+  another terminal. The startup dashboard gained an Active Extensions section.
+- **A manifest can point at a Markdown instructions file.** `instructions_file`
+  in `extension.json` loads a bounded Markdown file from inside the bundle,
+  keeping long guidance out of the JSON.
+- **Dropped Markdown files.** Dropping a `.md` path into the prompt reads that
+  file for the turn — quoted paths, escaped spaces, and local `file://` URLs are
+  accepted, bounded to 64 KiB. Typing `/onboard ` before the drop installs it as
+  the profile's `user-onboarding` guidance instead, replacing any previous copy;
+  `/onboard remove` withdraws it.
+- **Durable facts are retained automatically.** Clear statements of preference,
+  decision, codebase convention, or resolution are saved for the active profile
+  with the session and message they came from, so a new session starts with
+  established context. The filter is deterministic and conservative: questions,
+  temporary requests, code blocks, and likely secrets are skipped, and
+  `lightagent config set memory.auto_capture false` turns it off without
+  deleting anything. `memory.inject_recent` and `memory.top_k` are now settable
+  from `lightagent config` as well.
+- **Memory reflection.** `lightagent memory reflect [topic]` and the read-only
+  `memory.reflect` tool build a knowledge page grouped into preferences,
+  decisions, conventions, resolved issues, and other facts, newest first with
+  source citations. The page is derived on demand, so a correction or a
+  `forget` changes it immediately.
+- **Effective permissions are visible.** `lightagent tools list` and the chat
+  `/tools` listing show each tool's resolved `auto`, `ask`, or `block`
+  permission for the active profile alongside its risk class.
+
+### Changed
+
+- **Mutations and command execution always ask.** Any call classified as
+  mutating or executable, or carrying an `fs:write` or `terminal:exec` scope,
+  requires a fresh decision on every call; a remembered grant, a permissive
+  profile, or the session-wide relaxation can no longer cover one, and such a
+  grant is no longer recorded. Privileged calls are refused outright. The third
+  approval choice is now labelled "Allow this call; relax lower-risk tools this
+  session" to describe what it actually does.
+- **Approvals are enforced at the execution boundary.** A decision is bound to
+  one pending request and its exact tool call: resuming a paused run with a
+  decision for a different request is rejected, and the executor re-checks the
+  policy when the tool is invoked, so an approval-requiring call cannot run
+  without its matching one-time grant.
+- **`terminal.run` refuses obviously destructive programs.** `rm`, `dd`,
+  `mkfs*`, `sudo`, shells and other wrappers are denied by name before any
+  prompt is shown, and over-long argument sets are refused as unreviewable. This
+  is a review aid, not a sandbox — an approved program still runs with the
+  harness's own access.
+- **Approval previews are built for review.** An `fs.write` request shows its
+  path, mode, and content size instead of a truncated body, and a `terminal.run`
+  request shows redacted arguments.
+- **`serve` and `acp` resolve tools and settings per run.** Each run reloads the
+  configuration and builds its registry from the resolved profile, so a
+  profile's own extensions — not only the global ones — contribute their tools,
+  and `GET /api/lightagent/v1/tools` reports the registry the server would
+  actually use rather than the built-in set.
+
+### Fixed
+
+- **A leaf symlink can no longer redirect a workspace write.** `fs.write`
+  refuses a path whose final component is a symlink, including a dangling one,
+  so a link inside the workspace cannot be used to write outside it.
+- **The startup dashboard no longer hides tools.** A tool or permission line
+  wider than the panel is wrapped instead of truncated, so late entries in a
+  long list stay visible and every line keeps the panel width.
+
 ## [0.3.17] - 2026-09-12
 
 A patch release for the Lightagent interactive terminal. Durable memory and

@@ -153,6 +153,16 @@ impl RunState {
 /// the bounded tool executor. The factory calls [`drive`] with the loop it built.
 #[async_trait]
 pub trait RunFactory: Send + Sync + 'static {
+    /// Tools currently visible to the factory's active target.
+    async fn tools(&self) -> Result<Vec<lightagent_tools::ToolDefinition>, String> {
+        let registry = lightagent_tools::ToolRegistry::builtin();
+        Ok(registry
+            .names()
+            .iter()
+            .filter_map(|name| registry.get(name).map(|tool| tool.definition().clone()))
+            .collect())
+    }
+
     /// Drive `request` to a terminal [`RunStatus`], emitting events to `sink`,
     /// obeying `cancel`, and taking approval decisions from `decisions`.
     async fn run(
@@ -254,6 +264,11 @@ impl RunManager {
             factory,
             runs: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The tools the factory currently offers to the active target.
+    pub async fn tools(&self) -> Result<Vec<lightagent_tools::ToolDefinition>, String> {
+        self.factory.tools().await
     }
 
     /// Start a run and return its shared state. The run drives in the background.

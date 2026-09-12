@@ -10,8 +10,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod learning;
 pub mod store;
 pub mod tool;
 
+pub use learning::{Candidate, candidates, retain};
 pub use store::{Memory, MemorySource, MemoryStore, memory_path};
-pub use tool::{MemorySearch, MemoryWrite, SessionLookup};
+pub use tool::{MemoryReflect, MemorySearch, MemoryWrite, SessionLookup};
