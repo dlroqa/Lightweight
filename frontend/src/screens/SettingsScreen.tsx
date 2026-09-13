@@ -406,6 +406,7 @@ function AgentServerSettings() {
           <Pill tone={running ? "ok" : pending ? "info" : "warn"}>
             {server.error ? "Status unavailable" : pending ? "Starting…" : running ? "Running" :
               status?.status === "failed" ? "Failed to start" :
+              status?.status === "incompatible" ? "Update required" :
               status?.status === "unavailable" ? "Not responding" :
               status ? "Stopped" : "Checking…"}
           </Pill>

@@ -595,7 +595,7 @@ export interface BenchmarkSample {
 
 /** The separate Lightagent API process, managed by the gateway. */
 export interface AgentServerStatus {
-  status: "running" | "starting" | "unavailable" | "failed" | "stopped";
+  status: "running" | "starting" | "incompatible" | "unavailable" | "failed" | "stopped";
   upstream: string | null;
   can_start: boolean;
   message: string | null;

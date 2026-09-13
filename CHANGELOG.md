@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-09-12
+
+A patch release that makes the panel honest about the agent server it is
+talking to and tidies the desktop shell and rail layout. The gateway now tells
+a ready Lightagent apart from a different service on the configured upstream and
+from an outdated Lightagent that can list sessions but cannot create one; either
+case is reported as *incompatible* with an actionable message instead of being
+misread as ready or offered a pointless start. The desktop app presents itself
+as Lightweight rather than its internal package name, the rail keeps its status
+card in shorter windows while the navigation scrolls, and the panel's *New
+session* action moves beside the session list it affects. Existing sessions,
+runs, and settings keep working unchanged.
+
+### Changed
+
+- **The desktop app identifies itself as Lightweight.** The Electron runtime
+  name is set explicitly, so local and unpacked runs — and the macOS About,
+  Hide, and Quit menu labels — no longer fall back to the internal
+  `hermes-desktop` package name.
+- **The rail survives shorter windows, and New session sits by its list.** The
+  rail navigation scrolls and keeps the agent status card visible in shorter
+  desktop windows, and the *New session* action now lives beside the session
+  list; the Agent header carries only *Stop* while a run is in flight.
+
+### Fixed
+
+- **An incompatible or outdated agent upstream is reported, not misread.** The
+  gateway now verifies both the service identity and that the upstream can
+  create WebUI sessions. A different service, or an outdated Lightagent that can
+  only list sessions, is surfaced as `incompatible` with a message that says
+  what to do, the settings panel shows *Update required*, and starting over such
+  an upstream returns a clear 409 instead of launching a second process. The
+  status probe uses `OPTIONS` so polling no longer creates an empty session each
+  time.
+- **The dev proxy no longer lets agent calls fall through to Lightweight.** The
+  panel dev server proxies `/api/v1` rather than `/api`, so the Lightagent
+  `/api/lightagent` namespace is routed to the agent regardless of proxy
+  declaration order.
+
 ## [0.3.20] - 2026-09-12
 
 A patch release that hardens the panel's Agent screen against a slow or

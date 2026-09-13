@@ -316,7 +316,7 @@ export function Agent() {
   }
 
   const serviceStatus = server.data?.status;
-  const serviceUnavailable = serviceStatus === "stopped" || serviceStatus === "failed" || serviceStatus === "unavailable";
+  const serviceUnavailable = serviceStatus === "stopped" || serviceStatus === "failed" || serviceStatus === "incompatible" || serviceStatus === "unavailable";
   const shownError = error ?? (!recovering && serviceUnavailable
     ? server.data?.message ?? "The Lightagent server is not running."
     : null) ?? (!recovering ? sessions.error?.message : null);
@@ -339,13 +339,9 @@ export function Agent() {
         title="Agent"
         subtitle={session?.title || "Tool-using conversations"}
         actions={
-          running ? (
+          running && (
             <button type="button" className="btn btn--danger" onClick={() => void cancel()}>
               <Ban size={15} /> Stop
-            </button>
-          ) : (
-            <button type="button" className="btn" disabled={hasPendingWork} onClick={() => void startNew()}>
-              <Plus size={15} /> New session
             </button>
           )
         }

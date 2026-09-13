@@ -144,7 +144,7 @@ export function Shell() {
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 8 }}>
+        <div className="rail__controls">
           <button
             type="button"
             className="btn btn--icon"

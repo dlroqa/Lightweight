@@ -6,7 +6,7 @@ use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -32,6 +32,14 @@ struct Report {
     upstream: Option<String>,
     can_start: bool,
     message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Probe {
+    Ready,
+    Unreachable,
+    WrongService,
+    MissingSessionCreation,
 }
 
 fn local_address(upstream: Option<&str>) -> Result<(String, u16), String> {
@@ -108,35 +116,87 @@ fn select_binary(
     PathBuf::from(name)
 }
 
-async fn healthy(upstream: &str) -> bool {
+/// Verify the service identity and the API operation the Agent screen needs to
+/// start a conversation. `OPTIONS` discovers the route without creating an
+/// empty session every time the UI polls status.
+async fn probe(upstream: &str) -> Probe {
     let response = crate::agent_proxy::client()
         .get(format!("{}/health", upstream.trim_end_matches('/')))
         .timeout(Duration::from_secs(1))
         .send()
         .await;
     let Ok(response) = response else {
-        return false;
+        return Probe::Unreachable;
     };
     if !response.status().is_success() {
-        return false;
+        return Probe::WrongService;
     }
-    response
+    let is_lightagent = response
         .json::<serde_json::Value>()
         .await
-        .is_ok_and(|body| body["service"] == "lightagent" && body["status"] == "ok")
+        .is_ok_and(|body| body["service"] == "lightagent" && body["status"] == "ok");
+    if !is_lightagent {
+        return Probe::WrongService;
+    }
+
+    let response = crate::agent_proxy::client()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!(
+                "{}/api/lightagent/v1/sessions",
+                upstream.trim_end_matches('/')
+            ),
+        )
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return Probe::Unreachable;
+    };
+    let supports_session_creation = response
+        .headers()
+        .get(header::ALLOW)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|methods| {
+            methods
+                .split(',')
+                .any(|method| method.trim().eq_ignore_ascii_case("POST"))
+        });
+    if supports_session_creation {
+        Probe::Ready
+    } else {
+        Probe::MissingSessionCreation
+    }
+}
+
+fn incompatibility_message(upstream: &str, probe: Probe) -> Option<String> {
+    match probe {
+        Probe::WrongService => Some(format!(
+            "The configured agent upstream at {upstream} is a different service. Point --agent-upstream to `lightagent serve` (normally http://127.0.0.1:8735)."
+        )),
+        Probe::MissingSessionCreation => Some(format!(
+            "The Lightagent server at {upstream} is outdated and cannot create WebUI sessions. Stop it, install or build the current Lightagent CLI, then restart `lightagent serve`."
+        )),
+        Probe::Ready | Probe::Unreachable => None,
+    }
 }
 
 async fn report(state: &GatewayState) -> Report {
     let upstream = state.config.agent_upstream.clone();
-    let reachable = match &upstream {
-        Some(upstream) => healthy(upstream).await,
-        None => false,
+    let compatibility = match &upstream {
+        Some(upstream) => probe(upstream).await,
+        None => Probe::Unreachable,
     };
     let local = local_address(upstream.as_deref());
     let inner = state.agent_server.inner.lock().await;
     Report {
-        status: if reachable {
+        status: if compatibility == Probe::Ready {
             "running"
+        } else if matches!(
+            compatibility,
+            Probe::WrongService | Probe::MissingSessionCreation
+        ) {
+            "incompatible"
         } else if inner.starting {
             "starting"
         } else if inner.active {
@@ -146,11 +206,13 @@ async fn report(state: &GatewayState) -> Report {
         } else {
             "stopped"
         },
-        can_start: !reachable && !inner.active && local.is_ok(),
-        message: if reachable {
+        can_start: compatibility == Probe::Unreachable && !inner.active && local.is_ok(),
+        message: if compatibility == Probe::Ready {
             None
         } else {
-            inner.error.clone().or_else(|| local.err())
+            incompatibility_message(upstream.as_deref().unwrap_or_default(), compatibility)
+                .or_else(|| inner.error.clone())
+                .or_else(|| local.err())
         },
         upstream,
     }
@@ -181,7 +243,11 @@ pub async fn start(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -
     // two children, and an already running external agent stays external.
     let mut inner = state.agent_server.inner.lock().await;
     let upstream = state.config.agent_upstream.clone().unwrap_or_default();
-    if !inner.active && !healthy(&upstream).await {
+    let compatibility = probe(&upstream).await;
+    if let Some(message) = incompatibility_message(&upstream, compatibility) {
+        return failure(StatusCode::CONFLICT, &message);
+    }
+    if !inner.active && compatibility != Probe::Ready {
         let executable = binary();
         let mut command = Command::new(&executable);
         command
@@ -268,7 +334,7 @@ async fn supervise(
                 break Some("The agent did not become ready within 30 seconds. Check its configuration and try again.".into());
             }
             _ = tokio::time::sleep(Duration::from_millis(250)), if !ready => {
-                if healthy(&upstream).await {
+                if probe(&upstream).await == Probe::Ready {
                     ready = true;
                     server.inner.lock().await.starting = false;
                 }

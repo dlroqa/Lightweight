@@ -171,8 +171,11 @@ textarea {
 
 .rail__nav {
   display: flex;
+  min-height: 0;
   flex-direction: column;
   gap: 2px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .navitem {
@@ -212,6 +215,7 @@ textarea {
 }
 
 .railcard {
+  flex: none;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border);
   background: var(--surface-raised);
@@ -239,6 +243,30 @@ textarea {
   border: none;
   border-top: 1px solid var(--rule);
   margin: var(--space-1) 0;
+}
+
+.rail__controls {
+  display: flex;
+  flex: none;
+  gap: var(--space-2);
+}
+
+/* Preserve the complete status card in shorter desktop windows. The nav gives
+ * up height first and remains scrollable if the window becomes smaller still. */
+@media (max-height: 900px) and (min-width: 901px) {
+  .rail {
+    gap: var(--space-3);
+    padding-block: var(--space-3);
+  }
+
+  .navitem {
+    padding-block: var(--space-2);
+  }
+
+  .railcard {
+    gap: var(--space-1);
+    padding: var(--space-3);
+  }
 }
 
 /* ---------------------------------------------------------------- main --- */

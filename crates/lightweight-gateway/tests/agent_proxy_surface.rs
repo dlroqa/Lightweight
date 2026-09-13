@@ -53,6 +53,16 @@ async fn start_agent_server() -> String {
                 let received: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 axum::Json(json!({ "method": method, "path": path, "received": received }))
             }),
+        )
+        .route(
+            "/api/lightagent/v1/sessions",
+            get(|| async { axum::Json(json!({ "sessions": [] })) }).post(
+                |request: Request| async move {
+                    let method = request.method().to_string();
+                    let path = request.uri().path().to_owned();
+                    axum::Json(json!({ "id": "session-test", "method": method, "path": path }))
+                },
+            ),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -166,6 +176,26 @@ async fn a_same_origin_post_reaches_the_upstream_with_method_path_and_body() {
 }
 
 #[tokio::test]
+async fn agent_sessions_use_the_lightagent_namespace_and_support_creation() {
+    ensure_provider();
+    let upstream = start_agent_server().await;
+    let gateway = start_gateway(Some(upstream)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/api/lightagent/v1/sessions"))
+        .header("origin", &gateway)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["id"], "session-test");
+    assert_eq!(body["method"], "POST");
+    assert_eq!(body["path"], "/api/lightagent/v1/sessions");
+}
+
+#[tokio::test]
 async fn a_cross_origin_write_is_refused_before_it_reaches_the_upstream() {
     // The proxied surface is guarded on the same terms as `/api/v1`: the agent
     // server it forwards to is loopback and keyless, so nothing but this stops a
@@ -256,6 +286,55 @@ async fn settings_detects_an_existing_agent_and_start_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(body["status"], "running");
+}
+
+#[tokio::test]
+async fn an_outdated_agent_is_not_reported_as_ready() {
+    ensure_provider();
+    let app = Router::new()
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({"status": "ok", "service": "lightagent"})) }),
+        )
+        // Legacy Lightagent builds could list sessions but could not create one.
+        .route(
+            "/api/lightagent/v1/sessions",
+            get(|| async { axum::Json(json!({ "sessions": [] })) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind legacy agent");
+    let upstream = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let gateway = start_gateway(Some(upstream)).await;
+    let client = reqwest::Client::new();
+
+    let report: Value = client
+        .get(format!("{gateway}/api/v1/agent-server"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(report["status"], "incompatible");
+    assert_eq!(report["can_start"], false);
+    assert!(
+        report["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outdated"))
+    );
+
+    let response = client
+        .post(format!("{gateway}/api/v1/agent-server/start"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "agent_start_failed");
 }
 
 #[tokio::test]
