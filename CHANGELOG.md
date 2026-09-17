@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.22] - 2026-09-16
+
+A patch release that redraws the terminal logo from the updated pixel-art
+Lightagent artwork and makes it sharper. The interactive startup dashboard now
+shows a larger 72-column mark, close to the artwork's native pixel grid, so the
+gold star, lightning bolt and `Lightagent` wordmark read cleanly; narrower
+terminals and the plain `lightagent` mark keep a compact 56-column derivative
+with the same layout as before, so nothing overflows. No commands, flags, or
+settings change.
+
+### Changed
+
+- The terminal logo is redrawn from the updated pixel-art Lightagent artwork.
+  The startup dashboard now shows a larger 72-column mark, closer to the
+  artwork's native pixel grid, so the star, bolt and `Lightagent` wordmark stay
+  sharp; terminals narrower than 128 columns and the plain `lightagent` mark
+  keep a compact 56-column derivative so nothing overflows.
+
 ## [0.3.21] - 2026-09-12
 
 A patch release that makes the panel honest about the agent server it is

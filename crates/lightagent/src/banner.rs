@@ -13,14 +13,47 @@
 //!     monochrome silhouette, the second turns the mark off entirely.
 //!
 //! Two image rows render into one terminal row with half-block characters.
+//! The startup dashboard uses a larger, sharper derivative when the terminal is
+//! wide enough to hold it beside the live details; narrower terminals and the
+//! plain mark keep the compact one.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 
-const LOGO_WIDTH: usize = 56;
-const LOGO_HEIGHT: usize = 56;
-const LOGO_RGBA: &[u8; LOGO_WIDTH * LOGO_HEIGHT * 4] =
-    include_bytes!("../assets/lightagent-logo-56x56.rgba");
+const COMPACT_WIDTH: usize = 56;
+const COMPACT_HEIGHT: usize = 52;
+const COMPACT_RGBA: &[u8; COMPACT_WIDTH * COMPACT_HEIGHT * 4] =
+    include_bytes!("../assets/lightagent-logo-56x52.rgba");
+
+const LARGE_WIDTH: usize = 72;
+const LARGE_HEIGHT: usize = 68;
+const LARGE_RGBA: &[u8; LARGE_WIDTH * LARGE_HEIGHT * 4] =
+    include_bytes!("../assets/lightagent-logo-72x68.rgba");
+
+/// One embedded terminal-native RGBA derivative of the logo.
+struct Logo {
+    width: usize,
+    height: usize,
+    rgba: &'static [u8],
+}
+
+/// Fits within an 80-column terminal; used by the plain mark and narrow
+/// startup dashboards.
+const COMPACT_LOGO: Logo = Logo {
+    width: COMPACT_WIDTH,
+    height: COMPACT_HEIGHT,
+    rgba: COMPACT_RGBA,
+};
+
+/// Closer to the artwork's native pixel grid, so the wordmark stays legible.
+const LARGE_LOGO: Logo = Logo {
+    width: LARGE_WIDTH,
+    height: LARGE_HEIGHT,
+    rgba: LARGE_RGBA,
+};
+
+/// Narrowest detail column kept beside the logo in the side-by-side layout.
+const DETAIL_MIN_WIDTH: usize = 47;
 
 /// Live chat metadata rendered beside the logo at startup.
 pub(crate) struct StartupInfo<'a> {
@@ -58,7 +91,7 @@ pub(crate) fn print_startup(info: &StartupInfo<'_>) {
 /// terminal.
 pub fn render(version: &str, colour: bool) -> String {
     let mut out = String::from("\n");
-    for line in logo_lines(colour) {
+    for line in logo_lines(&COMPACT_LOGO, colour) {
         out.push_str(&line);
         out.push('\n');
     }
@@ -75,13 +108,13 @@ pub fn render(version: &str, colour: bool) -> String {
     out
 }
 
-fn logo_lines(colour: bool) -> Vec<String> {
-    let mut lines = Vec::with_capacity(LOGO_HEIGHT.div_ceil(2));
-    for top_row in (0..LOGO_HEIGHT).step_by(2) {
+fn logo_lines(logo: &Logo, colour: bool) -> Vec<String> {
+    let mut lines = Vec::with_capacity(logo.height.div_ceil(2));
+    for top_row in (0..logo.height).step_by(2) {
         let mut line = String::from("  ");
-        for column in 0..LOGO_WIDTH {
-            let upper = logo_pixel(top_row, column);
-            let lower = logo_pixel(top_row + 1, column);
+        for column in 0..logo.width {
+            let upper = logo_pixel(logo, top_row, column);
+            let lower = logo_pixel(logo, top_row + 1, column);
             line.push_str(&image_cell(upper, lower, colour));
         }
         if colour {
@@ -95,19 +128,30 @@ fn logo_lines(colour: bool) -> Vec<String> {
 /// Read one terminal-native RGBA pixel. The embedded mark uses binary alpha and
 /// a compact, non-dithered palette, so every visible source pixel maps directly
 /// to one sharply rendered terminal pixel without a blended halo.
-fn logo_pixel(row: usize, column: usize) -> Option<(u8, u8, u8)> {
-    if row >= LOGO_HEIGHT || column >= LOGO_WIDTH {
+fn logo_pixel(logo: &Logo, row: usize, column: usize) -> Option<(u8, u8, u8)> {
+    if row >= logo.height || column >= logo.width {
         return None;
     }
-    let offset = (row * LOGO_WIDTH + column) * 4;
-    if LOGO_RGBA[offset + 3] < 128 {
+    let offset = (row * logo.width + column) * 4;
+    if logo.rgba[offset + 3] < 128 {
         return None;
     }
     Some((
-        LOGO_RGBA[offset],
-        LOGO_RGBA[offset + 1],
-        LOGO_RGBA[offset + 2],
+        logo.rgba[offset],
+        logo.rgba[offset + 1],
+        logo.rgba[offset + 2],
     ))
+}
+
+/// Visible columns reserved for a logo in the side-by-side layout: two leading
+/// spaces from `logo_lines` plus a two-column gap before the details.
+fn side_by_side_left_width(logo: &Logo) -> usize {
+    logo.width + 4
+}
+
+/// Terminal width at which `logo` fits beside a usable detail column.
+fn side_by_side_min_width(logo: &Logo) -> usize {
+    side_by_side_left_width(logo) + 1 + DETAIL_MIN_WIDTH + 4
 }
 
 /// The live terminal width, with `COLUMNS` retained as a fallback for previews
@@ -126,14 +170,18 @@ pub(crate) fn terminal_width() -> usize {
 }
 
 fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String {
-    const LEFT_WIDTH: usize = 60;
-    const SIDE_BY_SIDE_MIN: usize = 112;
     let width = width.max(64);
-    let logo = logo_lines(colour);
+    let mark = if width >= side_by_side_min_width(&LARGE_LOGO) {
+        &LARGE_LOGO
+    } else {
+        &COMPACT_LOGO
+    };
+    let left_width = side_by_side_left_width(mark);
+    let logo = logo_lines(mark, colour);
     let content_width = width.saturating_sub(4);
-    let side_by_side = width >= SIDE_BY_SIDE_MIN;
+    let side_by_side = width >= side_by_side_min_width(mark);
     let detail_width = if side_by_side {
-        content_width.saturating_sub(LEFT_WIDTH + 1)
+        content_width.saturating_sub(left_width + 1)
     } else {
         content_width
     };
@@ -150,12 +198,12 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
         let rows = logo.len().max(details.len());
         for row in 0..rows {
             let left = logo.get(row).map(String::as_str).unwrap_or("");
-            let left_visible = if row < logo.len() { LOGO_WIDTH + 2 } else { 0 };
+            let left_visible = if row < logo.len() { mark.width + 2 } else { 0 };
             let right = details.get(row).map(String::as_str).unwrap_or("");
             out.push_str(&paint_border("│", colour));
             out.push(' ');
             out.push_str(left);
-            out.push_str(&" ".repeat(LEFT_WIDTH.saturating_sub(left_visible)));
+            out.push_str(&" ".repeat(left_width.saturating_sub(left_visible)));
             // Deliberately use whitespace rather than a divider: the modern
             // mark and the live harness information share one open canvas.
             out.push(' ');
@@ -167,7 +215,7 @@ fn render_startup(info: &StartupInfo<'_>, width: usize, colour: bool) -> String 
         }
     } else {
         for line in &logo {
-            push_startup_row(&mut out, line, LOGO_WIDTH + 2, content_width, colour, false);
+            push_startup_row(&mut out, line, mark.width + 2, content_width, colour, false);
         }
         push_startup_row(&mut out, "", 0, content_width, colour, false);
         for line in &details {
@@ -398,21 +446,56 @@ mod tests {
 
     #[test]
     fn embedded_logo_has_the_expected_rgba_geometry() {
-        assert_eq!(LOGO_RGBA.len(), LOGO_WIDTH * LOGO_HEIGHT * 4);
-        assert_eq!(logo_lines(false).len(), LOGO_HEIGHT.div_ceil(2));
-        assert!(logo_pixel(LOGO_HEIGHT / 2, LOGO_WIDTH / 2).is_some());
-        let (pixels, remainder) = LOGO_RGBA.as_chunks::<4>();
-        assert!(remainder.is_empty());
-        assert!(pixels.iter().all(|pixel| matches!(pixel[3], 0 | 255)));
-        let colours = pixels
-            .iter()
-            .filter(|pixel| pixel[3] == 255)
-            .map(|pixel| (pixel[0], pixel[1], pixel[2]))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            (8..=32).contains(&colours.len()),
-            "logo should retain a compact pixel-art palette"
-        );
+        for logo in [&COMPACT_LOGO, &LARGE_LOGO] {
+            assert_eq!(logo.rgba.len(), logo.width * logo.height * 4);
+            assert_eq!(logo_lines(logo, false).len(), logo.height.div_ceil(2));
+            assert!(logo_pixel(logo, logo.height / 2, logo.width / 2).is_some());
+            let (pixels, remainder) = logo.rgba.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(pixels.iter().all(|pixel| matches!(pixel[3], 0 | 255)));
+            let colours = pixels
+                .iter()
+                .filter(|pixel| pixel[3] == 255)
+                .map(|pixel| (pixel[0], pixel[1], pixel[2]))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                (8..=32).contains(&colours.len()),
+                "logo should retain a compact pixel-art palette"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_uses_the_large_logo_only_when_it_fits_beside_the_details() {
+        let info = StartupInfo {
+            version: "0.3.22",
+            release_date: "2026-09-16",
+            profile: "default",
+            model: "model",
+            session: "session",
+            tools: &[],
+            skills: &[],
+            extensions: &[],
+        };
+        let large_min = side_by_side_min_width(&LARGE_LOGO);
+        // The sparse details are shorter than either logo, so the rows
+        // between the two borders are exactly the logo's rows.
+        let logo_rows = |width| {
+            render_startup(&info, width, false)
+                .lines()
+                .filter(|line| line.starts_with('│'))
+                .count()
+        };
+        assert_eq!(logo_rows(large_min), LARGE_HEIGHT.div_ceil(2));
+        assert_eq!(logo_rows(large_min - 1), COMPACT_HEIGHT.div_ceil(2));
+        for width in [large_min - 1, large_min, 160] {
+            for line in render_startup(&info, width, false)
+                .lines()
+                .filter(|line| !line.is_empty())
+            {
+                assert_eq!(line.chars().count(), width, "wrong width: {line:?}");
+            }
+        }
     }
 
     #[test]
