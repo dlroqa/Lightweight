@@ -9,8 +9,9 @@ All notable changes to this project are documented in this file.
 A patch release that gives both command-line tools one update command.
 `lightweight update`, `lightagent update` and `/update` in terminal chat now
 update both CLIs to the latest release from prebuilt, checksum-verified
-archives, one after the other, and roll back if either step fails. Existing
-settings, profiles and sessions are untouched.
+archives, one after the other, and roll back if either step fails. The panel's
+Agent screen also stops showing a fast run's answer twice. Existing settings,
+profiles and sessions are untouched.
 
 ### Changed
 
@@ -29,6 +30,12 @@ settings, profiles and sessions are untouched.
   `method`, `binaries` and `blocked` fields. Copies bundled inside the desktop
   app and development builds are refused rather than replaced, and an install
   outside a `bin` directory no longer falls back to guessing `~/.local`.
+
+### Fixed
+
+- The panel's Agent screen no longer shows a finished run's answer twice when
+  the run completes before the screen reloads its session. Once a run is saved
+  to the session, the saved transcript is the only copy of its answer shown.
 
 ## [0.3.22] - 2026-09-16
 

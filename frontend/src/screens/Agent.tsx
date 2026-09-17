@@ -93,7 +93,12 @@ export function Agent() {
   const running = busy || (runId !== null && !done);
   const hasPendingWork = running || steering.length > 0;
   const persisted = runId !== null && session?.runs.some((run) => run.run_id === runId);
-  const showLiveAnswer = runId !== null && (!done || !persisted);
+  // The API records a run in its session only once the run is terminal, in the
+  // same save as its assistant message. From then on the saved transcript holds
+  // the answer, so the live copy is hidden even if the stream's terminal event
+  // has not arrived yet — a session reloaded in that gap (a fast run finishing
+  // before `send` reloads it) would otherwise show the answer twice.
+  const showLiveAnswer = runId !== null && !persisted;
   const pending = useMemo(() => {
     if (done) return null;
     let open: { id: string; tool: string } | null = null;
