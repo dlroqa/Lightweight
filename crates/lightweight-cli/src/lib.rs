@@ -283,6 +283,15 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    /// Update lightweight, and lightagent when installed beside it, to the latest release.
+    Update {
+        /// Report whether an update is available without installing it.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when this version is already current.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -701,6 +710,18 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
         Command::Key { action } => key_command(cli, out, action),
         Command::Config { action } => config_command(cli, out, action),
         Command::Fleet { config } => fleet::run(config.clone()),
+        Command::Update { check, force } => {
+            runtime()?.block_on(release_update::run(
+                release_update::Cli::Lightweight,
+                env!("CARGO_PKG_VERSION"),
+                release_update::Request {
+                    check: *check,
+                    force: *force,
+                    json: cli.json,
+                },
+            ))?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Inspect { model, header_only } => {
             let metadata = load_metadata(model, *header_only)?;
             if cli.json {

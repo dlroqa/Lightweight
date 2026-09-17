@@ -46,6 +46,31 @@ Of the two Linux builds, prefer the Flatpak: it keeps its Chromium sandbox on a
 host that does not allow unprivileged user namespaces, where the AppImage
 refuses to start rather than run unsandboxed.
 
+### Updating the command-line tools
+
+`lightweight` and `lightagent` share one update command, and either one updates
+both when they are installed in the same directory, because they are released
+together:
+
+```sh
+lightweight update --check      # or: lightagent update --check
+lightweight update              # or: lightagent update, or /update in chat
+```
+
+The update handles one CLI at a time, `lightweight` first and then `lightagent`:
+each is downloaded from the latest release's archive for this platform, checked
+against the release's `SHA256SUMS`, run once to confirm its version, and swapped
+in before the next one starts. If the second one fails, the first is restored,
+so the two never end up on different releases. On a platform the
+release publishes no archive for, it builds the same release tag from source
+with `cargo install --locked` instead. `--force` reinstalls a current version,
+and `--check --json` prints the report as JSON. Restart a running
+`lightweight serve` or `lightagent` afterwards to use the new version.
+
+The desktop app's own bundled copies and development builds in a Cargo
+`target/` directory are never replaced: update the desktop app, or rebuild from
+source, instead.
+
 ## Lightagent terminal harness
 
 Lightagent also runs directly in a terminal. Launch `lightagent` (or
@@ -126,9 +151,11 @@ lightagent update --check
 lightagent update
 ```
 
-The updater installs the latest published tag through Cargo into the same bin
-root as the running executable. Set `LIGHTAGENT_INSTALL_ROOT` to override that
-location.
+The updater installs the latest published release into the directory holding
+the running executable, and updates `lightweight` too when it is installed
+there; see [Updating the command-line tools](#updating-the-command-line-tools).
+Set `LIGHTAGENT_INSTALL_ROOT` to install into that root's `bin` directory
+instead. In terminal chat, `/update` does the same between turns.
 
 No `init` is required: a fresh installation uses a built-in default profile and
 connects to `http://127.0.0.1:11434`. Existing settings and the active profile
@@ -1012,6 +1039,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
 | `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
 | `lightweight-cli` | Command-line access to the above |
+| `release-update` | The shared `update` command of both CLIs: checksum-verified release archives, swapped in together. Depends on no `lightweight-*` or `lightagent-*` crate |
 
 Two parts of the product are not crates:
 

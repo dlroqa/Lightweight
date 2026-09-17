@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-09-16
+
+A patch release that gives both command-line tools one update command.
+`lightweight update`, `lightagent update` and `/update` in terminal chat now
+update both CLIs to the latest release from prebuilt, checksum-verified
+archives, one after the other, and roll back if either step fails. Existing
+settings, profiles and sessions are untouched.
+
+### Changed
+
+- `lightweight update` joins `lightagent update`, and `/update` works inside
+  terminal chat, as one update command for both CLIs. Whichever one runs
+  updates itself and the other CLI when it is installed in the same directory,
+  so the gateway and agent stay on the same release.
+- The update installs the release's prebuilt archive for this platform instead
+  of compiling with Cargo: the archive is checked against the release's
+  `SHA256SUMS` and the new binary is run once to confirm its version. The CLIs
+  are updated one at a time, `lightweight` first and then `lightagent`, and the
+  first is restored if the second fails, so they never end up on different
+  releases. Platforms without a published archive still build the release tag
+  with `cargo install --locked`.
+- `--check`, `--force` and `--check --json` keep working; the JSON report gains
+  `method`, `binaries` and `blocked` fields. Copies bundled inside the desktop
+  app and development builds are refused rather than replaced, and an install
+  outside a `bin` directory no longer falls back to guessing `~/.local`.
+
 ## [0.3.22] - 2026-09-16
 
 A patch release that redraws the terminal logo from the updated pixel-art

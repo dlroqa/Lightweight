@@ -26,6 +26,7 @@ lightagent-memory.workspace = true
 lightagent-acp.workspace = true
 lightagent-extensions.workspace = true
 lightagent-runtime.workspace = true
+release-update.workspace = true
 async-trait.workspace = true
 axum = { workspace = true }
 clap.workspace = true

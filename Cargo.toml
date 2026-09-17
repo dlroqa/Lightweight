@@ -29,10 +29,11 @@ members = [
     "crates/lightagent-extensions",
     "crates/lightagent-runtime",
     "crates/lightagent",
+    "crates/release-update",
 ]
 
 [workspace.package]
-version = "0.3.22"
+version = "0.3.23"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -147,6 +148,9 @@ lightweight-gateway = { path = "crates/lightweight-gateway" }
 lightweight-system-info = { path = "crates/lightweight-system-info" }
 lightweight-observability = { path = "crates/lightweight-observability" }
 lightweight-sys = { path = "crates/lightweight-sys" }
+
+# --- shared by both CLI families; depends on neither ---
+release-update = { path = "crates/release-update" }
 
 # --- lightagent (agent harness; strictly additive, no edge into lightweight-*) ---
 lightagent-core = { path = "crates/lightagent-core" }

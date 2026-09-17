@@ -35,6 +35,8 @@ pub enum Slash {
     Stop,
     /// `/continue` — pick up a run that paused on its time budget.
     Continue,
+    /// `/update` — update lightagent, and lightweight beside it, to the latest release.
+    Update,
     /// `/exit` or `/quit` — leave the session.
     Exit,
     /// A `/word` that is not a known command; carries the word.
@@ -82,6 +84,7 @@ pub fn parse(line: &str) -> Option<Slash> {
         "reject" | "n" | "no" => Slash::Reject,
         "stop" => Slash::Stop,
         "continue" | "resume" => Slash::Continue,
+        "update" => Slash::Update,
         "exit" | "quit" | "q" => Slash::Exit,
         other => Slash::Unknown(other.to_string()),
     };
@@ -124,6 +127,7 @@ mod tests {
         assert_eq!(parse("/approve now"), Some(Slash::Approve));
         assert_eq!(parse("/continue"), Some(Slash::Continue));
         assert_eq!(parse("/resume"), Some(Slash::Continue));
+        assert_eq!(parse("/update"), Some(Slash::Update));
     }
 
     #[test]

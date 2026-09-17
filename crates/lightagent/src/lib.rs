@@ -22,7 +22,6 @@ mod runtime;
 mod serve;
 mod setup;
 mod slash;
-mod update;
 
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
@@ -159,7 +158,7 @@ enum Command {
         #[arg(long)]
         preview: bool,
     },
-    /// Check for or install the latest published Lightagent CLI.
+    /// Update lightagent, and lightweight when installed beside it, to the latest release.
     Update {
         /// Report whether an update is available without installing it.
         #[arg(long)]
@@ -465,7 +464,16 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Some(Command::Update { check, force }) => {
-            update::run(VERSION, check, force, cli.json).await
+            release_update::run(
+                release_update::Cli::Lightagent,
+                VERSION,
+                release_update::Request {
+                    check,
+                    force,
+                    json: cli.json,
+                },
+            )
+            .await
         }
     }
 }

@@ -29,6 +29,7 @@ lightweight-store.workspace = true
 lightweight-catalog.workspace = true
 lightweight-bench.workspace = true
 lightweight-api.workspace = true
+release-update.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

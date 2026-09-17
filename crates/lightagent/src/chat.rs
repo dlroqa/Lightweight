@@ -721,6 +721,18 @@ pub async fn run(
                 );
                 continue;
             }
+            if command == Slash::Update {
+                if let Err(error) = release_update::run(
+                    release_update::Cli::Lightagent,
+                    env!("CARGO_PKG_VERSION"),
+                    release_update::Request::default(),
+                )
+                .await
+                {
+                    eprintln!("· {error}");
+                }
+                continue;
+            }
             if command == Slash::New {
                 if let Some(run) = paused.take() {
                     drop_paused(run, &mut session, &session_store);
@@ -1775,7 +1787,7 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
         Slash::Exit => return true,
         Slash::Help => {
             println!(
-                "Commands: /help  /tools  /skills  /extensions  /onboard  /reload  /new  /continue  /stop  /exit"
+                "Commands: /help  /tools  /skills  /extensions  /onboard  /reload  /new  /continue  /stop  /update  /exit"
             );
             println!("During a run: type a message and press Enter to queue it as the next turn.");
         }
@@ -1794,6 +1806,7 @@ fn handle_slash(command: Slash, skills: &SkillStore, tools: &[String]) -> bool {
             println!("(extension management is handled by the chat runtime)");
         }
         Slash::New => println!("(new session)"),
+        Slash::Update => println!("(update is handled by the chat runtime)"),
         Slash::Stop => println!("(nothing running)"),
         // A paused run is picked up before commands are handled, so reaching
         // here means there is none.

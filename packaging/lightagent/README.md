@@ -41,9 +41,12 @@ system-wide and nothing is code-signed. Verify the download against `SHA256SUMS`
 from the same release.
 
 After the initial install, `lightagent update --check` reports whether a newer
-release exists and `lightagent update` installs the latest published tag through
-Cargo into the same installation root. `LIGHTAGENT_INSTALL_ROOT` overrides the
-destination when needed.
+release exists and `lightagent update` (or `/update` in chat) installs it: the
+release archive for this platform is verified against `SHA256SUMS` and swapped
+in place. When `lightweight` is installed in the same directory it is updated
+first, and restored if `lightagent` then fails, so both stay on one release. A platform without a published archive builds the release tag with
+`cargo install --locked` instead. `LIGHTAGENT_INSTALL_ROOT` installs into that
+root's `bin` directory when needed.
 
 ## Using the terminal harness
 
