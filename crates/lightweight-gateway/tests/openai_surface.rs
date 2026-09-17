@@ -1871,7 +1871,7 @@ async fn a_generation_the_client_abandons_is_counted_as_cancelled_not_as_an_erro
 }
 
 #[tokio::test]
-async fn metrics_are_behind_the_key_when_one_is_configured() {
+async fn metrics_keep_local_panel_access_and_require_a_key_remotely() {
     ensure_provider();
     // Request rates, token counts and queue depth describe what this machine is
     // doing. On a bind that is reachable from elsewhere, that is not public.
@@ -1879,13 +1879,22 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
         MockConfig::default(),
         GatewayConfig {
             auth: AuthPolicy::with_static_key("secret-key".into()),
+            trust_forwarded: true,
             ..GatewayConfig::default()
         },
     )
     .await;
 
     assert_eq!(harness.get("/metrics").await.status(), 401);
-    assert_eq!(harness.get("/api/v1/metrics").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/metrics").await.status(), 200);
+
+    let remote = Harness::client()
+        .get(format!("{}/api/v1/metrics", harness.base))
+        .header("cf-connecting-ip", "198.51.100.8")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(remote.status(), 401);
 
     let authorized = Harness::client()
         .get(format!("{}/metrics", harness.base))
@@ -1894,6 +1903,15 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
         .await
         .expect("request");
     assert_eq!(authorized.status(), 200);
+
+    let authorized_remote = Harness::client()
+        .get(format!("{}/api/v1/metrics", harness.base))
+        .header("cf-connecting-ip", "198.51.100.8")
+        .header("Authorization", "Bearer secret-key")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(authorized_remote.status(), 200);
 }
 
 #[tokio::test]
@@ -2026,7 +2044,7 @@ async fn the_event_stream_reports_a_generation_the_client_abandoned() {
 }
 
 #[tokio::test]
-async fn describing_the_machine_and_the_service_needs_the_key() {
+async fn machine_and_service_details_keep_local_access_and_require_a_key_remotely() {
     ensure_provider();
     // `/api/v1/system` reports this machine's processor, its memory pressure
     // and where its disks are; `/api/v1/gateway` reports where it is serving
@@ -2036,17 +2054,27 @@ async fn describing_the_machine_and_the_service_needs_the_key() {
         MockConfig::default(),
         GatewayConfig {
             auth: AuthPolicy::with_static_key("secret-key".into()),
+            trust_forwarded: true,
             ..GatewayConfig::default()
         },
     )
     .await;
 
-    assert_eq!(harness.get("/api/v1/system").await.status(), 401);
-    assert_eq!(harness.get("/api/v1/gateway").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/system").await.status(), 200);
+    assert_eq!(harness.get("/api/v1/gateway").await.status(), 200);
 
     for path in ["/api/v1/system", "/api/v1/gateway"] {
+        let remote = Harness::client()
+            .get(format!("{}{path}", harness.base))
+            .header("cf-connecting-ip", "198.51.100.8")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(remote.status(), 401, "{path} without the key");
+
         let authorized = Harness::client()
             .get(format!("{}{path}", harness.base))
+            .header("cf-connecting-ip", "198.51.100.8")
             .header("Authorization", "Bearer secret-key")
             .send()
             .await

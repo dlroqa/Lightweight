@@ -80,11 +80,20 @@ async fn start_gateway(upstream: Option<String>) -> String {
 }
 
 async fn start_gateway_with_auth(upstream: Option<String>, auth: AuthPolicy) -> String {
+    start_gateway_with_security(upstream, auth, false).await
+}
+
+async fn start_gateway_with_security(
+    upstream: Option<String>,
+    auth: AuthPolicy,
+    trust_forwarded: bool,
+) -> String {
     let state = Arc::new(GatewayState::new(
         Arc::new(MockBackend::default()),
         lightweight_gateway::catalog::shared(None),
         GatewayConfig {
             auth,
+            trust_forwarded,
             agent_upstream: upstream,
             ..GatewayConfig::default()
         },
@@ -101,7 +110,7 @@ async fn start_gateway_with_auth(upstream: Option<String>, auth: AuthPolicy) -> 
 }
 
 #[tokio::test]
-async fn a_keyed_gateway_protects_the_proxied_agent_api() {
+async fn a_local_panel_reaches_the_proxied_agent_api_on_a_keyed_gateway() {
     ensure_provider();
     let upstream = start_agent_server().await;
     let gateway = start_gateway_with_auth(
@@ -115,9 +124,30 @@ async fn a_keyed_gateway_protects_the_proxied_agent_api() {
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn a_keyed_gateway_protects_the_proxied_agent_api_from_remote_callers() {
+    ensure_provider();
+    let upstream = start_agent_server().await;
+    let gateway = start_gateway_with_security(
+        Some(upstream),
+        AuthPolicy::with_static_key("agent-test-key".into()),
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{gateway}/api/lightagent/v1/tools"))
+        .header("cf-connecting-ip", "198.51.100.8")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), 401);
     let response = client
         .get(format!("{gateway}/api/lightagent/v1/tools"))
+        .header("cf-connecting-ip", "198.51.100.8")
         .bearer_auth("agent-test-key")
         .send()
         .await

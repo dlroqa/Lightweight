@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.24] - 2026-09-17
+
+A patch release that keeps the local control panel usable after the gateway is
+bound to a reachable address and API-key authentication turns on. Models,
+conversations, settings, logs, bind choices, and Agent screens now remain
+available from the machine running Lightweight. Existing models, conversations,
+keys, and configuration are untouched.
+
+### Fixed
+
+- The local panel no longer locks itself out with “an API key is required: send
+  an Authorization: Bearer header” after an exposed LAN, Tailscale, overlay, or
+  proxied listener enables authentication. Loopback requests to the gateway’s
+  control and Agent proxy surfaces use the machine-local trust boundary, while
+  remote control callers and every OpenAI-compatible `/v1` caller still require
+  a valid bearer key. Caller-supplied copies of the internal local marker are
+  stripped before that decision, so it cannot be used to bypass authentication.
+
 ## [0.3.23] - 2026-09-16
 
 A patch release that gives both command-line tools one update command.

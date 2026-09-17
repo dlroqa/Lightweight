@@ -116,7 +116,7 @@ pub async fn proxy(State(state): State<Arc<GatewayState>>, request: Request) -> 
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-/// The request's headers, minus the ones that describe only this hop.
+/// The request's headers, minus connection-specific and internal headers.
 fn forwardable(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = HeaderMap::with_capacity(headers.len());
     for (name, value) in headers {
@@ -129,11 +129,11 @@ fn forwardable(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-/// Whether a header describes one connection hop and must not be relayed to the
-/// next one.
+/// Whether a header must not be relayed to the next hop.
 ///
 /// `host` is included: `reqwest` sets the upstream's own `Host`, and forwarding
-/// the gateway's would name the wrong server.
+/// the gateway's would name the wrong server. The local-control marker is also
+/// private to the gateway and must never become input to the agent server.
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -141,6 +141,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | crate::LOCAL_CONTROL_AUTHORITY
             | "te"
             | "trailer"
             | "transfer-encoding"

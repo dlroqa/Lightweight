@@ -18,7 +18,7 @@ use lightweight_backend_mock::MockBackend;
 use lightweight_catalog::CatalogStore;
 use lightweight_catalog::install::Installer;
 use lightweight_gateway::manager::{ModelManager, RuntimeDefaults};
-use lightweight_gateway::{GatewayConfig, GatewayState};
+use lightweight_gateway::{AuthPolicy, GatewayConfig, GatewayState};
 use lightweight_gguf::fixture::{GgufBuilder, TempDir};
 use serde_json::Value;
 
@@ -32,6 +32,21 @@ fn ensure_provider() {
 
 /// A gateway with a catalog holding one imported fixture model.
 async fn gateway_with_a_model(tag: &str) -> (TempDir, Arc<GatewayState>, String) {
+    gateway_with_a_model_and_auth(tag, AuthPolicy::Disabled).await
+}
+
+async fn gateway_with_a_model_and_auth(
+    tag: &str,
+    auth: AuthPolicy,
+) -> (TempDir, Arc<GatewayState>, String) {
+    gateway_with_a_model_and_security(tag, auth, false).await
+}
+
+async fn gateway_with_a_model_and_security(
+    tag: &str,
+    auth: AuthPolicy,
+    trust_forwarded: bool,
+) -> (TempDir, Arc<GatewayState>, String) {
     let dir = TempDir::new(tag);
     let model_path = dir.write("fixture.gguf", &GgufBuilder::small_model("llama").build());
 
@@ -49,6 +64,8 @@ async fn gateway_with_a_model(tag: &str) -> (TempDir, Arc<GatewayState>, String)
     // reports that instead of what the caller asked about, and a test that
     // never gave it one would only ever exercise that branch.
     let config = GatewayConfig {
+        auth,
+        trust_forwarded,
         paths: Some(lightweight_system_info::DataPaths::rooted_at(dir.path())),
         ..GatewayConfig::default()
     };
@@ -62,6 +79,69 @@ async fn gateway_with_a_model(tag: &str) -> (TempDir, Arc<GatewayState>, String)
     );
     let id = installed.id.clone();
     (dir, state, id)
+}
+
+#[tokio::test]
+async fn local_panel_calls_survive_key_auth_without_relaxing_openai() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model_and_auth(
+        "local-panel-auth",
+        AuthPolicy::with_static_key("secret".into()),
+    )
+    .await;
+    let server = Server::start(state).await;
+
+    // The control panel is reached over loopback and must not lock itself out
+    // when an exposed listener makes authentication mandatory.
+    let (status, body) = server.get("/api/v1/models").await;
+    assert_eq!(status, 200, "{body}");
+
+    // The OpenAI surface remains protected even for a local client.
+    let response = reqwest::get(format!("{}/v1/models", server.base))
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 401);
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/models", server.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn remote_control_calls_cannot_spoof_local_panel_authority() {
+    ensure_provider();
+    let (_dir, state, _id) = gateway_with_a_model_and_security(
+        "remote-panel-auth",
+        AuthPolicy::with_static_key("secret".into()),
+        true,
+    )
+    .await;
+    let server = Server::start(state).await;
+
+    // A trusted proxy tells the gateway this loopback connection originated
+    // remotely. Even copying the private marker must not bypass authentication:
+    // the middleware strips caller input before deciding whether to restore it.
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/v1/models", server.base))
+        .header("cf-connecting-ip", "198.51.100.8")
+        .header("x-lightweight-local-control", "1")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 401);
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/v1/models", server.base))
+        .header("cf-connecting-ip", "198.51.100.8")
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200);
 }
 
 /// A server on an ephemeral loopback port, as the other suites do it.
