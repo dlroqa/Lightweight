@@ -295,7 +295,7 @@ function KeysCard({
       ) : (
         <div className="notice notice--info" style={{ marginBottom: 14 }}>
           Create keys from the machine running the gateway, or with{" "}
-          <code>lightweight key create</code>.
+          <code>hermes key create</code>.
         </div>
       )}
 
@@ -654,7 +654,7 @@ function BindCard({
           )}
           {!shell()?.restart && (
             <span className="card__note">
-              Restart <code>lightweight serve</code> to apply.
+              Restart <code>hermes serve</code> to apply.
             </span>
           )}
         </div>

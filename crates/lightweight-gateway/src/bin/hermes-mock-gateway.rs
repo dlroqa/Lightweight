@@ -46,9 +46,6 @@ enum ScriptSpec {
         name: String,
         argument_fragments: Vec<String>,
     },
-    Sequence {
-        scripts: Vec<ScriptSpec>,
-    },
     Empty,
     FailMidStream {
         content: Vec<String>,
@@ -73,9 +70,6 @@ impl From<ScriptSpec> for Script {
                 name,
                 argument_fragments,
             },
-            ScriptSpec::Sequence { scripts } => {
-                Self::Sequence(scripts.into_iter().map(Into::into).collect())
-            }
             ScriptSpec::Empty => Self::Empty,
             ScriptSpec::FailMidStream { content, error } => Self::FailMidStream { content, error },
             ScriptSpec::Fail { error } => Self::Fail(error),

@@ -14,8 +14,6 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-pub mod agent_proxy;
-pub mod agent_server;
 pub mod auth;
 pub mod benchmark;
 pub mod catalog;
@@ -41,7 +39,7 @@ pub use state::{GatewayConfig, GatewayState};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 
 /// The service `axum::serve` is handed, with the peer address attached.
 ///
@@ -86,21 +84,12 @@ pub const DEFAULT_PORT: u16 = 11434;
 #[derive(Clone, Copy)]
 pub struct TrustForwarded(pub bool);
 
-/// An internal request marker installed only for the local control surface.
-///
-/// A client-supplied value is always removed by [`guard_control_surface`] before
-/// a handler sees it. Keeping the marker in the request lets the existing
-/// handler-level authorization checks distinguish the panel arriving over
-/// loopback from an agent calling the key-protected OpenAI surface. It is not a
-/// credential and is never accepted on `/v1`.
-pub(crate) const LOCAL_CONTROL_AUTHORITY: &str = "x-lightweight-local-control";
-
 pub fn app(state: Arc<GatewayState>) -> Router {
     // Read before `state` is moved into `with_state`: the extractor learns
     // whether to honour `CF-Connecting-IP` from this, and only a gateway started
     // behind a trusted proxy sets it.
     let trust_forwarded = TrustForwarded(state.config.trust_forwarded);
-    let router = Router::new()
+    Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/api/v1/metrics", get(routes::metrics_json))
@@ -164,21 +153,13 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             "/api/v1/gateway/keys/{id}/limit",
             axum::routing::put(store_api::set_key_limit),
         )
-        .route("/api/v1/agent-server", get(agent_server::status))
-        .route("/api/v1/agent-server/start", post(agent_server::start))
-        // Reserve the agent namespace even when no upstream is configured.
-        // The handler returns a JSON setup error instead of the SPA document.
-        .route("/api/lightagent", any(agent_proxy::proxy))
-        .route("/api/lightagent/{*rest}", any(agent_proxy::proxy))
         // Last, so that every route above is matched first: the panel's files
         // can never shadow an endpoint, only fill in what no endpoint claimed.
-        .fallback(web::serve);
-
-    router
+        .fallback(web::serve)
         // Wrapped around every route rather than written into each handler:
         // there are a dozen of them, and a gauge that a new endpoint can forget
         // to join is a gauge that quietly stops being true.
-        .layer(axum::middleware::from_fn(guard_control_surface))
+        .layer(axum::middleware::from_fn(guard_control_writes))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             count_in_flight,
@@ -210,14 +191,7 @@ async fn count_in_flight(
     // running, so counting those would pin this gauge at one on a gateway doing
     // nothing and add one to every reading of it - including the reading being
     // taken by the request doing the asking.
-    //
-    // A proxied agent request is excluded for a different reason: this gauge is
-    // the *engine's* load, and an agent run does not hold an engine slot here —
-    // it runs on the server this only forwards to, where an SSE tail can stay
-    // open for minutes. Counting it would inflate a reading about work this
-    // gateway is not doing.
-    let path = request.uri().path();
-    if is_monitoring(path) || is_agent_proxy(path) {
+    if is_monitoring(request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -234,54 +208,28 @@ async fn count_in_flight(
     axum::response::Response::from_parts(parts, axum::body::Body::from_stream(counted))
 }
 
-/// Establish local control authority and refuse writes that a foreign page
-/// forged.
+/// Refuse a state-changing request to the control surface that a foreign page
+/// forged. See [`routes::forbid_cross_origin`] for why this is separate from
+/// authentication and why it cannot be.
 ///
-/// The loopback peer check keeps the panel usable after an exposed listener
-/// turns key auth on. Remote control requests remain behind the key, as does
-/// every request to the OpenAI surface under `/v1`. The origin check is a
-/// separate condition on state-changing control requests; see
-/// [`routes::forbid_cross_origin`] for why both checks are needed.
-///
-/// Written as a layer, not a line in each handler, for the same reason
-/// `count_in_flight` is: a guard a new endpoint can forget to join is a guard
-/// that quietly stops being true.
-///
-/// The proxied agent surface under `/api/lightagent/` is guarded on the same
-/// terms. It is forwarded to a loopback agent server that, being loopback,
-/// requires no key of its own — so without this a page on another origin could
-/// start a run or answer an approval through the gateway while the user was only
-/// looking at the panel. A same-origin call from the panel echoes the gateway's
-/// authority in `Origin` and passes. A non-browser caller sends no origin and
-/// remains governed by the peer boundary: loopback is trusted, while a remote
-/// caller must authenticate.
-async fn guard_control_surface(
-    peer: scheduler::PeerKey,
-    mut request: axum::extract::Request,
+/// Scoped to `/api/v1` and to the methods that change state: a `GET` is safe to
+/// serve to anyone the auth layer admits, and the OpenAI surface under `/v1` is
+/// the API's front door, guarded by its key rather than by the browser's
+/// same-origin rule. Written as a layer, not a line in each handler, for the
+/// same reason `count_in_flight` is: a guard a new endpoint can forget to join
+/// is a guard that quietly stops being true.
+async fn guard_control_writes(
+    request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::http::Method;
-
-    let path = request.uri().path();
-    let is_control = path.starts_with("/api/v1/") || is_agent_proxy(path);
-
-    // This header is an implementation detail, not something a caller may
-    // assert. Strip it first on every request, then put it back only when the
-    // control request really arrived from this machine. In particular, never
-    // put it on `/v1`: local OpenAI clients still obey the configured key.
-    request.headers_mut().remove(LOCAL_CONTROL_AUTHORITY);
-    if is_control && peer.is_local() {
-        request.headers_mut().insert(
-            LOCAL_CONTROL_AUTHORITY,
-            axum::http::HeaderValue::from_static("1"),
-        );
-    }
 
     let method = request.method();
     let is_write = matches!(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
+    let is_control = request.uri().path().starts_with("/api/v1/");
 
     if is_write
         && is_control
@@ -312,12 +260,4 @@ fn is_monitoring(path: &str) -> bool {
             | "/api/v1/logs"
             | "/api/v1/events"
     )
-}
-
-/// Whether a path belongs to the proxied agent surface.
-///
-/// The forwarding routes are `/api/lightagent` and everything beneath it; both
-/// the write guard and the in-flight gauge treat the whole prefix as one.
-fn is_agent_proxy(path: &str) -> bool {
-    path == "/api/lightagent" || path.starts_with("/api/lightagent/")
 }

@@ -11,6 +11,10 @@ name = "lightweight_cli"
 path = "src/lib.rs"
 
 [[bin]]
+name = "hermes"
+path = "src/bin/hermes.rs"
+
+[[bin]]
 name = "lightweight"
 path = "src/bin/lightweight.rs"
 
@@ -29,7 +33,6 @@ lightweight-store.workspace = true
 lightweight-catalog.workspace = true
 lightweight-bench.workspace = true
 lightweight-api.workspace = true
-release-update.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

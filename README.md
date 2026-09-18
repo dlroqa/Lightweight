@@ -1,4 +1,4 @@
-# Lightweight CPU Inference Gateway
+# Hermes CPU Inference Gateway
 
 A local, **CPU and RAM only** LLM inference platform: an OpenAI-compatible
 gateway, GGUF model management, and a desktop UI. No GPU is required anywhere,
@@ -29,7 +29,7 @@ Every artifact is built and then *run* on the platform it is for, by
 | Windows x86-64 | `Lightweight-Setup-*.exe` |
 | Linux x86-64, sandboxed | `Lightweight-*.flatpak` |
 | Linux x86-64, portable | `Lightweight-*.AppImage` |
-| Inference gateway CLI | `lightweight-*-<target-triple>.tar.gz` / `.zip` |
+| Command line only | `hermes-*-<target-triple>.tar.gz` / `.zip` |
 
 Two facts worth knowing before the first launch:
 
@@ -45,263 +45,6 @@ Two facts worth knowing before the first launch:
 Of the two Linux builds, prefer the Flatpak: it keeps its Chromium sandbox on a
 host that does not allow unprivileged user namespaces, where the AppImage
 refuses to start rather than run unsandboxed.
-
-### Updating the command-line tools
-
-`lightweight` and `lightagent` share one update command, and either one updates
-both when they are installed in the same directory, because they are released
-together:
-
-```sh
-lightweight update --check      # or: lightagent update --check
-lightweight update              # or: lightagent update, or /update in chat
-```
-
-The update handles one CLI at a time, `lightweight` first and then `lightagent`:
-each is downloaded from the latest release's archive for this platform, checked
-against the release's `SHA256SUMS`, run once to confirm its version, and swapped
-in before the next one starts. If the second one fails, the first is restored,
-so the two never end up on different releases. On a platform the
-release publishes no archive for, it builds the same release tag from source
-with `cargo install --locked` instead. `--force` reinstalls a current version,
-and `--check --json` prints the report as JSON. Restart a running
-`lightweight serve` or `lightagent` afterwards to use the new version.
-
-The desktop app's own bundled copies and development builds in a Cargo
-`target/` directory are never replaced: update the desktop app, or rebuild from
-source, instead.
-
-## Lightagent terminal harness
-
-Lightagent also runs directly in a terminal. Launch `lightagent` (or
-`lightagent chat`) for interactive chat with tools, approvals, profiles, and
-saved sessions. The desktop app and `lightagent serve` are optional; terminal
-chat connects directly to the configured inference gateway.
-
-Follow-up prompts in the same chat include prior user and assistant turns in
-the model context. The transcript is saved after each prompt; to resume it
-after closing the terminal, use `lightagent sessions` to find its ID and run
-`lightagent chat --session <id>` (add `--profile <id>` for another profile).
-Long chats now keep recent turns verbatim and pack selected older excerpts and
-bounded tool-result evidence into a share of the model's context. The saved
-session remains complete. `lightagent sessions show <id>` numbers its messages
-and shows each stored tool excerpt and source. The `ctx` status is still the
-last provider prompt's token use, not a cumulative session size.
-
-Durable memory is separate from session history. Clear user statements such as
-"I prefer concise answers," "We decided to use SQLite," and "The issue was
-resolved by changing the parser" are retained automatically for the active
-profile. Questions, temporary requests, code blocks, and likely secrets are
-skipped. Each request selects up to three relevant memories for its prompt, so
-a new session can use established context immediately. `memory.reflect` lets
-the agent read grouped working knowledge; `lightagent memory reflect` shows the
-same view in the terminal. To review and promote a statement the automatic
-filter skipped, run:
-
-```sh
-lightagent memory candidates <session-id>
-lightagent memory promote <session-id> <message-number> --kind preference
-lightagent memory search "what should I remember?"
-lightagent memory reflect preference
-```
-
-`promote` saves the reviewed text with its session and message number; use
-`--text` to edit the fact before saving. `lightagent memory update <id> <text>`
-corrects an outdated fact, and `lightagent memory forget <id>` removes one.
-The read-only `session.lookup` tool can retrieve a cited saved message or tool
-excerpt by id later, within the same profile.
-Use `lightagent config set memory.auto_capture false` to stop automatic
-retention, or `lightagent config set memory.inject_recent 0` to stop prompt
-injection. `memory list`, `update`, `forget`, and `clear` remain available for
-review and correction. See [long-term memory](docs/memory.md) for the full
-retention, recall, and reflection flow.
-Memory search uses lexical ranking by default and combines it with semantic
-ranking when `rag.semantic` is configured. A malformed memory record now reports
-its line instead of being silently discarded, and writes are atomic and locked.
-`/new` starts a separate conversation with an empty context and resets
-session-only approval choices. The ACP editor integration likewise reuses one
-history per `sessionId`, persists it, and supports `session/load` on reconnect.
-The browser Agent screen keeps its session ID across reloads and has an explicit
-New session button; API callers can create one with `POST /api/lightagent/v1/sessions`
-and pass its `id` as `session_id` to later `POST /api/lightagent/v1/runs` calls.
-Runs without a `session_id` remain stateless for backwards compatibility.
-If the process stops mid-run, the saved conversation can be reopened, but an
-in-flight model or tool invocation is not resumed automatically.
-
-To install the current source build on Linux or macOS:
-
-```sh
-cargo build -p lightagent --bin lightagent
-mkdir -p ~/.local/bin
-install -m755 target/debug/lightagent ~/.local/bin/lightagent
-# If ~/.local/bin is not already on PATH, add it in your shell configuration:
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Once installed, start chatting with one command:
-
-```sh
-lightagent
-```
-
-Check for and install future CLI releases without locating the source checkout:
-
-```sh
-lightagent update --check
-lightagent update
-```
-
-The updater installs the latest published release into the directory holding
-the running executable, and updates `lightweight` too when it is installed
-there; see [Updating the command-line tools](#updating-the-command-line-tools).
-Set `LIGHTAGENT_INSTALL_ROOT` to install into that root's `bin` directory
-instead. In terminal chat, `/update` does the same between turns.
-
-No `init` is required: a fresh installation uses a built-in default profile and
-connects to `http://127.0.0.1:11434`. Existing settings and the active profile
-are reused. `lightagent init` is optional for creating a saved initial profile
-or choosing a custom endpoint; `lightagent doctor` checks the connection.
-
-The interactive prompt can stream provider-supplied reasoning in a separate
-panel or hide it behind an animated gold-and-cyan Lightagent star. The first
-prompt bar appears immediately below the startup dashboard; subsequent prompts
-follow each response in normal terminal flow and scroll naturally as the
-terminal fills. Its status row shows command tips plus the active model, context
-usage, output tokens, token rate, and elapsed time after each response; the
-status background and separator end with that elapsed-time value rather than
-filling unused terminal columns. While Lightagent is working, type another
-message and press Enter to steer: the message is queued without interrupting
-the active run, then handled as the next turn. Multiple steering messages keep
-their arrival order. A
-submitted user message receives a compact lower border matching the exact
-display width of that prompt, so it remains easy to find in the transcript.
-Completed agent answers use an explicitly labelled `Lightagent` box sized to
-their longest rendered line (or the label when it is longer), expanding only
-when a line must wrap at the terminal edge. The initialization notice appears
-only for the first model request. Models that do not emit reasoning simply show
-the answer panel. The
-full-width startup dashboard places the pixel-art Lightagent star-and-bolt image
-beside the release version and date, active profile and model, session, tools,
-and its updated block-pixel wordmark beside the session information. Its
-terminal-native raster uses nearest-neighbour sampling, a compact non-dithered
-palette and binary transparency so the mark remains sharp at terminal scale.
-Approval
-requests use a compact high-contrast warning box with
-their risk class, tool, argument preview, and three numbered choices: `Allow`,
-`Don't allow`, or `Allow this call; relax lower-risk tools` for the current
-session. File mutations and terminal calls still require approval each time.
-`lightagent tools list` shows each available tool's effective `auto`, `ask`, or
-`block` permission. See [tool permissions](docs/permissions.md) for the rules and
-workspace limits.
-
-Run `lightagent setup` for a guided terminal menu. It shows current values and
-lets you create, switch, and delete profiles; select the gateway/model, local
-file and terminal tools, web fetch/search, reasoning visibility, and approval
-behavior without editing `config.json`. A section can be opened directly with
-`lightagent setup profiles`, `provider`, `tools`, `web`, `terminal`, or
-`approvals`. The Profiles
-screen keeps the main account as the protected `default` profile and asks for
-confirmation before removing a secondary profile. The Terminal UI screen
-offers **Show reasoning** and **Hide reasoning**; hidden mode displays the
-animated star while the model works. The same preference can be changed with
-`lightagent config set tui.show_reasoning true|false`.
-
-Profiles can also be managed without opening setup:
-
-```sh
-lightagent profile list
-lightagent profile create research --name "Research" --persona "You are a careful researcher."
-lightagent profile use research
-lightagent profile delete research
-lightagent profile use default
-```
-
-`lightagent profile use <name>` changes the active user for future chats and
-served API runs. Deleting the active secondary profile switches back to
-`default`; the default profile itself cannot be deleted. The older plural form,
-`lightagent profiles ...`, remains available as an alias.
-
-The Tools screen is an interactive checklist: use ↑/↓ to navigate, Space to
-toggle capabilities, Enter to save, or Escape to cancel.
-
-The Tools screen exposes realtime RAG separately from its lower-level web
-search/fetch dependencies, and the startup dashboard reports the effective
-runtime registry after those settings are applied.
-
-The Gateway screen is also a keyboard-driven picker. It includes local
-Lightweight, named custom OpenAI-compatible endpoints, manual endpoint entry,
-and removal of saved providers. After choosing a provider it fetches the
-available models and presents them as a second picker. API keys are saved only
-as environment-variable references.
-`lightagent setup gateway` remains an alias for the provider screen.
-
-For realtime web research, run `lightagent setup web` and choose **Agentic
-search — DuckDuckGo (no account)**. This enables `rag.realtime`, a one-call
-retrieval tool that searches, fetches candidate pages concurrently, splits them
-at readable boundaries, ranks passages with BM25 plus optional semantic
-embeddings, removes duplicates, and returns a compact evidence pack with source
-URLs. It is designed for quantized local models: the model supplies one complete
-query and synthesizes the selected evidence instead of reliably coordinating a
-long search/fetch/rerank sequence. The lower-level `web.search` and `web.fetch`
-tools remain available for follow-up research. Web content is treated as
-untrusted evidence rather than agent instructions.
-
-The same no-account setup can be applied without the menu:
-
-```sh
-lightagent config set web.enabled true
-lightagent config set web.search.endpoint https://html.duckduckgo.com/html/
-```
-
-Choose the custom endpoint option in `lightagent setup web` to use SearXNG or
-another service that returns a JSON `results` array. Retrieval works without an
-embedding model; when `rag.semantic` is enabled, the top sparse candidates get a
-single batched semantic pass and both rankings are fused.
-
-Keep an inference gateway running with a model loaded. Use the gateway's origin
-as the base URL, without `/v1`; Lightagent adds the API path itself. For an
-existing installation, `lightagent config set inference.base_url <origin>`
-changes the endpoint without reinitializing profiles. In chat, `/help` lists
-commands, `/tools` lists callable tools, `/extensions` manages installed bundles,
-`/reload` picks up changes made in another terminal between turns, and `/exit`
-leaves the harness. Drop a `.md` file into the terminal prompt and press Enter
-to have Lightagent read it for that turn. Type `/onboard ` before dropping the
-file to save it as profile guidance; `/onboard remove` withdraws that guidance.
-
-Tools can be added without rebuilding Lightagent by installing an extension
-containing an `extension.json` manifest. An extension can supply MCP tools,
-skills, and optional Markdown instructions. The CLI copies a local extension
-directory into Lightagent's managed store; an extension with MCP servers enables
-MCP when installed. Its server starts in the installed directory, so relative
-script and asset paths work. For example:
-
-```sh
-lightagent extensions install ./my-tool
-lightagent extensions install 'https://example.org/tools.git#my-tool'
-lightagent tools list                  # lists tools the active profile can call
-lightagent extensions list
-lightagent extensions uninstall my-tool
-```
-
-Use `--profile` with install or uninstall to manage the active profile's copy
-instead of the global copy. In an open TUI, `/extensions install <directory>`
-and `/extensions uninstall <name>` update the tool registry immediately. Run
-`/reload` after changing extensions in another terminal. See
-[extension authoring and onboarding](docs/extensions.md) for the manifest,
-verification steps, and how to customize a profile.
-
-Lightagent checks the gateway's current model before every generation. A
-matching explicit profile model takes precedence over `inference.model`; when
-Lightweight advertises one resident model, Lightagent follows it even if a
-profile contains an older model ID. Switching models in the Models screen is
-therefore reflected in terminal chat and the Agent API without reconfiguration.
-The gateway also resolves `model: "default"` (and an omitted model) to its one
-resident model on every request, while response objects continue to report the
-real model ID. When no model is loaded, Lightagent reports that directly.
-
-The terminal and API share `~/.lightagent` by default. Set `LIGHTAGENT_HOME` to
-use a separate home. For release archives and platform installation details,
-see [Packaging Lightagent](packaging/lightagent/README.md).
 
 ## Status
 
@@ -337,46 +80,12 @@ and settings in the two directories M0 chose for them. On those seams sits a
 **control panel** — React and TypeScript, eight screens — served by the gateway
 itself, so the panel and the API are the same origin and no CORS layer exists
 anywhere. A browser on another machine reaches it over the exposed bind for
-free. The panel's agent screens talk to a separate agent server
-(`lightagent serve`); `lightweight serve --agent-upstream <origin>` reverse-proxies
-`/api/lightagent/*` to it (default `http://127.0.0.1:8735`, `off` to disable), so
-those screens stay same-origin too.
-
-If Agent Tools cannot connect, open **Settings → Lightagent server → Start
-server**. Settings shows startup progress and any error returned by the agent
-(run `lightagent init` once first for a new installation). The gateway can start
-an agent at a configured `http://127.0.0.1:<port>` or `http://localhost:<port>`
-origin. Desktop packages include both binaries. The gateway looks for `lightagent`
-beside its own executable, then in `~/.local/bin` on Linux/macOS, then on `PATH`;
-set `LIGHTAGENT_BIN` before starting the gateway to use a different binary.
-The child inherits the gateway's environment, including `LIGHTAGENT_HOME`, and
-stops when the gateway shuts down. An agent already running is left alone.
-You can also start `lightagent serve` yourself. For a different agent address,
-start the gateway with `--agent-upstream <origin>`. A disabled proxy
-returns a JSON setup error; an unreachable agent returns a connection error.
-After correcting the connection, click **Retry** in Agent Tools. If the panel
-reports a non-JSON response, check that the running gateway is a current build
-with the agent proxy enabled.
-
-The **Agent** screen has its own saved-session list: search, resume, start a
-fresh session, or delete one. Each session keeps its messages, runs and tool
-history; its first message becomes the list title. While a run is active,
-submitting another message queues a visible steer, handled in arrival order
-after the active turn ends. If the local agent server is stopped, Agent starts
-it and retries on its own, showing a **starting** status while it comes up, and
-still offers **Start agent server and retry** if a start is needed again; a
-gateway that answers a health check but does not yet expose the agent API is
-caught before use rather than misread as ready, and a run whose event stream
-drops mid-flight is reconciled against the run endpoint instead of looking
-idle. The separate
-**Settings → Lightagent** card edits the same configuration used by the CLI and
-TUI, including approval policy, run limits, web/file/terminal tools, durable
-memory and terminal reasoning display. Changes apply to new runs.
+free.
 
 Around both is a **desktop shell**. Electron: it attaches to a gateway already
 serving or starts one of its own, stops only what it started, and keeps serving
 after its window is closed. Keys are the gateway's own — hashed on disk, created
-in the panel or with `lightweight key create`, and shown once — so a key shared with a
+in the panel or with `hermes key create`, and shown once — so a key shared with a
 remote agent survives a restart of the shell.
 `npm run package` builds this platform's installers — a Flatpak and an AppImage
 on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
@@ -393,7 +102,7 @@ set, because the weights are mmapped and the kernel already counts them. And the
 panel offers a context and a KV cache type per load, priced by the gateway before
 the button is pressed.
 
-And it can now be **measured rather than described**. `lightweight bench` brings its
+And it can now be **measured rather than described**. `hermes bench` brings its
 own engine, sizes its prompts by asking the tokenizer, and records what this
 machine did with a model — prefill, decode, what prefix reuse saves, cores
 actually kept busy, peak memory against what was predicted — beside a
@@ -515,12 +224,12 @@ cargo run -p lightweight-cli -- serve
 ### Benchmarks
 
 ```sh
-lightweight bench model.gguf                          # its own engine, then gone
-lightweight bench model.gguf --ubatch 128,512 --fit   # a sweep, and a calibration fit
+hermes bench model.gguf                          # its own engine, then gone
+hermes bench model.gguf --ubatch 128,512 --fit   # a sweep, and a calibration fit
 curl -X POST "$BASE/api/v1/benchmarks"           # measure what is already loaded
 ```
 
-`lightweight bench` never disturbs a running gateway: it starts its own engine,
+`hermes bench` never disturbs a running gateway: it starts its own engine,
 reloads between buckets — `VmHWM` is a high-water mark for the life of a
 process, so a second bucket in the same engine would inherit the first one's
 peak — and shuts down after. The gateway's own benchmark is the smaller one, and
@@ -547,12 +256,12 @@ that makes it. See [benchmarks/](benchmarks/).
 ### Models
 
 ```sh
-lightweight models list                    # what this machine has
-lightweight models available               # the pinned models, with sizes
-lightweight models add qwen3-1.7b-q4_k_m   # download one, digest checked
-lightweight models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
-lightweight models import ~/models/mine.gguf   # referenced where it is, not copied
-lightweight models remove <id> [--delete]
+hermes models list                    # what this machine has
+hermes models available               # the pinned models, with sizes
+hermes models add qwen3-1.7b-q4_k_m   # download one, digest checked
+hermes models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
+hermes models import ~/models/mine.gguf   # referenced where it is, not copied
+hermes models remove <id> [--delete]
 ```
 
 A HuggingFace link is verified against the sha256 the site publishes for the
@@ -603,7 +312,7 @@ busy — a second slot takes a core rather than finding one. **Memory**: at that
 many slots a full-sized window for every client must still fit, and a machine
 that cannot hold them serves fewer clients well rather than more badly. On the
 development box that is one slot, which is what the flag has always defaulted
-to; on a sixteen-core machine it is four. `lightweight serve` prints which rule
+to; on a sixteen-core machine it is four. `hermes serve` prints which rule
 decided, and a number overrides both.
 
 The slot count follows the *engine*, not the command line: it is re-derived on
@@ -764,19 +473,19 @@ Headscale, Netmaker, ZeroTier, Nebula and a hand-rolled WireGuard are all the
 same case:
 
 ```sh
-lightweight key create --name my-agent          # printed once; stored hashed
-lightweight serve model.gguf --host <address-or-name>
+hermes key create --name my-agent          # printed once; stored hashed
+hermes serve model.gguf --host <address-or-name>
 
 # A machine holding several addresses can serve on each of them, with one
 # engine and one queue behind them all:
-lightweight serve model.gguf --host <lan-name> --host <mesh-name>
+hermes serve model.gguf --host <lan-name> --host <mesh-name>
 ```
 
 A remote agent then authenticates with the key it was given:
 
 ```sh
 export OPENAI_BASE_URL=http://<address-or-name>:11434/v1
-export OPENAI_API_KEY=sk-lw-…               # the key lightweight key create printed
+export OPENAI_API_KEY=sk-lw-…               # the key hermes key create printed
 ```
 
 `--host` takes an address in either family or a **name**, resolved at startup.
@@ -785,13 +494,13 @@ survives it. The default port is **11434** — the common local-LLM port — so 
 client that assumes it finds the gateway without being told.
 
 Because 11434 is also Ollama's default, a machine already running Ollama holds
-it, and `lightweight serve` then fails with `address in use` rather than moving the
+it, and `hermes serve` then fails with `address in use` rather than moving the
 port on its own — a remote agent's URL must not shift underneath it. The failure
 names the likely culprit and offers the fix. When you do want any free port, ask
 for one explicitly:
 
 ```sh
-lightweight serve model.gguf --port auto        # or --port 0; the chosen port is printed
+hermes serve model.gguf --port auto        # or --port 0; the chosen port is printed
 ```
 
 `--port auto` reports the kernel-assigned port on the startup line and in the
@@ -817,8 +526,8 @@ machine-local. The header is trusted only from a loopback peer, so it cannot be
 spoofed from off the machine.
 
 ```sh
-lightweight key create --name my-agent            # printed once
-lightweight serve model.gguf --behind-proxy       # still on 127.0.0.1:11434, now key-required
+hermes key create --name my-agent            # printed once
+hermes serve model.gguf --behind-proxy       # still on 127.0.0.1:11434, now key-required
 
 cloudflared tunnel login                     # pick your Cloudflare zone
 cloudflared tunnel create lightweight
@@ -839,13 +548,13 @@ drops a request whose first byte takes longer than ~100 s, so for a cold load or
 a long generation prefer `stream: true` — the gateway keeps the connection alive
 with SSE keep-alives while it works.
 
-### Several models, isolated per tenant (`lightweight fleet`)
+### Several models, isolated per tenant (`hermes fleet`)
 
 The engine is single-resident by design, so serving several models — and keeping
 one tenant's traffic from evicting another's — means **one gateway per model**,
 each with its own data root (`HERMES_GATEWAY_HOME`) and therefore its own keys,
-rate limits and catalog. `lightweight fleet` reads a manifest, caps it at **four
-models**, and launches each as its own `lightweight serve … --behind-proxy`:
+rate limits and catalog. `hermes fleet` reads a manifest, caps it at **four
+models**, and launches each as its own `hermes serve … --behind-proxy`:
 
 ```json
 // ~/.config/CpuInferenceGateway/fleet.json  (or pass --config <path>)
@@ -858,9 +567,9 @@ models**, and launches each as its own `lightweight serve … --behind-proxy`:
 ```
 
 ```sh
-HERMES_GATEWAY_HOME=/srv/lw/qwen  lightweight key create --name tenant-a   # per-profile keys
-HERMES_GATEWAY_HOME=/srv/lw/llama lightweight key create --name tenant-b
-lightweight fleet                                                          # launches both; Ctrl-C stops all
+HERMES_GATEWAY_HOME=/srv/lw/qwen  hermes key create --name tenant-a   # per-profile keys
+HERMES_GATEWAY_HOME=/srv/lw/llama hermes key create --name tenant-b
+hermes fleet                                                          # launches both; Ctrl-C stops all
 ```
 
 Point one tunnel `ingress` rule at each model's port (`qwen.api.example.com` →
@@ -877,7 +586,7 @@ its own service unit instead.
 Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,
 or wherever `HERMES_GATEWAY_HOME` points), both owner-only:
 
-* **`api.json`** — the bind hosts and port. Written by `lightweight config` or by the
+* **`api.json`** — the bind hosts and port. Written by `hermes config` or by the
   panel's *Serve on* control, and read beneath the command-line flags: a typed
   `--host`/`--port` always wins, and the file speaks only when one was not given.
 * **`api-keys.json`** — the API keys, stored as SHA-256 hashes and a display
@@ -886,10 +595,10 @@ or wherever `HERMES_GATEWAY_HOME` points), both owner-only:
   work as a single static key alongside the named ones.
 
 ```sh
-lightweight key create --name ci --per-minute 60 --per-day 2000
-lightweight key list                # names, prefixes and limits — never the secret
-lightweight key revoke <id>
-lightweight config show             # what api.json currently holds
+hermes key create --name ci --per-minute 60 --per-day 2000
+hermes key list                # names, prefixes and limits — never the secret
+hermes key revoke <id>
+hermes config show             # what api.json currently holds
 ```
 
 Per-key limits are enforced live: a key over its ceiling gets a `429` with a
@@ -904,21 +613,20 @@ click rather than a reading of `ip addr`. Creating and revoking keys, and
 widening the bind set, are refused from a remote session: those take access to
 the machine itself.
 
-The gateway command is `lightweight`; the agent harness command is `lightagent`.
-This project does not build or ship a `hermes` executable, keeping Hermes Agent
-independent. Desktop launchers use `LIGHTWEIGHT_BIN` for an explicit gateway
-binary override. Existing gateway data paths and configuration keys are retained.
+Every command above is also available as `lightweight` — the same tool, which
+prints a small feather on an interactive terminal to confirm you are in.
+`hermes` is unchanged.
 
 Ask the machine what it can be reached at rather than guessing:
 
 ```sh
-lightweight sysinfo            # the Network section lists every bindable address
-lightweight sysinfo --json     # same, under "reachable_addresses", for scripts
+hermes sysinfo            # the Network section lists every bindable address
+hermes sysinfo --json     # same, under "reachable_addresses", for scripts
 ```
 
 ### The one that catches everyone
 
-`lightweight serve --host "$(hostname)"` is the obvious way to ask for remote access,
+`hermes serve --host "$(hostname)"` is the obvious way to ask for remote access,
 and on most Linux installs it serves **nobody**. Debian and Ubuntu write
 `127.0.1.1 <hostname>` into `/etc/hosts` at install time, and that entry beats
 whatever a LAN or an overlay network publishes for the same name. Every signal
@@ -939,7 +647,7 @@ warning: --host "hermes" resolved only to 127.0.1.1, which is loopback.
     --host 192.0.2.10
     --host 198.51.100.4
 
-  Bind one of those, or a name that resolves to one, and create a key with `lightweight key create`.
+  Bind one of those, or a name that resolves to one, and create a key with `hermes key create`.
 ```
 
 It warns rather than refuses: a name that resolves to loopback is unusual but
@@ -952,7 +660,7 @@ A second trap sits next to it, and no software can detect this one for you: the
 name your **overlay network** knows a machine by is not necessarily its local
 hostname. If the name was already taken in the network, the machine will have
 been given another — a host whose `hostname` is `hermes` can be `hermes-1` on
-the mesh, with `hermes` belonging to somebody else entirely. `lightweight sysinfo`
+the mesh, with `hermes` belonging to somebody else entirely. `hermes sysinfo`
 reports addresses, which are unambiguous; check the name against the network's
 own listing before trusting it.
 
@@ -1002,14 +710,14 @@ minimum 64,000 required by … Choose a model with at least 64K context.
 
 That is a client policy, not a fault in either side. Serving such a client
 means loading a model at 64K, and the KV cache for that is measured in
-gigabytes — `lightweight estimate model.gguf --ctx 65536` says whether this machine
+gigabytes — `hermes estimate model.gguf --ctx 65536` says whether this machine
 can, before anything is loaded. On a machine that cannot, the honest options
 are a client with a lower floor or more memory; advertising a window the
 gateway is not serving would trade a clear refusal for silent truncation.
 
 ### Keeping it running
 
-`lightweight serve` in the foreground needs nothing from any platform and is the
+`hermes serve` in the foreground needs nothing from any platform and is the
 portable answer. For a machine that should serve after logout,
 `packaging/systemd/` holds a Linux `systemd --user` example whose every value —
 model, addresses, key — comes from a file outside the repository. M10 shipped the
@@ -1039,7 +747,6 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
 | `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
 | `lightweight-cli` | Command-line access to the above |
-| `release-update` | The shared `update` command of both CLIs: checksum-verified release archives, swapped in together. Depends on no `lightweight-*` or `lightagent-*` crate |
 
 Two parts of the product are not crates:
 

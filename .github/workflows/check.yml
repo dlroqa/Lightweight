@@ -23,12 +23,6 @@ concurrency:
 permissions:
   contents: read
 
-# Hosted jobs do not reuse Cargo's per-function incremental graph. Avoid
-# spending runner disk and cache bandwidth on it; rust-cache still preserves
-# dependencies and final artifacts for subsequent runs.
-env:
-  CARGO_INCREMENTAL: '0'
-
 jobs:
   check:
     name: check (${{ matrix.label }})
@@ -98,19 +92,7 @@ jobs:
       # real machines is worth more than one that quotes four assertions, and
       # this is where those numbers come from.
       - name: What this machine reports
-        run: cargo run -q -p lightweight-cli --bin lightweight -- sysinfo
-
-      # The Lightagent welcome mark, rendered on a real (stronger) runner and
-      # through a non-TTY pipe, proving the preview path is TTY-independent.
-      # Property-asserted (half-block present in colour; no escapes under
-      # NO_COLOR), never byte-matched, so a runner's terminal cannot flake it.
-      # One leg only: the mark is platform-independent.
-      - name: Lightagent welcome mark renders
-        if: matrix.label == 'linux-x64'
-        run: |
-          cargo run -q -p lightagent --bin lightagent -- banner --preview | grep -q $'▀'
-          NO_COLOR=1 cargo run -q -p lightagent --bin lightagent -- banner --preview | { ! grep -q $'\x1b'; }
-          cargo run -q -p lightagent --bin lightagent -- tools list --json | grep -q datetime.now
+        run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
 
   # Rendering: prove the icon pipeline runs and produces the right shape.
   #
@@ -184,7 +166,7 @@ jobs:
       # staging it from `target/release` alone was green here every time while
       # failing in the release. The `flatpak` job below builds without a triple,
       # so the two jobs exercise one resolution branch each.
-      - run: cargo build --release -p lightweight-cli -p lightagent --target x86_64-unknown-linux-gnu
+      - run: cargo build --release -p lightweight-cli --target x86_64-unknown-linux-gnu
       - run: npm run build --prefix frontend
 
       - name: Package the AppImage
@@ -213,22 +195,6 @@ jobs:
           sudo apt-get install -y xvfb
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           xvfb-run --auto-servernum ./scripts/test-artifacts.sh
-
-      # The Lightagent CLI archive is a separate product surface with its own
-      # packaging (packaging/lightagent/), so it is exercised as its own step
-      # rather than folded into the gateway artifact checks above. `--target`
-      # matches the build above so its binary lands under `target/<triple>/release`,
-      # the path the smoke script prefers, and the rust-cache is shared. The smoke
-      # script builds, packages, unpacks and *runs* the binary.
-      - name: Lightagent package
-        run: |
-          cargo build --release -p lightagent --target x86_64-unknown-linux-gnu
-          ./scripts/smoke-lightagent-package.sh
-      - uses: actions/upload-artifact@v7
-        with:
-          name: lightagent-cli
-          path: dist-cli/lightagent-*.tar.gz
-          if-no-files-found: error
 
   # The Flatpak build, which is the primary public Linux artifact.
   #
@@ -268,7 +234,7 @@ jobs:
             org.freedesktop.Sdk//24.08 \
             org.electronjs.Electron2.BaseApp//24.08
 
-      - run: cargo build --release -p lightweight-cli -p lightagent
+      - run: cargo build --release -p lightweight-cli
       - run: npm run build --prefix frontend
       - run: npm --prefix apps/desktop run package -- --linux flatpak
 

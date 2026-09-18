@@ -34,33 +34,6 @@
   --shadow: 0 4px 16px rgba(15, 42, 88, 0.06);
   --shadow-lg: 0 8px 32px rgba(15, 42, 88, 0.09);
 
-  /*
-   * --- overlays: fully opaque, never see-through -------------------------
-   *
-   * Every portal surface (dropdown, select, popover, command menu, context
-   * menu, dialog, sheet) paints on one of these. They are solid colours on
-   * purpose: a translucent menu lets the composer placeholder and the page
-   * headings show through and collide with its own labels, which is the
-   * readability defect the panel is required never to reproduce. No alpha, no
-   * blur-as-the-only-layer, no inherited element opacity may stand in for a
-   * real background here.
-   */
-  --popover: #ffffff;
-  --popover-foreground: #0f172a;
-  --popover-muted: #5b6472;
-  --popover-border: rgba(15, 42, 88, 0.12);
-  --popover-hover: #eef2fb;
-  --popover-shadow: 0 12px 40px rgba(15, 42, 88, 0.18);
-  --card: #ffffff;
-  --card-foreground: #0f172a;
-  --scrim: rgba(15, 23, 42, 0.42);
-
-  /* --- stacking: one ladder, so nothing guesses ------------------------- */
-  --z-sticky: 20;
-  --z-drawer-scrim: 880;
-  --z-drawer: 900;
-  --z-overlay: 1000;
-
   /* --- text -------------------------------------------------------------- */
   --text: #0f172a;
   --text-soft: #475569;
@@ -142,18 +115,6 @@
     --shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
 
-    /* Opaque even in dark, and lifted a step off the near-black surfaces so a
-       border and shadow can still separate the menu from what it covers. */
-    --popover: #1b2436;
-    --popover-foreground: #f1f5f9;
-    --popover-muted: #9aa7bd;
-    --popover-border: rgba(255, 255, 255, 0.16);
-    --popover-hover: #26314a;
-    --popover-shadow: 0 14px 44px rgba(0, 0, 0, 0.6);
-    --card: #151d2e;
-    --card-foreground: #f1f5f9;
-    --scrim: rgba(2, 6, 23, 0.62);
-
     --text: #f1f5f9;
     --text-soft: #cbd5e1;
     --text-muted: #94a3b8;
@@ -203,16 +164,6 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
   --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.45);
-
-  --popover: #1b2436;
-  --popover-foreground: #f1f5f9;
-  --popover-muted: #9aa7bd;
-  --popover-border: rgba(255, 255, 255, 0.16);
-  --popover-hover: #26314a;
-  --popover-shadow: 0 14px 44px rgba(0, 0, 0, 0.6);
-  --card: #151d2e;
-  --card-foreground: #f1f5f9;
-  --scrim: rgba(2, 6, 23, 0.62);
 
   --text: #f1f5f9;
   --text-soft: #cbd5e1;

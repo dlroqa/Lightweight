@@ -1,14 +1,11 @@
-import { useEffect, useState } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet } from "react-router-dom";
 import {
-  Bot,
   ChevronLeft,
   Cpu,
   FileText,
   Gauge,
   KeyRound,
   LayoutDashboard,
-  Menu as MenuIcon,
   MessageSquare,
   Moon,
   Network,
@@ -17,21 +14,17 @@ import {
   Settings as SettingsIcon,
   Sliders,
   Sun,
-  Wrench,
 } from "lucide-react";
 
 import { api } from "../api/client";
 import { bytes, percent } from "../api/format";
 import { usePoll } from "../hooks/usePoll";
-import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useUtilization } from "../hooks/useSeries";
 import { usePreferences } from "../state/preferences";
 import { wasRead } from "../api/types";
 
 const NAV = [
-  { to: "/", label: "Agent", icon: Bot, end: true },
-  { to: "/agent/tools", label: "Agent Tools", icon: Wrench },
-  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/chat", label: "Chat", icon: MessageSquare },
   { to: "/models", label: "Models", icon: Package },
   { to: "/inference", label: "Inference", icon: Sliders },
@@ -51,22 +44,7 @@ const NAV = [
  */
 export function Shell() {
   const { preferences, update } = usePreferences();
-  const location = useLocation();
-
-  // Layout follows the same breakpoints the stylesheet uses. On mobile the rail
-  // is a drawer and shows its full self; on tablet it is always compact so the
-  // working surface keeps its room; on desktop it honours the saved preference.
-  const mobile = useMediaQuery("(max-width: 760px)");
-  const tablet = useMediaQuery("(max-width: 1100px) and (min-width: 761px)");
-  const collapsed = mobile ? false : tablet ? true : preferences.railCollapsed;
-
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  // A route change or a return to a wider viewport closes the drawer, so it is
-  // never left open behind the page it navigated to.
-  useEffect(() => setDrawerOpen(false), [location.pathname]);
-  useEffect(() => {
-    if (!mobile) setDrawerOpen(false);
-  }, [mobile]);
+  const collapsed = preferences.railCollapsed;
 
   // One poll for the whole rail. Two seconds rather than one: this is ambient
   // context, and the screens that need a faster reading take their own.
@@ -81,20 +59,7 @@ export function Shell() {
     <div className={`shell${collapsed ? " is-collapsed" : ""}`}>
       <div className="shell__frame" aria-hidden="true" />
 
-      {mobile && drawerOpen && (
-        <button
-          type="button"
-          className="drawer-scrim"
-          aria-label="Close the menu"
-          onClick={() => setDrawerOpen(false)}
-        />
-      )}
-
-      <nav
-        className={`rail${mobile && drawerOpen ? " is-open" : ""}`}
-        aria-label="Sections"
-        aria-hidden={mobile && !drawerOpen}
-      >
+      <nav className="rail" aria-label="Sections">
         <div className="rail__brand">
           {/*
             The application's own icon, from `public/`, rather than a glyph
@@ -175,7 +140,7 @@ export function Shell() {
           </div>
         )}
 
-        <div className="rail__controls">
+        <div style={{ display: "flex", gap: 8 }}>
           <button
             type="button"
             className="btn btn--icon"
@@ -210,20 +175,6 @@ export function Shell() {
       </nav>
 
       <main className="main">
-        <div className="mobilebar">
-          <button
-            type="button"
-            className="btn btn--icon"
-            aria-label="Open the menu"
-            aria-expanded={drawerOpen}
-            onClick={() => setDrawerOpen(true)}
-          >
-            <MenuIcon size={18} />
-          </button>
-          <img className="rail__mark" src="/icon.png" alt="" width={26} height={26}
-            style={{ width: 26, height: 26 }} />
-          <span className="mobilebar__name">Lightweight</span>
-        </div>
         <Outlet />
       </main>
     </div>

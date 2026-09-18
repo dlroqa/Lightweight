@@ -592,11 +592,3 @@ export interface BenchmarkSample {
   machine_ticks: number | null;
   peak_rss: number | null;
 }
-
-/** The separate Lightagent API process, managed by the gateway. */
-export interface AgentServerStatus {
-  status: "running" | "starting" | "incompatible" | "unavailable" | "failed" | "stopped";
-  upstream: string | null;
-  can_start: boolean;
-  message: string | null;
-}

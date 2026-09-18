@@ -73,19 +73,6 @@ pub struct GatewayConfig {
     /// `None` means no panel is served and every unmatched path is a 404,
     /// which is what every existing deployment and every test does today.
     pub web_root: Option<std::path::PathBuf>,
-    /// The origin of the Lightagent API server (`lightagent serve`), when this
-    /// gateway should reverse-proxy the panel's agent screens to it.
-    ///
-    /// `None` returns a JSON setup error under `/api/lightagent`, keeping agent
-    /// requests out of the panel's HTML fallback. `Some` enables the proxy at
-    /// `/api/lightagent` and `/api/lightagent/*` that
-    /// forwards each request verbatim to `{origin}`, so the panel's agent, tools
-    /// and chat screens are same-origin with the rest of it and need no CORS —
-    /// the same property [`web_root`] gives the control API. A base origin only,
-    /// scheme through port with no path, e.g. `http://127.0.0.1:8735`.
-    ///
-    /// [`web_root`]: GatewayConfig::web_root
-    pub agent_upstream: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -101,7 +88,6 @@ impl Default for GatewayConfig {
             paths: None,
             bound_addresses: Vec::new(),
             web_root: None,
-            agent_upstream: None,
         }
     }
 }
@@ -111,8 +97,6 @@ pub struct GatewayState {
     pub backend: Arc<dyn InferenceBackend>,
     pub catalog: Arc<Catalog>,
     pub config: GatewayConfig,
-    /// The local agent process started from Settings.
-    pub agent_server: Arc<crate::agent_server::AgentServer>,
     /// The live authentication policy.
     ///
     /// Seeded from `config.auth` at startup and swapped by [`refresh_keys`] when
@@ -186,7 +170,6 @@ impl GatewayState {
             catalog,
             auth,
             config,
-            agent_server: Arc::new(crate::agent_server::AgentServer::default()),
             scheduler,
             metrics: Arc::new(Metrics::new()),
             manager: None,
@@ -273,7 +256,7 @@ impl GatewayState {
     /// One definition, because a benchmark taken through this gateway and a fit
     /// looked up by it have to agree about what "the same engine" means. The
     /// build is stated by the backend rather than guessed here, which is what
-    /// makes a run taken by `lightweight bench` comparable with one taken through
+    /// makes a run taken by `hermes bench` comparable with one taken through
     /// the API.
     pub fn engine_fingerprint(&self) -> lightweight_bench::EngineFingerprint {
         lightweight_bench::engine_fingerprint(self.backend.as_ref())

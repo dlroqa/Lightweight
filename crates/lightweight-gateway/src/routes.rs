@@ -805,13 +805,6 @@ fn is_authorized(state: &GatewayState, headers: &HeaderMap) -> bool {
 ///
 /// Returns the refusal to send, or `None` when the request may proceed.
 pub(crate) fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
-    // The router installs this marker only on control-surface requests whose
-    // socket peer is loopback (and strips any caller-supplied copy first).
-    // That keeps the local panel usable after an exposed listener turns key
-    // auth on, without relaxing `/v1` or a panel reached from another machine.
-    if headers.contains_key(crate::LOCAL_CONTROL_AUTHORITY) {
-        return None;
-    }
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());

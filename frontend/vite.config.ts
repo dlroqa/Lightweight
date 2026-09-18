@@ -10,31 +10,24 @@ import react from "@vitejs/plugin-react";
  * gateway taken in order to answer a question about where a file is served
  * from.
  *
- * `11434` is the port `lightweight serve` uses by default. Set `HERMES_DEV_ORIGIN`
+ * `11434` is the port `hermes serve` uses by default. Set `HERMES_DEV_ORIGIN`
  * in the environment or a `.env` file when the gateway is elsewhere.
  */
-const PROXIED = ["/api/v1", "/v1", "/health", "/props", "/version", "/metrics"];
+const PROXIED = ["/api", "/v1", "/health", "/props", "/version", "/metrics"];
 
 export default defineConfig(({ mode }) => {
   // Read through Vite rather than `process.env`, which does not exist in the
   // browser-facing type world this project compiles against.
   const env = loadEnv(mode, process.cwd(), "HERMES_");
   const gateway = env.HERMES_DEV_ORIGIN ?? "http://127.0.0.1:11434";
-  // The Lightagent API is a separate server (`lightagent serve`, default 8735).
-  // Its namespace is disjoint from the gateway's `/api/v1`, so session calls
-  // cannot depend on proxy declaration order or fall through to Lightweight.
-  const agent = env.HERMES_AGENT_ORIGIN ?? "http://127.0.0.1:8735";
 
   return {
   plugins: [react()],
   server: {
     port: 5173,
-    proxy: {
-      "/api/lightagent": { target: agent, changeOrigin: true },
-      ...Object.fromEntries(
-        PROXIED.map((path) => [path, { target: gateway, changeOrigin: true }]),
-      ),
-    },
+    proxy: Object.fromEntries(
+      PROXIED.map((path) => [path, { target: gateway, changeOrigin: true }]),
+    ),
   },
   build: {
     outDir: "dist",

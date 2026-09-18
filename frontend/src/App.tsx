@@ -1,8 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import { Shell } from "./components/Shell";
-import { Agent } from "./screens/Agent";
-import { AgentTools } from "./screens/AgentTools";
 import { Chat } from "./screens/Chat";
 import { Dashboard } from "./screens/Dashboard";
 import { AccessScreen } from "./screens/AccessScreen";
@@ -17,13 +15,7 @@ export function App() {
   return (
     <Routes>
       <Route element={<Shell />}>
-        {/* The agent surface is the first viewport. The gateway dashboard keeps
-            its place at an explicit path, and the old /agent link still lands
-            on it, so no existing route is broken. */}
-        <Route index element={<Agent />} />
-        <Route path="agent" element={<Agent />} />
-        <Route path="dashboard" element={<Dashboard />} />
-        <Route path="agent/tools" element={<AgentTools />} />
+        <Route index element={<Dashboard />} />
         <Route path="chat" element={<Chat />} />
         <Route path="models" element={<Models />} />
         <Route path="inference" element={<Inference />} />

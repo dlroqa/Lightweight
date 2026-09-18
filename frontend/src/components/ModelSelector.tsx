@@ -1,9 +1,8 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { ChevronDown } from "lucide-react";
 
 import { api, followJob } from "../api/client";
 import type { CatalogRow } from "../api/types";
-import { Menu, MenuItem } from "./Menu";
 
 /**
  * The model pill in the header: what is loaded, and a way to change it.
@@ -24,7 +23,6 @@ export function ModelSelector({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
-  const trigger = useRef<HTMLButtonElement | null>(null);
 
   const loaded = models.find((model) => model.id === loadedId);
   const label = loaded?.name ?? (loadedId ?? "No model loaded");
@@ -50,11 +48,10 @@ export function ModelSelector({
   return (
     <div style={{ position: "relative" }}>
       <button
-        ref={trigger}
         type="button"
         className="btn"
         style={{ minWidth: 210, justifyContent: "space-between", paddingLeft: 12 }}
-        aria-haspopup="menu"
+        aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
         disabled={busy !== null}
@@ -77,36 +74,70 @@ export function ModelSelector({
         <ChevronDown size={16} />
       </button>
 
-      <Menu
-        open={open}
-        anchorRef={trigger}
-        onClose={() => setOpen(false)}
-        align="end"
-        minWidth={280}
-        label="Choose a model to load"
-      >
-        {models.length === 0 && <div className="menu__empty">No models installed yet.</div>}
-        {models.map((model) => (
-          <MenuItem
-            key={model.id}
-            disabled={model.state === "missing"}
-            onClick={() => void load(model.id)}
+      {open && (
+        <>
+          <div
+            style={{ position: "fixed", inset: 0, zIndex: 40 }}
+            onClick={() => setOpen(false)}
+            aria-hidden="true"
+          />
+          <ul
+            role="listbox"
+            style={{
+              position: "absolute",
+              right: 0,
+              top: "calc(100% + 6px)",
+              zIndex: 50,
+              margin: 0,
+              padding: 6,
+              listStyle: "none",
+              minWidth: 280,
+              maxHeight: 320,
+              overflowY: "auto",
+              borderRadius: "var(--radius-lg)",
+              border: "1px solid var(--border)",
+              background: "var(--surface-raised)",
+              backdropFilter: "blur(var(--glass-blur))",
+              boxShadow: "var(--shadow-lg)",
+            }}
           >
-            <span
-              className="dot"
-              style={{ color: model.id === loadedId ? "var(--ok)" : "var(--text-faint)" }}
-            />
-            <span style={{ minWidth: 0, textAlign: "left" }}>
-              <span style={{ display: "block" }}>{model.name}</span>
-              <span className="menu__meta">
-                {model.state === "missing"
-                  ? "file missing"
-                  : (model.quantization ?? model.architecture)}
-              </span>
-            </span>
-          </MenuItem>
-        ))}
-      </Menu>
+            {models.length === 0 && (
+              <li style={{ padding: 12, color: "var(--text-muted)", fontSize: 13 }}>
+                No models installed yet.
+              </li>
+            )}
+            {models.map((model) => (
+              <li key={model.id}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={model.id === loadedId}
+                  className="btn btn--ghost"
+                  style={{ width: "100%", justifyContent: "flex-start", gap: 10 }}
+                  disabled={model.state === "missing"}
+                  onClick={() => void load(model.id)}
+                >
+                  <span
+                    className="dot"
+                    style={{
+                      color:
+                        model.id === loadedId ? "var(--ok)" : "var(--text-faint)",
+                    }}
+                  />
+                  <span style={{ minWidth: 0, textAlign: "left" }}>
+                    <span style={{ display: "block" }}>{model.name}</span>
+                    <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+                      {model.state === "missing"
+                        ? "file missing"
+                        : (model.quantization ?? model.architecture)}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
 
       {failure && (
         <div

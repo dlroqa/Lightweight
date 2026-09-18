@@ -29,10 +29,31 @@ use lightweight_system_info::{
     CpuInfo, MemoryProbe, SystemMemoryProbe, classified_addresses, reachable_addresses,
 };
 
+/// Which name the program was invoked as.
+///
+/// The binary was `hermes` and stays `hermes`, byte for byte — the 0.1.2 rename
+/// kept the command deliberately. `lightweight` is a second, additive entry
+/// point over the very same command tree, distinguished only by a welcome mark
+/// it prints and by the name that appears in its own `--help`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Personality {
+    Hermes,
+    Lightweight,
+}
+
+impl Personality {
+    const fn binary_name(self) -> &'static str {
+        match self {
+            Self::Hermes => "hermes",
+            Self::Lightweight => "lightweight",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
-    name = "lightweight",
-    about = "Lightweight CPU Inference Gateway",
+    name = "hermes",
+    about = "Hermes CPU Inference Gateway",
     version,
     disable_help_subcommand = true
 )]
@@ -149,17 +170,6 @@ enum Command {
         /// it. Without this, `/` is a 404 and the API is unchanged.
         #[arg(long, value_name = "DIR")]
         web_root: Option<PathBuf>,
-        /// Forward the panel's agent screens to the agent server at this origin.
-        ///
-        /// The agent API (`lightagent serve`) runs on its own server and port;
-        /// the panel's Agent, Tools and Chat screens call it under
-        /// `/api/lightagent`. Proxying it from here puts it on the gateway's own
-        /// origin, so those screens work without a CORS policy — the same
-        /// property `--web-root` gives the control API. Defaults to the agent
-        /// server's own loopback default; pass `off` to serve no agent surface,
-        /// in which case those screens are inert.
-        #[arg(long, value_name = "ORIGIN", default_value = "http://127.0.0.1:8735")]
-        agent_upstream: String,
         /// Require this key on every request.
         ///
         /// Optional on loopback and mandatory as soon as any bind is reachable
@@ -273,7 +283,7 @@ enum Command {
     /// Serve several models at once, one isolated gateway per model.
     ///
     /// Reads a JSON manifest listing up to four models — each with its own port,
-    /// data directory and keys — and launches each as a `lightweight serve …
+    /// data directory and keys — and launches each as a `hermes serve …
     /// --behind-proxy` child. One tenant's traffic can never evict or disturb
     /// another's, because each model is its own process. Point a reverse proxy
     /// or Cloudflare Tunnel at the per-model ports to publish them.
@@ -282,15 +292,6 @@ enum Command {
         /// directory.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
-    },
-    /// Update lightweight, and lightagent when installed beside it, to the latest release.
-    Update {
-        /// Report whether an update is available without installing it.
-        #[arg(long)]
-        check: bool,
-        /// Reinstall even when this version is already current.
-        #[arg(long)]
-        force: bool,
     },
 }
 
@@ -333,7 +334,7 @@ enum ModelsAction {
     Import { path: PathBuf },
     /// Download a model.
     ///
-    /// Either one of the pinned ids from `lightweight models available`, whose
+    /// Either one of the pinned ids from `hermes models available`, whose
     /// digest is recorded in this build, or any direct https link with
     /// `--url`. A HuggingFace link is verified against the digest the site
     /// publishes; any other link is recorded rather than verified unless you
@@ -360,7 +361,7 @@ enum ModelsAction {
     },
 }
 
-/// `lightweight models ...`.
+/// `hermes models ...`.
 ///
 /// The read-only actions need no async runtime; import and add do, because they
 /// hash and download. Built here rather than around every command, the same way
@@ -466,7 +467,7 @@ fn key_command(cli: &Cli, out: &mut String, action: &KeyAction) -> Result<ExitCo
             } else if keys.is_empty() {
                 line!(
                     out,
-                    "No API keys. Create one with `lightweight key create --name <label>`."
+                    "No API keys. Create one with `hermes key create --name <label>`."
                 );
             } else {
                 for record in &keys {
@@ -559,13 +560,24 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|err| format!("could not start the async runtime: {err}"))
 }
 
-/// Run the Lightweight CLI. The `hermes` command belongs to Hermes Agent.
-pub fn run_cli() -> ExitCode {
-    let mut command = <Cli as clap::CommandFactory>::command();
+/// Appends a formatted line to the output buffer.
+///
+/// Reports are rendered into a `String` and written once, rather than printed a
+/// line at a time. Two reasons: `println!` panics if the reader has closed the
+/// pipe - `hermes sysinfo | head` would crash, because Rust ignores SIGPIPE at
+/// startup and turns it into a write error - and a rendered `String` is
+/// something tests can assert against.
+/// Run the CLI under a given name.
+///
+/// The single entry point both binaries call. `hermes` behaves exactly as it
+/// always has; `lightweight` adds the welcome mark and its own program name in
+/// help, and nothing else.
+pub fn run_cli(personality: Personality) -> ExitCode {
+    let mut command = <Cli as clap::CommandFactory>::command().name(personality.binary_name());
 
     // Bare `lightweight`, with no subcommand: greet and show what it can do,
-    // exiting cleanly.
-    if std::env::args_os().count() == 1 {
+    // exiting cleanly. `hermes` keeps clap's usage error, unchanged.
+    if personality == Personality::Lightweight && std::env::args_os().count() == 1 {
         if banner::should_show(false) {
             banner::print(env!("CARGO_PKG_VERSION"));
         }
@@ -584,7 +596,7 @@ pub fn run_cli() -> ExitCode {
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
 
     // The welcome mark, once the run is known not to be machine-readable.
-    if banner::should_show(cli.json) {
+    if personality == Personality::Lightweight && banner::should_show(cli.json) {
         banner::print(env!("CARGO_PKG_VERSION"));
     }
 
@@ -627,7 +639,6 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
             api_key,
             concurrency,
             web_root,
-            agent_upstream,
             behind_proxy,
         } => {
             // Only this command needs an async runtime, so it is built here
@@ -664,12 +675,6 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
                 behind_proxy: *behind_proxy || env_flag("HERMES_BEHIND_PROXY"),
                 concurrency: *concurrency,
                 web_root: web_root.clone(),
-                // `off` (or an empty value) serves no agent surface; anything
-                // else is the origin to forward `/api/lightagent` to.
-                agent_upstream: match agent_upstream.trim() {
-                    "" | "off" => None,
-                    origin => Some(origin.to_owned()),
-                },
             }))?;
             Ok(ExitCode::SUCCESS)
         }
@@ -710,18 +715,6 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
         Command::Key { action } => key_command(cli, out, action),
         Command::Config { action } => config_command(cli, out, action),
         Command::Fleet { config } => fleet::run(config.clone()),
-        Command::Update { check, force } => {
-            runtime()?.block_on(release_update::run(
-                release_update::Cli::Lightweight,
-                env!("CARGO_PKG_VERSION"),
-                release_update::Request {
-                    check: *check,
-                    force: *force,
-                    json: cli.json,
-                },
-            ))?;
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Inspect { model, header_only } => {
             let metadata = load_metadata(model, *header_only)?;
             if cli.json {
@@ -759,7 +752,7 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
             } else {
                 lightweight_memory::ComputeModel::default()
             };
-            // This machine's own coefficients when `lightweight bench --fit` has
+            // This machine's own coefficients when `hermes bench --fit` has
             // earned them for exactly these settings, and the shipped ones
             // otherwise. A data directory that cannot be discovered is not a
             // reason to refuse an estimate: it means there is nowhere a fit
@@ -1157,7 +1150,7 @@ mod tests {
     /// Reports are rendered into a buffer rather than printed line by line.
     ///
     /// That is not a style preference. `println!` panics when the reader has
-    /// closed the pipe, so `lightweight sysinfo | head` used to abort with
+    /// closed the pipe, so `hermes sysinfo | head` used to abort with
     /// "failed printing to stdout: Broken pipe" - a crash in an ordinary
     /// invocation, in a crate that denies panics. Rust ignores SIGPIPE at
     /// startup, so the signal never arrives and the write returns an error

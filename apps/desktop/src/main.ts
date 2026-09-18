@@ -32,12 +32,6 @@ import {
 } from "./gateway.ts";
 import { inspectSandbox, sandboxFailureText } from "./sandbox.ts";
 
-// Electron otherwise derives the runtime name from the internal npm package
-// name (`hermes-desktop`) in local and unpacked runs. Set the branded name on
-// every platform; on macOS this also controls the default About, Hide and Quit
-// menu labels.
-app.setName("Lightweight");
-
 const here = fileURLToPath(new URL(".", import.meta.url));
 
 const supervisor = new GatewaySupervisor();
@@ -172,7 +166,7 @@ function showStartupFailure(reason: string): void {
   // running message loop; when the shell dies before either exists — or under a
   // virtual display, or in CI — the dialog is never seen and the process exits
   // silently, which is the least serviceable failure a supervisor can have.
-  console.error(`Lightweight: the gateway did not start.\n${detail}`);
+  console.error(`hermes-desktop: the gateway did not start.\n${detail}`);
   void dialog.showMessageBox({
     type: "error",
     title: "Lightweight could not start",
@@ -213,7 +207,7 @@ function updateTray(state: GatewayState): void {
     {
       // The shell no longer holds a key to copy: keys are the gateway's own,
       // hashed, and are created and shown once in the panel (or with
-      // `lightweight key create`). The tray points there rather than pretending to
+      // `hermes key create`). The tray points there rather than pretending to
       // have a credential it deliberately never sees.
       label: "Manage API keys\u2026",
       click: () => {
@@ -256,7 +250,7 @@ async function start(): Promise<void> {
   let binary: string;
   try {
     binary = resolveBinary({
-      override: process.env.LIGHTWEIGHT_BIN,
+      override: process.env.HERMES_BIN,
       resourcesPath: process.resourcesPath,
       repoRoot: repoRoot(),
     });

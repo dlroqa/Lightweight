@@ -656,65 +656,6 @@ async fn tool_call_deltas_reach_the_client_ready_to_accumulate() {
 }
 
 #[tokio::test]
-async fn default_streams_tool_calls_with_a_key_and_reports_the_real_model() {
-    ensure_provider();
-    let harness = Harness::start(
-        MockConfig {
-            script: Script::ToolCall {
-                id: "call_default".into(),
-                name: "datetime.now".into(),
-                argument_fragments: vec!["{}".into()],
-            },
-            ..MockConfig::default()
-        },
-        GatewayConfig {
-            auth: AuthPolicy::with_static_key("access-key".into()),
-            ..GatewayConfig::default()
-        },
-    )
-    .await;
-
-    let response = Harness::client()
-        .post(format!("{}/v1/chat/completions", harness.base))
-        .header("Authorization", "Bearer access-key")
-        .json(&json!({
-            "model": "default",
-            "messages": [{"role": "user", "content": "what time is it?"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "datetime.now",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }],
-            "stream": true
-        }))
-        .send()
-        .await
-        .expect("authenticated request");
-
-    assert_eq!(response.status(), 200);
-    assert!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"))
-    );
-    let events = read_stream(response).await;
-    let chunks: Vec<Value> = events
-        .iter()
-        .filter(|event| !event.is_done())
-        .map(chunk)
-        .collect();
-    assert!(chunks.iter().all(|chunk| chunk["model"] == "mock-model@4k"));
-    assert!(chunks.iter().any(|chunk| {
-        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "datetime.now"
-    }));
-    assert!(events.last().is_some_and(SseEvent::is_done));
-}
-
-#[tokio::test]
 async fn a_non_streamed_tool_call_assembles_into_one_call() {
     ensure_provider();
     // Both modes must produce the same call, or an agent behaves differently
@@ -1871,7 +1812,7 @@ async fn a_generation_the_client_abandons_is_counted_as_cancelled_not_as_an_erro
 }
 
 #[tokio::test]
-async fn metrics_keep_local_panel_access_and_require_a_key_remotely() {
+async fn metrics_are_behind_the_key_when_one_is_configured() {
     ensure_provider();
     // Request rates, token counts and queue depth describe what this machine is
     // doing. On a bind that is reachable from elsewhere, that is not public.
@@ -1879,22 +1820,13 @@ async fn metrics_keep_local_panel_access_and_require_a_key_remotely() {
         MockConfig::default(),
         GatewayConfig {
             auth: AuthPolicy::with_static_key("secret-key".into()),
-            trust_forwarded: true,
             ..GatewayConfig::default()
         },
     )
     .await;
 
     assert_eq!(harness.get("/metrics").await.status(), 401);
-    assert_eq!(harness.get("/api/v1/metrics").await.status(), 200);
-
-    let remote = Harness::client()
-        .get(format!("{}/api/v1/metrics", harness.base))
-        .header("cf-connecting-ip", "198.51.100.8")
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(remote.status(), 401);
+    assert_eq!(harness.get("/api/v1/metrics").await.status(), 401);
 
     let authorized = Harness::client()
         .get(format!("{}/metrics", harness.base))
@@ -1903,15 +1835,6 @@ async fn metrics_keep_local_panel_access_and_require_a_key_remotely() {
         .await
         .expect("request");
     assert_eq!(authorized.status(), 200);
-
-    let authorized_remote = Harness::client()
-        .get(format!("{}/api/v1/metrics", harness.base))
-        .header("cf-connecting-ip", "198.51.100.8")
-        .header("Authorization", "Bearer secret-key")
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(authorized_remote.status(), 200);
 }
 
 #[tokio::test]
@@ -2044,7 +1967,7 @@ async fn the_event_stream_reports_a_generation_the_client_abandoned() {
 }
 
 #[tokio::test]
-async fn machine_and_service_details_keep_local_access_and_require_a_key_remotely() {
+async fn describing_the_machine_and_the_service_needs_the_key() {
     ensure_provider();
     // `/api/v1/system` reports this machine's processor, its memory pressure
     // and where its disks are; `/api/v1/gateway` reports where it is serving
@@ -2054,27 +1977,17 @@ async fn machine_and_service_details_keep_local_access_and_require_a_key_remotel
         MockConfig::default(),
         GatewayConfig {
             auth: AuthPolicy::with_static_key("secret-key".into()),
-            trust_forwarded: true,
             ..GatewayConfig::default()
         },
     )
     .await;
 
-    assert_eq!(harness.get("/api/v1/system").await.status(), 200);
-    assert_eq!(harness.get("/api/v1/gateway").await.status(), 200);
+    assert_eq!(harness.get("/api/v1/system").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/gateway").await.status(), 401);
 
     for path in ["/api/v1/system", "/api/v1/gateway"] {
-        let remote = Harness::client()
-            .get(format!("{}{path}", harness.base))
-            .header("cf-connecting-ip", "198.51.100.8")
-            .send()
-            .await
-            .expect("request");
-        assert_eq!(remote.status(), 401, "{path} without the key");
-
         let authorized = Harness::client()
             .get(format!("{}{path}", harness.base))
-            .header("cf-connecting-ip", "198.51.100.8")
             .header("Authorization", "Bearer secret-key")
             .send()
             .await
