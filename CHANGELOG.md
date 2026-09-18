@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-18
+
+### Changed
+
+- Lightweight is again an exclusive local inference engine. The Lightagent
+  runtime, CLI, web interface, gateway proxy, packaging, extensions, and
+  release artifacts have been removed. Lightweight continues to provide its
+  OpenAI-compatible API, GGUF model management, native inference CLI, and
+  inference control panel.
+
 ## [0.2.1] - 2026-09-01
 
 Public reach and multi-model serving. The gateway can now sit behind a trusted
@@ -158,7 +168,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/dlroqa/Lightweight/compare/v0.2.1...v0.2.2
 [0.1.2]: https://github.com/dlroqa/Lightweight/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dlroqa/Lightweight/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dlroqa/Lightweight/releases/tag/v0.1.0
