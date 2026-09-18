@@ -137,7 +137,9 @@ async function checkToolUsingRun(context) {
     await page.getByText("The local tool completed successfully.", { exact: true }).waitFor({
       timeout: SETTLE_MS,
     });
-    await page.getByText("datetime.now", { exact: true }).waitFor();
+    // The executed tool shows in the live timeline and, once the run is saved,
+    // in this session's saved history too — either is proof it rendered.
+    await page.getByText("datetime.now", { exact: true }).first().waitFor();
     await page.getByText("done", { exact: true }).waitFor();
 
     const text = await page.evaluate(() => document.body.innerText);
@@ -200,17 +202,25 @@ async function assertOpaqueOverlay(page, openMenu, scheme, where) {
   await openMenu();
   const menu = page.getByRole("menu", { name: "Runtime tools" });
   await menu.waitFor({ timeout: SETTLE_MS });
+  // Let the open-then-measure reposition (flip-above / viewport clamp) settle
+  // before hit-testing, so a mid-reposition frame is never what gets sampled.
+  await page.waitForTimeout(250);
 
   const report = await menu.evaluate((el) => {
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     // Sample a grid of points inside the menu; each must resolve to the menu or
-    // a descendant, never to something painted beneath it.
+    // a descendant, never to something painted beneath it. Points that fall
+    // outside the viewport are not sampled — `elementFromPoint` returns null
+    // there, which is the absence of a hit, not a leak.
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
     const leaks = [];
     for (const fx of [0.15, 0.5, 0.85]) {
       for (const fy of [0.1, 0.5, 0.9]) {
         const x = rect.left + rect.width * fx;
         const y = rect.top + rect.height * fy;
+        if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
         const hit = document.elementFromPoint(x, y);
         if (!hit || !hit.closest(".menu")) leaks.push({ x: Math.round(x), y: Math.round(y) });
       }
@@ -306,7 +316,10 @@ async function captureResponsive(context) {
         await page.setViewportSize({ width: size.width, height: size.height });
         await page.emulateMedia({ colorScheme: scheme });
         await page.goto(`${BASE}/#/`, { waitUntil: "domcontentloaded" });
-        await page.getByText("Start an agent session", { exact: true }).waitFor({ timeout: SETTLE_MS });
+        // Wait for the session pane, which is present whether or not a session
+        // is active — the empty-state text is not, and a session left in
+        // storage by an earlier check would otherwise never show it.
+        await page.locator(".agent-sessions").waitFor({ timeout: SETTLE_MS });
         // No horizontal overflow at any width.
         const overflow = await page.evaluate(
           () => document.documentElement.scrollWidth - document.documentElement.clientWidth,

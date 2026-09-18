@@ -64,9 +64,16 @@ export function Menu({
     const below = window.innerHeight - rect.bottom - margin;
     const above = rect.top - margin;
     const flip = menuHeight > below && above > below;
-    const top = flip
-      ? Math.max(margin, rect.top - 6 - menuHeight)
-      : rect.bottom + 6;
+    let top = flip ? rect.top - 6 - menuHeight : rect.bottom + 6;
+    // Keep the whole menu on screen once its height is known: never let it run
+    // off the bottom or above the top. `.menu`'s max-height keeps it shorter
+    // than the viewport, so a clamped menu is always fully visible — and a
+    // menu that never overflows the viewport cannot appear to "leak" the page
+    // at points that fall off-screen.
+    if (menuHeight > 0) {
+      top = Math.min(top, window.innerHeight - margin - menuHeight);
+      top = Math.max(margin, top);
+    }
     setPos({ top, left: rect.left, width: rect.width });
   }, [anchorRef]);
 
