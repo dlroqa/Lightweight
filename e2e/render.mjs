@@ -42,8 +42,10 @@ const FALLBACK_SIGNS = [
 // agent API, which are the ones a missing proxy breaks and so are checked for
 // the fallback signs above.
 const ROUTES = [
-  { name: "dashboard", hash: "#/" },
-  { name: "agent", hash: "#/agent", agentBacked: true, mustContain: "Start an agent session" },
+  { name: "dashboard", hash: "#/dashboard" },
+  // The agent surface is the panel's first viewport, so the bare route is it.
+  { name: "agent", hash: "#/", agentBacked: true, mustContain: "Start an agent session" },
+  { name: "agent-alias", hash: "#/agent", agentBacked: true, mustContain: "Start an agent session" },
   {
     name: "agent-tools",
     hash: "#/agent/tools",
@@ -142,7 +144,7 @@ async function checkToolUsingRun(context) {
     if (!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z/.test(text)) {
       throw new Error("datetime.now result was not rendered");
     }
-    if (!text.includes("Current tool calls") || !text.includes("ok")) {
+    if (!text.includes("Current tool calls") || !text.includes("succeeded")) {
       throw new Error("the completed tool card was not rendered");
     }
     if (FALLBACK_SIGNS.some((sign) => text.includes(sign))) {
@@ -177,6 +179,178 @@ function assertResponse(response, description) {
   if (!response.ok) {
     throw new Error(`${description} returned HTTP ${response.status}`);
   }
+}
+
+/** The alpha channel of a computed CSS colour; 1 for any `rgb(...)` or keyword. */
+function alphaOf(color) {
+  const match = /rgba?\(([^)]+)\)/.exec(color);
+  if (!match) return 1;
+  const parts = match[1].split(",").map((p) => p.trim());
+  return parts.length < 4 ? 1 : Number(parts[3]);
+}
+
+/**
+ * The blocking regression: an open overlay must be fully opaque and on top, so
+ * no composer, card or page text shows through it. Asserted as computed style
+ * and as hit-testing — the menu, not what it covers, is what the browser finds
+ * at points inside it — for both the composer tool dropdown and the sidebar
+ * runtime-tools dropdown, in the current colour scheme.
+ */
+async function assertOpaqueOverlay(page, openMenu, scheme, where) {
+  await openMenu();
+  const menu = page.getByRole("menu", { name: "Runtime tools" });
+  await menu.waitFor({ timeout: SETTLE_MS });
+
+  const report = await menu.evaluate((el) => {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    // Sample a grid of points inside the menu; each must resolve to the menu or
+    // a descendant, never to something painted beneath it.
+    const leaks = [];
+    for (const fx of [0.15, 0.5, 0.85]) {
+      for (const fy of [0.1, 0.5, 0.9]) {
+        const x = rect.left + rect.width * fx;
+        const y = rect.top + rect.height * fy;
+        const hit = document.elementFromPoint(x, y);
+        if (!hit || !hit.closest(".menu")) leaks.push({ x: Math.round(x), y: Math.round(y) });
+      }
+    }
+    // Any ancestor applying element-level opacity would dim the subtree.
+    let node = el;
+    let dimmedAncestor = false;
+    while (node) {
+      if (Number(getComputedStyle(node).opacity) < 1) dimmedAncestor = true;
+      node = node.parentElement;
+    }
+    return {
+      background: style.backgroundColor,
+      opacity: style.opacity,
+      zIndex: style.zIndex,
+      width: rect.width,
+      leaks,
+      dimmedAncestor,
+    };
+  });
+
+  const problems = [];
+  if (alphaOf(report.background) < 1) {
+    problems.push(`background is translucent (${report.background})`);
+  }
+  if (Number(report.opacity) < 1) problems.push(`opacity is ${report.opacity}`);
+  if (report.dimmedAncestor) problems.push("an ancestor applies opacity < 1 to the menu");
+  if (!(Number(report.zIndex) >= 100)) problems.push(`z-index is ${report.zIndex}, not above the page`);
+  if (report.leaks.length) {
+    problems.push(`page content shows through at ${report.leaks.length} sampled point(s)`);
+  }
+  if (report.width < 320) problems.push(`menu is only ${Math.round(report.width)}px wide`);
+
+  await page.screenshot({ path: `${OUT_DIR}/overlay-${where}-${scheme}.png` });
+  // Close the menu so the next open starts clean.
+  await page.keyboard.press("Escape");
+  await menu.waitFor({ state: "detached" }).catch(() => {});
+
+  if (problems.length) {
+    throw new Error(`${where} overlay (${scheme}): ${problems.join("; ")}`);
+  }
+}
+
+/**
+ * Open both tool menus in both colour schemes and assert every one is opaque.
+ * A session is created first so the composer, and its tool control, are present.
+ */
+async function checkOverlayOpacity(context) {
+  for (const scheme of ["dark", "light"]) {
+    const page = await context.newPage();
+    try {
+      await page.emulateMedia({ colorScheme: scheme });
+      await page.goto(`${BASE}/#/`, { waitUntil: "domcontentloaded" });
+      await page.getByRole("button", { name: "New session" }).first().click();
+      // The tool controls enable once the runtime tool list has loaded.
+      const composerTools = page.locator(".composer-meta__tools");
+      await composerTools.waitFor({ timeout: SETTLE_MS });
+      await page.waitForFunction(
+        () => !document.querySelector(".composer-meta__tools")?.disabled,
+        null,
+        { timeout: SETTLE_MS },
+      );
+
+      await assertOpaqueOverlay(
+        page,
+        () => composerTools.click(),
+        scheme,
+        "composer",
+      );
+      await assertOpaqueOverlay(
+        page,
+        () => page.getByRole("button", { name: /Tool access/ }).click(),
+        scheme,
+        "sidebar",
+      );
+      console.log(`  [ok] overlays opaque in ${scheme} mode`);
+    } finally {
+      await page.close();
+    }
+  }
+}
+
+/** Screenshot the agent surface at tablet and mobile widths, both schemes. */
+async function captureResponsive(context) {
+  const sizes = [
+    { name: "tablet", width: 900, height: 1000 },
+    { name: "mobile", width: 390, height: 844 },
+  ];
+  for (const scheme of ["dark", "light"]) {
+    for (const size of sizes) {
+      const page = await context.newPage();
+      try {
+        await page.setViewportSize({ width: size.width, height: size.height });
+        await page.emulateMedia({ colorScheme: scheme });
+        await page.goto(`${BASE}/#/`, { waitUntil: "domcontentloaded" });
+        await page.getByText("Start an agent session", { exact: true }).waitFor({ timeout: SETTLE_MS });
+        // No horizontal overflow at any width.
+        const overflow = await page.evaluate(
+          () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        );
+        if (overflow > 1) {
+          throw new Error(`${size.name} (${scheme}): ${overflow}px of horizontal overflow`);
+        }
+        // The two panes must not overlap when the layout stacks. Measured from
+        // real geometry rather than a screenshot, which a sticky bar can make
+        // stitch-duplicate on a full-page capture.
+        const overlap = await page.evaluate(() => {
+          const sessions = document.querySelector(".agent-sessions");
+          const transcript = document.querySelector(".agent-layout > .card:last-child");
+          if (!sessions || !transcript) return 0;
+          const a = sessions.getBoundingClientRect();
+          const b = transcript.getBoundingClientRect();
+          // Vertical overlap of the two boxes (they may sit side by side on wide
+          // layouts, where horizontal separation makes this harmless).
+          const vertical = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+          const horizontal = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+          return vertical > 2 && horizontal > 2 ? Math.round(Math.min(vertical, horizontal)) : 0;
+        });
+        if (overlap > 0) {
+          throw new Error(`${size.name} (${scheme}): panes overlap by ${overlap}px`);
+        }
+        // The working surface must start at the top of the frame, not halfway
+        // down it. (A screenshot of a page with a fixed body background can
+        // ghost content downward in headless capture; this reads the real box.)
+        const mainTop = await page.evaluate(() => {
+          const main = document.querySelector(".main");
+          return main ? Math.round(main.getBoundingClientRect().top) : -1;
+        });
+        if (mainTop > 40) {
+          throw new Error(`${size.name} (${scheme}): main surface starts ${mainTop}px down`);
+        }
+        // Viewport-only capture: a full-page screenshot of a sticky, blurred bar
+        // stitches into visible duplicates that are not on the real page.
+        await page.screenshot({ path: `${OUT_DIR}/agent-${size.name}-${scheme}.png` });
+      } finally {
+        await page.close();
+      }
+    }
+  }
+  console.log("  [ok] tablet and mobile layouts have no horizontal overflow");
 }
 
 async function main() {
@@ -233,6 +407,18 @@ async function main() {
     await checkToolUsingRun(context);
   } catch (err) {
     failures.push(`agent tool run: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    await checkOverlayOpacity(context);
+  } catch (err) {
+    failures.push(`overlay opacity: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    await captureResponsive(context);
+  } catch (err) {
+    failures.push(`responsive layout: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   await context.close();

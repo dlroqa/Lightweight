@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Ban, Plus, Search, Send, Trash2, Wrench } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Ban, ChevronDown, Cpu, Plus, Search, Send, ShieldCheck, Trash2, Wrench } from "lucide-react";
 
 import {
   agentApi,
@@ -7,10 +8,12 @@ import {
   type SessionMessage,
   type SessionSummary,
   type SystemTime,
+  type ToolInfo,
 } from "../api/agent";
 import { api } from "../api/client";
 import { whenever } from "../api/format";
 import { Empty, Pill } from "../components/Bits";
+import { Menu } from "../components/Menu";
 import { TopBar } from "../components/Shell";
 import { usePoll } from "../hooks/usePoll";
 import { useRunEvents, type RunEvent } from "../hooks/useRunEvents";
@@ -19,13 +22,41 @@ const SESSION_KEY = "lightagent.agent.session";
 const text = (value: unknown) => (typeof value === "string" ? value : "");
 const unix = (value: SystemTime) => value.secs_since_epoch;
 
+type ToolStatus = "requested" | "running" | "ok" | "error";
+
 interface ToolCall {
   id: string;
   name: string;
   arguments: string;
-  status: "requested" | "running" | "ok" | "error";
+  status: ToolStatus;
   result: string;
+  durationMs?: number;
 }
+
+/** The lifecycle word for a tool call's state, as the timeline shows it. */
+const STATUS_LABEL: Record<ToolStatus, string> = {
+  requested: "queued",
+  running: "running",
+  ok: "succeeded",
+  error: "failed",
+};
+
+/** How each risk class is spoken and coloured, shared by both tool menus. */
+const RISK_TONE: Record<string, "ok" | "warn" | "danger" | "info" | "neutral"> = {
+  observe: "ok",
+  external: "info",
+  sensitive: "warn",
+  mutating: "warn",
+  executable: "danger",
+  privileged: "danger",
+};
+const riskTone = (risk: string) => RISK_TONE[risk] ?? "neutral";
+
+const POLICY_LABEL: Record<string, string> = {
+  permissive: "Permissive",
+  balanced: "Balanced",
+  strict: "Strict",
+};
 
 function foldTools(events: RunEvent[]): ToolCall[] {
   const calls = new Map<string, ToolCall>();
@@ -44,9 +75,11 @@ function foldTools(events: RunEvent[]): ToolCall[] {
     else if (event.type === "tool.output" && call) {
       call.status = "ok";
       call.result = text(event.data.content);
+      if (typeof event.data.duration_ms === "number") call.durationMs = event.data.duration_ms;
     } else if (event.type === "tool.failed" && call) {
       call.status = "error";
       call.result = text(event.data.content);
+      if (typeof event.data.duration_ms === "number") call.durationMs = event.data.duration_ms;
     }
   }
   return [...calls.values()];
@@ -55,6 +88,19 @@ function foldTools(events: RunEvent[]): ToolCall[] {
 export function Agent() {
   const sessions = usePoll(() => agentApi.sessions().then((body) => body.sessions), 2000);
   const server = usePoll(api.agentServer, 2000);
+  // The runtime facts the composer shows: the tools this agent can call, the
+  // settings that govern a run, and the model the gateway has loaded. The first
+  // two only exist once the agent server answers, so they wait for it rather
+  // than retrying into a closed door. The gateway is a separate service and is
+  // always reachable when the panel is.
+  const serviceReady = server.data?.status === "running";
+  const toolCatalog = usePoll(() => agentApi.tools().then((body) => body.tools), 0, serviceReady);
+  const agentSettings = usePoll(agentApi.settings, 0, serviceReady);
+  const gateway = usePoll(api.gateway, 5000);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [railToolsOpen, setRailToolsOpen] = useState(false);
+  const composerToolsBtn = useRef<HTMLButtonElement | null>(null);
+  const railToolsBtn = useRef<HTMLButtonElement | null>(null);
   const [activeId, setActiveId] = useState<string | null>(() =>
     window.localStorage.getItem(SESSION_KEY),
   );
@@ -351,8 +397,8 @@ export function Agent() {
           )
         }
       />
-      <div className="page" style={{ display: "grid", gridTemplateColumns: "300px minmax(0, 1fr)", gap: 16 }}>
-        <aside className="card" style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
+      <div className="page agent-layout">
+        <aside className="card agent-sessions" style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: 0 }}>
           <div style={{ position: "relative" }}>
             <Search size={15} style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)", color: "var(--text-faint)" }} />
             <input className="input" style={{ paddingLeft: 34 }} placeholder="Search sessions…"
@@ -362,7 +408,31 @@ export function Agent() {
           <button type="button" className="btn" disabled={hasPendingWork} onClick={() => void startNew()}>
             <Plus size={16} /> New session
           </button>
-          <div style={{ flex: 1, overflowY: "auto", margin: "0 -6px" }}>
+          <button
+            ref={railToolsBtn}
+            type="button"
+            className="btn"
+            style={{ justifyContent: "space-between" }}
+            aria-haspopup="menu"
+            aria-expanded={railToolsOpen}
+            disabled={!toolCatalog.data}
+            onClick={() => setRailToolsOpen((current) => !current)}
+          >
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <Wrench size={15} /> Tool access
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <span className="muted" style={{ fontSize: 12 }}>{toolCatalog.data?.length ?? "—"}</span>
+              <ChevronDown size={15} />
+            </span>
+          </button>
+          <ToolMenu
+            open={railToolsOpen}
+            anchorRef={railToolsBtn}
+            onClose={() => setRailToolsOpen(false)}
+            tools={toolCatalog.data}
+          />
+          <div className="agent-sessions__list" style={{ flex: 1, overflowY: "auto", margin: "0 -6px" }}>
             {visible.length === 0 ? (
               <div className="empty" style={{ padding: 20 }}>
                 <span>{sessions.loading ? "Loading sessions…" : search ? "Nothing matches." : "No agent sessions yet."}</span>
@@ -389,6 +459,12 @@ export function Agent() {
                   {recovering ? "Starting agent server…" : "Start agent server and retry"}
                 </button>
               )}
+            </div>
+          )}
+          {serviceReady && gateway.data && gateway.data.model === null && (
+            <div className="notice notice--warn" role="status" style={{ flexWrap: "wrap" }}>
+              <span>No model is loaded, so a run has nothing to answer with.</span>
+              <Link className="btn" to="/models" style={{ marginLeft: "auto" }}>Load a model</Link>
             </div>
           )}
           {!session ? (
@@ -419,12 +495,21 @@ export function Agent() {
                 <div ref={end} />
               </div>
               {pending && (
-                <div className="notice notice--warn" style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                  <Pill tone="warn" dot>{pending.tool}</Pill>
-                  <span>wants to run and needs your decision.</span>
-                  <span style={{ flex: 1 }} />
-                  <button type="button" className="btn btn--primary" onClick={() => void decide(true)}>Approve</button>
-                  <button type="button" className="btn" onClick={() => void decide(false)}>Reject</button>
+                <div className="approval" role="alertdialog" aria-label={`Approve ${pending.tool}`}>
+                  <ShieldCheck size={18} style={{ flex: "none", marginTop: 1 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                      <strong style={{ fontSize: 13.5 }}>{pending.tool}</strong>
+                      <span>needs your decision before it can run.</span>
+                    </div>
+                    <span className="muted" style={{ fontSize: 12 }}>
+                      Allowing runs this call once. It is not remembered for later calls.
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flex: "none" }}>
+                    <button type="button" className="btn" onClick={() => void decide(false)}>Deny</button>
+                    <button type="button" className="btn btn--primary" onClick={() => void decide(true)}>Allow once</button>
+                  </div>
                 </div>
               )}
               {steering.length > 0 && (
@@ -469,10 +554,47 @@ export function Agent() {
                   <Send size={15} /> {running || steering.length > 0 ? "Queue steer" : "Send"}
                 </button>
               </div>
-              <div style={{ display: "flex", gap: 10, alignItems: "center", color: "var(--text-muted)", fontSize: 12 }}>
-                <span>{session.messages.length} messages</span>
-                <span>{session.runs.length} runs</span>
+              <div className="composer-meta">
+                <button
+                  ref={composerToolsBtn}
+                  type="button"
+                  className="composer-meta__tools"
+                  aria-haspopup="menu"
+                  aria-expanded={toolsOpen}
+                  disabled={!toolCatalog.data}
+                  onClick={() => setToolsOpen((current) => !current)}
+                  title="Tools this agent can call"
+                >
+                  <Wrench size={13} />
+                  <span>{toolCatalog.data ? `${toolCatalog.data.length} tools` : "Tools"}</span>
+                  <ChevronDown size={13} />
+                </button>
+                <ToolMenu
+                  open={toolsOpen}
+                  anchorRef={composerToolsBtn}
+                  onClose={() => setToolsOpen(false)}
+                  tools={toolCatalog.data}
+                />
+                {session.profile && (
+                  <span className="composer-fact" title="Runs follow this session's profile">
+                    <Cpu size={13} /> {session.profile}
+                  </span>
+                )}
+                {gateway.data && (
+                  <span
+                    className="composer-fact"
+                    title="The model the gateway has loaded. Agent runs follow the active profile, not a per-run choice here."
+                  >
+                    {gateway.data.model ?? "no model loaded"}
+                  </span>
+                )}
+                {agentSettings.data && (
+                  <span className="composer-fact" title="Approval policy for new runs">
+                    <ShieldCheck size={13} /> {POLICY_LABEL[agentSettings.data.approval_policy] ?? agentSettings.data.approval_policy}
+                  </span>
+                )}
                 <span style={{ flex: 1 }} />
+                <span className="composer-fact">{session.messages.length} msgs · {session.runs.length} runs</span>
                 <Pill tone={badge.tone} dot>{badge.label}</Pill>
               </div>
             </>
@@ -542,6 +664,7 @@ function SavedTools({ session, currentRunId }: { session: AgentSession; currentR
     .flatMap((run) => run.tools.map((tool) => ({
       id: run.run_id + tool.id, name: tool.tool, arguments: tool.arguments_preview,
       result: tool.result_excerpt, status: tool.outcome === "error" ? "error" as const : "ok" as const,
+      durationMs: tool.duration_ms,
     })));
   return tools.length ? (
     <details style={{ marginTop: 12 }}>
@@ -558,11 +681,62 @@ function ToolRow({ tool }: { tool: ToolCall }) {
     <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: "10px 12px",
       marginTop: 8, border: "1px solid var(--border)", borderRadius: "var(--radius)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <Wrench size={14} /><strong>{tool.name}</strong>
-        <Pill tone={tool.status === "ok" ? "ok" : tool.status === "error" ? "danger" : "accent"}>{tool.status}</Pill>
+        <Wrench size={14} /><strong style={{ overflowWrap: "anywhere" }}>{tool.name}</strong>
+        <Pill tone={tool.status === "ok" ? "ok" : tool.status === "error" ? "danger" : "accent"} dot={tool.status === "running"}>
+          {STATUS_LABEL[tool.status]}
+        </Pill>
+        <span style={{ flex: 1 }} />
+        {tool.durationMs !== undefined && (
+          <span className="tnum muted" style={{ fontSize: 11.5 }}>{formatDuration(tool.durationMs)}</span>
+        )}
       </div>
-      {tool.arguments && tool.arguments !== "{}" && <code className="muted" style={{ fontSize: 12 }}>{tool.arguments}</code>}
-      {tool.result && <span style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{tool.result}</span>}
+      {tool.arguments && tool.arguments !== "{}" && <code className="muted" style={{ fontSize: 12, overflowWrap: "anywhere" }}>{tool.arguments}</code>}
+      {tool.result && <span style={{ fontSize: 13, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{tool.result}</span>}
     </div>
+  );
+}
+
+/** A tool call's wall time, as `840 ms` or `2.4 s`. */
+function formatDuration(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+/**
+ * The tool menu, shared by the composer and the sidebar.
+ *
+ * Rendered on the opaque {@link Menu} primitive, sized to the longest built-in
+ * tool name (`exec_shell_command` and its kind) so the name never collides with
+ * its risk badge or its description, which wraps beneath rather than beside it.
+ */
+function ToolMenu({
+  open,
+  anchorRef,
+  onClose,
+  tools,
+}: {
+  open: boolean;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+  tools: ToolInfo[] | null;
+}) {
+  return (
+    <Menu open={open} anchorRef={anchorRef} onClose={onClose} minWidth={320} label="Runtime tools">
+      <div className="menu__heading">Runtime tools{tools ? ` (${tools.length})` : ""}</div>
+      {!tools ? (
+        <div className="menu__empty">Loading tools…</div>
+      ) : tools.length === 0 ? (
+        <div className="menu__empty">No tools are enabled for this agent.</div>
+      ) : (
+        tools.map((tool) => (
+          <div key={tool.name} className="menu__tool" role="menuitem">
+            <div className="menu__tool-head">
+              <code className="menu__tool-name">{tool.name}</code>
+              <Pill tone={riskTone(tool.risk)}>{tool.risk}</Pill>
+            </div>
+            {tool.description && <span className="menu__tool-desc">{tool.description}</span>}
+          </div>
+        ))
+      )}
+    </Menu>
   );
 }

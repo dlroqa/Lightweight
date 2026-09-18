@@ -17,8 +17,12 @@ export function App() {
   return (
     <Routes>
       <Route element={<Shell />}>
-        <Route index element={<Dashboard />} />
+        {/* The agent surface is the first viewport. The gateway dashboard keeps
+            its place at an explicit path, and the old /agent link still lands
+            on it, so no existing route is broken. */}
+        <Route index element={<Agent />} />
         <Route path="agent" element={<Agent />} />
+        <Route path="dashboard" element={<Dashboard />} />
         <Route path="agent/tools" element={<AgentTools />} />
         <Route path="chat" element={<Chat />} />
         <Route path="models" element={<Models />} />
