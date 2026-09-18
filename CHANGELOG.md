@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.25] - 2026-09-18
+
+A feature release that makes the browser control panel a first-class Lightagent
+surface. Opening the panel now lands on the agent: a persistent session list, a
+streaming transcript, an inline tool-activity timeline, and approval decisions,
+all same-origin over the gateway with no new configuration. Existing sessions,
+settings, models, and keys are untouched, and every other panel screen keeps its
+place.
+
+### Added
+
+- The agent is the panel's first screen. Sessions can be created, searched,
+  resumed, and deleted; a run streams its answer, its tool calls fold into a
+  queued → running → succeeded/failed timeline with durations, and a
+  high-contrast card gates each risky tool with **Deny** or **Allow once**.
+- A composer fact strip shows the active profile, the loaded gateway model
+  (informational — agent runs follow the profile, not a per-run choice), the
+  approval policy, and the tool count. The runtime tools are listed from an
+  opaque dropdown in both the composer and the sidebar.
+- A responsive panel layout: the full rail on desktop, a compact icon rail on
+  tablet, and an off-canvas drawer on mobile, in both light and dark themes.
+
+### Fixed
+
+- Dropdown, select, and popover surfaces are now fully opaque in both themes and
+  stack above the page, so a menu can no longer show or collide with the
+  composer, cards, or text beneath it.
+
 ## [0.3.24] - 2026-09-17
 
 A patch release that keeps the local control panel usable after the gateway is
