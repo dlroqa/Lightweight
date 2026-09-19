@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file.
 
 ## [0.2.2] - 2026-09-18
 
+## [0.2.3] - 2026-09-18
+
+### Fixed
+
+- The locally served control panel now continues to reach its own management
+  API when a static gateway API key is configured, without exposing that key to
+  the browser. Remote API access remains key-protected.
+
 ### Changed
 
 - Lightweight is again an exclusive local inference engine. The Lightagent
@@ -168,7 +176,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/dlroqa/Lightweight/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/dlroqa/Lightweight/compare/v0.2.1...v0.2.2
 [0.1.2]: https://github.com/dlroqa/Lightweight/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/dlroqa/Lightweight/compare/v0.1.0...v0.1.1

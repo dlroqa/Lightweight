@@ -458,6 +458,25 @@ async fn a_configured_key_is_enforced() {
 }
 
 #[tokio::test]
+async fn local_control_api_accepts_loopback_without_the_static_key() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let response = Harness::client()
+        .get(format!("{}/api/v1/models", harness.base))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 501);
+}
+
+#[tokio::test]
 async fn a_generation_that_fails_midway_ends_the_stream_cleanly() {
     ensure_provider();
     let harness = Harness::start(

@@ -522,6 +522,14 @@ async fn await_ready(
             return Ok(());
         }
 
+        // The child can exit while a health probe is in flight. Check again
+        // before the deadline so a slow or timed-out TCP attempt never hides
+        // the real failure behind a generic startup timeout.
+        match engine.poll_exit() {
+            ExitClassification::Running => {}
+            exit => return Err(exit.into_error(engine.drained_stderr_tail().await)),
+        }
+
         if Instant::now() >= deadline {
             return Err(BackendError::StartTimeout {
                 seconds: config.start_timeout.as_secs(),

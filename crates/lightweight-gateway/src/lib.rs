@@ -39,6 +39,8 @@ pub use state::{GatewayConfig, GatewayState};
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::ConnectInfo;
+use axum::http::{HeaderName, HeaderValue};
 use axum::routing::{get, post};
 
 /// The service `axum::serve` is handed, with the peer address attached.
@@ -169,6 +171,55 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         // started behind a trusted proxy.
         .layer(axum::Extension(trust_forwarded))
         .with_state(state)
+        // This has to be the outermost layer. It removes a marker supplied by
+        // a client before adding one only for an actual loopback peer, so a
+        // remote caller cannot turn an unauthenticated request into panel
+        // access by copying the header name.
+        .layer(axum::middleware::from_fn(mark_loopback_control))
+}
+
+/// Mark same-machine requests to the panel's control API.
+/// Whether a panel management route may use the same-machine allowance.
+///
+/// Host inventory and live telemetry remain key-protected, even on loopback.
+fn is_panel_management_path(path: &str) -> bool {
+    path.starts_with("/api/v1/")
+        && !matches!(
+            path,
+            "/api/v1/metrics"
+                | "/api/v1/system"
+                | "/api/v1/gateway"
+                | "/api/v1/requests"
+                | "/api/v1/events"
+        )
+}
+
+///
+/// The browser cannot safely know a configured gateway key: putting it in the
+/// panel bundle, local storage, or an API response would disclose it to every
+/// page that can load the panel. A process on the gateway's loopback interface
+/// is already inside the machine boundary, so it may use the control API
+/// without a bearer token. Remote requests remain subject to normal auth.
+async fn mark_loopback_control(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_panel_management = is_panel_management_path(request.uri().path());
+    let is_loopback = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_none_or(|ConnectInfo(peer)| peer.ip().is_loopback());
+
+    let headers = request.headers_mut();
+    headers.remove(routes::LOCAL_CONTROL_HEADER);
+    if is_panel_management && is_loopback {
+        headers.insert(
+            HeaderName::from_static(routes::LOCAL_CONTROL_HEADER),
+            HeaderValue::from_static("1"),
+        );
+    }
+
+    next.run(request).await
 }
 
 /// Count a request as in flight until its response body has been delivered.

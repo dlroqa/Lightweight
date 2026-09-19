@@ -45,6 +45,11 @@ use crate::scheduler::{Band, PeerKey};
 use crate::state::GatewayState;
 use crate::stream::{self as sse_stream, RequestGuard, StartGeneration};
 
+/// Set only by the router for a control request that arrived over loopback.
+/// It is deliberately not a browser credential: [`crate::mark_loopback_control`]
+/// strips a client-supplied copy before considering the peer address.
+pub(crate) const LOCAL_CONTROL_HEADER: &str = "x-lightweight-local-control";
+
 /// An error on its way to the client.
 ///
 /// The envelope is boxed because this type is the `Err` of the request path's
@@ -805,6 +810,12 @@ fn is_authorized(state: &GatewayState, headers: &HeaderMap) -> bool {
 ///
 /// Returns the refusal to send, or `None` when the request may proceed.
 pub(crate) fn authorize(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
+    // The panel is served by this gateway and cannot safely carry the static
+    // key. The router marks only same-machine `/api/v1` requests; see the
+    // middleware for the spoofing guard.
+    if headers.contains_key(LOCAL_CONTROL_HEADER) {
+        return None;
+    }
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
