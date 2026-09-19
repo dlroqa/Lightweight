@@ -477,6 +477,32 @@ async fn local_control_api_accepts_loopback_without_the_static_key() {
 }
 
 #[tokio::test]
+async fn the_api_gateway_screen_reads_its_status_on_loopback_without_the_static_key() {
+    // The API Gateway screen polls `/api/v1/gateway` and `/api/v1/metrics` and
+    // holds `/api/v1/events` open for its live feed. The browser cannot send the
+    // static key (the panel never holds it, and `EventSource` cannot set an
+    // `Authorization` header), so a configured key must not 401 the panel out of
+    // its own status surface. Each of these is a same-machine read.
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    for path in ["/api/v1/gateway", "/api/v1/metrics"] {
+        let response = Harness::client()
+            .get(format!("{}{path}", harness.base))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 200, "{path} was refused on loopback");
+    }
+}
+
+#[tokio::test]
 async fn a_generation_that_fails_midway_ends_the_stream_cleanly() {
     ensure_provider();
     let harness = Harness::start(
@@ -1834,7 +1860,14 @@ async fn a_generation_the_client_abandons_is_counted_as_cancelled_not_as_an_erro
 async fn metrics_are_behind_the_key_when_one_is_configured() {
     ensure_provider();
     // Request rates, token counts and queue depth describe what this machine is
-    // doing. On a bind that is reachable from elsewhere, that is not public.
+    // doing. On a bind that is reachable from elsewhere, that is not public, so
+    // the Prometheus `/metrics` scraper endpoint stays behind the key.
+    //
+    // `/api/v1/metrics` is the panel's own status feed: the API Gateway screen
+    // polls it for uptime and in-flight, and the browser cannot carry the key.
+    // A same-machine request to it is admitted on loopback (see
+    // `mark_loopback_control`); a remote one is not, because the loopback marker
+    // is never set for an off-machine peer.
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
@@ -1845,7 +1878,7 @@ async fn metrics_are_behind_the_key_when_one_is_configured() {
     .await;
 
     assert_eq!(harness.get("/metrics").await.status(), 401);
-    assert_eq!(harness.get("/api/v1/metrics").await.status(), 401);
+    assert_eq!(harness.get("/api/v1/metrics").await.status(), 200);
 
     let authorized = Harness::client()
         .get(format!("{}/metrics", harness.base))
@@ -1986,12 +2019,15 @@ async fn the_event_stream_reports_a_generation_the_client_abandoned() {
 }
 
 #[tokio::test]
-async fn describing_the_machine_and_the_service_needs_the_key() {
+async fn describing_the_machine_and_the_service_is_served_to_the_local_panel() {
     ensure_provider();
-    // `/api/v1/system` reports this machine's processor, its memory pressure
-    // and where its disks are; `/api/v1/gateway` reports where it is serving
-    // and whether a key is required. Both are inventory of the host, and on a
-    // bind reachable from elsewhere neither is public.
+    // `/api/v1/system` reports this machine's processor, its memory pressure and
+    // where its disks are; `/api/v1/gateway` reports where it is serving and
+    // whether a key is required. Both drive the panel's own screens, neither
+    // response carries the key, and the browser has no way to send one. So both
+    // are admitted on loopback like the rest of the panel's control surface. A
+    // remote caller never receives the loopback marker (see
+    // `mark_loopback_control`) and still needs the key on the same routes.
     let harness = Harness::start(
         MockConfig::default(),
         GatewayConfig {
@@ -2001,10 +2037,13 @@ async fn describing_the_machine_and_the_service_needs_the_key() {
     )
     .await;
 
-    assert_eq!(harness.get("/api/v1/system").await.status(), 401);
-    assert_eq!(harness.get("/api/v1/gateway").await.status(), 401);
-
     for path in ["/api/v1/system", "/api/v1/gateway"] {
+        assert_eq!(
+            harness.get(path).await.status(),
+            200,
+            "{path} was refused on loopback"
+        );
+
         let authorized = Harness::client()
             .get(format!("{}{path}", harness.base))
             .header("Authorization", "Bearer secret-key")

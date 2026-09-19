@@ -178,20 +178,20 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .layer(axum::middleware::from_fn(mark_loopback_control))
 }
 
-/// Mark same-machine requests to the panel's control API.
-/// Whether a panel management route may use the same-machine allowance.
+/// Whether a request is bound for the panel's own control API under `/api/v1`.
 ///
-/// Host inventory and live telemetry remain key-protected, even on loopback.
+/// The whole of `/api/v1` is the panel's surface, and none of it can carry the
+/// key: the panel is served by this gateway, so putting the static key in the
+/// bundle or an API response would disclose it to every page that can load the
+/// panel, and its `EventSource` streams (`/api/v1/events`) cannot set an
+/// `Authorization` header at all. So a configured key must not lock the panel
+/// out of its own status and management surface. Every `/api/v1` route is
+/// admitted for a same-machine peer; a remote caller never receives the
+/// loopback marker (see [`mark_loopback_control`]) and so still needs the key.
+/// State-changing routes carry the additional cross-origin guard in
+/// [`guard_control_writes`], which a key could not replace anyway.
 fn is_panel_management_path(path: &str) -> bool {
     path.starts_with("/api/v1/")
-        && !matches!(
-            path,
-            "/api/v1/metrics"
-                | "/api/v1/system"
-                | "/api/v1/gateway"
-                | "/api/v1/requests"
-                | "/api/v1/events"
-        )
 }
 
 ///

@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- The control panel again shows its values when a static gateway API key is
+  configured. Its status endpoints — `/api/v1/gateway`, `/api/v1/metrics`, the
+  `/api/v1/events` live feed, `/api/v1/system`, and `/api/v1/requests` — were
+  being refused on loopback, so the panel (which cannot carry the key, and whose
+  `EventSource` cannot send an `Authorization` header at all) was shut out of its
+  own status surface. The entire `/api/v1` control surface is now admitted on
+  loopback like the rest of the panel; remote requests to it remain
+  key-protected, and state-changing routes keep their cross-origin guard.
+
 ## [0.2.2] - 2026-09-18
 
 ## [0.2.3] - 2026-09-18
