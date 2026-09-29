@@ -29,6 +29,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod capabilities;
 pub mod chat;
 pub mod completions;
 pub mod error;
@@ -36,6 +37,7 @@ pub mod models;
 pub mod props;
 pub mod stream;
 
+pub use capabilities::{CapabilitiesBody, CapabilityModel, PROTOCOL_NAME, PROTOCOL_VERSION};
 pub use chat::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, RequestMessage, ResponseMessage,
     StreamOptions, UsageBody,

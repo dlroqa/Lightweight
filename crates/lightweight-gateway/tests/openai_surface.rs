@@ -383,6 +383,69 @@ async fn models_advertises_the_effective_context() {
 }
 
 #[tokio::test]
+async fn capabilities_describe_the_public_contract_and_loaded_model() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    let response = harness.get("/v1/capabilities").await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["object"], "capability.list");
+    assert_eq!(body["protocol"]["name"], "lightweight-public-inference");
+    assert_eq!(body["protocol"]["version"], 1);
+    assert_eq!(body["state"]["model_loaded"], true);
+    assert_eq!(body["state"]["model"]["id"], "mock-model@4k");
+    assert_eq!(body["state"]["model"]["context_length"], N_CTX);
+    assert_eq!(body["features"]["tools"], true);
+    assert_eq!(body["features"]["tool_call_deltas"], true);
+    let text = body.to_string();
+    assert!(!text.contains("/api/v1"));
+    assert!(!text.contains("/mock/model.gguf"));
+}
+
+#[tokio::test]
+async fn capabilities_report_no_model_without_a_control_plane_probe() {
+    ensure_provider();
+    let harness = Harness::default().await;
+    harness.state.catalog.set_resident(None).await;
+    let response = harness.get("/v1/capabilities").await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["state"]["model_loaded"], false);
+    assert!(body["state"].get("model").is_none());
+}
+
+#[tokio::test]
+async fn capabilities_use_the_same_auth_contract_as_models() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+
+    let unauthenticated = Harness::client()
+        .get(format!("{}/v1/capabilities", harness.base))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(unauthenticated.status(), 401);
+    let error: Value = unauthenticated.json().await.expect("json");
+    assert_eq!(error["error"]["type"], "authentication_error");
+    assert_eq!(error["error"]["code"], "missing_api_key");
+
+    let authenticated = Harness::client()
+        .get(format!("{}/v1/capabilities", harness.base))
+        .header("Authorization", "Bearer shared-secret")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(authenticated.status(), 200);
+}
+
+#[tokio::test]
 async fn props_and_models_agree_about_the_context() {
     ensure_provider();
     // Two endpoints disagreeing about the window is worse than one of them

@@ -22,6 +22,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
+use lightweight_api::capabilities::{CapabilitiesBody, CapabilityModel};
 use lightweight_api::chat::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, RequestError, ResponseFunction,
     ResponseMessage, ResponseToolCall, UsageBody,
@@ -167,6 +168,28 @@ pub async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) 
         return refusal;
     }
     axum::Json(ModelList::new(state.catalog.rows().await)).into_response()
+}
+
+/// `GET /v1/capabilities`.
+///
+/// This is the versioned public inference contract. It shares `/v1/models`'
+/// authentication rules, but reports readiness even with no resident model so
+/// a client can distinguish "no model" from an unreachable provider without
+/// consulting the private `/api/v1` control plane.
+pub async fn capabilities(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let model = state.catalog.resident().await.map(|model| CapabilityModel {
+        id: model.id.to_string(),
+        context_length: model.n_ctx,
+    });
+    axum::Json(CapabilitiesBody::new(
+        env!("CARGO_PKG_VERSION"),
+        model,
+        state.config.max_concurrent_requests,
+    ))
+    .into_response()
 }
 
 /// `GET /metrics`.
