@@ -1,10 +1,10 @@
 //! One-time installation of the rustls crypto provider.
 //!
-//! Reproduced from `lightweight-download::tls` and
-//! `lightagent-provider-lightweight::tls` rather than imported: this crate is
-//! shared by both CLI families and depends on neither. `rustls` here is built
-//! with **no default provider** — its usual `aws-lc-rs` needs CMake, which is
-//! unavailable on the target — so `ring` is installed explicitly.
+//! Reproduced from `lightweight-download::tls` rather than imported: this
+//! crate is a leaf over `reqwest` and `rustls` and depends on no sibling.
+//! `rustls` here is built with **no default provider** — its usual `aws-lc-rs`
+//! needs CMake, which is unavailable on the target — so `ring` is installed
+//! explicitly.
 //!
 //! It is not optional: `reqwest::Client::builder().build()` **panics** (it does
 //! not return an error) when no provider has been installed. So

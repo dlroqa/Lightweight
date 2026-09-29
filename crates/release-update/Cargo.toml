@@ -1,6 +1,6 @@
 [package]
 name = "release-update"
-description = "Updates the installed lightweight and lightagent CLIs together to the latest published release."
+description = "Updates the installed lightweight CLI to the latest published release."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
