@@ -46,7 +46,6 @@ impl Cli {
             Self::Lightweight => "lightweight-cli",
         }
     }
-
 }
 
 /// The order CLIs are updated in, whichever one runs the command.
