@@ -143,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n_ctx = 4096_u32;
     let mut model_id = "mock-model".to_owned();
     let mut api_key: Option<String> = None;
+    let mut script_file: Option<std::path::PathBuf> = None;
     let mut concurrency = 1_u32;
 
     while let Some(flag) = args.next() {
@@ -151,12 +152,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ctx" => n_ctx = args.next().unwrap_or_default().parse()?,
             "--model" => model_id = args.next().unwrap_or_default(),
             "--api-key" => api_key = args.next(),
+            "--script-file" => script_file = Some(args.next().unwrap_or_default().into()),
             "--concurrency" => concurrency = args.next().unwrap_or_default().parse()?,
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
 
     let backend = Arc::new(MockBackend::default());
+    if let Some(path) = script_file {
+        let specs: Vec<ScriptSpec> = serde_json::from_slice(&std::fs::read(path)?)?;
+        backend
+            .set_script_queue(specs.into_iter().map(Script::from).collect())
+            .await;
+    }
     let model = ModelId::with_context(&model_id, n_ctx);
     let loaded = backend.make_resident(model.clone(), n_ctx).await;
 
