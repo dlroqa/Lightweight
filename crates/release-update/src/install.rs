@@ -99,18 +99,15 @@ fn parse_version_output(stdout: &str, cli: Cli) -> Option<String> {
     (!version.is_empty() && !version.contains(char::is_whitespace)).then(|| version.to_owned())
 }
 
-/// The file name a release archive for `cli` at `version` has on this target.
-pub(crate) fn archive_name(cli: Cli, version: &str) -> String {
-    format!("{}.{}", archive_stem(cli, version), archive_extension())
+/// The file name the release archive at `version` has on this target.
+pub(crate) fn archive_name(version: &str) -> String {
+    format!("{}.{}", archive_stem(version), archive_extension())
 }
 
 /// The archive's top-level directory, as `scripts/package-cli.sh` names it.
-fn archive_stem(cli: Cli, version: &str) -> String {
-    format!(
-        "{}-{version}-{}",
-        cli.binary(),
-        env!("RELEASE_UPDATE_TARGET")
-    )
+/// The archive is always named for `hermes`; it carries both aliases.
+fn archive_stem(version: &str) -> String {
+    format!("hermes-{version}-{}", env!("RELEASE_UPDATE_TARGET"))
 }
 
 fn archive_extension() -> &'static str {
@@ -128,8 +125,8 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
-    pub(crate) fn create(install_dir: &Path, cli: Cli) -> Result<Self, String> {
-        let dir = install_dir.join(format!(".{}-update-{}", cli.binary(), std::process::id()));
+    pub(crate) fn create(install_dir: &Path) -> Result<Self, String> {
+        let dir = install_dir.join(format!(".hermes-update-{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
         Ok(Self { dir })
@@ -158,7 +155,7 @@ pub(crate) fn extract_binary(
 ) -> Result<(), String> {
     let entry = format!(
         "{}/{}{}",
-        archive_stem(cli, version),
+        archive_stem(version),
         cli.binary(),
         std::env::consts::EXE_SUFFIX
     );
@@ -456,8 +453,8 @@ mod tests {
 
     #[test]
     fn archive_names_follow_the_packaging_scripts() {
-        let name = archive_name(Cli::Lightweight, "0.3.22");
-        assert!(name.starts_with("lightweight-0.3.22-"));
+        let name = archive_name("0.3.22");
+        assert!(name.starts_with("hermes-0.3.22-"));
         assert!(name.contains(env!("RELEASE_UPDATE_TARGET")));
         assert!(name.ends_with(".tar.gz") || name.ends_with(".zip"));
     }
@@ -477,7 +474,7 @@ mod tests {
             return;
         }
         let temp = TempDir::new("extract");
-        let stem = archive_stem(Cli::Lightweight, "9.9.9");
+        let stem = archive_stem("9.9.9");
         let archive = temp.0.join("archive.tar.gz");
         {
             let encoder = flate2::write::GzEncoder::new(
@@ -486,9 +483,10 @@ mod tests {
             );
             let mut builder = tar::Builder::new(encoder);
             for (name, contents) in [
-                ("lightweight".to_owned(), &b"decoy"[..]),
+                ("hermes".to_owned(), &b"decoy"[..]),
                 (format!("{stem}/README.txt"), &b"readme"[..]),
-                (format!("{stem}/lightweight"), &b"binary"[..]),
+                (format!("{stem}/hermes"), &b"hermes-bin"[..]),
+                (format!("{stem}/lightweight"), &b"lightweight-bin"[..]),
             ] {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(contents.len() as u64);
@@ -498,20 +496,21 @@ mod tests {
             }
             builder.into_inner().unwrap().finish().unwrap();
         }
-        let destination = temp.0.join("lightweight.new");
-        extract_binary(&archive, Cli::Lightweight, "9.9.9", &destination).unwrap();
-        assert_eq!(std::fs::read(&destination).unwrap(), b"binary");
+        // Both aliases extract from the same `hermes-*` archive.
+        let hermes = temp.0.join("hermes.new");
+        extract_binary(&archive, Cli::Hermes, "9.9.9", &hermes).unwrap();
+        assert_eq!(std::fs::read(&hermes).unwrap(), b"hermes-bin");
+        let lightweight = temp.0.join("lightweight.new");
+        extract_binary(&archive, Cli::Lightweight, "9.9.9", &lightweight).unwrap();
+        assert_eq!(std::fs::read(&lightweight).unwrap(), b"lightweight-bin");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&destination)
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = std::fs::metadata(&hermes).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "extracted binary must be executable");
         }
 
-        let missing = extract_binary(&archive, Cli::Lightweight, "1.0.0", &temp.0.join("other"));
+        let missing = extract_binary(&archive, Cli::Hermes, "1.0.0", &temp.0.join("other"));
         assert!(missing.unwrap_err().contains("does not contain"));
     }
 

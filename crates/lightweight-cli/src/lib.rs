@@ -48,6 +48,13 @@ impl Personality {
             Self::Lightweight => "lightweight",
         }
     }
+
+    const fn update_cli(self) -> release_update::Cli {
+        match self {
+            Self::Hermes => release_update::Cli::Hermes,
+            Self::Lightweight => release_update::Cli::Lightweight,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -611,7 +618,7 @@ pub fn run_cli(personality: Personality) -> ExitCode {
 
     let mut out = String::new();
 
-    let outcome = run(&cli, &matches, &mut out);
+    let outcome = run(personality, &cli, &matches, &mut out);
 
     // A closed pipe is not an error: it is what `| head` does. Exit as the
     // default SIGPIPE disposition would, rather than panicking or reporting a
@@ -632,7 +639,12 @@ pub fn run_cli(personality: Personality) -> ExitCode {
     }
 }
 
-fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCode, String> {
+fn run(
+    personality: Personality,
+    cli: &Cli,
+    matches: &clap::ArgMatches,
+    out: &mut String,
+) -> Result<ExitCode, String> {
     match &cli.command {
         Command::Serve {
             model,
@@ -725,8 +737,9 @@ fn run(cli: &Cli, matches: &clap::ArgMatches, out: &mut String) -> Result<ExitCo
         Command::Config { action } => config_command(cli, out, action),
         Command::Fleet { config } => fleet::run(config.clone()),
         Command::Update { check, force } => {
+            let invoker = personality.update_cli();
             runtime()?.block_on(release_update::run(
-                release_update::Cli::Lightweight,
+                invoker,
                 env!("CARGO_PKG_VERSION"),
                 release_update::Request {
                     check: *check,
@@ -1167,6 +1180,18 @@ fn opt<T: std::fmt::Display>(value: Option<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_uses_the_alias_the_user_invoked() {
+        assert_eq!(
+            Personality::Hermes.update_cli(),
+            release_update::Cli::Hermes
+        );
+        assert_eq!(
+            Personality::Lightweight.update_cli(),
+            release_update::Cli::Lightweight
+        );
+    }
 
     /// Reports are rendered into a buffer rather than printed line by line.
     ///

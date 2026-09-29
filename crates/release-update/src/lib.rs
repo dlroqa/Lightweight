@@ -1,10 +1,16 @@
-//! The self-update command for the `lightweight` CLI.
+//! The self-update command for the `hermes` CLI and its `lightweight` alias.
 //!
-//! `lightweight update` replaces the running binary with the latest published
-//! release. The update installs exactly what the release published: when the
-//! release carries an archive for this target, the archive is downloaded,
-//! checked against the release's `SHA256SUMS`, its binary is extracted and run
-//! once to confirm the version, and then it is swapped in. A target with no
+//! The product ships two executable names — `hermes` and `lightweight` — that
+//! are the same tool (the latter prints a welcome mark). Both are released in
+//! one archive, `hermes-<version>-<target>`. `hermes update` and
+//! `lightweight update` both replace the installed aliases from that archive:
+//! the running binary **and** its sibling when it is installed in the same
+//! directory.
+//!
+//! The update installs exactly what the release published. When the release
+//! carries an archive for this target, the archive is downloaded, checked
+//! against the release's `SHA256SUMS`, the aliases are extracted and each run
+//! once to confirm the version, and then they are swapped in. A target with no
 //! published archive builds the same tag from source with `cargo install
 //! --locked`.
 //!
@@ -27,29 +33,36 @@ use std::path::{Path, PathBuf};
 
 use release::Release;
 
-/// One of the two CLIs this command keeps in step.
+/// One of the two executable names this command keeps in step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cli {
+    Hermes,
     Lightweight,
 }
 
 impl Cli {
     pub(crate) fn binary(self) -> &'static str {
         match self {
+            Self::Hermes => "hermes",
             Self::Lightweight => "lightweight",
         }
     }
 
-    /// The Cargo package that builds the binary.
+    /// The Cargo package that builds both aliases.
     pub(crate) fn package(self) -> &'static str {
+        "lightweight-cli"
+    }
+
+    fn other(self) -> Self {
         match self {
-            Self::Lightweight => "lightweight-cli",
+            Self::Hermes => Self::Lightweight,
+            Self::Lightweight => Self::Hermes,
         }
     }
 }
 
-/// The order CLIs are updated in, whichever one runs the command.
-const UPDATE_ORDER: [Cli; 1] = [Cli::Lightweight];
+/// The order the aliases are updated in, whichever one runs the command.
+const UPDATE_ORDER: [Cli; 2] = [Cli::Hermes, Cli::Lightweight];
 
 /// What the user asked for.
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,7 +91,7 @@ impl Method {
     }
 }
 
-/// One installed (or to-be-installed) CLI.
+/// One installed (or to-be-installed) alias.
 pub(crate) struct Target {
     pub(crate) cli: Cli,
     pub(crate) path: PathBuf,
@@ -110,7 +123,7 @@ pub async fn run(invoker: Cli, current: &str, request: Request) -> Result<(), St
     let latest = release.version().to_owned();
 
     let mut targets = Vec::new();
-    for cli in [invoker] {
+    for cli in [invoker, invoker.other()] {
         let path = install::binary_path(&install_dir, cli);
         let installed = path.is_file();
         if cli != invoker && !installed {
@@ -167,21 +180,21 @@ pub async fn run(invoker: Cli, current: &str, request: Request) -> Result<(), St
         return Err(reason);
     }
 
-    if method == Method::CargoSource {
+    if method == Some(Method::CargoSource) {
         println!(
             "Release {latest} publishes no archive for {}; building it from source with Cargo.",
             env!("RELEASE_UPDATE_TARGET")
         );
     }
     let source = match method {
-        Method::ReleaseArchive => {
-            Some(Archives::fetch(&client, &release, &install_dir, invoker).await?)
+        Some(Method::ReleaseArchive) => {
+            Some(Archives::fetch(&client, &release, &install_dir, &latest).await?)
         }
-        Method::CargoSource => None,
+        Some(Method::CargoSource) | None => None,
     };
 
-    // The previous binary is kept aside until the new one is in place, so a
-    // failure restores it.
+    // One alias at a time, hermes first. Each alias' previous binary is kept
+    // aside until the whole update has succeeded, so a failure restores both.
     let mut transaction = install::Transaction::default();
     for cli in UPDATE_ORDER {
         let Some(target) = pending.iter().find(|target| target.cli == cli) else {
@@ -213,96 +226,86 @@ pub async fn run(invoker: Cli, current: &str, request: Request) -> Result<(), St
             leftover.display()
         );
     }
-    println!("Restart running `lightweight serve` processes to use {latest}.");
+    println!("Restart running `hermes serve` processes to use {latest}.");
     Ok(())
 }
 
-/// Every binary that needs updating must come the same way: a release that
-/// publishes an archive for one of them on this target but not the other is
-/// incomplete.
-fn method(release: &Release, latest: &str, targets: &[Target]) -> Result<Method, String> {
-    let names: Vec<String> = targets
-        .iter()
-        .filter(|target| target.needs_update)
-        .map(|target| install::archive_name(target.cli, latest))
-        .collect();
-    let published = names
-        .iter()
-        .filter(|name| release.asset(name).is_some())
-        .count();
-    if published == names.len() {
-        Ok(Method::ReleaseArchive)
-    } else if published == 0 {
-        Ok(Method::CargoSource)
+/// How the aliases should be installed: from the release archive, from source,
+/// or — when nothing needs updating — not at all.
+fn method(release: &Release, latest: &str, targets: &[Target]) -> Result<Option<Method>, String> {
+    if !targets.iter().any(|target| target.needs_update) {
+        return Ok(None);
+    }
+    let name = install::archive_name(latest);
+    if release.asset(&name).is_some() {
+        Ok(Some(Method::ReleaseArchive))
     } else {
-        Err(format!(
-            "release {latest} is incomplete for {}: it publishes only some of {}",
-            env!("RELEASE_UPDATE_TARGET"),
-            names.join(", ")
-        ))
+        Ok(Some(Method::CargoSource))
     }
 }
 
-/// A release's archives for this target, and where they are unpacked.
+/// A release's single archive for this target, downloaded and verified once,
+/// and the staging directory its aliases are extracted into.
 struct Archives<'a> {
-    client: &'a reqwest::Client,
     release: &'a Release,
-    checksums: String,
+    archive: PathBuf,
     staging: install::Staging,
 }
 
 impl<'a> Archives<'a> {
     async fn fetch(
-        client: &'a reqwest::Client,
+        client: &reqwest::Client,
         release: &'a Release,
         install_dir: &Path,
-        invoker: Cli,
+        latest: &str,
     ) -> Result<Self, String> {
-        let asset = release.asset(release::CHECKSUMS_ASSET).ok_or_else(|| {
+        let name = install::archive_name(latest);
+        let asset = release
+            .asset(&name)
+            .ok_or_else(|| format!("release {latest} does not publish {name}"))?;
+        let checksum_asset = release.asset(release::CHECKSUMS_ASSET).ok_or_else(|| {
             format!(
-                "release {} has no {} to verify its archives against",
-                release.version(),
+                "release {latest} has no {} to verify its archives against",
                 release::CHECKSUMS_ASSET
             )
         })?;
-        Ok(Self {
-            client,
-            release,
-            checksums: release::text(client, asset).await?,
-            staging: install::Staging::create(install_dir, invoker)?,
-        })
-    }
-
-    /// Download, verify and install one CLI completely.
-    async fn install(
-        &self,
-        target: &Target,
-        transaction: &mut install::Transaction,
-    ) -> Result<(), String> {
-        let latest = self.release.version();
-        let name = install::archive_name(target.cli, latest);
-        let asset = self
-            .release
-            .asset(&name)
-            .ok_or_else(|| format!("release {latest} does not publish {name}"))?;
-        let digest = release::checksum_for(&self.checksums, &name).ok_or_else(|| {
+        let checksums = release::text(client, checksum_asset).await?;
+        let digest = release::checksum_for(&checksums, &name).ok_or_else(|| {
             format!(
                 "{} in release {latest} has no entry for {name}",
                 release::CHECKSUMS_ASSET
             )
         })?;
 
+        let staging = install::Staging::create(install_dir)?;
         println!("Downloading {name} ({})…", megabytes(asset.size));
-        let archive = self.staging.path(&name);
-        release::download_verified(self.client, asset, &archive, digest).await?;
+        let archive = staging.path(&name);
+        release::download_verified(client, asset, &archive, digest).await?;
+        Ok(Self {
+            release,
+            archive,
+            staging,
+        })
+    }
 
+    /// Extract, verify and install one alias from the already-downloaded archive.
+    async fn install(
+        &self,
+        target: &Target,
+        transaction: &mut install::Transaction,
+    ) -> Result<(), String> {
+        let latest = self.release.version();
         let staged = self.staging.path(&format!(
             "{}{}",
             target.cli.binary(),
             std::env::consts::EXE_SUFFIX
         ));
-        let (archive_path, staged_path, cli, version) =
-            (archive, staged.clone(), target.cli, latest.to_owned());
+        let (archive_path, staged_path, cli, version) = (
+            self.archive.clone(),
+            staged.clone(),
+            target.cli,
+            latest.to_owned(),
+        );
         tokio::task::spawn_blocking(move || {
             install::extract_binary(&archive_path, cli, &version, &staged_path)
         })
@@ -318,7 +321,7 @@ fn report_check(
     invoker: Cli,
     release: &Release,
     targets: &[Target],
-    method: Method,
+    method: Option<Method>,
     blocked: Option<&str>,
     json: bool,
 ) {
@@ -348,7 +351,7 @@ fn report_check(
                 "latest": latest,
                 "update_available": update_available,
                 "release": release.html_url,
-                "method": method.as_str(),
+                "method": method.map(Method::as_str),
                 "binaries": binaries,
                 "blocked": blocked,
             })
@@ -381,7 +384,7 @@ fn report_check(
     }
 }
 
-/// "lightweight 0.3.22".
+/// "hermes 0.3.22 and lightweight 0.3.22".
 fn with_versions(targets: &[Target]) -> String {
     targets
         .iter()
@@ -436,39 +439,55 @@ mod tests {
     }
 
     #[test]
-    fn the_update_order_is_just_lightweight() {
-        assert_eq!(UPDATE_ORDER, [Cli::Lightweight]);
+    fn the_hermes_alias_is_updated_before_lightweight() {
+        assert_eq!(UPDATE_ORDER, [Cli::Hermes, Cli::Lightweight]);
     }
 
     #[test]
-    fn lightweight_packages_as_lightweight_cli() {
+    fn each_alias_updates_its_sibling() {
+        assert_eq!(Cli::Hermes.other(), Cli::Lightweight);
+        assert_eq!(Cli::Lightweight.other(), Cli::Hermes);
+        assert_eq!(Cli::Hermes.package(), "lightweight-cli");
         assert_eq!(Cli::Lightweight.package(), "lightweight-cli");
     }
 
     #[test]
-    fn an_archive_is_used_only_when_it_is_published() {
-        let targets = [target(Cli::Lightweight, None)];
-        let archive = install::archive_name(Cli::Lightweight, "9.9.9");
+    fn an_archive_is_used_when_published_and_cargo_source_when_not() {
+        let targets = [target(Cli::Hermes, None)];
+        let archive = install::archive_name("9.9.9");
         assert_eq!(
             method(&release(&[&archive]), "9.9.9", &targets).unwrap(),
-            Method::ReleaseArchive
+            Some(Method::ReleaseArchive)
         );
         assert_eq!(
             method(&release(&["SHA256SUMS"]), "9.9.9", &targets).unwrap(),
-            Method::CargoSource
+            Some(Method::CargoSource)
         );
     }
 
     #[test]
+    fn method_is_none_when_nothing_needs_updating() {
+        let mut targets = [target(Cli::Hermes, Some("9.9.9"))];
+        targets[0].needs_update = false;
+        assert_eq!(method(&release(&[]), "9.9.9", &targets).unwrap(), None);
+    }
+
+    #[test]
     fn summaries_read_naturally() {
-        let one = [target(Cli::Lightweight, Some("0.3.22"))];
-        assert_eq!(with_versions(&one), "lightweight 0.3.22");
+        let two = [
+            target(Cli::Hermes, Some("0.3.22")),
+            target(Cli::Lightweight, None),
+        ];
+        assert_eq!(
+            with_versions(&two),
+            "hermes 0.3.22 and lightweight unknown version"
+        );
     }
 
     #[tokio::test]
     async fn json_without_check_is_refused_before_any_network_access() {
         let error = run(
-            Cli::Lightweight,
+            Cli::Hermes,
             "0.3.22",
             Request {
                 json: true,
@@ -477,6 +496,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.contains("`lightweight update --check`"));
+        assert!(error.contains("`hermes update --check`"));
     }
 }

@@ -99,10 +99,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const text = await response.text();
-  const parsed: unknown = text ? safeParse(text) : null;
+  const parsed = text ? safeParse(text) : { ok: true as const, value: null };
 
   if (!response.ok) {
-    const body = parsed as ApiErrorBody | null;
+    const body = parsed.ok ? (parsed.value as ApiErrorBody | null) : null;
     const error = body?.error;
     throw new ApiError(
       response.status,
@@ -112,14 +112,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
-  return parsed as T;
+  if (!parsed.ok) {
+    throw new ApiError(
+      response.status,
+      "invalid_json_response",
+      `The gateway returned invalid JSON for ${path}.`,
+      [{ label: "Restart `hermes serve`, then try again." }],
+    );
+  }
+
+  return parsed.value as T;
 }
 
-function safeParse(text: string): unknown {
+function safeParse(text: string): { ok: true; value: unknown } | { ok: false } {
   try {
-    return JSON.parse(text);
+    return { ok: true, value: JSON.parse(text) };
   } catch {
-    return null;
+    return { ok: false };
   }
 }
 
