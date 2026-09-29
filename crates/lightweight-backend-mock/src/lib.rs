@@ -21,6 +21,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -146,6 +147,8 @@ impl Default for MockConfig {
 #[derive(Debug)]
 pub struct MockBackend {
     config: Mutex<MockConfig>,
+    /// Optional deterministic scripts consumed one generation at a time.
+    script_queue: Mutex<Option<VecDeque<Script>>>,
     resident: Mutex<Option<LoadedModel>>,
     /// Counts generations, so a test can assert that a request the gateway
     /// should have refused never reached an engine.
@@ -184,6 +187,7 @@ impl MockBackend {
     pub fn new(config: MockConfig) -> Self {
         Self {
             config: Mutex::new(config),
+            script_queue: Mutex::new(None),
             resident: Mutex::new(None),
             generations: AtomicU64::new(0),
             loads: AtomicU64::new(0),
@@ -200,6 +204,11 @@ impl MockBackend {
             script: Script::Content(vec![content.into()]),
             ..MockConfig::default()
         })
+    }
+
+    /// Replace the default script with a sequence consumed one generation at a time.
+    pub async fn set_script_queue(&self, scripts: Vec<Script>) {
+        *self.script_queue.lock().await = Some(scripts.into());
     }
 
     /// Replace the script between requests.
@@ -330,7 +339,13 @@ impl InferenceBackend for MockBackend {
         self.generations.fetch_add(1, Ordering::Relaxed);
         *self.last_request.lock().await = Some(request);
 
-        let config = self.config.lock().await.clone();
+        let mut config = self.config.lock().await.clone();
+        let mut script_queue = self.script_queue.lock().await;
+        let next_script = script_queue.as_mut().and_then(VecDeque::pop_front);
+        drop(script_queue);
+        if let Some(script) = next_script {
+            config.script = script;
+        }
         if let Script::Fail(detail) = &config.script {
             return Err(BackendError::GenerationFailed {
                 detail: detail.clone(),
