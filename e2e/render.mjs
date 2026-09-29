@@ -27,7 +27,10 @@ const ROUTES = [
 ];
 
 function isControlApi(url) {
-  return url.startsWith(`${BASE}/api/v1/`);
+  // Dashboard and Gateway subscribe to this SSE stream. It is deliberately not
+  // JSON; every other `/api/v1/*` request made by this render suite is control
+  // data and must be a successful JSON response.
+  return url.startsWith(`${BASE}/api/v1/`) && !url.startsWith(`${BASE}/api/v1/events`);
 }
 
 /** Wait for a screen's own positive proof rather than merely React mounting. */
