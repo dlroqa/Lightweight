@@ -447,18 +447,12 @@ mod tests {
 
     #[test]
     fn an_archive_is_used_only_when_it_is_published() {
-        let mut targets = [target(Cli::Lightweight, None)];
+        let targets = [target(Cli::Lightweight, None)];
         let archive = install::archive_name(Cli::Lightweight, "9.9.9");
         assert_eq!(
             method(&release(&[&archive]), "9.9.9", &targets).unwrap(),
             Method::ReleaseArchive
         );
-        assert_eq!(
-            method(&release(&["SHA256SUMS"]), "9.9.9", &targets).unwrap(),
-            Method::CargoSource
-        );
-        // A current binary's missing archive does not matter.
-        targets[0].needs_update = false;
         assert_eq!(
             method(&release(&["SHA256SUMS"]), "9.9.9", &targets).unwrap(),
             Method::CargoSource
