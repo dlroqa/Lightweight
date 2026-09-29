@@ -340,10 +340,11 @@ impl InferenceBackend for MockBackend {
         *self.last_request.lock().await = Some(request);
 
         let mut config = self.config.lock().await.clone();
-        if let Some(queue) = self.script_queue.lock().await.as_mut() {
-            if let Some(script) = queue.pop_front() {
-                config.script = script;
-            }
+        let mut script_queue = self.script_queue.lock().await;
+        let next_script = script_queue.as_mut().and_then(VecDeque::pop_front);
+        drop(script_queue);
+        if let Some(script) = next_script {
+            config.script = script;
         }
         if let Script::Fail(detail) = &config.script {
             return Err(BackendError::GenerationFailed {
