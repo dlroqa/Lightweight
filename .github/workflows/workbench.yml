@@ -5,7 +5,7 @@ name: workbench
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "release/**"]
     paths:
       - 'deploy/workbench/**'
       - 'scripts/check-workbench.sh'
