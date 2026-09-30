@@ -230,7 +230,7 @@ pub async fn metrics_json(State(state): State<Arc<GatewayState>>, headers: Heade
     axum::Json(state.metrics_snapshot().await).into_response()
 }
 
-/// `POST /v1/chat/completions`.
+/// `POST /v1/chat/completions` and the panel's `/api/v1/chat/completions`.
 pub async fn chat_completions(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -901,6 +901,11 @@ pub(crate) fn forbid_cross_origin(headers: &HeaderMap) -> Option<Response> {
 /// budget and are never throttled — the limit exists to cap one *remote*
 /// consumer, not the machine's own use of its own engine.
 pub(crate) fn admit_request(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
+    // The router strips client-supplied markers and marks only loopback
+    // control requests. Public `/v1` and remote requests still require auth.
+    if headers.contains_key(LOCAL_CONTROL_HEADER) {
+        return None;
+    }
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());

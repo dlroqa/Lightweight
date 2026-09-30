@@ -103,6 +103,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/v1/completions", post(routes::completions))
         // Our own control surface. Everything the desktop shell drives lives
         // here, and nothing here is visible to a client walking `/v1`.
+        .route("/api/v1/chat/completions", post(routes::chat_completions))
         .route("/api/v1/models", get(control::models))
         .route("/api/v1/models/import", post(control::import))
         .route("/api/v1/models/download", post(control::download))
