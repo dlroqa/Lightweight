@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-29
+
+### Added
+
+- **Public provider capability discovery.** Authenticated clients can now use
+  `GET /v1/capabilities` to discover the versioned public inference contract,
+  supported OpenAI-compatible endpoints and features, model readiness, served
+  context length, and concurrency limit. The endpoint shares `/v1`
+  authentication, never loads a model, and intentionally excludes control-plane
+  routes, filesystem paths, hardware details, engine internals, jobs, and keys.
+
+### Changed
+
+- **Deterministic paired-provider test support.** The test-only mock gateway can
+  consume a startup-provided queue of scripted completions, enabling a
+  separate-process public HTTP/SSE integration test without exposing a runtime
+  test control endpoint.
+
 ## [0.2.4] - 2026-09-18
 
 ### Fixed
@@ -189,7 +207,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dlroqa/Lightweight/compare/v0.2.4...v0.4.0
 [0.2.4]: https://github.com/dlroqa/Lightweight/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/dlroqa/Lightweight/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/dlroqa/Lightweight/compare/v0.2.1...v0.2.2
