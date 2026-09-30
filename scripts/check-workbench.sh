@@ -29,8 +29,10 @@ docker compose --env-file "$env_file" -f "$compose_file" config -q
 # by default. Verify the authenticated, index-aligned remote Lightweight route
 # contract without contacting a gateway or starting a container.
 rendered=$(docker compose --env-file "$env_file" -f "$compose_file" config --format json)
+rendered_terminal=$(docker compose --profile terminal --env-file "$env_file" -f "$compose_file" config --format json)
 node -e '
   const config = JSON.parse(process.argv[1]);
+  const terminalConfig = JSON.parse(process.argv[2]);
   const services = config.services || {};
   for (const name of ["qdrant", "tika", "searxng", "infinity", "open-terminal"]) {
     if ((services[name]?.ports || []).length) throw new Error(name + " must not publish host ports");
@@ -50,13 +52,13 @@ node -e '
     const route = routeConfigs[String(index)];
     if (!route || route.enable !== true || !route.prefix_id || route.connection_type !== "external") throw new Error("remote Lightweight route " + index + " needs enabled external prefix config");
   });
-  const terminal = services["open-terminal"] || {};
+  const terminal = (terminalConfig.services || {})["open-terminal"] || {};
   if (!(terminal.profiles || []).includes("terminal")) throw new Error("open-terminal must be opt-in profile");
   if (terminal.cpus !== 2 || !["2g", "2G", 2147483648].includes(terminal.mem_limit) || terminal.pids_limit !== 256) throw new Error("open-terminal resource limits are required");
   if ((terminal.volumes || []).some((volume) => String(volume.source || volume).includes("/var/run/docker.sock") || String(volume.type || "").includes("bind"))) throw new Error("open-terminal cannot receive a host bind mount or Docker socket");
   if (Object.keys(terminal.environment || {}).some((key) => key.includes("MULTI_USER"))) throw new Error("open-terminal must not enable multi-user mode");
   if (Object.keys(env).some((key) => key === "TERMINAL_SERVER_CONNECTIONS")) throw new Error("Open WebUI must not auto-connect the terminal");
-' "$rendered"
+' "$rendered" "$rendered_terminal"
 
 if [ -d "$functions_dir" ]; then
   while IFS= read -r -d '' source; do
