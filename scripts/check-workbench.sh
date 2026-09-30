@@ -54,7 +54,7 @@ node -e '
   });
   const terminal = (terminalConfig.services || {})["open-terminal"] || {};
   if (!(terminal.profiles || []).includes("terminal")) throw new Error("open-terminal must be opt-in profile");
-  if (terminal.cpus !== 2 || !["2g", "2G", 2147483648].includes(terminal.mem_limit) || terminal.pids_limit !== 256) throw new Error("open-terminal resource limits are required");
+  if (Number(terminal.cpus) !== 2 || !["2g", "2147483648"].includes(String(terminal.mem_limit).toLowerCase()) || Number(terminal.pids_limit) !== 256) throw new Error("open-terminal resource limits are required");
   if ((terminal.volumes || []).some((volume) => String(volume.source || volume).includes("/var/run/docker.sock") || String(volume.type || "").includes("bind"))) throw new Error("open-terminal cannot receive a host bind mount or Docker socket");
   if (Object.keys(terminal.environment || {}).some((key) => key.includes("MULTI_USER"))) throw new Error("open-terminal must not enable multi-user mode");
   if (Object.keys(env).some((key) => key === "TERMINAL_SERVER_CONNECTIONS")) throw new Error("Open WebUI must not auto-connect the terminal");
