@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-30
+
+### Added
+
+- **Optional Open WebUI workbench.** A separately deployable companion stack
+  documents authenticated multi-gateway routing, private document extraction and
+  retrieval, reranking, web search, and an administrator-only terminal profile.
+- **Optional Jev model advice.** The `Lightweight Auto` Open WebUI Pipe can
+  advise among explicitly allowlisted, prefixed Lightweight routes, with a
+  deterministic local fallback for every timeout, invalid answer, or low-confidence
+  response.
+
+### Fixed
+
+- The locally served Chat panel now uses its authenticated internal control route
+  when a gateway key is configured. Public `/v1` clients still require a Bearer
+  credential, including attempts to forge the local-control marker.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added
