@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn version_one_is_a_public_inference_contract() {
         let body = CapabilitiesBody::new(
-            "0.2.4",
+            "0.4.0",
             Some(CapabilityModel {
                 id: "mock-model@4k".into(),
                 context_length: 4096,
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn the_public_contract_does_not_advertise_control_routes_or_paths() {
         let value =
-            serde_json::to_string(&CapabilitiesBody::new("0.2.4", None, 1)).expect("serialize");
+            serde_json::to_string(&CapabilitiesBody::new("0.4.0", None, 1)).expect("serialize");
         assert!(!value.contains("/api/v1"));
         assert!(!value.contains("model_path"));
         assert!(!value.contains("/home/"));
