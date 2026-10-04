@@ -31,6 +31,19 @@ pub enum CatalogError {
     #[error("{sha256:?} is not a sha256 digest")]
     NotADigest { sha256: String },
 
+    #[error("{alias:?} cannot be used as an alias: {problem}")]
+    InvalidAlias {
+        alias: String,
+        problem: crate::alias::AliasProblem,
+    },
+
+    /// Said in the user's own spelling of the alias, because that is what they
+    /// will look for; the model holding it is named so they can find it.
+    #[error(
+        "alias {alias:?} is already assigned to another model ({owner}); choose a different alias"
+    )]
+    AliasInUse { alias: String, owner: String },
+
     #[error(transparent)]
     Download(#[from] DownloadError),
 
@@ -62,6 +75,8 @@ impl Actionable for CatalogError {
             Self::InUse { .. } => "model_in_use",
             Self::CatalogUnreadable { .. } => "catalog_unreadable",
             Self::NotADigest { .. } => "not_a_digest",
+            Self::InvalidAlias { .. } => "invalid_alias",
+            Self::AliasInUse { .. } => "alias_in_use",
             Self::Download(err) => err.code(),
             Self::Io { .. } => "io_error",
         }
@@ -72,9 +87,11 @@ impl Actionable for CatalogError {
             Self::UnknownModel { .. }
             | Self::UnknownManifestModel { .. }
             | Self::FileNotFound { .. } => ErrorKind::NotFound,
-            Self::DuplicateModel { .. } | Self::NotAGguf { .. } | Self::NotADigest { .. } => {
-                ErrorKind::InvalidRequest
-            }
+            Self::DuplicateModel { .. }
+            | Self::NotAGguf { .. }
+            | Self::NotADigest { .. }
+            | Self::InvalidAlias { .. }
+            | Self::AliasInUse { .. } => ErrorKind::InvalidRequest,
             // Not an error the caller can fix by retrying, and not a failure
             // either: unloading first is a real, ordered thing to do.
             Self::InUse { .. } => ErrorKind::InvalidRequest,
@@ -109,6 +126,12 @@ impl Actionable for CatalogError {
                     section: SettingsSection::Storage,
                 },
             )],
+            Self::AliasInUse { owner, .. } => vec![Remedy::new(
+                format!("Choose a different alias, or clear the one on {owner} first"),
+                RemedyAction::OpenSettings {
+                    section: SettingsSection::Models,
+                },
+            )],
             Self::Download(err) => err.remedies(),
             _ => Vec::new(),
         }
@@ -136,6 +159,22 @@ mod tests {
     fn removing_a_loaded_model_is_refused_with_something_to_do_about_it() {
         let err = CatalogError::InUse { id: "qwen3".into() };
         assert_eq!(err.http_status(), 400);
+        assert_eq!(err.remedies().len(), 1);
+    }
+
+    #[test]
+    fn an_alias_clash_is_the_callers_to_fix_and_names_both_sides() {
+        let err = CatalogError::AliasInUse {
+            alias: "Coder".into(),
+            owner: "qwen3".into(),
+        };
+        assert_eq!(err.http_status(), 400);
+        assert_eq!(err.code(), "alias_in_use");
+        let said = err.to_string();
+        assert!(
+            said.contains("\"Coder\"") && said.contains("qwen3"),
+            "{said}"
+        );
         assert_eq!(err.remedies().len(), 1);
     }
 

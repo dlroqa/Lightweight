@@ -20,6 +20,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod alias;
 pub mod error;
 pub mod hf;
 pub mod install;
@@ -27,6 +28,7 @@ pub mod manifest;
 pub mod record;
 pub mod store;
 
+pub use alias::{ModelSelector, validate_alias};
 pub use error::CatalogError;
 pub use install::{AddModel, InstallProgress, Installer, Plan, Scanned, read_header};
 pub use manifest::CatalogModel;

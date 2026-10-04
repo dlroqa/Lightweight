@@ -301,7 +301,7 @@ impl Installer {
             None => store.free_id(&slug_for(&scanned.path)),
         };
         let replacing = scanned.id.is_some();
-        let record = InstalledModel::new(
+        let mut record = InstalledModel::new(
             id,
             &scanned.path,
             scanned.bytes,
@@ -313,7 +313,9 @@ impl Installer {
 
         if replacing {
             // A re-download is new bytes under a known id, so the old record
-            // describes a file that is gone.
+            // describes a file that is gone — but the name the user gave the
+            // model is about the model, not the bytes, and is kept.
+            record.alias = store.get(&record.id).and_then(|old| old.alias.clone());
             store.replace(record.clone());
         } else {
             store.insert(record.clone())?;
@@ -597,6 +599,7 @@ mod tests {
         store
             .insert(InstalledModel {
                 id: id.to_owned(),
+                alias: None,
                 name: id.to_owned(),
                 path: path.to_path_buf(),
                 bytes: 10,
