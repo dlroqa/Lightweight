@@ -453,6 +453,7 @@ async fn a_benchmark_that_cannot_get_a_slot_refuses_rather_than_measuring_conten
     let catalog = Arc::new(lightweight_gateway::catalog::Catalog::with_resident(
         lightweight_gateway::catalog::ResidentModel {
             id: model,
+            alias: None,
             instance: loaded.instance,
             n_ctx: 4096,
             architecture: "mock".into(),

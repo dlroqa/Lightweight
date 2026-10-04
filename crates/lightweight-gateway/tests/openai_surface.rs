@@ -35,6 +35,7 @@ impl Harness {
         let loaded = backend.make_resident(model.clone(), N_CTX).await;
         let catalog = Arc::new(Catalog::with_resident(ResidentModel {
             id: model,
+            alias: None,
             instance: loaded.instance,
             n_ctx: N_CTX,
             architecture: "mock".into(),

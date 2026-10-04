@@ -9,6 +9,8 @@
 use std::sync::Arc;
 
 use lightweight_api::models::{HermesModelInfo, ModelRow, ModelState};
+use lightweight_catalog::InstalledModel;
+use lightweight_catalog::alias::{self, ModelSelector};
 use lightweight_core::{InstanceId, ModelId};
 use tokio::sync::RwLock;
 
@@ -16,6 +18,13 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug)]
 pub struct ResidentModel {
     pub id: ModelId,
+    /// The alias the user gave this model in the catalog, if any.
+    ///
+    /// Carried here so a request is matched without touching the catalog, and
+    /// kept current by [`Catalog::adopt_alias`] when the user changes it —
+    /// which never reloads the engine, because nothing the engine knows about
+    /// has changed.
+    pub alias: Option<String>,
     pub instance: InstanceId,
     /// The context the model is actually loaded with — the number every
     /// endpoint advertises.
@@ -41,9 +50,29 @@ pub struct ResidentModel {
 }
 
 impl ResidentModel {
+    /// The id every OpenAI-shaped response names this model by.
+    ///
+    /// The alias when the user chose one, so a client that discovered `Coder`
+    /// in `/v1/models` and asked for `Coder` is answered as `Coder` on every
+    /// chunk, and never sees the file-derived id unless nobody named the
+    /// model. Without an alias it is the id it has always been, context suffix
+    /// included.
+    pub fn public_id(&self) -> String {
+        self.alias.clone().unwrap_or_else(|| self.id.to_string())
+    }
+
+    /// Whether this is the model `record` describes.
+    ///
+    /// By catalog id, or by file: a model served from the command line is
+    /// named after its file stem rather than its catalog slug, and is still
+    /// the model the catalog holds at that path.
+    pub fn is_record(&self, record: &InstalledModel) -> bool {
+        self.id.slug() == record.id || self.model_path == record.path.display().to_string()
+    }
+
     pub fn to_row(&self) -> ModelRow {
         ModelRow::new(
-            self.id.to_string(),
+            self.public_id(),
             self.n_ctx,
             HermesModelInfo {
                 architecture: self.architecture.clone(),
@@ -59,17 +88,27 @@ impl ResidentModel {
 
     /// Whether a client's `model` string names this model.
     ///
-    /// Exact match, or a match on the part before our `@context` suffix. The
-    /// tolerance is deliberate and asymmetric: the suffix is *our* invention
-    /// and changes whenever the context does, so a client holding
+    /// Read through the same [`ModelSelector`] the catalog uses, in this order:
+    ///
+    /// 1. nothing, or `default`: whatever is loaded, which is this model. It
+    ///    is resolved per request rather than stored, so a swap moves it.
+    /// 2. the model's alias, ignoring case.
+    /// 3. the id exactly, or a match on the part before our `@context` suffix.
+    ///
+    /// The suffix tolerance is deliberate and asymmetric: the suffix is *our*
+    /// invention and changes whenever the context does, so a client holding
     /// `model@8k` while we now serve `model@4k` is our doing, not a mistake —
     /// while a different base name is the user naming a model we do not have,
     /// which they need to be told about.
     pub fn matches(&self, requested: &str) -> bool {
-        let requested = requested.trim();
-        if requested.is_empty() {
-            // No model named at all: there is exactly one, so serve it. The
-            // response still reports the real id.
+        let ModelSelector::Named(requested) = ModelSelector::parse(Some(requested)) else {
+            return true;
+        };
+        if self
+            .alias
+            .as_deref()
+            .is_some_and(|held| alias::same_name(held, requested))
+        {
             return true;
         }
         if requested == self.id.as_str() {
@@ -105,6 +144,22 @@ impl Catalog {
         self.resident.read().await.clone()
     }
 
+    /// Take up `record`'s alias if it describes the resident model.
+    ///
+    /// Called whenever an alias is set, changed or cleared. Only the name
+    /// changes: the instance, the context and the slots are the same engine
+    /// they were a moment ago. Returns whether the resident model was the one.
+    pub async fn adopt_alias(&self, record: &InstalledModel) -> bool {
+        let mut resident = self.resident.write().await;
+        match resident.as_mut() {
+            Some(model) if model.is_record(record) => {
+                model.alias.clone_from(&record.alias);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The rows for `GET /v1/models`.
     pub async fn rows(&self) -> Vec<ModelRow> {
         self.resident
@@ -133,6 +188,7 @@ mod tests {
     fn model() -> ResidentModel {
         ResidentModel {
             id: ModelId::with_context("lfm2-1.2b-q4_k_m", 8192),
+            alias: None,
             instance: InstanceId::new(),
             n_ctx: 8192,
             architecture: "lfm2".into(),
@@ -172,6 +228,92 @@ mod tests {
     #[test]
     fn an_absent_model_field_is_served_by_the_only_model() {
         assert!(model().matches(""));
+    }
+
+    #[test]
+    fn default_is_the_resident_model_whatever_it_is_called() {
+        assert!(model().matches("default"));
+        assert!(model().matches("  default  "));
+        let named = ResidentModel {
+            alias: Some("Fast".into()),
+            ..model()
+        };
+        assert!(named.matches("default"));
+        assert!(named.matches(""));
+    }
+
+    #[test]
+    fn the_alias_matches_in_any_casing_and_the_id_still_does() {
+        let named = ResidentModel {
+            alias: Some("Fast".into()),
+            ..model()
+        };
+        assert!(named.matches("Fast"));
+        assert!(named.matches("fast"));
+        assert!(named.matches(" FAST "));
+        assert!(named.matches("lfm2-1.2b-q4_k_m@8k"));
+        assert!(named.matches("lfm2-1.2b-q4_k_m"));
+        assert!(!named.matches("Coder"));
+        // An alias is a whole name, not a prefix.
+        assert!(!named.matches("Fast@8k"));
+    }
+
+    #[test]
+    fn the_public_id_is_the_alias_when_there_is_one() {
+        assert_eq!(model().public_id(), "lfm2-1.2b-q4_k_m@8k");
+        let named = ResidentModel {
+            alias: Some("Fast".into()),
+            ..model()
+        };
+        assert_eq!(named.public_id(), "Fast");
+        assert_eq!(named.to_row().id, "Fast");
+        // The real context is still advertised; only the name changed.
+        assert_eq!(named.to_row().context_length, 8192);
+    }
+
+    #[tokio::test]
+    async fn an_alias_change_reaches_the_resident_model_and_no_other() {
+        let catalog = Catalog::with_resident(model());
+        let mut record: InstalledModel = serde_json::from_value(serde_json::json!({
+            "id": "lfm2-1.2b-q4_k_m", "name": "LFM2", "path": "/elsewhere/lfm2.gguf",
+            "bytes": 1, "sha256": "aa", "integrity": "imported",
+            "source": {"kind": "import", "original_path": "/elsewhere/lfm2.gguf"},
+            "architecture": "lfm2", "supported": true, "added_at": 0
+        }))
+        .expect("record");
+        record.alias = Some("Fast".into());
+        assert!(catalog.adopt_alias(&record).await);
+        assert_eq!(catalog.rows().await[0].id, "Fast");
+
+        record.alias = None;
+        assert!(catalog.adopt_alias(&record).await);
+        assert_eq!(catalog.rows().await[0].id, "lfm2-1.2b-q4_k_m@8k");
+
+        // A different model's alias leaves the resident one alone.
+        record.id = "something-else".into();
+        record.alias = Some("Coder".into());
+        assert!(!catalog.adopt_alias(&record).await);
+        assert_eq!(catalog.rows().await[0].id, "lfm2-1.2b-q4_k_m@8k");
+    }
+
+    #[tokio::test]
+    async fn a_model_served_from_its_file_takes_the_alias_recorded_for_that_file() {
+        // `hermes serve <file>` names the model after its file stem, which is
+        // not the catalog slug; the path is what they share.
+        let catalog = Catalog::with_resident(ResidentModel {
+            id: ModelId::with_context("LFM2-1.2B-Q4_K_M", 8192),
+            ..model()
+        });
+        let record: InstalledModel = serde_json::from_value(serde_json::json!({
+            "id": "lfm2-1.2b-q4_k_m-2", "alias": "Fast", "name": "LFM2",
+            "path": "/models/lfm2.gguf", "bytes": 1, "sha256": "aa",
+            "integrity": "imported",
+            "source": {"kind": "import", "original_path": "/models/lfm2.gguf"},
+            "architecture": "lfm2", "supported": true, "added_at": 0
+        }))
+        .expect("record");
+        assert!(catalog.adopt_alias(&record).await);
+        assert_eq!(catalog.rows().await[0].id, "Fast");
     }
 
     #[tokio::test]

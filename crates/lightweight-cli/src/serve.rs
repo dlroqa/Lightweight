@@ -422,13 +422,22 @@ pub async fn run(options: ServeOptions) -> Result<(), String> {
     // service.
     if let Some(model) = options.model.clone() {
         let manager = Arc::clone(&manager);
+        let catalog = Arc::clone(&state.catalog);
         tokio::spawn(async move {
-            if let Err(err) = manager.register_at_startup(model).await {
-                tracing::warn!(
-                    target: lightweight_observability::targets::MODEL,
-                    error = %err,
-                    "the model served from the command line could not be added to the catalog"
-                );
+            match manager.register_at_startup(model).await {
+                // A file the user already named in the catalog is served under
+                // that name from here on, exactly as if it had been loaded
+                // through `/api/v1/models/{id}/load`.
+                Ok(record) => {
+                    catalog.adopt_alias(&record).await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: lightweight_observability::targets::MODEL,
+                        error = %err,
+                        "the model served from the command line could not be added to the catalog"
+                    );
+                }
             }
         });
     }
@@ -875,6 +884,9 @@ async fn load_at_startup(
 
     Ok(ResidentModel {
         id: loaded.model.clone(),
+        // Taken up from the catalog once the file is registered there; see
+        // `register_at_startup` in `serve`.
+        alias: None,
         instance: loaded.instance,
         // The *effective* context, which is what every endpoint advertises. A
         // client sizes its prompts to this number.

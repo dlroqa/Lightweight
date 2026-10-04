@@ -110,7 +110,9 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/models/{id}/load", post(control::load))
         .route(
             "/api/v1/models/{id}",
-            get(control::model_detail).delete(control::remove),
+            get(control::model_detail)
+                .patch(control::update)
+                .delete(control::remove),
         )
         .route("/api/v1/catalog", get(control::pinned))
         .route(
