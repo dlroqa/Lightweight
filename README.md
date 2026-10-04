@@ -261,8 +261,24 @@ hermes models available               # the pinned models, with sizes
 hermes models add qwen3-1.7b-q4_k_m   # download one, digest checked
 hermes models add --url https://huggingface.co/owner/repo/resolve/main/m.gguf
 hermes models import ~/models/mine.gguf   # referenced where it is, not copied
+hermes models import ~/models/mine.gguf --alias Coder   # ...and give it a short name
+hermes models alias <id> Coder        # set or rename an alias
+hermes models alias Coder --clear     # serve it under its id again
 hermes models remove <id> [--delete]
 ```
+
+**Aliases.** A model's id is derived from its file name, and long. An alias is
+a short name *you* choose — `Coder`, `Fast`, `Jarvis` — that need not resemble
+the file. Once set, `/v1/models` lists the alias instead of the id, responses
+name the model by it, and clients may send it as `model`. The id, `default` and
+an omitted `model` keep working beside it. Nothing is ever derived
+automatically, the file and its digest never change, and renaming takes effect
+at once without a reload — the old name stops resolving. Aliases are unique
+ignoring case, at most 64 characters, may not contain `/`, `\`, `@` or control
+characters, and `default` is reserved. They are stored in the catalog, so they
+survive restarts; while a gateway is running, set them through it (the panel
+or the control API below) rather than with the CLI, which edits the file the
+running gateway does not re-read.
 
 A HuggingFace link is verified against the sha256 the site publishes for the
 file. Any other link is **recorded, not verified** unless you pass `--sha256`,
@@ -278,6 +294,7 @@ curl 127.0.0.1:8737/api/v1/models          # the catalog, with load state
 curl 127.0.0.1:8737/api/v1/catalog         # what can be downloaded
 curl -X POST 127.0.0.1:8737/api/v1/models/<id>/load -d '{"ctx":8192}'
 curl -X POST 127.0.0.1:8737/api/v1/models/unload
+curl -X PATCH 127.0.0.1:8737/api/v1/models/<id> -d '{"alias":"Coder"}'   # null clears it
 curl -N   127.0.0.1:8737/api/v1/jobs/<n>/events   # progress, as SSE
 ```
 

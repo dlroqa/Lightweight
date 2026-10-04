@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **User-defined model aliases.** A model can be given a short name of the
+  user's choosing (`Coder`, `Fast`, …) at import or download time or at any
+  point afterwards, from the panel's Models screen, `hermes models alias`, or
+  `PATCH /api/v1/models/{id}` with `{"alias": "Coder"}` (`null` clears it).
+  `/v1/models`, `/v1/capabilities` and every chat and text completion response
+  — streamed chunks included — name an aliased model by its alias; requests may
+  use the alias, the canonical id, `default`, or no `model` at all. The
+  control API reports both `id` and `alias`, and its load, detail and delete
+  routes accept either. Aliases are persisted in the catalog, unique ignoring
+  case, never derived from the file, and refused rather than adjusted on a
+  clash; existing catalogs load unchanged with no alias set.
+
+### Fixed
+
+- **`model: "default"` is accepted again.** It was removed from the gateway
+  with the Lightagent split; it once more means whichever model is loaded, and
+  is reserved so no model can be aliased `default`.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added
