@@ -25,7 +25,8 @@ export function ModelSelector({
   const [failure, setFailure] = useState<string | null>(null);
 
   const loaded = models.find((model) => model.id === loadedId);
-  const label = loaded?.name ?? (loadedId ?? "No model loaded");
+  // The alias first: it is the name every client of this gateway uses.
+  const label = loaded?.alias ?? loaded?.name ?? (loadedId ?? "No model loaded");
 
   async function load(id: string) {
     setBusy(id);
@@ -125,7 +126,9 @@ export function ModelSelector({
                     }}
                   />
                   <span style={{ minWidth: 0, textAlign: "left" }}>
-                    <span style={{ display: "block" }}>{model.name}</span>
+                    <span style={{ display: "block" }}>
+                      {model.alias ?? model.name}
+                    </span>
                     <span style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
                       {model.state === "missing"
                         ? "file missing"

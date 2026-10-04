@@ -196,15 +196,29 @@ export const api = {
       `/api/v1/models/${encodeURIComponent(id)}?delete_file=${deleteFile}`,
       { method: "DELETE" },
     ),
-  downloadModel: (body: { id?: string; url?: string; sha256?: string }) =>
+  /**
+   * Set, rename or clear (`null`) a model's alias. `id` may be the catalog id
+   * or the current alias. Nothing is reloaded.
+   */
+  setAlias: (id: string, alias: string | null) =>
+    request<CatalogRow>(`/api/v1/models/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ alias }),
+    }),
+  downloadModel: (body: {
+    id?: string;
+    url?: string;
+    sha256?: string;
+    alias?: string;
+  }) =>
     request<{ job: number; events: string }>("/api/v1/models/download", {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  importModel: (path: string) =>
+  importModel: (path: string, alias?: string) =>
     request<{ job: number; events: string }>("/api/v1/models/import", {
       method: "POST",
-      body: JSON.stringify({ path }),
+      body: JSON.stringify(alias ? { path, alias } : { path }),
     }),
 
   benchmarks: () =>

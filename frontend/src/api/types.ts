@@ -298,6 +298,11 @@ export interface GatewayBindConfig {
 /** A row of `GET /api/v1/models`. */
 export interface CatalogRow {
   id: string;
+  /**
+   * The short name the user chose, served to API clients in place of `id`.
+   * `null` until one is set; never derived from the file.
+   */
+  alias: string | null;
   name: string;
   path: string;
   bytes: number;

@@ -226,6 +226,13 @@ export function Models() {
             ) : (
               <ModelDetailBody
                 detail={detail}
+                onAliasSaved={(saved) => {
+                  // The detail keeps its header and estimate; only the name moved.
+                  setDetail((current) =>
+                    current ? { ...current, alias: saved.alias } : current,
+                  );
+                  models.refresh();
+                }}
                 wanted={wanted}
                 onWant={setWanted}
                 kvTypes={kvTypes}
@@ -262,8 +269,12 @@ function ModelRow({
       style={{ cursor: "pointer" }}
     >
       <td>
-        <div style={{ fontWeight: 600 }}>{model.name}</div>
-        <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>{model.id}</div>
+        {/* The alias leads when there is one: it is the name clients use. The
+            id stays beside it, because it is the one that never changes. */}
+        <div style={{ fontWeight: 600 }}>{model.alias ?? model.name}</div>
+        <div style={{ fontSize: 11.5, color: "var(--text-muted)" }}>
+          {model.alias ? `${model.name} · ${model.id}` : model.id}
+        </div>
       </td>
       <td className="tnum">{parameters(model.param_count)}</td>
       <td>{model.quantization ?? "—"}</td>
@@ -307,6 +318,7 @@ export interface LoadChoice {
 
 function ModelDetailBody({
   detail,
+  onAliasSaved,
   wanted,
   onWant,
   kvTypes,
@@ -317,6 +329,7 @@ function ModelDetailBody({
   defaultUbatch,
 }: {
   detail: ModelDetail;
+  onAliasSaved: (saved: CatalogRow) => void;
   wanted: LoadChoice;
   onWant: (wanted: LoadChoice) => void;
   kvTypes: string[];
@@ -341,13 +354,21 @@ function ModelDetailBody({
           marginBottom: 16,
         }}
       >
-        <span style={{ fontSize: 16, fontWeight: 600 }}>{detail.name}</span>
+        <span style={{ fontSize: 16, fontWeight: 600 }}>
+          {detail.alias ?? detail.name}
+        </span>
         <Pill tone="accent">GGUF</Pill>
         {detail.state === "loaded" && <Pill tone="ok">Loaded</Pill>}
         {!detail.supported && (
           <Pill tone="warn">The pinned engine cannot run this architecture</Pill>
         )}
       </div>
+
+      <AliasEditor
+        key={detail.id}
+        model={detail}
+        onSaved={onAliasSaved}
+      />
 
       {detail.state === "missing" && (
         <div className="notice notice--warn" style={{ marginBottom: 16 }}>
@@ -361,6 +382,8 @@ function ModelDetailBody({
         style={{ gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}
       >
         <div>
+          <Row label="Model id">{detail.id}</Row>
+          <Row label="Name">{detail.name}</Row>
           <Row label="Architecture">{detail.architecture.toUpperCase()}</Row>
           <Row label="Parameters">{parameters(detail.param_count)}</Row>
           <Row label="Quantization">{detail.quantization ?? "—"}</Row>
@@ -698,12 +721,129 @@ function sourceLabel(
   }
 }
 
+/**
+ * The model's alias: the short name clients see in `/v1/models` and may send
+ * as `model`.
+ *
+ * Saved explicitly rather than on every keystroke, because a rename takes
+ * effect for every client at once and the old name stops working. A refusal —
+ * the name is taken, or reserved — is shown under the field it is about.
+ */
+function AliasEditor({
+  model,
+  onSaved,
+}: {
+  model: CatalogRow;
+  onSaved: (saved: CatalogRow) => void;
+}) {
+  const [draft, setDraft] = useState(model.alias ?? "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const trimmed = draft.trim();
+  const unchanged = trimmed === (model.alias ?? "");
+
+  async function save(alias: string | null) {
+    setSaving(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const row = await api.setAlias(model.id, alias);
+      setDraft(row.alias ?? "");
+      setSaved(true);
+      onSaved(row);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form
+      className="field"
+      style={{ marginBottom: 16, maxWidth: 520 }}
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!unchanged && trimmed !== "") void save(trimmed);
+      }}
+    >
+      <label className="field__label" htmlFor="alias-edit">
+        Alias
+      </label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <input
+          id="alias-edit"
+          className="input"
+          style={{ flex: "1 1 200px" }}
+          placeholder="Not set"
+          maxLength={64}
+          value={draft}
+          aria-invalid={error !== null}
+          aria-describedby="alias-edit-help"
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setError(null);
+            setSaved(false);
+          }}
+        />
+        <button
+          type="submit"
+          className="btn btn--primary"
+          disabled={saving || unchanged || trimmed === ""}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        {model.alias && (
+          <button
+            type="button"
+            className="btn"
+            disabled={saving}
+            onClick={() => void save(null)}
+          >
+            Clear
+          </button>
+        )}
+      </div>
+      {error ? (
+        <div
+          role="alert"
+          className="notice notice--danger"
+          style={{ marginTop: 8 }}
+        >
+          {error}
+        </div>
+      ) : (
+        <div
+          id="alias-edit-help"
+          className="card__note"
+          style={{ marginTop: 6 }}
+          aria-live="polite"
+        >
+          {saved
+            ? model.alias
+              ? `Saved. Clients now see this model as “${model.alias}”.`
+              : "Cleared. Clients see this model under its id again."
+            : model.alias
+              ? "The short model name exposed to Lightagent and API clients. Renaming retires the old name at once; the file and its id never change."
+              : "Not set — clients see the model id. Give it a short name to expose to Lightagent and API clients."}
+        </div>
+      )}
+    </form>
+  );
+}
+
 /** Adding a model: the pinned list, a direct link, or a file already here. */
 function AddModel({ onDone }: { onDone: () => void }) {
   const pinned = usePoll<PinnedModel[]>(api.catalog, 0);
   const [url, setUrl] = useState("");
   const [sha256, setSha256] = useState("");
   const [path, setPath] = useState("");
+  // One alias for whichever way the model is added: it names the model, not
+  // the route it arrived by. Optional, and never filled in for the user.
+  const [alias, setAlias] = useState("");
+  const chosenAlias = alias.trim() || undefined;
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [started, setStarted] = useState<string | null>(null);
@@ -714,6 +854,7 @@ function AddModel({ onDone }: { onDone: () => void }) {
     try {
       const job = await work();
       setStarted(`${what} started as job ${job.job}. Progress is on the Logs screen.`);
+      setAlias("");
       onDone();
     } catch (cause) {
       setFailure(cause instanceof Error ? cause.message : String(cause));
@@ -726,6 +867,25 @@ function AddModel({ onDone }: { onDone: () => void }) {
     <Card title="Add a model">
       {failure && <div className="notice notice--danger">{failure}</div>}
       {started && <div className="notice notice--info">{started}</div>}
+
+      <div className="field" style={{ marginBottom: 18, maxWidth: 420 }}>
+        <label className="field__label" htmlFor="model-alias">
+          Alias (optional)
+        </label>
+        <input
+          id="model-alias"
+          className="input"
+          placeholder="e.g. Coder"
+          maxLength={64}
+          value={alias}
+          onChange={(event) => setAlias(event.target.value)}
+          aria-describedby="model-alias-help"
+        />
+        <div id="model-alias-help" className="card__note" style={{ marginTop: 6 }}>
+          The short model name exposed to Lightagent and API clients. Applies to
+          whichever model you add next; you can set or change it later.
+        </div>
+      </div>
 
       <div style={{ marginBottom: 18 }}>
         <div className="card__note" style={{ marginBottom: 8 }}>
@@ -755,7 +915,11 @@ function AddModel({ onDone }: { onDone: () => void }) {
                         className="btn"
                         disabled={busy}
                         onClick={() =>
-                          void start(() => api.downloadModel({ id: model.id }), "Download")
+                          void start(
+                            () =>
+                              api.downloadModel({ id: model.id, alias: chosenAlias }),
+                            "Download",
+                          )
                         }
                       >
                         <Download size={15} />
@@ -807,9 +971,11 @@ function AddModel({ onDone }: { onDone: () => void }) {
             onClick={() =>
               void start(
                 () =>
-                  api.downloadModel(
-                    sha256.trim() ? { url, sha256: sha256.trim() } : { url },
-                  ),
+                  api.downloadModel({
+                    url,
+                    ...(sha256.trim() ? { sha256: sha256.trim() } : {}),
+                    alias: chosenAlias,
+                  }),
                 "Download",
               )
             }
@@ -836,7 +1002,9 @@ function AddModel({ onDone }: { onDone: () => void }) {
             className="btn"
             style={{ marginTop: 10 }}
             disabled={busy || path.trim() === ""}
-            onClick={() => void start(() => api.importModel(path), "Import")}
+            onClick={() =>
+              void start(() => api.importModel(path, chosenAlias), "Import")
+            }
           >
             <HardDriveDownload size={15} />
             Import
