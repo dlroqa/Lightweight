@@ -624,6 +624,13 @@ the router's and the node's logs. `/metrics` carries time-to-first-token and
 latency histograms, and `/api/router/v1/traces` shows how recent requests were
 routed. These are measurements only; no routing decision reads them.
 
+A route can also keep models ready ahead of demand: with `"placement":
+{"min_ready": 1, "warm_standby": 1, "allowed_nodes": [...]}`, the router asks
+empty nodes, through their own control API, to load a model they already have
+installed until the route has that many ready deployments. The node's own
+memory admission decides; nothing is downloaded, swapped or unloaded; and a
+request never waits for a load.
+
 ```sh
 export LIGHTWEIGHT_DELL_KEY=...  LIGHTWEIGHT_T420_KEY=...   # one key per node, never in the file
 hermes router validate-config --config router.json          # checks everything; listens on nothing
@@ -800,7 +807,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `lightweight-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
 | `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
 | `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
-| `lightweight-router` | Stable logical model names over several gateways: routes, node health, priority / round-robin / least-busy selection, capability filtering, optional session affinity, pre-response failover, stream relaying, routing traces and metrics. A client of the gateways, never an engine |
+| `lightweight-router` | Stable logical model names over several gateways: routes, node health, priority / round-robin / least-busy selection, capability filtering, optional session affinity, pre-response failover, stream relaying, routing traces and metrics, and an optional placement controller that keeps routes at a target of ready deployments. A client of the gateways, never an engine |
 | `lightweight-cli` | Command-line access to the above |
 
 Two parts of the product are not crates:
