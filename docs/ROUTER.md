@@ -118,18 +118,46 @@ unhealthy.
 
 | Endpoint | Behaviour |
 |---|---|
-| `GET /v1/models` | Lists every configured route, including routes with nothing available right now. Each row has `owned_by: "lightweight-router"`. When a route's context is known it is given under the gateway's names (`context_length`, `n_ctx`, `max_tokens`, `max_output_tokens`), using the **smallest** context any of the route's deployments was last seen serving. No node, address, node-local name or file appears. |
+| `GET /v1/models` | Lists every configured route, including routes with nothing available right now. Each row has `owned_by: "lightweight-router"`. When a route's context is known it is given under the gateway's names (`context_length`, `n_ctx`, `max_tokens`, `max_output_tokens`), using the **smallest** context among the deployments the route could send a request to right now (see below). No node, address, node-local name or file appears. |
 | `GET /v1/capabilities` | The gateway's contract, with the same protocol name and version (`lightweight-public-inference`, v1) and the same top-level fields, plus a `routes` array. |
 | `POST /v1/chat/completions`, `POST /v1/completions` | Routed and proxied, streamed or not. |
 | `GET /health` | Never refused. Returns `ok`, `degraded` or `unavailable` with route counts, and nothing more. |
 | `GET /metrics` | Prometheus text, behind the client key. |
 
-**The rule for capabilities is conservative.** A route claims a feature only if
-every deployment it could send a request to right now supports it. The router as
-a whole claims only what every available route supports. A route with nothing
-available claims nothing. `state.model` describes the default route, and only
-while that route is available. `limits.max_concurrent_requests` is the smallest
-limit among the available deployments, or `0` when none is available.
+**Context and capabilities come from one eligible set.** A route's public
+context, features and concurrency are all computed by `select::summarize` over
+exactly the deployments `select::plan` would try for a request at that moment.
+That is the same eligible set the router uses to route. The invariant holds by
+construction:
+
+> A route's public context never advertises more context, and its features never
+> claim more support, than a currently eligible deployment can serve.
+
+- A feature is claimed only if every eligible deployment supports it.
+- The context is the smallest among the eligible deployments.
+- The router as a whole claims only what every available route supports.
+- A route with nothing eligible claims nothing and lists no context.
+- If an eligible deployment has never reported its figures, nothing narrower than
+  "unknown" is advertised.
+- `state.model` describes the default route, and only while that route is
+  available.
+- `limits.max_concurrent_requests` is the smallest limit among the eligible
+  deployments, or `0` when there are none.
+
+The public figure moves when the eligible set changes. For example, with a
+32K-context primary and an 8K-context backup both healthy, `Coder` reports 8K.
+With the backup down it reports 32K. That is the honest figure for where
+requests can actually go.
+
+**Per-deployment state is kept separately.** Each successful probe files the
+node's features, context and concurrency limit under every deployment of that
+node whose model is the one being served. These records are never merged, and a
+route's summary never overwrites them. They survive the node going unhealthy,
+and are overwritten only by a later observation of the same deployment.
+`GET /api/router/v1/deployments` shows each deployment's own `observed` record.
+This is the data a later capability-aware selector (R5) needs: "the request uses
+tools, so deployment A is eligible and deployment B is not." No such selection is
+done yet.
 
 ### Model identity, both ways
 
@@ -139,8 +167,17 @@ unchanged. On the way back, the response's `model` is rewritten to the route's
 own spelling. That applies to a whole JSON body and to every streamed chunk that
 carries a `model`.
 
-Errors from a node are forwarded as the node wrote them, so a context overflow
-still parses the same way.
+Errors from a node are forwarded as the node wrote them, with their status, code
+and message, so a context overflow still parses the same way. The router rewrites
+model identity only where it appears as a structured `model` field: a whole
+success body, or a streamed event, including an in-band error frame that carries
+one. It never edits free-text error messages.
+
+The only Lightweight error whose message names a node-local model is the 404
+`model_not_found` a node sends after swapping models. The router never forwards
+it: it fails over, or, when no deployment is left, answers with its own
+`route_unavailable`, which names only the route. An unknown route is refused with
+a message that names only what the client itself asked for.
 
 | Request `model` | Result |
 |---|---|
@@ -178,7 +215,9 @@ are copied from the node's response.
 **Request ids:** a well-formed `X-Request-Id` from the client (up to 128 visible
 ASCII characters) is kept. If the client sends none, the router generates one
 (`rtr-…`). The id is sent to the node, echoed in the response, and included in
-every router log line.
+every router log line. Gateways do not log it yet. Node-side request-id logging
+is a future observability enhancement (R6), deliberately left out of this
+change.
 
 ## Health
 
@@ -192,34 +231,47 @@ credential. That one cheap call shows:
 
 Nothing is probed during a request.
 
-- One success makes a node `healthy` immediately.
+- One success makes a node `healthy` immediately, with no router restart.
 - `failure_threshold` consecutive failures make it `unhealthy`. A failed
   connection or a timeout during a request counts as one of those failures.
-- A node that has never been seen stays `unknown`.
+- A node that has never been seen stays `unknown`, and an `unknown` node gets no
+  traffic, even if it has come up since the last probe.
+- The threshold is `health.failure_threshold`. This is a deliberately simple,
+  deterministic counter, not a circuit breaker.
 - A deployment is **available** only if its node is enabled and healthy and is
   serving the deployment's model (compared ignoring case, as the node compares
   aliases).
-- The first probe runs before the first request is accepted.
+- The first probe runs before the first request is accepted. A node that is
+  offline then does not stop the router from starting.
 
 ## Priority routing and failover
 
-The router takes the route's deployments in configured order and drops every one
-that is not available. The first remaining deployment gets the request. Nothing
+For each request, the router reads the health snapshot, takes the route's
+deployments in configured order, and drops every one that is not available. The first remaining deployment gets the request. Nothing
 is reordered by latency. When a primary recovers, it is first again on the very
 next request.
 
 **Failover happens only before anything has been sent to the client.** The next
 deployment is tried when the current one:
 
-- refuses the connection, fails DNS, or times out connecting;
+- refuses the connection, fails DNS, or times out connecting. The failure is
+  recorded against the node's health and the next eligible deployment is tried
+  in the same request. The request never waits for the next probe. That is why
+  the first request after a primary dies still succeeds, while the primary is
+  still marked healthy;
 - answers `502`, `503` or `504` (for example `server_busy` or no model loaded);
 - answers `404 model_not_found`. That means the node swapped models since the
   last probe. The router forgets what that node was serving until the next
   probe, and the node's message is not shown to the client.
 
-Every other answer commits the deployment. That includes `400` and `500`: a
-`500` is the node's verdict on this request, and is returned rather than run
-again elsewhere. If every candidate refuses, the last node's own refusal is
+Every other answer commits the deployment. That includes `400` and `500`.
+**A `500` is never retried elsewhere.** It may be a deterministic failure of this
+request or this model. Running the request again on another model could
+duplicate work, or hide a real application error behind a different model's
+answer. Lightweight's `500`s (such as `generation_failed`) say nothing to show
+they are infrastructure-only, so the node's response is returned with its code
+and message intact. `502`, `503` and `504` do say the node could not take the
+request, which is why only they fail over. If every candidate refuses, the last node's own refusal is
 returned. If every candidate fails to connect, the result is `route_unavailable`.
 
 Once a response has started, the deployment stays committed. If the node fails
@@ -239,7 +291,7 @@ only as `"bearer"` or `"none"`.
 |---|---|
 | `GET /api/router/v1/nodes` | Each node's URL, `enabled`, health, consecutive failures, last check, last seen, last error, the model it is serving, and its version. |
 | `GET /api/router/v1/routes` | Each route's strategy, `available`, and its deployments with their priority, availability and reason. Also the `default_route`. |
-| `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, and its availability. |
+| `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, its availability, and its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`. |
 | `GET /api/router/v1/health` | Node and route health in one read, the probe settings, and active requests. |
 
 ## Observability
@@ -264,13 +316,71 @@ unhealthy, `-1` unknown). A request for an unconfigured route is counted under
 - **Rewritten frames reorder JSON keys.** A frame whose `model` is rewritten is
   re-serialized, and its keys come out in sorted order. JSON gives key order no
   meaning, and the openai SDK and Lightagent both parse it unchanged.
-- **The node control plane is not proxied.** The router does not serve
-  `/api/v1/gateway` or `/api/v1/models`. Lightagent already treats them as
-  optional, so its runtime panel shows nothing about the engine behind a router.
+- **The node control plane is not proxied, and not imitated.** See
+  [Lightagent's runtime panel](#lightagents-runtime-panel).
 - **Nodes do not log the request id.** The router sends `X-Request-Id` and logs
-  it, but gateways do not log it yet. Propagating it there is node-side work.
+  it, but gateways do not log it yet (R6).
 - **No latency or TTFT histograms yet.** The log lines already carry the timing
   data those metrics would be built from.
+
+## Lightagent's runtime panel
+
+Lightagent `7d95232` reads a gateway's `/api/v1` control plane in exactly one
+live place: the provider panel (`crates/lightagent/src/serve.rs`). It treats both
+endpoints as optional.
+
+There is also a `crates/lightagent/src/runtime.rs`, which reads more and can
+place models. It is not declared as a module and has no subcommand in that build,
+so it never runs. It is listed below because it is the consumer a compatibility
+layer would have to survive once it is wired up.
+
+| Endpoint | Consumer | Fields read | Meaningful for a router? |
+|---|---|---|---|
+| `GET /api/v1/gateway` | Provider panel (live) | `engine_capabilities.reasoning_content`, which sets the "Reasoning ready" badge | Only per route, and the panel asks once per provider |
+| `GET /api/v1/models` | Provider panel (live) | Per row: `id`, `name`, `state`, `supported`. They fill a disabled "Backend runtime catalog" group of models that need loading. | No. Routes are already the selectable models via `/v1/models`, and loading is placement. |
+| `GET /api/v1/gateway` | `runtime.rs` (not wired) | `engine_capabilities.device` (required), `build`, `kv_cache_types`, `max_concurrent_requests`, `streaming`, `tool_calls`; `defaults.*`; `model`, `backend`, `version` | No. They describe one physical engine and its load defaults. |
+| `GET /api/v1/system` | `runtime.rs` (not wired) | `os`, `cpu`, `memory` | No. They describe one machine. |
+| `POST /api/v1/models/{id}/load`, `POST /api/v1/models/unload` | `runtime.rs` (not wired) | — | No. This is placement, which is out of scope until R7. |
+
+**Decision: the router serves none of these, neither proxied nor imitated.** The
+reasons:
+
+- Proxying one node's `/api/v1` would present that node as the router.
+- A router-owned `/api/v1/gateway` would have to make up the required
+  `engine_capabilities.device`, which only exists for a single engine.
+- Worse, a router-owned `/api/v1/gateway` would let the placement code in
+  `runtime.rs`, once it is wired up, get past its gateway read and send a model
+  load to the router. Without that endpoint, it stops at the gateway read, which
+  is the safe failure.
+
+What the panel loses is small. The "Reasoning ready" badge reads "Standard
+reasoning", and the disabled runtime-catalog group is empty. Model selection,
+chat and streaming are unaffected, because they use `/v1`.
+
+The logical state the panel could use is already router-owned: route availability
+and features in `/v1/capabilities`, and node health and deployments in
+`/api/router/v1/*`. Showing it in Lightagent needs Lightagent to read those
+endpoints, which is a change to Lightagent and left for later.
+
+## Tests and cleanup
+
+The router's integration tests run every node and router as a tokio task inside
+the test process:
+
+- real gateways over the mock engine, with `paths: None`, so nothing is written
+  to disk;
+- scripted nodes;
+- the router itself.
+
+They spawn no processes and create no files or directories. When a test passes,
+fails an assertion, panics or times out, its runtime is dropped and every
+listener closes with it. Interrupting `cargo test` (Ctrl-C or `kill -9`) ends the
+one process that holds them all. This was checked by killing the test binary
+mid-run with both signals: no process or listener survived, and nothing new
+appeared in the temp or data directories.
+
+The disk growth seen while building this was Cargo's own output in `target/`,
+mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 

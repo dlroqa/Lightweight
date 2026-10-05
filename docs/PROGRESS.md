@@ -1337,6 +1337,47 @@ profile, with node-local aliases `QwenCoder` (node A) and `CoderBackup`
 - The user's own gateway on port 11434 was not touched. The scratch processes
   were stopped by their recorded PIDs.
 
+Final review pass (2026-10-05). R4 not started. `./scripts/check.sh` passes in
+full:
+
+- workspace tests: 1001 passed, 0 failed. The router has 81 of them (53 unit,
+  28 integration);
+- real-model header tests: 3;
+- the contract suite: 47 passed, 2 skipped;
+- the panel and desktop builds;
+- the cross-target `lightweight-sys` checks;
+- the version, dependency and secrets gates.
+
+- **Lightagent's runtime panel.** The only live consumer is the provider panel,
+  which reads `/api/v1/gateway` for `reasoning_content` and `/api/v1/models` for
+  the runtime catalog. The router serves neither, proxied or imitated. Imitating
+  `/api/v1/gateway` would mean inventing an engine `device`, and would open a
+  path to model placement through the router. The full table and the reasoning
+  are in `docs/ROUTER.md`.
+- **Per-deployment state.** Each deployment's capabilities, context and
+  concurrency limit are now filed and kept separately (`HealthBook::deployment`),
+  and shown in `/api/router/v1/deployments`.
+- **Route context.** The route's public context, features and limit come from
+  `select::summarize` over exactly the set `select::plan` would try. Before this,
+  `/v1/models` context counted every deployment last seen serving, including
+  unhealthy ones.
+- **New coverage.** Tests now cover:
+  - an identity-leak audit across every client surface and refusal;
+  - a single-deployment stale `model_not_found` answered as `route_unavailable`
+    without the alias;
+  - a 500 that is not retried;
+  - an `unknown` node at startup that gets no traffic until a probe sees it,
+    then serves without a restart;
+  - an immediate failover asserting that one failure is recorded and the
+    request did not wait for a probe.
+- **Cleanup audit.** The integration tests spawn no processes and write no
+  files. Killing the test binary with SIGINT or SIGKILL mid-run left no process
+  or listener behind. The disk growth was `target/debug/incremental`.
+- **Real re-smoke.** Unmodified Lightagent `7d95232` went through the router to
+  primary node-a. Node-a was then killed, and the next new Lightagent request
+  failed over in the same request to node-b (`primary_failed_fallback`,
+  `failover_count=1`). Lightagent showed `Coder` both times.
+
 Deliberately not built (see the `docs/ROUTER.md` roadmap):
 
 - strategies other than priority, and session affinity;
