@@ -524,10 +524,7 @@ mod tests {
         };
         let printed = format!("{auth:?}");
         assert!(!printed.contains("test-secret"), "{printed}");
-        assert_eq!(
-            auth.header_value().as_deref(),
-            Some("Bearer test-secret")
-        );
+        assert_eq!(auth.header_value().as_deref(), Some("Bearer test-secret"));
         assert_eq!(auth.kind(), "bearer");
     }
 
