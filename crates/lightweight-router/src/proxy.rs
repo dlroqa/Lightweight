@@ -48,6 +48,8 @@
 //! remember to check.
 
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -63,6 +65,7 @@ use serde_json::Value;
 use crate::RouterState;
 use crate::affinity::{AffinityKey, Established, Reassignment};
 use crate::auto_route::{AUTO_ROUTE, AutoRoute};
+use crate::classifier::{Classification, ClassificationInput};
 use crate::domain::{
     CapabilityGap, DeploymentId, Node, Route, RouteName, RoutingFailure, RoutingReason,
 };
@@ -344,6 +347,32 @@ pub async fn forward(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Response {
+    forward_as(state, endpoint, headers, body, false).await
+}
+
+/// Forward a request the router itself makes — a classification — through
+/// the same pipeline as a client's.
+///
+/// `nested` is what makes classification non-recursive: a nested request that
+/// reaches a classifying `Auto` rule takes the rule's fallback rather than
+/// classifying again. Boxed because it is called from inside the pipeline it
+/// runs.
+pub(crate) fn forward_nested(
+    state: Arc<RouterState>,
+    endpoint: Endpoint,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+    Box::pin(async move { forward_as(state, endpoint, &headers, &body, true).await })
+}
+
+async fn forward_as(
+    state: Arc<RouterState>,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: &Bytes,
+    nested: bool,
+) -> Response {
     // The router has the whole request from here: every router-side duration
     // starts now.
     let received = Instant::now();
@@ -357,6 +386,7 @@ pub async fn forward(
         &request_id,
         active,
         received,
+        nested,
     )
     .await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
@@ -367,7 +397,7 @@ pub async fn forward(
     response
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn route_request(
     state: &Arc<RouterState>,
     endpoint: Endpoint,
@@ -376,6 +406,7 @@ async fn route_request(
     request_id: &str,
     active: ActiveGuard,
     received: Instant,
+    nested: bool,
 ) -> Response {
     let mut request = match parse(body) {
         Ok(request) => request,
@@ -392,7 +423,7 @@ async fn route_request(
     // route resolution, requirements, the affinity lookup, eligibility, the
     // capability filter and the policy. TTFT and the request duration start
     // earlier, at `received`; they measure something else.
-    let planning_started = Instant::now();
+    let mut planning_started = Instant::now();
     pause(&state.phase_delays.during_planning_ms).await;
 
     let requested = request.get("model").and_then(Value::as_str);
@@ -405,8 +436,23 @@ async fn route_request(
     let mut auto_rule: Option<Option<String>> = None;
     let resolution = match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
         Some(auto) => {
-            match resolve_auto(state, auto, endpoint, body, request_id, planning_started) {
+            match resolve_auto(
+                state,
+                auto,
+                endpoint,
+                body,
+                request_id,
+                planning_started,
+                nested,
+            )
+            .await
+            {
                 Ok(resolved) => {
+                    // The classifier's time is its own, measured on its own:
+                    // `routing_ms` stays the router's planning time, as in R6.
+                    if let Some(classification) = &resolved.classification {
+                        planning_started += classification.duration;
+                    }
                     early_needs = Some(resolved.needs);
                     auto_rule = Some(resolved.rule);
                     resolved.route
@@ -904,6 +950,8 @@ struct AutoResolution<'a> {
     needs: RequestRequirements,
     /// The rule that matched; `None` for the fallback.
     rule: Option<String>,
+    /// The classification, when the rule asked for one.
+    classification: Option<Classification>,
 }
 
 /// Resolve an `Auto` request: read what it requires, and let the first
@@ -913,13 +961,19 @@ struct AutoResolution<'a> {
 /// afterwards exactly as for a request that named the route. A request the
 /// gateway would refuse is refused before any route is chosen, and counted
 /// under `Auto` — a fixed name, never one a client typed.
-fn resolve_auto<'a>(
-    state: &'a RouterState,
+///
+/// When the matching rule asks to classify, the classifier route is asked
+/// which candidate should answer — unless this request is itself a
+/// classification, which takes the rule's fallback instead. A classification
+/// that fails or is unsure resolves to the classifier's fallback.
+async fn resolve_auto<'a>(
+    state: &'a Arc<RouterState>,
     auto: &'a AutoRoute,
     endpoint: Endpoint,
     body: &[u8],
     request_id: &str,
     planning_started: Instant,
+    nested: bool,
 ) -> Result<AutoResolution<'a>, Box<Response>> {
     let needs = match requirements::extract(endpoint, body) {
         Ok(needs) => needs,
@@ -944,12 +998,25 @@ fn resolve_auto<'a>(
         }
     };
     let decision = auto.decide(&needs);
+    let classification = match auto.classifier.as_ref().filter(|_| decision.classify) {
+        Some(_) if nested => Some(Classification::nested()),
+        Some(classifier) => {
+            let input =
+                ClassificationInput::read(endpoint, body, &needs, classifier.max_input_chars);
+            Some(crate::classifier::classify(state, classifier, &input, request_id).await)
+        }
+        None => None,
+    };
+    let resolved = match (&classification, &auto.classifier) {
+        (Some(classification), Some(classifier)) => classification.route(classifier),
+        _ => decision.route,
+    };
     tracing::info!(
         target: targets::ROUTER,
         request_id,
         requested_route = AUTO_ROUTE,
         auto_rule = decision.rule_label(),
-        resolved_route = %decision.route,
+        resolved_route = %resolved,
         endpoint = endpoint.as_str(),
         requires_tools = needs.tools,
         tool_choice = needs.tool_choice.as_str(),
@@ -959,19 +1026,20 @@ fn resolve_auto<'a>(
     );
     state.metrics.record_auto_decision(
         decision.rule_label(),
-        decision.route.as_str(),
+        resolved.as_str(),
         decision.is_fallback(),
     );
     let route = state
         .topology
-        .route(decision.route)
+        .route(resolved)
         .ok_or_else(|| RoutingFailure::UnknownRoute {
-            requested: decision.route.to_string(),
+            requested: resolved.to_string(),
         });
     Ok(AutoResolution {
         route,
         needs,
         rule: decision.rule.map(str::to_owned),
+        classification,
     })
 }
 

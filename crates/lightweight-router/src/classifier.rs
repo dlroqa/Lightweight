@@ -30,7 +30,11 @@
 //! recommendation is a route name, and the request then goes through that
 //! route's pipeline exactly as if the client had named it.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderValue};
 
 use lightweight_api::chat::ChatCompletionRequest;
 use lightweight_api::completions::CompletionRequest;
@@ -39,10 +43,11 @@ use lightweight_inference::generation::{MessageRole, Prompt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::RouterState;
 use crate::auto_route::is_auto;
 use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
-use crate::proxy::Endpoint;
+use crate::proxy::{Endpoint, REQUEST_ID_HEADER};
 use crate::requirements::RequestRequirements;
 
 /// How long a classification may take, by default. Classification sits in
@@ -63,6 +68,8 @@ pub const MAX_CANDIDATES: usize = 16;
 pub const MAX_DESCRIPTION_CHARS: usize = 200;
 /// The output budget of a classification: one short JSON object.
 const ANSWER_TOKENS: u32 = 48;
+/// How much of the classifier's answer is read.
+const ANSWER_LIMIT: usize = 64 * 1024;
 
 /// The `auto_route.classifier` section, as written.
 #[derive(Debug, Deserialize)]
@@ -291,6 +298,89 @@ pub fn parse_answer(body: &[u8], candidates: &[Candidate]) -> Result<Verdict, &'
         .filter(|value| (0.0..=1.0).contains(value))
         .ok_or("bad_confidence")?;
     Ok(Verdict { route, confidence })
+}
+
+/// One classification, start to finish.
+#[derive(Clone, Debug)]
+pub struct Classification {
+    pub outcome: ClassifierOutcome,
+    /// What the classifier named, when it named a candidate — taken only when
+    /// `outcome` is [`ClassifierOutcome::Chosen`].
+    pub verdict: Option<Verdict>,
+    pub duration: Duration,
+    /// The classification request's own id, in the router's and the node's
+    /// logs.
+    pub request_id: String,
+}
+
+impl Classification {
+    /// The route this classification resolves the request to.
+    pub fn route<'a>(&'a self, classifier: &'a RouteClassifier) -> &'a RouteName {
+        match (&self.verdict, self.outcome) {
+            (Some(verdict), ClassifierOutcome::Chosen) => &verdict.route,
+            _ => &classifier.fallback,
+        }
+    }
+
+    pub fn nested() -> Self {
+        Self {
+            outcome: ClassifierOutcome::Nested,
+            verdict: None,
+            duration: Duration::ZERO,
+            request_id: String::new(),
+        }
+    }
+}
+
+/// Ask the classifier route which candidate should answer `input`.
+///
+/// The request goes through the router's own pipeline as a nested request:
+/// the classifier route's health, capabilities and policy choose where it
+/// runs. On timeout the nested request is dropped, which closes its upstream
+/// connection and stops the node generating.
+pub async fn classify(
+    state: &Arc<RouterState>,
+    classifier: &RouteClassifier,
+    input: &ClassificationInput,
+    request_id: &str,
+) -> Classification {
+    let started = Instant::now();
+    let nested_id = format!("{request_id}-classify");
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&nested_id) {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+    let body = Bytes::from(request_body(classifier, input).to_string());
+    let call = async {
+        let response = crate::proxy::forward_nested(
+            Arc::clone(state),
+            Endpoint::ChatCompletions,
+            headers,
+            body,
+        )
+        .await;
+        if !response.status().is_success() {
+            return Err(ClassifierOutcome::Unavailable);
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), ANSWER_LIMIT)
+            .await
+            .map_err(|_| ClassifierOutcome::Unavailable)?;
+        parse_answer(&bytes, &classifier.candidates).map_err(|_| ClassifierOutcome::Invalid)
+    };
+    let (outcome, verdict) = match tokio::time::timeout(classifier.timeout, call).await {
+        Err(_) => (ClassifierOutcome::Timeout, None),
+        Ok(Err(outcome)) => (outcome, None),
+        Ok(Ok(verdict)) if verdict.confidence < classifier.min_confidence => {
+            (ClassifierOutcome::LowConfidence, Some(verdict))
+        }
+        Ok(Ok(verdict)) => (ClassifierOutcome::Chosen, Some(verdict)),
+    };
+    Classification {
+        outcome,
+        verdict,
+        duration: started.elapsed(),
+        request_id: nested_id,
+    }
 }
 
 /// Check the classifier section against the configured routes.
