@@ -99,6 +99,31 @@ invalid response, unknown advisory, low-confidence answer, invalid route map,
 or route outside the allowlist selects `LIGHTWEIGHT_AUTO_DEFAULT_MODEL`.
 Jev is therefore an opt-in advisor, never a gateway dependency.
 
+### Allowlists and model aliases
+
+Workbench allowlists must use the model identity advertised by each gateway's
+`/v1/models`, behind that gateway's prefix. What a gateway advertises depends
+on whether the model has an alias:
+
+| Model in Lightweight | Advertised by `/v1/models` | Allowlist entry |
+|---|---|---|
+| no alias | the canonical id, e.g. `qwen3.5-9b-q8_0@8k` | `fast.qwen3.5-9b-q8_0@8k` |
+| alias `Coder` | the alias, `Coder` | `fast.Coder` |
+
+So giving a model an alias, or renaming or clearing one, changes the ID Open
+WebUI sees. Update `LIGHTWEIGHT_AUTO_DEFAULT_MODEL`,
+`LIGHTWEIGHT_AUTO_ALLOWED_MODELS` and `JEV_ROUTE_MODELS` to match, or the
+entry stops matching and the pipe falls back to the default model. Entries are
+compared exactly, so use the alias in the casing Lightweight lists it, and
+since the allowlist is comma-separated, an alias used here must not contain a
+comma. Aliases are the steadier choice: an alias has no `@context` suffix, so
+it does not change when the model is loaded at a different context, while an
+unaliased canonical ID does. To check what a gateway advertises:
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" https://<gateway>/v1/models
+```
+
 ## Remote use
 
 Keep port 3000 bound to loopback and put Open WebUI behind an authenticated
