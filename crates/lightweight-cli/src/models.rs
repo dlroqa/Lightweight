@@ -172,11 +172,16 @@ pub fn name_added(
     }
 }
 
-/// How long to wait for a local gateway before concluding there is none.
+/// How long to wait for a local gateway to answer.
 ///
 /// Loopback, so a gateway that is there answers in milliseconds; this only
-/// bounds the case where something holds the port and never replies.
-const GATEWAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// bounds the case where something holds the port and never replies, which is
+/// treated as a gateway in the way. It must comfortably outlast a *refused*
+/// connection, which is how "nothing is listening" is recognised: on Windows a
+/// loopback connect to a closed port is retried for about two seconds before
+/// it is refused, and a two-second budget turned exactly that into a timeout —
+/// caught by `check (windows-x64)`, not by the Linux box this was written on.
+const GATEWAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What is listening where a gateway serving this profile would be.
 #[derive(Debug, PartialEq, Eq)]
@@ -328,7 +333,7 @@ async fn alias_through_gateway(
     let response = client
         .patch(url)
         .json(&serde_json::json!({ "alias": alias }))
-        .timeout(GATEWAY_PROBE_TIMEOUT * 5)
+        .timeout(GATEWAY_PROBE_TIMEOUT * 3)
         .send()
         .await
         .map_err(|err| {
