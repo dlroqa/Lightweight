@@ -62,7 +62,24 @@ pub struct Run {
 /// The aggregating path, and like the chat endpoint's it is the streaming one
 /// with an accumulator on the end rather than a second implementation.
 pub async fn aggregate(mut run: Run) -> Result<CompletionResponse, BackendError> {
-    let _guard = run.guard;
+    let collected = collect_all(&mut run).await;
+    // Said before the guard goes, so its closing log line reports how the
+    // request ended.
+    match &collected {
+        Ok(_) => run.guard.completed(),
+        Err(_) => run.guard.failed(),
+    }
+    let (choices, usage) = collected?;
+    Ok(CompletionResponse::new(
+        run.builder.id().to_owned(),
+        run.model_id.clone(),
+        choices,
+        usage,
+    ))
+}
+
+/// Run every queued completion in order, collecting each into a choice.
+async fn collect_all(run: &mut Run) -> Result<(Vec<CompletionChoice>, UsageBody), BackendError> {
     let mut choices = Vec::with_capacity(run.queue.len());
     let mut usage = UsageBody::default();
 
@@ -101,13 +118,7 @@ pub async fn aggregate(mut run: Run) -> Result<CompletionResponse, BackendError>
             finish_reason: Some(finish_reason.as_str().to_owned()),
         });
     }
-
-    Ok(CompletionResponse::new(
-        run.builder.id().to_owned(),
-        run.model_id.clone(),
-        choices,
-        usage,
-    ))
+    Ok((choices, usage))
 }
 
 /// State carried while streaming one request's completions.
@@ -245,8 +256,10 @@ fn finish_choice(encoder: &mut Encoder, index: u32, reason: FinishReason) {
 
 /// End the stream after a failure that arrived once bytes were already sent.
 fn fail(encoder: &mut Encoder, err: &BackendError) {
+    encoder.run.guard.failed();
     tracing::warn!(
         target: targets::INFERENCE,
+        request_id = encoder.run.guard.request_id(),
         code = err.code(),
         "a completion failed after the response had started"
     );
@@ -275,10 +288,12 @@ fn close(encoder: &mut Encoder) {
         // sampler or template problem, and it is invisible otherwise.
         tracing::warn!(
             target: targets::INFERENCE,
+            request_id = encoder.run.guard.request_id(),
             id = encoder.run.builder.id(),
             "the model produced no text for any prompt"
         );
     }
 
+    encoder.run.guard.completed();
     encoder.run.guard.cancel();
 }

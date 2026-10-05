@@ -52,6 +52,39 @@ pub const DEFAULT_FAILURE_THRESHOLD: u32 = 2;
 /// machine must not cut one off.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The header a client names its session in, when session affinity is on and
+/// the file names no other.
+pub const DEFAULT_SESSION_HEADER: &str = "x-lightweight-session";
+/// How long a session may sit idle before its affinity is forgotten, by
+/// default. Long enough to cover a person reading an answer and typing the
+/// next turn; short enough that an affinity is an operational hint and not a
+/// record of who used the router.
+pub const DEFAULT_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// How many sessions' affinities are held at once, by default.
+pub const DEFAULT_SESSION_MAX_ENTRIES: usize = 10_000;
+/// The most a configuration may ask to hold. An entry is a few dozen bytes;
+/// this bounds the map at tens of megabytes whatever the file says.
+pub const MAX_SESSION_ENTRIES: usize = 1_000_000;
+/// How many recent routing traces are kept for `/api/router/v1/traces`, by
+/// default.
+pub const DEFAULT_TRACE_CAPACITY: usize = 200;
+/// The most traces a configuration may ask to keep.
+pub const MAX_TRACE_CAPACITY: usize = 10_000;
+
+/// Headers a session may not be read from: each already means something to
+/// the router or to a node, and reusing one would either leak a credential
+/// into the affinity map or tie affinity to something that is not a session.
+const RESERVED_SESSION_HEADERS: [&str; 8] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-request-id",
+    "content-type",
+    "content-length",
+    "accept",
+    "host",
+];
+
 /// The file as written.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +104,12 @@ pub struct RouterFile {
     pub health: HealthFile,
     #[serde(default)]
     pub request: RequestFile,
+    /// Optional. Absent means no affinity: every request is routed by its
+    /// route's policy alone, exactly as before sessions existed.
+    #[serde(default)]
+    pub session_affinity: SessionAffinityFile,
+    #[serde(default)]
+    pub traces: TracesFile,
     #[serde(default)]
     pub nodes: Vec<NodeFile>,
     #[serde(default)]
@@ -129,6 +168,61 @@ const fn default_connect_secs() -> u64 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SessionAffinityFile {
+    /// Off unless the operator turns it on.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_session_header")]
+    pub header: String,
+    #[serde(default = "default_session_ttl_secs")]
+    pub idle_ttl_secs: u64,
+    #[serde(default = "default_session_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for SessionAffinityFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            header: default_session_header(),
+            idle_ttl_secs: default_session_ttl_secs(),
+            max_entries: default_session_max_entries(),
+        }
+    }
+}
+
+fn default_session_header() -> String {
+    DEFAULT_SESSION_HEADER.to_owned()
+}
+const fn default_session_ttl_secs() -> u64 {
+    DEFAULT_SESSION_IDLE_TTL.as_secs()
+}
+const fn default_session_max_entries() -> usize {
+    DEFAULT_SESSION_MAX_ENTRIES
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracesFile {
+    /// Recent routing traces kept in memory. `0` keeps none.
+    #[serde(default = "default_trace_capacity")]
+    pub capacity: usize,
+}
+
+impl Default for TracesFile {
+    fn default() -> Self {
+        Self {
+            capacity: default_trace_capacity(),
+        }
+    }
+}
+
+const fn default_trace_capacity() -> usize {
+    DEFAULT_TRACE_CAPACITY
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeFile {
     pub id: String,
     pub url: String,
@@ -178,6 +272,27 @@ impl Default for HealthPolicy {
     }
 }
 
+/// How related requests are kept on one deployment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AffinityPolicy {
+    pub enabled: bool,
+    /// Lowercase, as HTTP header names are compared.
+    pub header: String,
+    pub idle_ttl: Duration,
+    pub max_entries: usize,
+}
+
+impl Default for AffinityPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            header: DEFAULT_SESSION_HEADER.to_owned(),
+            idle_ttl: DEFAULT_SESSION_IDLE_TTL,
+            max_entries: DEFAULT_SESSION_MAX_ENTRIES,
+        }
+    }
+}
+
 /// A configuration that passed every check.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
@@ -187,6 +302,9 @@ pub struct RouterConfig {
     pub client_key: Option<Secret>,
     pub health: HealthPolicy,
     pub connect_timeout: Duration,
+    pub affinity: AffinityPolicy,
+    /// How many recent routing traces to keep. `0` keeps none.
+    pub trace_capacity: usize,
 }
 
 /// One reason a configuration was refused.
@@ -238,6 +356,19 @@ pub enum ConfigError {
     TimeoutExceedsInterval,
     #[error("request.connect_timeout_secs must be at least 1")]
     BadConnectTimeout,
+    #[error("session_affinity.header {header:?} {problem}")]
+    BadSessionHeader {
+        header: String,
+        problem: &'static str,
+    },
+    #[error("session_affinity.{field} must be between {minimum} and {maximum}")]
+    BadSessionLimit {
+        field: &'static str,
+        minimum: u64,
+        maximum: u64,
+    },
+    #[error("traces.capacity must be at most {maximum}")]
+    BadTraceCapacity { maximum: usize },
 }
 
 /// Every reason a configuration was refused, in file order.
@@ -311,6 +442,12 @@ pub fn validate(
     if file.request.connect_timeout_secs == 0 {
         errors.push(ConfigError::BadConnectTimeout);
     }
+    let affinity = validate_affinity(&file.session_affinity, &mut errors);
+    if file.traces.capacity > MAX_TRACE_CAPACITY {
+        errors.push(ConfigError::BadTraceCapacity {
+            maximum: MAX_TRACE_CAPACITY,
+        });
+    }
 
     if file.nodes.is_empty() {
         errors.push(ConfigError::NoNodes);
@@ -353,7 +490,53 @@ pub fn validate(
         client_key,
         health,
         connect_timeout: Duration::from_secs(file.request.connect_timeout_secs),
+        affinity,
+        trace_capacity: file.traces.capacity,
     })
+}
+
+/// Check the affinity settings. They are checked even while affinity is off,
+/// so turning it on later cannot be the moment a typo surfaces.
+fn validate_affinity(raw: &SessionAffinityFile, errors: &mut Vec<ConfigError>) -> AffinityPolicy {
+    let header = raw.header.trim().to_ascii_lowercase();
+    let problem = if header.is_empty() {
+        Some("is empty")
+    } else if axum::http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+        Some("is not a valid HTTP header name")
+    } else if RESERVED_SESSION_HEADERS.contains(&header.as_str()) {
+        Some("already means something else and cannot carry a session")
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        errors.push(ConfigError::BadSessionHeader {
+            header: raw.header.clone(),
+            problem,
+        });
+    }
+    // A day at most: an affinity is a hint for one conversation, not a
+    // long-lived record of who talks to the router.
+    const MAX_TTL_SECS: u64 = 24 * 60 * 60;
+    if raw.idle_ttl_secs == 0 || raw.idle_ttl_secs > MAX_TTL_SECS {
+        errors.push(ConfigError::BadSessionLimit {
+            field: "idle_ttl_secs",
+            minimum: 1,
+            maximum: MAX_TTL_SECS,
+        });
+    }
+    if raw.max_entries == 0 || raw.max_entries > MAX_SESSION_ENTRIES {
+        errors.push(ConfigError::BadSessionLimit {
+            field: "max_entries",
+            minimum: 1,
+            maximum: MAX_SESSION_ENTRIES as u64,
+        });
+    }
+    AffinityPolicy {
+        enabled: raw.enabled,
+        header,
+        idle_ttl: Duration::from_secs(raw.idle_ttl_secs),
+        max_entries: raw.max_entries,
+    }
 }
 
 fn validate_listen(raw: &[String], errors: &mut Vec<ConfigError>) -> Vec<SocketAddr> {
@@ -921,6 +1104,68 @@ mod tests {
                 owner: "router".into(),
                 var: "LIGHTWEIGHT_ROUTER_KEY".into()
             }]
+        );
+    }
+
+    #[test]
+    fn affinity_is_off_and_traces_are_bounded_when_the_file_says_nothing() {
+        let config = validate(parse(valid()), &env_with(KEYS)).expect("valid");
+        assert_eq!(config.affinity, AffinityPolicy::default());
+        assert!(!config.affinity.enabled);
+        assert_eq!(config.trace_capacity, DEFAULT_TRACE_CAPACITY);
+    }
+
+    #[test]
+    fn affinity_settings_are_read_and_the_header_is_lowercased() {
+        let mut file = valid();
+        file["session_affinity"] = json!({
+            "enabled": true,
+            "header": "X-Conversation",
+            "idle_ttl_secs": 60,
+            "max_entries": 5
+        });
+        file["traces"] = json!({"capacity": 0});
+        let config = validate(parse(file), &env_with(KEYS)).expect("valid");
+        assert_eq!(
+            config.affinity,
+            AffinityPolicy {
+                enabled: true,
+                header: "x-conversation".into(),
+                idle_ttl: Duration::from_secs(60),
+                max_entries: 5,
+            }
+        );
+        assert_eq!(config.trace_capacity, 0);
+    }
+
+    #[test]
+    fn a_session_header_that_already_means_something_is_refused() {
+        for header in ["Authorization", "x-request-id", "Cookie", "", "bad header"] {
+            let mut file = valid();
+            file["session_affinity"] = json!({"enabled": true, "header": header});
+            let errors = validate(parse(file), &env_with(KEYS)).unwrap_err().0;
+            assert!(
+                matches!(errors.as_slice(), [ConfigError::BadSessionHeader { .. }]),
+                "{header:?}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbounded_affinity_and_trace_limits_are_refused() {
+        let mut file = valid();
+        file["session_affinity"] = json!({"idle_ttl_secs": 0, "max_entries": 0});
+        file["traces"] = json!({"capacity": MAX_TRACE_CAPACITY + 1});
+        let errors = validate(parse(file), &env_with(KEYS)).unwrap_err().0;
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors.contains(&ConfigError::BadTraceCapacity {
+            maximum: MAX_TRACE_CAPACITY
+        }));
+        let mut file = valid();
+        file["session_affinity"] = json!({"bogus": true});
+        assert!(
+            serde_json::from_value::<RouterFile>(file).is_err(),
+            "unknown keys are refused"
         );
     }
 }

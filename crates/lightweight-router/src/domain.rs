@@ -451,6 +451,10 @@ pub enum RoutingReason {
     /// (`context_length_exceeded`), before answering, and this one advertises
     /// a larger context. Any policy.
     ContextOverflowFailover,
+    /// The request named a session whose last successful deployment is still
+    /// healthy and able to serve it, so that deployment was preferred and the
+    /// route's policy was not consulted for the first choice. Any policy.
+    SessionAffinity,
 }
 
 impl RoutingReason {
@@ -466,6 +470,7 @@ impl RoutingReason {
             Self::LeastBusyTiebreak => "least_busy_tiebreak",
             Self::LeastBusyFailover => "least_busy_failover",
             Self::ContextOverflowFailover => "context_overflow_failover",
+            Self::SessionAffinity => "session_affinity",
         }
     }
 }

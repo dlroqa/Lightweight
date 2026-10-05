@@ -171,6 +171,14 @@ enum Act {
     /// Stay in flight until the gate is opened, then answer. A streamed
     /// request gets its first chunk at once and the rest after the gate.
     Hold(Arc<tokio::sync::Semaphore>),
+    /// Answer as `Answer` does, reporting this many prompt tokens in `usage`
+    /// (in the final usage chunk, when streamed).
+    AnswerWithUsage(u32),
+    /// Stream a keep-alive, a role-only chunk and an empty delta at once,
+    /// then the first content after this many milliseconds.
+    SlowFirstToken(u64),
+    /// Stream one in-band error frame and end, before any output.
+    StreamError,
 }
 
 /// A gate a held request waits behind.
@@ -204,6 +212,8 @@ struct NodeScript {
     hits: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
     probes: Arc<Mutex<Vec<HeaderMap>>>,
+    /// Replaces `act` while set, so a deployment can answer and then fail.
+    now: Arc<Mutex<Option<Act>>>,
 }
 
 struct FakeNode {
@@ -245,6 +255,7 @@ impl FakeNode {
             hits: Arc::default(),
             seen: Arc::default(),
             probes: Arc::default(),
+            now: Arc::default(),
         };
         let app = axum::Router::new()
             .route("/v1/capabilities", get(fake_capabilities))
@@ -272,6 +283,25 @@ impl FakeNode {
 
     fn seen(&self) -> Vec<Seen> {
         self.script.seen.lock().unwrap().clone()
+    }
+
+    /// Do this instead of the node's own act from the next request on.
+    fn act_now(&self, act: Act) {
+        *self.script.now.lock().unwrap() = Some(act);
+    }
+
+    /// The `X-Request-Id` of every generation request that reached the node.
+    fn request_ids(&self) -> Vec<String> {
+        self.seen()
+            .iter()
+            .map(|seen| {
+                seen.headers
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
     }
 }
 
@@ -326,7 +356,87 @@ async fn fake_generate(
         body: body.clone(),
     });
     let model = body["model"].clone();
-    match script.act {
+    let act = script
+        .now
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| script.act.clone());
+    match act {
+        Act::AnswerWithUsage(prompt_tokens) if body["stream"] == true => {
+            let mut text = String::new();
+            for frame in [
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}),
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [], "usage": {"prompt_tokens": prompt_tokens,
+                       "completion_tokens": 1, "total_tokens": prompt_tokens + 1}}),
+            ] {
+                text.push_str(&format!("data: {frame}\n\n"));
+            }
+            text.push_str("data: [DONE]\n\n");
+            ([("content-type", "text/event-stream")], text).into_response()
+        }
+        Act::AnswerWithUsage(prompt_tokens) => axum::Json(json!({
+            "id": "c1",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1,
+                      "total_tokens": prompt_tokens + 1},
+        }))
+        .into_response(),
+        Act::SlowFirstToken(delay_ms) => {
+            let opening = format!(
+                ": keep-alive\n\ndata: {}\n\ndata: {}\n\n",
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}),
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {}}]}),
+            );
+            let content = |text: &str| {
+                format!(
+                    "data: {}\n\n",
+                    json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                           "choices": [{"index": 0, "delta": {"content": text}}]})
+                )
+            };
+            let (first, second) = (content("Hello"), content(" world"));
+            let stream = futures_util::stream::unfold(0_u8, move |step| {
+                let (opening, first, second) = (opening.clone(), first.clone(), second.clone());
+                async move {
+                    match step {
+                        0 => Some((Ok::<_, std::io::Error>(opening), 1)),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            Some((Ok(first), 2))
+                        }
+                        2 => {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            Some((Ok(format!("{second}data: [DONE]\n\n")), 3))
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Act::StreamError => (
+            [("content-type", "text/event-stream")],
+            format!(
+                "data: {}\n\n",
+                json!({"error": {"message": "the engine stopped", "type": "server_error",
+                                 "code": "engine_crashed"}})
+            ),
+        )
+            .into_response(),
         Act::Hold(ref gate) if body["stream"] == true => {
             let gate = Arc::clone(gate);
             let first = format!(
@@ -3077,4 +3187,922 @@ async fn least_busy_moves_the_slot_from_the_overflowed_deployment_and_returns_it
     assert_eq!(status, 200);
     assert_eq!(body["model"], "Coder");
     all_released(&router, "slots after a least-busy overflow").await;
+}
+
+// --- R6: session affinity ----------------------------------------------------
+
+const SESSION: &str = "X-Lightweight-Session";
+
+fn with_affinity(mut config: Value, idle_ttl_secs: u64) -> Value {
+    config["session_affinity"] = json!({"enabled": true, "idle_ttl_secs": idle_ttl_secs});
+    config
+}
+
+fn two(strategy: &str, a: &FakeNode, b: &FakeNode) -> Value {
+    policy_config(
+        strategy,
+        &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+    )
+}
+
+/// Post a chat body, naming a session and a request id when given.
+async fn post_as(
+    router: &Router,
+    body: Value,
+    session: Option<&str>,
+    request_id: Option<&str>,
+) -> reqwest::Response {
+    let mut request = client()
+        .post(format!("{}/v1/chat/completions", router.base))
+        .header("Authorization", "Bearer no-key-required")
+        .json(&body);
+    if let Some(session) = session {
+        request = request.header(SESSION, session);
+    }
+    if let Some(id) = request_id {
+        request = request.header("X-Request-Id", id);
+    }
+    request.send().await.expect("request")
+}
+
+/// One chat turn, optionally in a session; which node answered it.
+async fn turn(router: &Router, nodes: &[&FakeNode], session: Option<&str>, body: Value) -> usize {
+    let before = hits(nodes);
+    let response = post_as(router, body, session, None).await;
+    assert_eq!(response.status(), 200);
+    let _ = response.bytes().await;
+    which(nodes, &before)
+}
+
+async fn traces(router: &Router) -> Vec<Value> {
+    let (status, body) = router.get("/api/router/v1/traces?limit=1000").await;
+    assert_eq!(status, 200);
+    body["data"].as_array().cloned().unwrap_or_default()
+}
+
+/// The trace of the request with this id.
+async fn trace_of(router: &Router, request_id: &str) -> Value {
+    poll("the request's trace", async || {
+        traces(router)
+            .await
+            .into_iter()
+            .find(|trace| trace["request_id"] == request_id)
+    })
+    .await
+}
+
+fn coder() -> lightweight_router::domain::RouteName {
+    lightweight_router::domain::RouteName::parse("Coder").unwrap()
+}
+
+#[tokio::test]
+async fn a_session_stays_on_its_deployment_while_other_traffic_rotates() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("round_robin", &a, &b), 1800), &[]).await;
+    let nodes = [&a, &b];
+    let hi = || chat_body("Coder", json!({}));
+
+    // No session: the rotation, exactly as before.
+    assert_eq!(turn(&router, &nodes, None, hi()).await, 0);
+    assert_eq!(turn(&router, &nodes, None, hi()).await, 1);
+    // A session's first request is the rotation's turn; the rest stay there,
+    // streamed or not, and take no turn of their own.
+    assert_eq!(
+        turn(&router, &nodes, Some("conversation-alpha"), hi()).await,
+        0
+    );
+    for stream in [false, true, false] {
+        let body = chat_body("Coder", json!({"stream": stream}));
+        assert_eq!(
+            turn(&router, &nodes, Some("conversation-alpha"), body).await,
+            0
+        );
+    }
+    // Another session gets the next turn, and keeps it.
+    assert_eq!(
+        turn(&router, &nodes, Some("conversation-beta"), hi()).await,
+        1
+    );
+    assert_eq!(
+        turn(&router, &nodes, Some("conversation-beta"), hi()).await,
+        1
+    );
+    // Sessionless traffic carries on from where the rotation was.
+    assert_eq!(turn(&router, &nodes, None, hi()).await, 0);
+    assert_eq!(turn(&router, &nodes, None, hi()).await, 1);
+
+    let state = &router.state;
+    assert_eq!(
+        state.selector.cursor(&state.topology, &coder()),
+        Some(6),
+        "four affinity hits drew no cursor value"
+    );
+    assert_eq!(state.metrics.affinity_hits("Coder"), 4);
+    assert_eq!(state.metrics.affinity_misses("Coder"), 2);
+    assert_eq!(state.metrics.decisions("Coder", "session_affinity"), 4);
+    assert_eq!(state.affinity.len(), 2);
+
+    let (status, sessions) = router.get("/api/router/v1/sessions").await;
+    assert_eq!(status, 200);
+    assert_eq!(sessions["enabled"], true);
+    assert_eq!(sessions["idle_ttl_secs"], 1800);
+    assert_eq!(sessions["active"], 2);
+    let text = sessions.to_string();
+    assert!(
+        !text.contains("conversation-"),
+        "raw session ids leaked: {text}"
+    );
+    let (_, metrics) = (
+        (),
+        client()
+            .get(format!("{}/metrics", router.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    );
+    assert!(metrics.contains("router_session_affinity_hits_total{route=\"Coder\"} 4"));
+    assert!(metrics.contains("router_session_affinity_entries 2"));
+    assert!(!metrics.contains("conversation-"));
+    all_released(&router, "slots after session traffic").await;
+}
+
+#[tokio::test]
+async fn without_affinity_configured_a_session_header_changes_nothing() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(two("round_robin", &a, &b), &[]).await;
+    let nodes = [&a, &b];
+    let mut turns = Vec::new();
+    for _ in 0..4 {
+        turns.push(
+            turn(
+                &router,
+                &nodes,
+                Some("conversation-alpha"),
+                chat_body("Coder", json!({})),
+            )
+            .await,
+        );
+    }
+    assert_eq!(turns, [0, 1, 0, 1], "plain round-robin");
+    assert!(router.state.affinity.is_empty());
+    assert_eq!(router.state.metrics.affinity_misses("Coder"), 0);
+    // The session header is the router's business and never reaches a node.
+    assert!(
+        a.seen()
+            .iter()
+            .all(|seen| seen.headers.get(SESSION).is_none())
+    );
+}
+
+#[tokio::test]
+async fn an_idle_session_expires_back_to_ordinary_routing() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("round_robin", &a, &b), 1), &[]).await;
+    let nodes = [&a, &b];
+    let hi = || chat_body("Coder", json!({}));
+    assert_eq!(turn(&router, &nodes, Some("s"), hi()).await, 0);
+    assert_eq!(turn(&router, &nodes, Some("s"), hi()).await, 0);
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    // Expired: the rotation decides again (its next turn is b), and the
+    // session settles there.
+    assert_eq!(turn(&router, &nodes, Some("s"), hi()).await, 1);
+    assert_eq!(turn(&router, &nodes, Some("s"), hi()).await, 1);
+    assert_eq!(router.state.metrics.affinity_misses("Coder"), 2);
+    assert_eq!(router.state.affinity.evictions().0, 1);
+}
+
+#[tokio::test]
+async fn an_unhealthy_sticky_deployment_is_passed_over_and_a_recovery_does_not_pull_the_session_back()
+ {
+    ensure_provider();
+    let mut a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("least_busy", &a, &b), 1800), &[]).await;
+    let hi = || chat_body("Coder", json!({}));
+    assert_eq!(turn(&router, &[&a, &b], Some("s"), hi()).await, 0);
+
+    let port = a.served.port;
+    a.served.shutdown().await;
+    router.probe().await;
+    router.probe().await;
+    assert_eq!(router.health("a"), NodeHealth::Unhealthy);
+    let before = b.hits();
+    let response = post_as(&router, hi(), Some("s"), Some("after-a-died")).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(b.hits(), before + 1);
+    let metrics = &router.state.metrics;
+    assert_eq!(
+        metrics.affinity_reassignments("Coder", "sticky_unhealthy"),
+        1
+    );
+    let trace = trace_of(&router, "after-a-died").await;
+    assert_eq!(trace["session"]["affinity"], "reassigned");
+    assert_eq!(trace["session"]["reassignment"], "sticky_unhealthy");
+    assert_eq!(trace["session"]["sticky"], "a/AliasA");
+    assert_eq!(trace["final_deployment"], "b/AliasB");
+    assert_eq!(
+        trace["attempts"].as_array().unwrap().len(),
+        1,
+        "a was never tried"
+    );
+
+    // a comes back. The session stays on b: stability, not a return to the
+    // first deployment it ever used.
+    let a = FakeNode::start_limited(port, "AliasA", Act::Answer, 1).await;
+    router.probe().await;
+    assert_eq!(router.health("a"), NodeHealth::Healthy);
+    for _ in 0..3 {
+        assert_eq!(turn(&router, &[&a, &b], Some("s"), hi()).await, 1);
+    }
+    // Sessionless least-busy traffic reaches a again.
+    assert_eq!(turn(&router, &[&a, &b], None, hi()).await, 0);
+    all_released(&router, "slots after a sticky node died and recovered").await;
+}
+
+#[tokio::test]
+async fn a_sticky_deployment_that_fails_before_answering_moves_the_session_under_one_request_id() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("priority", &a, &b), 1800), &[]).await;
+    let hi = || chat_body("Coder", json!({}));
+    assert_eq!(turn(&router, &[&a, &b], Some("s"), hi()).await, 0);
+
+    a.act_now(Act::Refuse(
+        503,
+        json!({"error": {"message": "busy", "type": "server_error", "code": "server_busy"}}),
+    ));
+    let response = post_as(&router, hi(), Some("s"), Some("one-logical-request")).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-request-id"], "one-logical-request");
+    // Both nodes saw the client's id: failover is one request, not two.
+    assert_eq!(a.request_ids().last().unwrap(), "one-logical-request");
+    assert_eq!(b.request_ids().last().unwrap(), "one-logical-request");
+    let metrics = &router.state.metrics;
+    assert_eq!(metrics.affinity_reassignments("Coder", "sticky_failed"), 1);
+
+    let trace = trace_of(&router, "one-logical-request").await;
+    let attempts = trace["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["deployment"], "a/AliasA");
+    assert_eq!(attempts[0]["reason"], "session_affinity");
+    assert_eq!(attempts[0]["outcome"], "failed");
+    assert_eq!(attempts[0]["upstream_status"], 503);
+    assert_eq!(attempts[1]["deployment"], "b/AliasB");
+    assert_eq!(attempts[1]["outcome"], "committed");
+    assert_eq!(trace["selection_reason"], "session_affinity");
+    assert_eq!(trace["session"]["reassignment"], "sticky_failed");
+
+    // The session now goes straight to b; a is not tried again for it.
+    let a_hits = a.hits();
+    assert_eq!(turn(&router, &[&a, &b], Some("s"), hi()).await, 1);
+    assert_eq!(a.hits(), a_hits);
+    all_released(&router, "slots after a sticky failover").await;
+}
+
+#[tokio::test]
+async fn a_sticky_deployment_without_a_needed_capability_is_skipped_and_the_session_moves() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("priority", &a, &b), 1800), &[]).await;
+    assert_eq!(
+        turn(&router, &[&a, &b], Some("s"), chat_body("Coder", json!({}))).await,
+        0
+    );
+
+    // a stops offering tools; the session's next request needs them.
+    a.withhold(|w| w.tools = true);
+    router.probe().await;
+    let with_tools = || chat_body("Coder", json!({"tools": a_tool()}));
+    assert_eq!(turn(&router, &[&a, &b], Some("s"), with_tools()).await, 1);
+    assert_eq!(
+        router
+            .state
+            .metrics
+            .affinity_reassignments("Coder", "sticky_capability_mismatch"),
+        1
+    );
+    // Settled on b, which can serve both kinds of request.
+    assert_eq!(
+        turn(&router, &[&a, &b], Some("s"), chat_body("Coder", json!({}))).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_context_overflow_moves_the_session_to_the_larger_deployment() {
+    ensure_provider();
+    let a = FakeNode::start_with("AliasA", Act::Answer, true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+    let router = Router::start(with_affinity(two("priority", &a, &b), 1800), &[]).await;
+    assert_eq!(
+        turn(&router, &[&a, &b], Some("s"), chat_body("Coder", json!({}))).await,
+        0
+    );
+
+    // The conversation has grown past a's context.
+    a.act_now(overflows(8_192));
+    let response = post_as(
+        &router,
+        long_enough_chat(json!({})),
+        Some("s"),
+        Some("grew"),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        router
+            .state
+            .metrics
+            .affinity_reassignments("Coder", "sticky_context_overflow"),
+        1
+    );
+    let trace = trace_of(&router, "grew").await;
+    let overflow = &trace["context_overflow"];
+    assert_eq!(
+        overflow["estimated_prompt_tokens"],
+        trace["estimated_prompt_tokens"]
+    );
+    assert_eq!(overflow["too_small"][0]["deployment"], "a/AliasA");
+    assert_eq!(overflow["too_small"][0]["context"], 8_192);
+    assert_eq!(overflow["answered_context"], 32_768);
+    assert_eq!(trace["attempts"][1]["reason"], "context_overflow_failover");
+
+    // The next turns go to the larger deployment directly.
+    let a_hits = a.hits();
+    assert_eq!(
+        turn(&router, &[&a, &b], Some("s"), long_enough_chat(json!({}))).await,
+        1
+    );
+    assert_eq!(a.hits(), a_hits);
+}
+
+#[tokio::test]
+async fn concurrent_first_requests_of_one_session_settle_on_one_deployment() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(with_affinity(two("round_robin", &a, &b), 1800), &[]).await;
+    let requests =
+        (0..16).map(|_| post_as(&router, chat_body("Coder", json!({})), Some("racer"), None));
+    for response in futures_util::future::join_all(requests).await {
+        assert_eq!(response.status(), 200);
+    }
+    assert_eq!(router.state.affinity.len(), 1, "one entry, whatever raced");
+    let settled = turn(
+        &router,
+        &[&a, &b],
+        Some("racer"),
+        chat_body("Coder", json!({})),
+    )
+    .await;
+    for _ in 0..4 {
+        assert_eq!(
+            turn(
+                &router,
+                &[&a, &b],
+                Some("racer"),
+                chat_body("Coder", json!({}))
+            )
+            .await,
+            settled
+        );
+    }
+    all_released(&router, "slots after a race").await;
+}
+
+// --- R6: time to first token and latency -------------------------------------
+
+fn single(a: &FakeNode) -> Value {
+    policy_config("priority", &[("a", a.base(), "AliasA")])
+}
+
+const ROUTE: [(&str, &str); 2] = [("route", "Coder"), ("policy", "priority")];
+const AT_A: [(&str, &str); 2] = [("route", "Coder"), ("deployment", "a/AliasA")];
+
+#[tokio::test]
+async fn ttft_runs_from_receipt_to_the_first_generated_delta_and_is_never_overwritten() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::SlowFirstToken(300)).await;
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        Some("slow-one"),
+    )
+    .await;
+    let text = String::from_utf8(response.bytes().await.unwrap().to_vec()).unwrap();
+    assert!(text.contains("Hello") && text.contains(" world"));
+
+    // Keep-alive, role-only and empty deltas went out at once and did not
+    // stop the clock; the content 300 ms later did; the second content 300 ms
+    // after that did not move it.
+    assert_eq!(metrics.histogram_count("router_ttft_seconds", &ROUTE), 1);
+    let ttft = metrics.histogram_sum("router_ttft_seconds", &ROUTE);
+    assert!((300..550).contains(&ttft), "ttft {ttft} ms");
+    assert_eq!(
+        metrics.histogram_count("router_upstream_ttft_seconds", &AT_A),
+        1
+    );
+    assert!(metrics.histogram_sum("router_upstream_ttft_seconds", &AT_A) <= ttft);
+    let trace = trace_of(&router, "slow-one").await;
+    let (ttft_ms, duration_ms) = (
+        trace["ttft_ms"].as_f64().unwrap(),
+        trace["duration_ms"].as_f64().unwrap(),
+    );
+    assert!(
+        ttft_ms >= 300.0 && duration_ms >= 600.0 && ttft_ms < duration_ms,
+        "{trace}"
+    );
+    assert_eq!(trace["outcome"], "ok");
+    assert_eq!(trace["stream"], true);
+
+    // A second stream is a second sample, never a rewrite of the first.
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        None,
+    )
+    .await
+    .bytes()
+    .await;
+    assert_eq!(metrics.histogram_count("router_ttft_seconds", &ROUTE), 2);
+}
+
+#[tokio::test]
+async fn an_error_before_any_output_records_no_ttft() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::StreamError).await;
+    let router = Router::start(single(&a), &[]).await;
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        Some("broken"),
+    )
+    .await;
+    let _ = response.bytes().await;
+    let metrics = &router.state.metrics;
+    assert_eq!(metrics.histogram_count("router_ttft_seconds", &ROUTE), 0);
+    assert_eq!(
+        metrics.histogram_count("router_upstream_ttft_seconds", &AT_A),
+        0
+    );
+    assert_eq!(
+        metrics.histogram_count("router_request_duration_seconds", &ROUTE),
+        1
+    );
+    let trace = trace_of(&router, "broken").await;
+    assert_eq!(trace["outcome"], "interrupted");
+    assert!(trace.get("ttft_ms").is_none());
+}
+
+#[tokio::test]
+async fn durations_are_recorded_once_for_every_way_a_request_ends() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(two("priority", &a, &b), &[]).await;
+    let metrics = &router.state.metrics;
+    let at_b = [("route", "Coder"), ("deployment", "b/AliasB")];
+    let count =
+        |family: &str, labels: &[(&'static str, &str)]| metrics.histogram_count(family, labels);
+
+    // Non-streamed success: no TTFT, one of everything else.
+    let _ = post_as(&router, chat_body("Coder", json!({})), None, None)
+        .await
+        .bytes()
+        .await;
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 1);
+    assert_eq!(count("router_routing_duration_seconds", &ROUTE), 1);
+    assert_eq!(count("router_upstream_response_seconds", &AT_A), 1);
+    assert_eq!(count("router_upstream_duration_seconds", &AT_A), 1);
+    assert_eq!(count("router_ttft_seconds", &ROUTE), 0);
+
+    // Streamed success.
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        None,
+    )
+    .await
+    .bytes()
+    .await;
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 2);
+    assert_eq!(count("router_upstream_duration_seconds", &AT_A), 2);
+    assert_eq!(count("router_ttft_seconds", &ROUTE), 1);
+
+    // Failover: both attempts got a response head; only b's body is relayed.
+    let busy = json!({"error": {"message": "busy", "type": "server_error", "code": "server_busy"}});
+    a.act_now(Act::Refuse(503, busy.clone()));
+    let _ = post_as(&router, chat_body("Coder", json!({})), None, None)
+        .await
+        .bytes()
+        .await;
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 3);
+    assert_eq!(count("router_upstream_response_seconds", &AT_A), 3);
+    assert_eq!(count("router_upstream_response_seconds", &at_b), 1);
+    assert_eq!(count("router_upstream_duration_seconds", &AT_A), 2);
+    assert_eq!(count("router_upstream_duration_seconds", &at_b), 1);
+
+    // Every deployment fails: one request, nothing committed.
+    b.act_now(Act::Refuse(503, busy));
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("all-busy"),
+    )
+    .await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 4);
+    assert_eq!(count("router_routing_duration_seconds", &ROUTE), 4);
+    assert_eq!(count("router_upstream_duration_seconds", &at_b), 1);
+    let trace = trace_of(&router, "all-busy").await;
+    assert_eq!(trace["status"], 503);
+    assert_eq!(trace["outcome"], "server_error");
+
+    // Planning that fails outright is still planning time, and still a request.
+    a.withhold(|w| w.chat = true);
+    b.withhold(|w| w.chat = true);
+    router.probe().await;
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("nothing-fits"),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(count("router_routing_duration_seconds", &ROUTE), 5);
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 5);
+    assert_eq!(
+        trace_of(&router, "nothing-fits").await["outcome"],
+        "client_error"
+    );
+    assert!(trace.get("final_deployment").is_none());
+    for family in [
+        "router_request_duration_seconds",
+        "router_upstream_response_seconds",
+        "router_upstream_duration_seconds",
+    ] {
+        for labels in [&ROUTE[..], &AT_A[..], &at_b[..]] {
+            assert!(metrics.histogram_sum(family, labels) >= 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_mid_stream_is_recorded_as_cancelled_once() {
+    ensure_provider();
+    let held = gate();
+    let a = FakeNode::start("AliasA", Act::Hold(Arc::clone(&held))).await;
+    let router = Router::start(single(&a), &[]).await;
+    let mut response = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        Some("walked-away"),
+    )
+    .await;
+    let first = response.chunk().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("held"));
+    drop(response);
+
+    let trace = trace_of(&router, "walked-away").await;
+    assert_eq!(trace["outcome"], "cancelled");
+    assert_eq!(trace["status"], 200);
+    assert!(
+        trace["ttft_ms"].as_f64().is_some(),
+        "output had reached the client"
+    );
+    let metrics = &router.state.metrics;
+    assert_eq!(
+        metrics.histogram_count("router_request_duration_seconds", &ROUTE),
+        1
+    );
+    assert_eq!(
+        metrics.histogram_count("router_upstream_duration_seconds", &AT_A),
+        1
+    );
+    all_released(&router, "slots after a client left").await;
+    open(&held);
+}
+
+// --- R6: request ids -----------------------------------------------------------
+
+#[tokio::test]
+async fn the_clients_request_id_is_kept_and_a_missing_one_is_generated_and_forwarded() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let router = Router::start(single(&a), &[]).await;
+
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("client-trace-7"),
+    )
+    .await;
+    assert_eq!(response.headers()["x-request-id"], "client-trace-7");
+    assert_eq!(a.request_ids(), ["client-trace-7"]);
+
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        None,
+    )
+    .await;
+    let generated = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(generated.starts_with("rtr-"), "{generated}");
+    let _ = response.bytes().await;
+    assert_eq!(
+        a.request_ids()[1],
+        generated,
+        "the node got the id the client was told"
+    );
+}
+
+// --- R6: routing traces --------------------------------------------------------
+
+#[tokio::test]
+async fn traces_explain_each_request_hold_no_content_and_stay_bounded() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let mut config = with_affinity(two("priority", &a, &b), 1800);
+    config["traces"] = json!({"capacity": 3});
+    let router = Router::start(config, &[]).await;
+
+    for n in 1..=5 {
+        let response = post_as(
+            &router,
+            chat_body(
+                "Coder",
+                json!({"messages": [{"role": "user", "content": "PROMPT-MARKER"}]}),
+            ),
+            Some("raw-session-id-xyz"),
+            Some(&format!("t{n}")),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+    }
+    let all = traces(&router).await;
+    let ids: Vec<&str> = all
+        .iter()
+        .map(|t| t["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["t5", "t4", "t3"], "newest first, oldest evicted");
+
+    let first = &all[2];
+    assert_eq!(first["session"]["affinity"], "hit");
+    let newest = &all[0];
+    assert_eq!(newest["route"], "Coder");
+    assert_eq!(newest["policy"], "priority");
+    assert_eq!(newest["endpoint"], "chat");
+    assert_eq!(newest["deployments"], 2);
+    assert_eq!(newest["available"], 2);
+    assert_eq!(newest["capable"], 2);
+    assert_eq!(newest["selected"], "a/AliasA");
+    assert_eq!(newest["selection_reason"], "session_affinity");
+    assert_eq!(newest["attempts"][0]["outcome"], "committed");
+    assert_eq!(newest["final_deployment"], "a/AliasA");
+    assert_eq!(newest["status"], 200);
+    assert_eq!(newest["outcome"], "ok");
+    assert_eq!(newest["session"]["fingerprint"].as_str().unwrap().len(), 8);
+    assert!(newest["routing_ms"].as_f64().unwrap() >= 0.0);
+
+    let (_, one) = router.get("/api/router/v1/traces?limit=1").await;
+    assert_eq!(one["data"].as_array().unwrap().len(), 1);
+    assert_eq!(one["capacity"], 3);
+
+    let text = serde_json::to_string(&all).unwrap();
+    for leak in [
+        "PROMPT-MARKER",
+        "raw-session-id-xyz",
+        "Bearer",
+        "no-key-required",
+    ] {
+        assert!(!text.contains(leak), "{leak} leaked into a trace: {text}");
+    }
+}
+
+// --- R6: context estimate against the node's own count ------------------------
+
+#[tokio::test]
+async fn the_estimate_is_compared_with_the_nodes_prompt_count_when_it_reports_one() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::AnswerWithUsage(300)).await;
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+    let route = [("route", "Coder")];
+    let ratio = || metrics.histogram_count("router_context_estimation_ratio", &route);
+    let error = || metrics.histogram_count("router_context_estimation_error_tokens", &route);
+    let ratio_sum = || metrics.histogram_sum("router_context_estimation_ratio", &route);
+    let error_sum = || metrics.histogram_sum("router_context_estimation_error_tokens", &route);
+    // 60 bytes of message text: a lower bound of exactly 10 tokens.
+    let sixty = |extra: Value| {
+        let mut body = chat_body("Coder", extra);
+        body["messages"] = json!([{"role": "user", "content": "x".repeat(60)}]);
+        body
+    };
+
+    // An underestimate, non-streamed: the node counted 300.
+    let _ = post_as(&router, sixty(json!({})), None, Some("under"))
+        .await
+        .bytes()
+        .await;
+    let trace = trace_of(&router, "under").await;
+    assert_eq!(trace["estimated_prompt_tokens"], 10);
+    assert_eq!(trace["actual_prompt_tokens"], 300);
+    assert_eq!((ratio(), error()), (1, 1));
+    assert_eq!(ratio_sum(), 30_000, "300 / 10, in thousandths");
+    assert_eq!(error_sum(), 290);
+
+    // Streamed, with the usage chunk.
+    let _ = post_as(
+        &router,
+        sixty(json!({"stream": true})),
+        None,
+        Some("streamed"),
+    )
+    .await
+    .bytes()
+    .await;
+    assert_eq!(
+        trace_of(&router, "streamed").await["actual_prompt_tokens"],
+        300
+    );
+    assert_eq!((ratio(), error()), (2, 2));
+
+    // Exact.
+    a.act_now(Act::AnswerWithUsage(10));
+    let _ = post_as(&router, sixty(json!({})), None, None)
+        .await
+        .bytes()
+        .await;
+    assert_eq!((ratio(), error()), (3, 3));
+    assert_eq!(ratio_sum(), 61_000);
+    assert_eq!(error_sum(), 580);
+
+    // A stream without usage: nothing to compare, nothing recorded.
+    a.act_now(Act::Answer);
+    let _ = post_as(
+        &router,
+        sixty(json!({"stream": true})),
+        None,
+        Some("no-usage"),
+    )
+    .await
+    .bytes()
+    .await;
+    assert!(
+        trace_of(&router, "no-usage")
+            .await
+            .get("actual_prompt_tokens")
+            .is_none()
+    );
+    assert_eq!((ratio(), error()), (3, 3));
+
+    // An empty prompt is refused before routing — the gateway's own rule — so
+    // there is no node count to compare and nothing is recorded. (An estimate
+    // of zero beside a real count is covered where it can occur, in the
+    // metrics' own tests: no ratio, the error still recorded.)
+    let mut empty = chat_body("Coder", json!({}));
+    empty["messages"] = json!([{"role": "user", "content": ""}]);
+    let response = post_as(&router, empty, None, Some("empty")).await;
+    assert_eq!(response.status(), 400);
+    let empty_trace = trace_of(&router, "empty").await;
+    assert_eq!(empty_trace["outcome"], "client_error", "{empty_trace}");
+    assert!(empty_trace.get("actual_prompt_tokens").is_none());
+    assert_eq!((ratio(), error()), (3, 3));
+    assert_eq!(error_sum(), 580);
+}
+
+// --- R6: `routing_ms` keeps its R5 meaning --------------------------------------
+
+fn set_delays(router: &Router, before_ms: u64, during_ms: u64) {
+    let delays = &router.state.phase_delays;
+    delays
+        .before_planning_ms
+        .store(before_ms, Ordering::Relaxed);
+    delays
+        .during_planning_ms
+        .store(during_ms, Ordering::Relaxed);
+}
+
+#[tokio::test]
+async fn routing_time_excludes_work_before_planning_and_includes_planning() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+
+    // A pause after the body is parsed and before planning: in TTFT and the
+    // request's duration, never in routing time.
+    set_delays(&router, 300, 0);
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        Some("slow-before"),
+    )
+    .await
+    .bytes()
+    .await;
+    let trace = trace_of(&router, "slow-before").await;
+    let routing = trace["routing_ms"].as_f64().unwrap();
+    assert!(
+        routing < 100.0,
+        "routing_ms {routing} includes the pre-planning pause"
+    );
+    assert!(
+        trace["ttft_ms"].as_f64().unwrap() >= 300.0,
+        "TTFT still starts at receipt: {trace}"
+    );
+    assert!(trace["duration_ms"].as_f64().unwrap() >= 300.0);
+    assert!(
+        metrics.histogram_sum("router_routing_duration_seconds", &ROUTE) < 100_000,
+        "the planning histogram (µs) excludes it too"
+    );
+
+    // A pause inside planning: in routing time.
+    set_delays(&router, 0, 200);
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("slow-planning"),
+    )
+    .await
+    .bytes()
+    .await;
+    let routing = trace_of(&router, "slow-planning").await["routing_ms"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        routing >= 200.0,
+        "routing_ms {routing} misses planning work"
+    );
+    assert!(metrics.histogram_sum("router_routing_duration_seconds", &ROUTE) >= 200_000);
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &ROUTE),
+        2
+    );
+}
+
+#[tokio::test]
+async fn planning_that_fails_still_records_its_routing_time() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| w.tools = true);
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+    set_delays(&router, 0, 50);
+
+    // route_capability_mismatch.
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({"tools": a_tool()})),
+        None,
+        Some("no-tools-anywhere"),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let trace = trace_of(&router, "no-tools-anywhere").await;
+    assert!(trace["routing_ms"].as_f64().unwrap() >= 50.0, "{trace}");
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &ROUTE),
+        1
+    );
+
+    // model_not_found: no route, so no trace, but the planning time is still
+    // recorded, under the bounded `_unknown` label.
+    let response = post_as(&router, chat_body("NoSuchRoute", json!({})), None, None).await;
+    assert_eq!(response.status(), 404);
+    let unknown = [("route", "_unknown"), ("policy", "none")];
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &unknown),
+        1
+    );
+    assert!(metrics.histogram_sum("router_routing_duration_seconds", &unknown) >= 50_000);
 }

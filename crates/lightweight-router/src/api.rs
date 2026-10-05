@@ -6,8 +6,9 @@
 //!   to. It names routes and nothing else: no node, no address, no node-local
 //!   model name, no file.
 //! * **`/api/router/v1`** is the operator's read-only view of what is behind
-//!   the routes — nodes, deployments, health. It shares `/v1`'s credential and
-//!   never shows a node's key.
+//!   the routes — nodes, deployments, health, session affinity and recent
+//!   routing traces. It shares `/v1`'s credential and never shows a node's
+//!   key, a session id (only a keyed fingerprint) or any request content.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -46,6 +47,8 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/routes", get(routes))
         .route("/api/router/v1/deployments", get(deployments))
         .route("/api/router/v1/health", get(health_detail))
+        .route("/api/router/v1/sessions", get(sessions))
+        .route("/api/router/v1/traces", get(traces))
         .fallback(not_found)
         .with_state(state)
 }
@@ -259,11 +262,66 @@ async fn metrics(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> R
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state
-            .metrics
-            .to_prometheus(&state.health.snapshot(), &state.selector.load().snapshot()),
+        {
+            let mut text = state
+                .metrics
+                .to_prometheus(&state.health.snapshot(), &state.selector.load().snapshot());
+            text.push_str(&crate::metrics::RouterMetrics::affinity_to_prometheus(
+                &state.affinity,
+            ));
+            text
+        },
     )
         .into_response()
+}
+
+/// `GET /api/router/v1/sessions`: session affinity at a glance.
+///
+/// Operator-only, behind the same key as the rest of `/api/router/v1`. Each
+/// entry is named by its route and a keyed fingerprint of the session — never
+/// the id the client sent, which the router does not keep.
+async fn sessions(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let policy = state.affinity.policy();
+    let (expired, capacity) = state.affinity.evictions();
+    let entries = state.affinity.entries();
+    axum::Json(json!({
+        "enabled": policy.enabled,
+        "header": policy.header,
+        "idle_ttl_secs": policy.idle_ttl.as_secs(),
+        "max_entries": policy.max_entries,
+        "active": entries.len(),
+        "evicted": {"expired": expired, "capacity": capacity},
+        "data": entries,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TraceQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /api/router/v1/traces?limit=N`: the most recent routing traces,
+/// newest first. Memory only and bounded by `traces.capacity`; no prompt,
+/// message, credential or session id is ever in one.
+async fn traces(
+    State(state): State<Arc<RouterState>>,
+    headers: HeaderMap,
+    Query(query): Query<TraceQuery>,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let limit = query.limit.unwrap_or(50).min(state.traces.capacity());
+    axum::Json(json!({
+        "object": "list",
+        "capacity": state.traces.capacity(),
+        "data": state.traces.recent(limit),
+    }))
+    .into_response()
 }
 
 fn node_json(node: &crate::domain::Node, status: &NodeStatus) -> Value {

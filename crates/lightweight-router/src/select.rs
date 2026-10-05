@@ -28,12 +28,22 @@
 //! is already right for the request, and order it exactly as they did before
 //! capabilities existed. Nothing here reads latency, history or a prompt's
 //! meaning.
+//!
+//! Session affinity sits between steps 2 and 3, and only as a preference over
+//! what steps 1 and 2 left: when a request's session last succeeded on a
+//! deployment that is still in the candidate set, that deployment goes first
+//! and the policy does not take a turn — round-robin draws no cursor value,
+//! least-busy compares no loads for the first choice. The rest of the plan,
+//! where failover goes, is the policy's own order of what remains. A sticky
+//! deployment that is not in the candidate set is ignored, and the policy
+//! chooses exactly as it would for a request with no session.
 
 use std::cmp::Ordering as Order;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::affinity::Reassignment;
 use crate::domain::{CapabilityGap, CapabilitySet};
 use crate::domain::{
     DeploymentId, NodeId, Route, RouteName, RoutePolicy, RoutingDecision, RoutingFailure,
@@ -87,6 +97,18 @@ pub enum Selection {
         /// Whether another eligible deployment had exactly the same load.
         tied: bool,
     },
+    /// The session's sticky deployment was still a candidate and went first;
+    /// the policy took no turn.
+    SessionAffinity,
+}
+
+/// What became of a request's sticky deployment when its plan was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sticky {
+    /// Still a candidate: it is `candidates[0]`.
+    Hit,
+    /// Not a candidate, for this reason; the policy chose instead.
+    Broken(Reassignment),
 }
 
 /// The ordered deployments one request may be sent to.
@@ -106,6 +128,8 @@ pub struct Plan {
     /// lock it chose under; the other policies take it the same way so the
     /// proxy has one path.
     pub reservation: Option<Lease>,
+    /// Set when the request named a sticky deployment.
+    pub sticky: Option<Sticky>,
     route_size: usize,
 }
 
@@ -119,6 +143,7 @@ impl Plan {
             unfit: eligible.unfit,
             selection,
             reservation: None,
+            sticky: None,
             route_size: eligible.route_size,
         }
     }
@@ -127,6 +152,14 @@ impl Plan {
     /// candidate in this plan was tried and failed.
     pub fn decision(&self, attempt: usize) -> Option<RoutingDecision> {
         let candidate = self.candidates.get(attempt)?;
+        if attempt == 0 && self.sticky == Some(Sticky::Hit) {
+            return Some(RoutingDecision {
+                route: self.route.clone(),
+                deployment: candidate.deployment.clone(),
+                node: candidate.node.clone(),
+                reason: RoutingReason::SessionAffinity,
+            });
+        }
         let reason = match self.policy {
             RoutePolicy::Priority => {
                 if self.route_size == 1 {
@@ -394,6 +427,27 @@ impl Selector {
         observed: &BTreeMap<DeploymentId, DeploymentObservation>,
         needs: &RequestRequirements,
     ) -> Result<Plan, RoutingFailure> {
+        self.plan_with_affinity(topology, route, health, observed, needs, None)
+    }
+
+    /// [`Self::plan_request`], preferring `sticky` — the deployment the
+    /// request's session last succeeded on — if, and only if, it survived
+    /// both filters.
+    ///
+    /// On a hit the policy takes no turn for the first choice: no cursor value
+    /// is drawn and no loads are compared for it. What follows the sticky
+    /// deployment is the policy's own failover order of the rest. On a miss
+    /// the plan is exactly the one [`Self::plan_request`] would make, and
+    /// [`Plan::sticky`] says why the sticky deployment was passed over.
+    pub fn plan_with_affinity(
+        &self,
+        topology: &Topology,
+        route: &Route,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+        needs: &RequestRequirements,
+        sticky: Option<&DeploymentId>,
+    ) -> Result<Plan, RoutingFailure> {
         let eligible = eligible(topology, route, health)?;
         let eligible = crate::capability::filter(eligible, needs, observed)?;
         let state = topology
@@ -401,6 +455,11 @@ impl Selector {
             .iter()
             .position(|r| r.name == route.name)
             .and_then(|index| self.routes.get(index));
+
+        let standing = sticky.map(|id| sticky_standing(&eligible, id));
+        if let Some(Ok(index)) = standing {
+            return Ok(self.plan_sticky(route.policy, state, eligible, index, observed));
+        }
 
         let mut plan = match (route.policy, state) {
             (RoutePolicy::RoundRobin, Some(state)) => {
@@ -412,16 +471,7 @@ impl Selector {
                     .least_busy
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let loads: Vec<Load> = eligible
-                    .candidates
-                    .iter()
-                    .map(|candidate| Load {
-                        active: self.load.active(&candidate.deployment),
-                        limit: observed
-                            .get(&candidate.deployment)
-                            .map(|seen| seen.max_concurrent_requests),
-                    })
-                    .collect();
+                let loads = self.loads(&eligible.candidates, observed);
                 let mut plan = order_least_busy(eligible, &loads);
                 // Reserved before the lock is released: the next request to
                 // read the loads sees this one already counted.
@@ -429,6 +479,7 @@ impl Selector {
                     .candidates
                     .first()
                     .map(|first| self.load.acquire(&first.deployment));
+                plan.sticky = standing.and_then(Result::err).map(Sticky::Broken);
                 return Ok(plan);
             }
             // Priority, or a route the selector does not know (which
@@ -439,7 +490,99 @@ impl Selector {
             .candidates
             .first()
             .map(|first| self.load.acquire(&first.deployment));
+        plan.sticky = standing.and_then(Result::err).map(Sticky::Broken);
         Ok(plan)
+    }
+
+    /// The plan for an affinity hit: the sticky candidate first, then the rest
+    /// in the order the policy would fail over through.
+    fn plan_sticky(
+        &self,
+        policy: RoutePolicy,
+        state: Option<&RouteState>,
+        mut eligible: Eligible,
+        index: usize,
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+    ) -> Plan {
+        let finish = |mut plan: Plan| {
+            plan.sticky = Some(Sticky::Hit);
+            plan.reservation = plan
+                .candidates
+                .first()
+                .map(|first| self.load.acquire(&first.deployment));
+            plan
+        };
+        match (policy, state) {
+            (RoutePolicy::RoundRobin, Some(_)) => {
+                // The ring from the sticky deployment on: its successors, in
+                // ring order, are where a round-robin failover goes.
+                eligible.candidates.rotate_left(index);
+                finish(Plan::from(
+                    eligible,
+                    RoutePolicy::RoundRobin,
+                    Selection::SessionAffinity,
+                ))
+            }
+            (RoutePolicy::LeastBusy, Some(state)) => {
+                // Under the route's lock, like any least-busy choice, so the
+                // slot taken on the sticky deployment is counted before the
+                // next request reads the loads.
+                let _choosing = state
+                    .least_busy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let first = eligible.candidates.remove(index);
+                let loads = self.loads(&eligible.candidates, observed);
+                let mut rest = order_least_busy(eligible, &loads);
+                rest.candidates.insert(0, first);
+                rest.selection = Selection::SessionAffinity;
+                finish(rest)
+            }
+            _ => {
+                let first = eligible.candidates.remove(index);
+                eligible.candidates.insert(0, first);
+                finish(Plan::from(eligible, policy, Selection::SessionAffinity))
+            }
+        }
+    }
+
+    fn loads(
+        &self,
+        candidates: &[Candidate],
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+    ) -> Vec<Load> {
+        candidates
+            .iter()
+            .map(|candidate| Load {
+                active: self.load.active(&candidate.deployment),
+                limit: observed
+                    .get(&candidate.deployment)
+                    .map(|seen| seen.max_concurrent_requests),
+            })
+            .collect()
+    }
+}
+
+/// Where a sticky deployment stands after both filters: its index among the
+/// candidates, or why it is not one.
+fn sticky_standing(eligible: &Eligible, sticky: &DeploymentId) -> Result<usize, Reassignment> {
+    if let Some(index) = eligible
+        .candidates
+        .iter()
+        .position(|candidate| &candidate.deployment == sticky)
+    {
+        return Ok(index);
+    }
+    if eligible.unfit.iter().any(|(id, _)| id == sticky) {
+        return Err(Reassignment::StickyCapabilityMismatch);
+    }
+    match eligible.skipped.iter().find(|(id, _)| id == sticky) {
+        Some((_, UnavailableReason::NodeUnhealthy | UnavailableReason::NodeUnknown)) => {
+            Err(Reassignment::StickyUnhealthy)
+        }
+        // Disabled, swapped to another model, or (after a configuration
+        // change, which this router does not do live) no longer in the route.
+        _ => Err(Reassignment::StickyUnavailable),
     }
 }
 
@@ -1687,5 +1830,202 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("fastest"), "{error}");
+    }
+
+    // --- R6: session affinity as a preference over valid candidates -------
+
+    fn sticky_to(node: &str) -> DeploymentId {
+        DeploymentId::of(&NodeId::parse(node).unwrap(), &node.to_uppercase())
+    }
+
+    fn plan_sticky(
+        t: &Topology,
+        selector: &Selector,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+        needs: &RequestRequirements,
+        sticky: Option<&DeploymentId>,
+    ) -> Plan {
+        selector
+            .plan_with_affinity(t, &t.routes()[0], health, observed, needs, sticky)
+            .expect("a plan")
+    }
+
+    #[test]
+    fn without_a_sticky_deployment_every_policy_plans_exactly_as_before() {
+        for strategy in ["priority", "round_robin", "least_busy"] {
+            let (t, with_none) = ring(strategy);
+            let (_, plain) = ring(strategy);
+            let observed = offering(FULL, FULL, FULL);
+            let needs = chat_needing(false, false, 10);
+            for _ in 0..5 {
+                let a = plan_sticky(&t, &with_none, &all_up(), &observed, &needs, None);
+                let b = pick(&t, &plain, &all_up(), &observed, &needs);
+                assert_eq!(nodes(&a), nodes(&b), "{strategy}");
+                assert_eq!(a.selection, b.selection, "{strategy}");
+                assert_eq!(a.sticky, None);
+                // Held concurrently, as live requests would be.
+                std::mem::forget((a.reservation, b.reservation));
+            }
+        }
+    }
+
+    #[test]
+    fn priority_prefers_a_valid_sticky_deployment_and_falls_back_in_configured_order() {
+        let (t, selector) = ring("priority");
+        let observed = offering(FULL, FULL, FULL);
+        let needs = chat_needing(false, false, 10);
+        let b = sticky_to("b");
+        let plan = plan_sticky(&t, &selector, &all_up(), &observed, &needs, Some(&b));
+        assert_eq!(nodes(&plan), ["b", "a", "c"]);
+        assert_eq!(plan.sticky, Some(Sticky::Hit));
+        assert_eq!(plan.selection, Selection::SessionAffinity);
+        assert_eq!(
+            plan.decision(0).unwrap().reason,
+            RoutingReason::SessionAffinity
+        );
+        assert_eq!(
+            plan.decision(1).unwrap().reason,
+            RoutingReason::PrimaryFailedFallback
+        );
+
+        // b goes down: ordinary priority, and the plan says why b was passed.
+        let plan = plan_sticky(
+            &t,
+            &selector,
+            &with(all_up(), "b", down()),
+            &observed,
+            &needs,
+            Some(&b),
+        );
+        assert_eq!(nodes(&plan), ["a", "c"]);
+        assert_eq!(
+            plan.sticky,
+            Some(Sticky::Broken(Reassignment::StickyUnhealthy))
+        );
+        assert_eq!(
+            plan.decision(0).unwrap().reason,
+            RoutingReason::PrimaryHealthy
+        );
+    }
+
+    #[test]
+    fn round_robin_takes_no_turn_on_an_affinity_hit() {
+        let (t, selector) = ring("round_robin");
+        let observed = offering(FULL, FULL, FULL);
+        let needs = chat_needing(false, false, 10);
+        let c = sticky_to("c");
+        for _ in 0..4 {
+            let plan = plan_sticky(&t, &selector, &all_up(), &observed, &needs, Some(&c));
+            assert_eq!(
+                nodes(&plan),
+                ["c", "a", "b"],
+                "the sticky one, then the ring from it"
+            );
+            assert_eq!(
+                plan.decision(1).unwrap().reason,
+                RoutingReason::RoundRobinFailover
+            );
+        }
+        assert_eq!(
+            selector.cursor(&t, &t.routes()[0].name),
+            Some(0),
+            "no cursor value drawn"
+        );
+        // Requests without a session still rotate from where the ring was.
+        let picks: Vec<String> = (0..3)
+            .map(|_| nodes(&pick(&t, &selector, &all_up(), &observed, &needs))[0].to_owned())
+            .collect();
+        assert_eq!(picks, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn least_busy_keeps_a_sticky_deployment_even_when_another_is_idler() {
+        let (t, selector) = ring("least_busy");
+        let observed = offering(FULL, FULL, FULL);
+        let needs = chat_needing(false, false, 10);
+        let a = sticky_to("a");
+        // a is the busiest by far.
+        let _held: Vec<Lease> = (0..3).map(|_| selector.load().acquire(&a)).collect();
+        let plan = plan_sticky(&t, &selector, &all_up(), &observed, &needs, Some(&a));
+        assert_eq!(nodes(&plan)[0], "a", "stickiness is not soft");
+        assert_eq!(selector.load().active(&a), 4, "the slot is reserved on a");
+        // Failover after a is least-busy over the rest.
+        assert_eq!(&nodes(&plan)[1..], ["b", "c"]);
+        assert_eq!(
+            plan.decision(1).unwrap().reason,
+            RoutingReason::LeastBusyFailover
+        );
+        drop(plan);
+
+        // a unhealthy: stickiness breaks and least-busy resumes.
+        let plan = plan_sticky(
+            &t,
+            &selector,
+            &with(all_up(), "a", down()),
+            &observed,
+            &needs,
+            Some(&a),
+        );
+        assert_eq!(nodes(&plan), ["b", "c"]);
+        assert!(matches!(plan.selection, Selection::LeastBusy { .. }));
+    }
+
+    #[test]
+    fn a_sticky_deployment_that_cannot_serve_the_request_is_never_resurrected() {
+        for strategy in ["priority", "round_robin", "least_busy"] {
+            let (t, selector) = ring(strategy);
+            let no_tools = Offers {
+                tools: false,
+                ..FULL
+            };
+            let observed = offering(no_tools, FULL, FULL);
+            let a = sticky_to("a");
+            let plan = plan_sticky(
+                &t,
+                &selector,
+                &all_up(),
+                &observed,
+                &chat_needing(true, false, 10),
+                Some(&a),
+            );
+            assert!(!nodes(&plan).contains(&"a"), "{strategy}: a has no tools");
+            assert_eq!(
+                plan.sticky,
+                Some(Sticky::Broken(Reassignment::StickyCapabilityMismatch)),
+                "{strategy}"
+            );
+            // The same session's next request without tools may use a again.
+            let plan = plan_sticky(
+                &t,
+                &selector,
+                &all_up(),
+                &observed,
+                &chat_needing(false, false, 10),
+                Some(&a),
+            );
+            assert_eq!(nodes(&plan)[0], "a", "{strategy}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_or_swapped_sticky_deployment_is_unavailable_not_unhealthy() {
+        let (t, selector) = ring("priority");
+        let observed = offering(FULL, FULL, FULL);
+        let needs = chat_needing(false, false, 10);
+        let b = sticky_to("b");
+        let plan = plan_sticky(
+            &t,
+            &selector,
+            &with(all_up(), "b", serving("SomethingElse")),
+            &observed,
+            &needs,
+            Some(&b),
+        );
+        assert_eq!(
+            plan.sticky,
+            Some(Sticky::Broken(Reassignment::StickyUnavailable))
+        );
+        assert_eq!(nodes(&plan)[0], "a");
     }
 }

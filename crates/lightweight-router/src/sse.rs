@@ -16,6 +16,18 @@
 //! finish this one's sentence — so the failure is surfaced the way the gateway
 //! surfaces its own: one `data: {"error":…}` frame and no `[DONE]`, which every
 //! OpenAI client reads as a failed stream rather than a short answer.
+//!
+//! While it rewrites, it also notices two things, for observability only:
+//!
+//! * **The first generated output.** A chunk counts when one of its choices
+//!   carries a non-empty `delta.content`, `delta.reasoning_content` or
+//!   `delta.tool_calls` (chat), or a non-empty `text` (completions). A
+//!   keep-alive comment, a queue notice, the role-only opening delta, an empty
+//!   delta, a usage-only chunk and an error frame do not. This is the event
+//!   the router's time to first token stops at — the same set of events the
+//!   gateway's own TTFT counts.
+//! * **`usage.prompt_tokens`**, when the node sends it (the final usage chunk
+//!   a client asks for with `stream_options.include_usage`).
 
 use lightweight_core::sse::{DONE_DATA, encode_data};
 use serde_json::{Value, json};
@@ -34,6 +46,10 @@ pub struct FrameRewriter {
     /// Set once the stream has been ended by this rewriter; nothing after it
     /// is forwarded.
     finished: bool,
+    /// Whether a frame carrying generated output has been forwarded.
+    generated: bool,
+    /// The node's own prompt count, if it reported one.
+    prompt_tokens: Option<u32>,
 }
 
 impl FrameRewriter {
@@ -44,7 +60,20 @@ impl FrameRewriter {
             saw_done: false,
             saw_error: false,
             finished: false,
+            generated: false,
+            prompt_tokens: None,
         }
+    }
+
+    /// Whether any frame forwarded so far carried generated output — see the
+    /// module documentation for exactly which frames count.
+    pub fn has_generated(&self) -> bool {
+        self.generated
+    }
+
+    /// `usage.prompt_tokens` from the stream, once the node has sent it.
+    pub fn prompt_tokens(&self) -> Option<u32> {
+        self.prompt_tokens
     }
 
     /// Feed bytes off the wire; returns whatever complete frames they finished.
@@ -160,6 +189,11 @@ impl FrameRewriter {
         };
         if event.contains_key("error") {
             self.saw_error = true;
+        } else if !self.generated && carries_output(&event) {
+            self.generated = true;
+        }
+        if let Some(tokens) = prompt_tokens(&event) {
+            self.prompt_tokens = Some(tokens);
         }
         if !matches!(event.get("model"), Some(Value::String(_))) {
             out.extend_from_slice(raw);
@@ -173,6 +207,50 @@ impl FrameRewriter {
         }
         out.extend_from_slice(encode_data(&Value::Object(event).to_string()).as_bytes());
     }
+}
+
+/// Whether one event carries generated output a client would show or act on.
+fn carries_output(event: &serde_json::Map<String, Value>) -> bool {
+    let non_empty = |value: Option<&Value>| match value {
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    };
+    let Some(Value::Array(choices)) = event.get("choices") else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        let delta = choice.get("delta");
+        non_empty(choice.get("text"))
+            || delta.is_some_and(|delta| {
+                non_empty(delta.get("content"))
+                    || non_empty(delta.get("reasoning_content"))
+                    || non_empty(delta.get("tool_calls"))
+            })
+    })
+}
+
+/// `usage.prompt_tokens` of an event or a whole response, if present.
+fn prompt_tokens(object: &serde_json::Map<String, Value>) -> Option<u32> {
+    object
+        .get("usage")?
+        .get("prompt_tokens")?
+        .as_u64()
+        .and_then(|tokens| u32::try_from(tokens).ok())
+}
+
+/// [`rewrite_body`], also returning the body's `usage.prompt_tokens` — read
+/// from the one parse the rewrite already makes.
+pub fn rewrite_body_measuring(body: &[u8], public_model: &str) -> (Option<Vec<u8>>, Option<u32>) {
+    let Ok(Value::Object(mut object)) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    let tokens = prompt_tokens(&object);
+    if !matches!(object.get("model"), Some(Value::String(_))) {
+        return (None, tokens);
+    }
+    object.insert("model".into(), Value::String(public_model.to_owned()));
+    (serde_json::to_vec(&Value::Object(object)).ok(), tokens)
 }
 
 /// Rewrite the `model` of a whole JSON response body.
@@ -312,6 +390,68 @@ mod tests {
         let events = decode(&tail);
         let error: Value = serde_json::from_str(&events[0].data).unwrap();
         assert_eq!(error["error"]["code"], "upstream_stream_interrupted");
+    }
+
+    #[test]
+    fn only_generated_output_counts_as_the_first_token() {
+        let mut rewriter = FrameRewriter::new("Coder");
+        let event = |delta: Value| {
+            encode_data(
+                &json!({"model": "QwenCoder", "choices": [{"index": 0, "delta": delta}]})
+                    .to_string(),
+            )
+        };
+        rewriter.push(b": keep-alive\n\n");
+        rewriter.push(b": queued position=1 waited=3s\n\n");
+        rewriter.push(event(json!({"role": "assistant", "content": ""})).as_bytes());
+        rewriter.push(event(json!({})).as_bytes());
+        rewriter.push(
+            encode_data(r#"{"model":"QwenCoder","choices":[],"usage":{"prompt_tokens":3}}"#)
+                .as_bytes(),
+        );
+        assert!(!rewriter.has_generated(), "nothing generated yet");
+        rewriter.push(event(json!({"reasoning_content": "hmm"})).as_bytes());
+        assert!(rewriter.has_generated(), "reasoning is output");
+
+        let mut tools = FrameRewriter::new("Coder");
+        tools.push(event(json!({"tool_calls": [{"index": 0, "id": "c"}]})).as_bytes());
+        assert!(tools.has_generated());
+
+        let mut text = FrameRewriter::new("Coder");
+        text.push(encode_data(r#"{"model":"m","choices":[{"index":0,"text":""}]}"#).as_bytes());
+        assert!(!text.has_generated());
+        text.push(encode_data(r#"{"model":"m","choices":[{"index":0,"text":"x"}]}"#).as_bytes());
+        assert!(text.has_generated());
+    }
+
+    #[test]
+    fn an_error_before_any_output_is_not_a_first_token() {
+        let mut rewriter = FrameRewriter::new("Coder");
+        rewriter
+            .push(encode_data(r#"{"error":{"message":"boom","type":"server_error"}}"#).as_bytes());
+        assert!(!rewriter.has_generated());
+    }
+
+    #[test]
+    fn the_prompt_count_is_read_from_a_usage_chunk_or_a_body() {
+        let mut rewriter = FrameRewriter::new("Coder");
+        assert_eq!(rewriter.prompt_tokens(), None);
+        rewriter.push(
+            encode_data(
+                r#"{"model":"Q","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":2}}"#,
+            )
+            .as_bytes(),
+        );
+        assert_eq!(rewriter.prompt_tokens(), Some(42));
+
+        let (body, tokens) = rewrite_body_measuring(
+            br#"{"model":"Q","choices":[],"usage":{"prompt_tokens":17}}"#,
+            "Coder",
+        );
+        assert_eq!(tokens, Some(17));
+        let body: Value = serde_json::from_slice(&body.unwrap()).unwrap();
+        assert_eq!(body["model"], "Coder");
+        assert_eq!(rewrite_body_measuring(b"{}", "Coder"), (None, None));
     }
 
     #[test]
