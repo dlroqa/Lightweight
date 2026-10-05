@@ -1719,6 +1719,84 @@ with a priority `Coder`, `min_ready 1, warm_standby 1`, all three allowed:
 
 **Next:** review of this branch. R8 (rule-based `Auto` route) is not started.
 
+## Router rule-based `Auto`, R8 (feature/router-auto-routing)
+
+R7 was merged first (PR #35, head `321a163` re-verified unchanged; merge
+commit `b1c7bc6`) and master validated: `./scripts/check.sh` 1146 tests, 0
+failed, contract suite 47 passed, 2 skipped; CI run 37384572874 (all seven
+`check` jobs, Flatpak, Linux artifacts, render icons) and 37384572855 (render
+panel) green. Post-merge placement smoke on real gateways: node A serving,
+node B empty with the model installed, `Coder` `min_ready 1, warm_standby 1`
+— the controller loaded B through its control API and counted it ready only
+after the probe confirmed it (1539 ms); with A stopped, the next request
+failed over to B in the same request (`primary_failed_fallback`) and the one
+after went straight to B (`primary_unavailable_fallback`). `v0.5.0` (tag
+`e0f2baf` → `7c177d0`, eight assets) unchanged. R7 is frozen; R8 is branched
+from that master.
+
+What master offered, read before any code: route resolution
+(`Topology::resolve`, `alias::ModelSelector`) ran *before* requirements were
+read (`requirements::extract`, R5); requirements carry endpoint, tools,
+`ToolChoiceRequirement`, reasoning and the bytes/6 prompt bound; affinity is
+keyed by the resolved `RouteName`; the response is rewritten to `route.name`
+(`sse::FrameRewriter`, `rewrite_body_measuring`); metric labels are only
+configured names or fixed reasons. So `Auto` needed exactly one change in the
+request path: for an `Auto` request, read the requirements first and let the
+rules name the route — everything after that already keys on the route.
+
+- **Domain/config** (`auto_route.rs`): `auto_route {enabled, fallback_route,
+  rules[{name, when, route}]}`, off unless `enabled`. `AutoCondition`
+  (`endpoint`, `requires_tools`, `tool_choice`, `requires_reasoning`,
+  `min/max_prompt_tokens`) is ANDed; `false` means absent; first match wins;
+  no match is the fallback. Named `fallback_route`, not `default_route`, which
+  already means `model: "default"`. Validation (on or off) refuses unknown,
+  reserved or `Auto` targets, a route named `Auto`, duplicate or label-unsafe
+  rule names (`_fallback` reserved), condition-free, zero-threshold and
+  unsatisfiable rules, and more than 64 rules. No section: no change at all,
+  and a legacy route called `Auto` still works.
+- **Request path** (`proxy::resolve_auto`): requirements read once and reused
+  for capability filtering; a request the gateway would refuse is refused
+  before any route is chosen (counted under the fixed `Auto` label). The chosen
+  route goes through the unchanged pipeline; no other route is ever tried.
+- **Identity:** `response.model` is the resolved route in bodies, every stream
+  chunk, the usage chunk, tool answers and the route's own errors. `/v1/models`
+  lists `Auto` with no context fields; `/v1/capabilities` adds
+  `auto {id, router_resolved, routes}` and does not touch `routes` or the
+  top-level features.
+- **Observability:** trace `requested_route` / `auto_rule` / `auto_fallback`
+  beside `route`; the same on the `routed` and `request finished` lines; one
+  `auto route resolved` line with the traits (no prompt);
+  `router_auto_route_decisions_total{rule,route}`,
+  `router_auto_route_fallback_total{route}`; `GET /api/router/v1/auto`.
+- **Mutation check:** making no rule ever match fails 10 of the 14 integration
+  tests, ignoring `enabled` fails 1, dropping `requested_route` fails 3.
+
+Verified by execution against two real gateways (`target/debug/hermes serve`,
+SmolLM2-135M, scratch `XDG_DATA_HOME`s): `General → node-a/QwenCoder`,
+`Coder → node-b/CoderBackup`, rule `tools → Coder`, fallback `General`:
+
+- `/v1/models` listed `General, Coder, Auto`; `validate-config` printed
+  `auto  Auto  on -> tools -> Coder, otherwise General`.
+- `smoke-r8-ordinary` and `smoke-r8-stream` (`Auto`, no tools) resolved by
+  `_fallback` to `General` and appear only in node A's `gateway.log`;
+  `smoke-r8-tools` (`Auto`, one tool) resolved by `tools` to `Coder` and
+  appears only in node B's. Every stream chunk said `General`; no alias
+  reached the client. A direct `Coder` request traced `requested_route=Coder`.
+- **Unmodified Lightagent `7d95232`** (isolated `LIGHTAGENT_HOME`, the scratch
+  profile's model set to `Auto`) listed `General, Coder, Auto` and streamed a
+  chat. Lightagent sends its tool set on every turn, so its request traced
+  `requested_route=Auto, route=Coder, auto_rule=tools` (estimate 123, node 160)
+  and reached node B; a tool-less Lightagent request is not possible, so the
+  ordinary path was shown with the plain requests above. Its tree is unchanged.
+- The user's gateway on 11434 was not touched; processes were stopped by PID.
+- **Validation.** `./scripts/check.sh` passed in full: 1184 workspace tests, 0
+  failed (1146 on master). The router has 258 (159 unit, 72 surface, 14 Auto
+  integration, 12 placement, 1 log-correlation). Contract suite 47 passed, 2
+  skipped. Cross-platform proof is the PR's CI.
+
+**Next:** review of this branch. R9 (learned/adaptive routing, mixture of
+agents) is not started.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

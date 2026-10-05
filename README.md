@@ -631,6 +631,16 @@ installed until the route has that many ready deployments. The node's own
 memory admission decides; nothing is downloaded, swapped or unloaded; and a
 request never waits for a load.
 
+A client can also send `"model": "Auto"` and let the router choose the route,
+when the configuration has an `auto_route` section (off unless
+`"enabled": true`). Ordered rules over the request's structure — its endpoint,
+whether it declares tools, its `tool_choice`, whether it asks for reasoning,
+and the router's prompt-size estimate — pick the route, first match wins, with
+an explicit `fallback_route`. The chosen route then picks the deployment
+exactly as if the client had named it, and the response names that route.
+`Auto` never reads a prompt for meaning, never tries a second route, and is
+not learned or adaptive.
+
 ```sh
 export LIGHTWEIGHT_DELL_KEY=...  LIGHTWEIGHT_T420_KEY=...   # one key per node, never in the file
 hermes router validate-config --config router.json          # checks everything; listens on nothing
@@ -640,7 +650,8 @@ hermes router --config router.json                          # http://127.0.0.1:1
 `hermes serve` is unchanged. The router only uses each node's public `/v1`
 surface and never loads, places or inspects a model. See
 [docs/ROUTER.md](docs/ROUTER.md) for the configuration, the failover rules,
-session affinity, the metrics and the read-only `/api/router/v1` control API.
+session affinity, `Auto`, the metrics and the read-only `/api/router/v1`
+control API.
 
 ### Keys, and where the configuration lives
 
@@ -807,7 +818,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `lightweight-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
 | `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
 | `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
-| `lightweight-router` | Stable logical model names over several gateways: routes, node health, priority / round-robin / least-busy selection, capability filtering, optional session affinity, pre-response failover, stream relaying, routing traces and metrics, and an optional placement controller that keeps routes at a target of ready deployments. A client of the gateways, never an engine |
+| `lightweight-router` | Stable logical model names over several gateways: routes, node health, priority / round-robin / least-busy selection, capability filtering, optional session affinity, an optional rule-based `Auto` model that chooses the route, pre-response failover, stream relaying, routing traces and metrics, and an optional placement controller that keeps routes at a target of ready deployments. A client of the gateways, never an engine |
 | `lightweight-cli` | Command-line access to the above |
 
 Two parts of the product are not crates:
