@@ -28,8 +28,8 @@
 //!
 //! The node counts `p` with the model's own tokenizer and chat template. The
 //! router has neither, and asking a node would put a network call in the
-//! request path. So the router counts a **lower bound**: the bytes the
-//! template will be given, divided by [`BYTES_PER_TOKEN_CEILING`]. It rules a
+//! request path. So the router counts a **lower bound**: the bytes of message
+//! text, which every template renders, divided by [`BYTES_PER_TOKEN_CEILING`]. It rules a
 //! deployment out only when even that bound cannot fit. Near the boundary it
 //! lets the request through, and the node — still the authority — answers
 //! with its own `context_length_exceeded`. Wrongly refusing a request that a
@@ -49,11 +49,12 @@ use crate::proxy::Endpoint;
 /// The most UTF-8 bytes one token is assumed to cover, on average over a whole
 /// prompt.
 ///
-/// Dividing by it gives a count no real tokenizer is expected to go under:
-/// BPE vocabularies of the models Lightweight serves average roughly three to
-/// five bytes a token on prose and code. A larger figure here makes the bound
-/// lower — safer against a wrong refusal, and slower to rule out a deployment
-/// that truly cannot fit.
+/// Dividing by it gives a count no real tokenizer is expected to go under.
+/// Measured on SmolLM2-135M through a real node (`docs/ROUTER.md`): English
+/// 3.86 bytes a token, Markdown 3.30, Rust 3.69, indented code 3.76, JSON
+/// 1.92, one word repeated 4.87 (the highest seen), base64 1.21, CJK 1.77,
+/// digits 0.98. A larger figure here makes the bound lower — safer against a
+/// wrong refusal, and slower to rule out a deployment that truly cannot fit.
 pub const BYTES_PER_TOKEN_CEILING: usize = 6;
 
 /// How a request uses `tool_choice`, as far as a deployment must honour it.
@@ -211,41 +212,25 @@ fn chat_requirements(
     }
 }
 
-/// The bytes a chat template is given: every message's text, the tool calls
-/// replayed in history, and every tool declaration.
+/// The bytes of message text the chat template is given.
 ///
-/// The template's own markup is left out — it only adds tokens, and this is a
-/// lower bound.
+/// Only the messages' own text. Every chat template renders it, so it is in
+/// the prompt whatever the model. What a template does with the rest varies
+/// with the model, and this is a lower bound, so the rest is left out:
+///
+/// * tool declarations: SmolLM2's template drops them entirely — eight tools,
+///   1 778 bytes of schema, measured at 31 prompt tokens in all — while a
+///   tool-aware template renders every one;
+/// * tool calls replayed in history, and author names, for the same reason;
+/// * the template's own markup, which only adds tokens.
 fn chat_bytes(generation: &GenerationRequest) -> usize {
-    let messages: usize = match &generation.prompt {
+    match &generation.prompt {
         lightweight_inference::generation::Prompt::Chat(messages) => messages
             .iter()
-            .map(|message| {
-                message.content.reveal().len()
-                    + message.name.as_deref().map_or(0, str::len)
-                    + message
-                        .tool_calls
-                        .iter()
-                        .map(|call| call.name.len() + call.arguments.len())
-                        .sum::<usize>()
-            })
+            .map(|message| message.content.reveal().len())
             .sum(),
         lightweight_inference::generation::Prompt::Text(text) => text.reveal().len(),
-    };
-    let tools: usize = generation
-        .tools
-        .iter()
-        .map(|tool| {
-            tool.name.len()
-                + tool.description.as_deref().map_or(0, str::len)
-                + if tool.parameters.is_null() {
-                    0
-                } else {
-                    tool.parameters.to_string().len()
-                }
-        })
-        .sum();
-    messages + tools
+    }
 }
 
 /// A token count no tokenizer is expected to go under, for `bytes` of text.
@@ -388,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn the_context_bound_grows_with_the_prompt_and_the_tools() {
+    fn the_context_bound_counts_the_message_text_every_template_renders() {
         let short = chat(json!({"messages": hello()})).prompt_tokens.unwrap();
         let long_text = "word ".repeat(6_000);
         let long = chat(json!({"messages": [{"role": "user", "content": long_text}]}))
@@ -398,18 +383,24 @@ mod tests {
         // 30 000 bytes: at least 5 000 tokens, never more than the bytes.
         assert_eq!(long, 5_000);
 
+        // Every message's text counts, system turns included.
+        let history = chat(json!({"messages": [
+            {"role": "system", "content": "x".repeat(600)},
+            {"role": "assistant", "content": "y".repeat(600)},
+            {"role": "user", "content": "hello"}
+        ]}))
+        .prompt_tokens
+        .unwrap();
+        assert_eq!(history, 201, "1 205 bytes");
+
+        // Tool declarations and replayed calls do not: some templates drop
+        // them, and a lower bound cannot count what may not be there.
         let with_tools =
             chat(json!({"messages": hello(), "tools": [tool("search"), tool("fetch")]}))
                 .prompt_tokens
                 .unwrap();
-        assert!(
-            with_tools > short,
-            "tool declarations are part of the prompt"
-        );
-
-        // History counts: system turns and replayed tool calls.
-        let history = chat(json!({"messages": [
-            {"role": "system", "content": "x".repeat(600)},
+        assert_eq!(with_tools, short);
+        let replayed = chat(json!({"messages": [
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "1", "type": "function", "function": {"name": "search", "arguments": "y".repeat(600)}}
             ]},
@@ -417,7 +408,7 @@ mod tests {
         ]}))
         .prompt_tokens
         .unwrap();
-        assert!(history >= 200, "{history}");
+        assert_eq!(replayed, short);
     }
 
     #[test]
