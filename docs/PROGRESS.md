@@ -1454,6 +1454,80 @@ request going to B at 25% rather than A at 50%). Both fail without the fix.
 After the fix, `./scripts/check.sh` passed again: 1027 workspace tests passed,
 0 failed (the router now has 106), and the contract suite 47 passed, 2 skipped.
 
+R4 merged as `357b415` (PR #32).
+
+## Router capability filtering, R5 (feature/router-capability-filtering)
+
+`./scripts/check.sh` passed in full on 2026-10-05:
+
+- workspace tests: **1063 passed, 0 failed**. The router has 142 of them
+  (94 unit, 48 integration), up from 106;
+- the contract suite: 47 passed, 2 skipped;
+- the panel and desktop builds, and the version, dependency and secrets gates.
+
+What was built:
+
+- **Pipeline.** `select::eligible` → `capability::filter` → the route's policy.
+  `Selector::plan_request` runs all three. `Selector::plan` now means "nothing
+  required", so every R4 caller and test is unchanged.
+- **Requirements** (`requirements.rs`). Each request is read once, with the
+  gateway's own `ChatCompletionRequest::to_generation_request` and
+  `CompletionRequest::expand`, so a request the gateway would refuse is refused
+  by the router with the gateway's exact 400. It records the endpoint, whether
+  tools are declared (`[]` is none), how `tool_choice` must be honoured,
+  whether `reasoning_effort` asks for an effort (`"none"` does not), and a
+  lower bound on the prompt's tokens.
+- **Filter** (`capability.rs`). Each deployment's own last observation gets a
+  yes or a no. Reasons are kept, all of them, as `CapabilityGap`. Nothing is
+  reordered or ranked. An unobserved deployment is never assumed capable.
+- **Context rule.** It matches the node: refuse only `prompt_tokens >= n_ctx`.
+  `max_tokens` is clamped by the node, so it is logged and not required.
+  Filtering on prompt plus budget would have refused Hermes' default 65536
+  everywhere.
+- **Errors.** `400 route_capability_mismatch` names the route and what was
+  missing, never a node. It is distinct from `model_not_found` and
+  `route_unavailable`. If only an *unavailable* deployment could have served
+  the request, the answer is `route_unavailable`.
+- **Observability.** Requirement fields and `eligible_before`/`eligible_after`
+  go on the routed log line. Two metrics are added:
+  `router_capability_filtered_total{route,reason}` and
+  `router_capability_mismatch_total{route}`.
+- **Mutation check.** With the filter bypassed, 9 unit and all 10 new
+  integration tests fail, and the 38 existing integration tests still pass.
+
+Measured before it was trusted, as the bound's input. Through a real node
+running SmolLM2-135M:
+
+- Text ran from 0.98 to 4.87 bytes a token, always above the bound's 6.
+- Eight tool declarations cost **31** prompt tokens in all, because that
+  template drops tools. So the bound counts only message text (`d33251b`).
+- The table is in `docs/ROUTER.md`.
+
+Verified by execution, with two real gateways running SmolLM2-135M: node A at
+`--ctx 8192` aliased `BigWindow`, and node B at `--ctx 2048` aliased
+`SmallWindow`. They sat behind the real `hermes router` on a round-robin
+`Coder`:
+
+- `/v1/models` listed `Coder` at 2048, the conservative summary.
+- Ordinary and tool requests alternated A, B, A, B (`filtered=""`). A streamed
+  answer carried only `Coder`.
+- Two 13.5 KB prompts (bound 2251, real 2731 tokens) both went to node A, at
+  cursors 7 and 8 (`eligible_after=1`, `filtered="context_too_small=1"`).
+- A 60 KB prompt was refused `400 route_capability_mismatch` with no node hit.
+  `tool_choice: "required"` with no tools got the gateway's
+  `400 invalid_tool_choice` from the router.
+- Real gateways advertise every feature flag as `true`, so tool filtering was
+  shown with a scripted third node advertising `tools: false`, placed first in
+  a priority `Coder`:
+  - a request without tools went to it;
+  - **unmodified Lightagent `7d95232`**, in an isolated `LIGHTAGENT_HOME`,
+    chatted with `Coder`. Its request carried its tools, the router passed over
+    the scripted node (`tools_unsupported`), node A answered
+    (`primary_unavailable_fallback`), and Lightagent's status bar showed
+    `Coder`.
+- The user's own gateway on 11434 was not touched. The scratch processes were
+  stopped by their recorded PIDs, and the Lightagent tree is unchanged.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

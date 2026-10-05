@@ -23,6 +23,28 @@ All notable changes to this project are documented in this file.
     counts by policy and a per-deployment in-flight gauge.
   - An unknown `strategy` is refused at startup. No latency, weights, session
     affinity or capability filtering is involved.
+- **Router capability filtering (R5).** Before a route's policy chooses, the
+  router drops every available deployment that cannot serve the request in
+  hand, using that deployment's own last-probed capabilities.
+  - It checks the endpoint (chat or text completion), declared `tools`, a
+    `tool_choice` that must be honoured (`required`, a named function, or
+    `none` beside tools), a `reasoning_effort` that asks for reasoning, and
+    whether the prompt fits the deployment's context.
+  - The context rule is the node's own: a prompt must leave room to generate,
+    and `max_tokens` is clamped rather than required. The router counts a
+    lower bound on prompt tokens, so it never refuses a request a node could
+    serve.
+  - Priority, round-robin and least-busy are unchanged and see only capable
+    deployments. Failover never reaches a deployment that was filtered out.
+  - When available deployments exist but none can serve the request, the
+    answer is `400 route_capability_mismatch`. It names the route and what was
+    missing, never a node. That is distinct from `model_not_found` and
+    `route_unavailable`. A request the gateway would refuse as malformed gets
+    the gateway's own `400` from the router.
+  - Logs carry each request's requirements and candidate counts before and
+    after filtering. `/metrics` gains `router_capability_filtered_total` and
+    `router_capability_mismatch_total`. Existing router configurations work
+    unchanged.
 - **User-defined model aliases.** Give any installed model a short name of your
   choosing (`Coder`, `Fast`, …) when adding it or at any time later, from the
   panel's Models screen, `hermes models alias`, or
