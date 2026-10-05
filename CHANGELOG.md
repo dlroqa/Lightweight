@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Router session affinity (R6).** Off unless `session_affinity.enabled` is
+  set. A client names a session in `X-Lightweight-Session` (configurable);
+  the router never infers one from an address, a key or the prompt.
+  - The session's last successful deployment is preferred **only while it is
+    still healthy and able to serve the request**. Otherwise the route's
+    policy chooses exactly as it would without a session, and the session
+    moves to wherever the request succeeds (`sticky_unhealthy`,
+    `sticky_unavailable`, `sticky_capability_mismatch`,
+    `sticky_context_overflow`, `sticky_failed`). A recovered deployment does
+    not pull sessions back.
+  - A hit takes no policy turn: round-robin draws no cursor value, and
+    least-busy keeps the session even when another deployment is idler.
+  - Keyed by route and a keyed hash of the id, never the id itself. Memory
+    only, with an idle TTL (default 30 minutes) and an entry limit (default
+    10 000); a restart forgets every affinity. The first of two simultaneous
+    first requests to commit wins.
+  - `GET /api/router/v1/sessions`, and hit, miss, reassignment, entry and
+    eviction metrics labelled by route and reason only.
+- **Router observability (R6).** Measured only; no routing decision reads it.
+  - Histograms for time to first token (from the router having the request
+    to the first relayed content, reasoning or tool-call delta; streams only),
+    upstream time to first token, request duration, the router's own planning
+    time, each attempt's time to a response head, and the committed upstream
+    body.
+  - The router's prompt-token estimate compared with the node's
+    `usage.prompt_tokens` when one is reported: `actual / estimated` ratio and
+    signed error histograms.
+  - One `RoutingTrace` per request — availability, filtering, affinity, every
+    attempt, the final deployment, timings, status — in a bounded in-memory
+    ring at `GET /api/router/v1/traces` (`traces.capacity`, default 200). A
+    closing `request finished` log line carries the same summary.
+- **Request ids reach the node's log (R6).** A gateway now reads
+  `X-Request-Id`, writes it on every log line about the request — including a
+  new closing `request finished` line with outcome, timings and token counts
+  — and echoes it on the response. Every failover attempt carries the same
+  id. A gateway never invents one; without it, logging is as before. No
+  prompt text is logged.
+
 ## [0.5.0] - 2026-10-05
 
 ### Added

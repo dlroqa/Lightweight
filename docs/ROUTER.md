@@ -11,11 +11,18 @@ Lightagent ─ model="Coder" ─▶ router ─ model="QwenCoder" ─▶ node A  
                                      └ model="CoderBackup" ─▶ node B   (fallback)
 ```
 
-This document covers milestones R0 to R4:
+This document covers milestones R0 to R6:
 
 - **R0–R3:** the domain model, a transparent proxy, a multi-node registry with
   health checks, and priority routing with failover before the response starts.
 - **R4:** two load-balancing policies, round-robin and least-busy.
+- **R5:** request-aware capability filtering, and failover to a larger context
+  after `context_length_exceeded`.
+- **R6:** optional session affinity, and observability: time to first token,
+  latency histograms, one request id from client to node log, per-request
+  routing traces, and the router's prompt estimate compared with the node's
+  own count. **Everything R6 measures is measured only: no routing decision
+  reads latency, TTFT, estimator error or history.**
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -74,6 +81,8 @@ silently ignored.
   "default_route": "Fast",
   "health": { "interval_secs": 5, "timeout_secs": 3, "failure_threshold": 2 },
   "request": { "connect_timeout_secs": 5 },
+  "session_affinity": { "enabled": true, "header": "X-Lightweight-Session", "idle_ttl_secs": 1800, "max_entries": 10000 },
+  "traces": { "capacity": 200 },
   "nodes": [
     { "id": "dell-7820", "url": "http://192.0.2.10:11434", "api_key_env": "LIGHTWEIGHT_DELL_KEY" },
     { "id": "t420",      "url": "http://192.0.2.11:11434", "api_key_env": "LIGHTWEIGHT_T420_KEY", "enabled": true }
@@ -97,6 +106,11 @@ silently ignored.
 | `health.failure_threshold` | 2 | How many consecutive failures make a healthy node unhealthy. |
 | `request.connect_timeout_secs` | 5 | How long a request waits to connect to a node. A generation itself has no timeout, because a CPU prefill can take minutes. |
 | `nodes[].enabled` | `true` | The operator's off switch. A disabled node is never probed or sent traffic, and its key is not required. |
+| `session_affinity.enabled` | `false` | Keep a client-named session on the deployment its last request succeeded on. Off unless set: without it, routing is exactly R5's. See [Session affinity](#session-affinity). |
+| `session_affinity.header` | `X-Lightweight-Session` | The request header a session id is read from. Compared ignoring case. `Authorization`, `Cookie`, `X-Request-Id` and other headers that already mean something are refused. |
+| `session_affinity.idle_ttl_secs` | 1800 | How long a session may sit unused before its affinity is forgotten. 1 to 86 400. |
+| `session_affinity.max_entries` | 10 000 | The most sessions held at once (at most 1 000 000). When full, expired entries go first, then the least recently used. |
+| `traces.capacity` | 200 | How many recent routing traces `GET /api/router/v1/traces` keeps in memory. `0` keeps none; at most 10 000. |
 
 **Secrets are never written in the file.** Each node names its own environment
 variable, and nothing falls back to a shared key. A URL that contains a
@@ -113,7 +127,11 @@ any:
 - a URL that is malformed, uses a scheme other than `http` or `https`, or carries
   credentials, a query or a fragment;
 - an environment variable that is missing or empty;
-- out-of-range health or request timings.
+- out-of-range health or request timings;
+- a session header that is not a valid header name or already means something
+  else, an affinity TTL or entry limit out of range, or a trace capacity over
+  the limit. These are checked even while affinity is off, so turning it on is
+  never the moment a typo surfaces.
 
 A configuration being valid and a node being up are separate questions. The
 router starts even when every node is offline, and reports those nodes as
@@ -220,16 +238,29 @@ Two separate trust boundaries:
 
 Request headers are forwarded by name only. Upstream, a request carries
 `Content-Type`, `Accept`, `X-Request-Id`, and the node's own `Authorization`.
-The client's `Authorization`, its cookies and any other header are not
-forwarded. Downstream, only `Content-Type`, `Cache-Control` and `Retry-After`
+The client's `Authorization`, its cookies, its session header and any other
+header are not forwarded. Downstream, only `Content-Type`, `Cache-Control` and `Retry-After`
 are copied from the node's response.
 
 **Request ids:** a well-formed `X-Request-Id` from the client (up to 128 visible
-ASCII characters) is kept. If the client sends none, the router generates one
-(`rtr-…`). The id is sent to the node, echoed in the response, and included in
-every router log line. Gateways do not log it yet. Node-side request-id logging
-is a future observability enhancement (R6), deliberately left out of this
-change.
+ASCII characters, no spaces) is kept exactly. If the client sends none, the
+router generates one (`rtr-…`). The id is sent to the node, echoed in the
+response, and included in every router log line. **Every attempt of one
+request carries the same id**: a failover is one logical request, so the node
+that refused and the node that answered log the same id.
+
+Since R6 the node logs it too. A gateway reads `X-Request-Id`, writes it as
+`request_id` on every line about the request — `generating`, `queued behind
+another request`, `admitted after waiting`, `request refused` (status and
+code), `generation failed after the response had started`, and one closing
+`request finished` line (`outcome` `completed`, `failed` or `cancelled`, with
+`ttft_ms`, `total_ms`, `queue_wait_ms`, `prompt_tokens`, `completion_tokens`)
+— and echoes it on its response. A node never invents an id: a request without
+one logs as before, under the node's own completion id (`chatcmpl-…`), which is
+also on every line. Both sides share one rule for a usable id
+(`lightweight_gateway::request_id`), so neither rewrites what the other
+accepts. `grep <id>` then finds the request in the client's, the router's
+(stderr) and the node's (`gateway.log`) logs.
 
 ## Health
 
@@ -545,6 +576,124 @@ canonical id or a file. `param` is set to `tools`, `tool_choice` or
 `reasoning_effort` when one of those is at fault. The router never moves the
 request to another route.
 
+## Session affinity
+
+Related requests — the turns of one conversation — can prefer the deployment
+that answered the last one. That keeps one conversation on one model's
+behaviour, keeps a node's prompt cache relevant, and makes a conversation easy
+to follow in the logs. **Off unless `session_affinity.enabled` is set.**
+
+### Where the session comes from
+
+Only from an explicit header, `X-Lightweight-Session` by default. A request
+without it is routed exactly as without affinity. The router never infers a
+session from an IP address, an API key, a user agent or the prompt: none of
+those is a conversation, and treating one as such would make an operational
+hint into user tracking.
+
+Lightagent `7d95232` sends no session or conversation identifier — its
+requests carry `model`, `messages`, `stream`, `stream_options`, `tools`,
+`temperature` and `max_tokens`, and a bearer key — so it is routed without
+affinity, unchanged. A client that wants affinity sends the header with any
+stable id of its own (up to 256 visible ASCII characters).
+
+### The decision order
+
+```text
+Request
+  → Route resolution
+  → Health / availability          (every request)
+  → Capability filter              (this request's needs)
+  → Session affinity preference    (only if the sticky deployment survived both)
+  → Priority | RoundRobin | LeastBusy
+  → Proxy / failover
+```
+
+**A sticky deployment is preferred only while it is still eligible.**
+
+- If the session's sticky deployment is among the candidates left after health
+  and the capability filter, it goes first. The policy takes no turn for that
+  first choice: round-robin draws no cursor value and least-busy compares no
+  loads for it (`routing reason` `session_affinity`). What follows it in the
+  plan — where failover goes — is the policy's own order of the rest: the
+  configured order (priority), the ring after the sticky deployment
+  (round-robin), or least-busy over the rest, chosen and reserved under the
+  route's lock.
+- If it is not among them, it is ignored and the policy chooses exactly as it
+  would for a request with no session. Affinity never resurrects a deployment
+  that is unhealthy, disabled, swapped to another model, or unable to serve
+  this request.
+- Stickiness is not soft. Under least-busy a sticky deployment keeps the
+  session even when another is idler; under priority it keeps it even when the
+  primary is healthy again. A node at its scheduler limit is still eligible
+  (the router has no admission control and the node queues), so it keeps its
+  sessions too.
+
+The policies themselves know nothing about sessions; affinity lives in
+`affinity.rs` and `Selector::plan_with_affinity`.
+
+### When a session moves
+
+A session settles where a request **succeeds**: a committed `2xx` answer (for a
+stream, a `2xx` `text/event-stream` head — the point at which the router
+commits). A refusal the router returns as the node's answer (a `400`, a `500`)
+does not move or create an affinity.
+
+| What happened | Reassignment reason |
+|---|---|
+| The sticky deployment's node is unhealthy or not yet known | `sticky_unhealthy` |
+| It is disabled, or its node now serves another model | `sticky_unavailable` |
+| It cannot serve this request (tools, `tool_choice`, reasoning, endpoint, context) | `sticky_capability_mismatch` |
+| It was tried first and refused the prompt as too long; a larger deployment answered | `sticky_context_overflow` |
+| It was tried first and failed before answering (connection, timeout, 502/503/504, stale model) | `sticky_failed` |
+
+In each case the session moves to the deployment that answered. It does **not**
+move back when the old one recovers: a recovered primary gets new sessions and
+sessionless traffic, while existing sessions stay where they are until they
+expire or their deployment stops being valid. A capability mismatch moves the
+session too, because the deployment that answered can serve both kinds of
+request; if it later cannot, the session moves again.
+
+### State, TTL and bounds
+
+- **Key:** the route and a keyed hash of the session id. `Coder` and `Research`
+  under the same id are two independent affinities. The raw id is never
+  stored: it is hashed on arrival with a key drawn at startup, so the map, the
+  admin view and the traces cannot be turned back into ids, nor matched
+  across restarts. Two ids colliding (one in 2⁶⁴ per pair) would share a
+  preference among valid deployments — harmless.
+- **Value:** the deployment id, when the affinity was created, and when it was
+  last used. Nothing else: no prompt, message, token or address.
+- **TTL:** idle time. Every lookup and every successful request refreshes it,
+  so a long stream does not expire its own session. An expired entry is
+  removed when next looked up, by a sweep every `min(TTL, 60 s)` (at least
+  1 s), and before any eviction for space.
+- **Bound:** `max_entries`. A new session arriving at a full book first drops
+  expired entries, then the least recently used.
+- **Memory only.** No Redis, no database, nothing on disk. A router restart
+  forgets every affinity; each session's next request is routed by the policy
+  and settles again.
+
+### Concurrency
+
+The book is one short lock around a hash map, held for a map operation and
+never across a network call; sessions do not wait on each other in any way a
+request could notice. Two simultaneous first requests of one session may both
+be routed by the policy, possibly to different deployments. **The first to
+commit establishes the affinity; the other's success does not overwrite it**,
+so the session settles on one deployment and the map is never torn. A
+reassignment (the sticky deployment failed) does overwrite, because it is the
+newer fact.
+
+### KV cache
+
+Affinity keeps a conversation on the node that holds its recent prompt.
+Whether that saves work depends on the engine: llama.cpp reuses a slot's
+cached prompt prefix when the next request lands on the same slot, which
+affinity makes more likely but does not guarantee (a node with several slots
+may place the turn elsewhere). The router claims no cache benefit and measures
+none; TTFT is the place to look.
+
 ## Failover
 
 **Failover happens only before anything has been sent to the client.** The next
@@ -623,7 +772,7 @@ better:
 | `priority` | `explicit_single_deployment`, `primary_healthy`, `primary_unavailable_fallback`, `primary_failed_fallback` |
 | `round_robin` | `round_robin`, `round_robin_failover` |
 | `least_busy` | `least_busy`, `least_busy_tiebreak`, `least_busy_failover` |
-| any | `context_overflow_failover` |
+| any | `context_overflow_failover`, `session_affinity` (first choice was the session's sticky deployment) |
 
 ## The control API (read-only)
 
@@ -636,15 +785,24 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/routes` | Each route's `strategy`, `available`, and its deployments with their configured position (`priority`), availability and reason. Also the `default_route`. |
 | `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, and its availability. Also its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`, and what least-busy reads: `active_requests` (the router's in-flight count) and `concurrency_limit`. |
 | `GET /api/router/v1/health` | Node and route health in one read, the probe settings, and active requests. |
+| `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
+| `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
 ## Observability
 
+**Measured, never consulted.** Nothing in this section is read by a routing
+decision. Priority, round-robin, least-busy, the capability filter and session
+affinity behave identically whatever TTFT, latency or estimator error say. A
+later milestone may choose to use the evidence; R6 only collects it.
+
+### Logs
+
 Logs use the target `hermes::router` (filter with `HERMES_LOG=hermes::router=debug`)
 and go to stderr, never to the data directory's `gateway.log`. Each routed
-request logs:
+request logs `routed` when it commits:
 
 - `request_id`, `route`, `policy`, `node`, `deployment`, `reason`, `routing_ms`,
-  `upstream_status` and `failover_count`;
+  `upstream_status`, `upstream_response_ms` and `failover_count`;
 - under round-robin, also `cursor` and `selected_index`;
 - under least-busy, also `active_before` and `concurrency_limit`;
 - what the request required: `endpoint` (`chat` or `completion`),
@@ -652,20 +810,120 @@ request logs:
   `max_tokens`;
 - `eligible_before` and `eligible_after` the capability filter, and `filtered`,
   how many deployments each requirement ruled out
-  (`tools_unsupported=1,context_too_small=1`).
+  (`tools_unsupported=1,context_too_small=1`);
+- with a session: `session` (the fingerprint), `affinity` (`hit`, `miss` or
+  `reassigned`) and `reassignment`.
+
+And `request finished` when it ends — however it ends, including a client
+leaving — with `stream`, `session`, `affinity`, the final `deployment`,
+`attempts`, `status`, `outcome`, `routing_ms`, `ttft_ms`, `duration_ms`,
+`estimated_prompt_tokens` and `actual_prompt_tokens`.
 
 At `debug`, each ruled-out deployment is logged with all of its reasons. A
 refused request logs `no available deployment can serve this request` with
 the same fields and `unmet`.
 
-Prompt text, credentials and file paths are never logged.
+Prompt text, message history, tool arguments, credentials, session ids and
+file paths are never logged. The node side is described under
+[Headers and credentials](#headers-and-credentials).
 
-Metrics:
+### Time to first token
+
+`router_ttft_seconds{route,policy}`: **from the moment the router has the whole
+request body to the moment it relays the first frame carrying generated
+output.** A frame counts when one of its choices has a non-empty
+`delta.content`, `delta.reasoning_content` or `delta.tool_calls` (chat) or a
+non-empty `text` (completions) — the same events the gateway's own TTFT
+counts. Keep-alive comments, queue notices, the role-only opening delta, empty
+deltas, usage-only chunks and error frames do not. Only the first such frame
+counts; later ones never move it. Streams only: a non-streamed response has no
+first token the client saw, so it has no TTFT sample, only durations. A stream
+that fails before any output records no TTFT.
+
+`router_upstream_ttft_seconds{route,deployment}`: the same event, measured from
+sending to the deployment that answered. The difference between the two is the
+router's planning plus any failed attempts before it.
+
+### Latency
+
+| Metric | From → to | Recorded for |
+|---|---|---|
+| `router_routing_duration_seconds{route,policy}` | request body in hand → plan made (parse, requirements, affinity lookup, eligibility, filter, policy) | every request that reached planning. Microsecond buckets: this is the router's own time, with no upstream wait in it. |
+| `router_upstream_response_seconds{route,deployment}` | one attempt sent → its response head | every attempt that got a response, including refusals that failed over |
+| `router_upstream_duration_seconds{route,deployment}` | the committed attempt sent → its body ended (or the client left) | committed attempts only |
+| `router_request_duration_seconds{route,policy}` | request body in hand → response finished, refused, or abandoned | every request with a route, once |
+
+`routing_ms` against the upstream numbers is how a slow router is told apart
+from a slow model. Connection time is not measured separately: the HTTP client
+exposes no connect hook, and an approximation would be a number nobody should
+trust. Durations come from a monotonic clock and cannot be negative.
+
+### Context estimate against the node's count
+
+The capability filter's prompt estimate is a lower bound — message-text bytes
+divided by 6 — and the node counts the real thing. When a response carries
+`usage.prompt_tokens` (every non-streamed chat answer, and a stream whose
+client asked for `stream_options.include_usage`, as Lightagent does), the two
+are compared:
+
+- `router_context_estimation_ratio{route}`: **`actual / estimated`**. Above 1
+  is an underestimate, which a lower bound is built to be. Not recorded when
+  the estimate is 0, because that ratio is not a number.
+- `router_context_estimation_error_tokens{route}`: `actual − estimated`, signed;
+  a negative value would mean the bound overestimated.
+
+Nothing is recorded when the node reported no count. When a request fails over
+after `context_length_exceeded`, its trace records the estimate, every
+context that proved too small, and the context of the deployment that
+answered. The estimator is not tightened automatically: these numbers exist so
+a later release can change it on evidence. (First real-node figures, SmolLM2:
+a one-line prompt estimated 4 and counted 36 — template markup dominates short
+prompts; a Lightagent turn with tools estimated 124 and counted 160.)
+
+### Routing traces
+
+One `RoutingTrace` per routed request, kept in a memory-only ring of
+`traces.capacity` (oldest dropped) and served by
+`GET /api/router/v1/traces`. Distinct from `RoutingDecision`, which says where
+one attempt went and why; a trace says what happened over the whole request:
+
+```json
+{
+  "request_id": "rtr-…", "received_at": 1791221798, "route": "Coder",
+  "endpoint": "chat", "stream": true, "policy": "round_robin",
+  "session": {"fingerprint": "d7630584", "affinity": "reassigned",
+              "sticky": "node-a/QwenCoder", "reassignment": "sticky_failed"},
+  "deployments": 2, "available": 2, "capable": 2,
+  "unavailable": [], "unfit": [],
+  "selected": "node-a/QwenCoder", "selection_reason": "session_affinity",
+  "attempts": [
+    {"deployment": "node-a/QwenCoder", "reason": "session_affinity", "outcome": "failed"},
+    {"deployment": "node-b/CoderBackup", "reason": "round_robin_failover",
+     "outcome": "committed", "upstream_status": 200, "response_ms": 3.1}
+  ],
+  "final_deployment": "node-b/CoderBackup",
+  "estimated_prompt_tokens": 4, "actual_prompt_tokens": 36,
+  "routing_ms": 0.27, "ttft_ms": 70.6, "duration_ms": 892.4,
+  "status": 200, "outcome": "ok"
+}
+```
+
+`outcome` is `ok`, `client_error`, `server_error`, `unavailable`,
+`interrupted` (a committed stream that ended without `[DONE]`: the node broke
+off or sent an in-band error) or `cancelled` (the client went away). A
+`context_overflow` object appears after an overflow failover. No trace holds a
+prompt, a message, a tool argument, a credential or a session id.
+
+### Metrics
+
+Labels are only configured names — a route, its policy, a deployment — or a
+reason from a fixed list. Never a session, a request id, a prompt, a tool name
+or an address.
 
 - `router_requests_total{route,outcome}`
 - `router_failovers_total{route}`
 - `router_routing_decisions_total{route,policy,reason}`. Failovers by policy are
-  the `*_failover` reasons.
+  the `*_failover` reasons; affinity hits are `session_affinity`.
 - `router_active_requests`
 - `router_deployment_active_requests{deployment}`
 - `router_capability_filtered_total{route,reason}`: available deployments a
@@ -676,8 +934,22 @@ Metrics:
   `route_capability_mismatch`.
 - `router_context_overflow_failovers_total{route}`: failovers to a larger
   context after `context_length_exceeded`.
-- `router_node_health{node}`: `1` healthy, `0` unhealthy, `-1` unknown. A request for an unconfigured route is counted under
-`route="_unknown"`, so clients cannot add labels by inventing model names.
+- `router_node_health{node}`: `1` healthy, `0` unhealthy, `-1` unknown.
+- `router_session_affinity_hits_total{route}`,
+  `router_session_affinity_misses_total{route}` (a session with no usable
+  affinity: new, expired, or its deployment no longer valid),
+  `router_session_affinity_reassignments_total{route,reason}`,
+  `router_session_affinity_entries`, `router_session_affinity_enabled`,
+  `router_session_affinity_evictions_total{reason="expired"|"capacity"}`.
+- Histograms (`_bucket`, `_sum`, `_count`): `router_request_duration_seconds`,
+  `router_routing_duration_seconds`, `router_ttft_seconds`
+  (`{route,policy}`); `router_upstream_ttft_seconds`,
+  `router_upstream_response_seconds`, `router_upstream_duration_seconds`
+  (`{route,deployment}`); `router_context_estimation_ratio`,
+  `router_context_estimation_error_tokens` (`{route}`).
+
+A request for an unconfigured route is counted under `route="_unknown"`, so
+clients cannot add labels by inventing model names.
 
 ## Limits of this version
 
@@ -722,10 +994,17 @@ Metrics:
   meaning, and the openai SDK and Lightagent both parse it unchanged.
 - **The node control plane is not proxied, and not imitated.** See
   [Lightagent's runtime panel](#lightagents-runtime-panel).
-- **Nodes do not log the request id.** The router sends `X-Request-Id` and logs
-  it, but gateways do not log it yet (R6).
-- **No latency or TTFT histograms yet.** The log lines already carry the timing
-  data those metrics would be built from.
+- **Affinity is per router process.** Two routers in front of the same nodes
+  keep separate books, and a restart forgets every affinity. Neither breaks a
+  conversation; it only costs one policy decision per session.
+- **A session moves only on success.** If every deployment fails, the session
+  keeps pointing at its sticky deployment, and its next request tries it first
+  again — unless health has ruled it out by then, which is the usual case.
+- **TTFT is the relay's first generated frame, not the client's first byte.**
+  The keep-alives and the role-only chunk before it reach the client earlier;
+  they are deliberately not counted.
+- **Upstream connection time is not separated** from the response-head time;
+  see [Latency](#latency).
 
 ## Lightagent's runtime panel
 
@@ -788,14 +1067,15 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R5 (capability filtering) is built. Nothing after it is. Each later step
-builds on the types above without changing the public route identity.
+R6 (session affinity and observability) is built. Nothing after it is. Each
+later step builds on the types above without changing the public route
+identity.
 
 | Milestone | Scope |
 |---|---|
 | **R4** | Done: `round_robin` and `least_busy`. Deliberately left out: weighted, random, latency/EWMA/P95/TTFT, and cost-aware selection. Any of these would be a new `RoutePolicy` variant with its own ordering function. |
 | **R5** | Done: request-aware capability filtering between eligibility and policy, for endpoint, tools, `tool_choice`, reasoning and context. Deliberately left out: ranking by capability, routing on the output budget, per-model tokenization, and moving a request to another route. |
-| **R6** | Session affinity keyed by a client-supplied conversation id. Latency and TTFT histograms. Request ids in node logs. |
+| **R6** | Done: optional session affinity (explicit header, route-scoped, bounded, idle TTL, a preference only over valid candidates); TTFT, latency and planning histograms; one request id from client to node log, across failover; per-request routing traces; estimate-versus-node prompt-token telemetry. Deliberately left out: using any of it to route, soft affinity, persistence, and inferring sessions. |
 | **R7** | Placement control: a control plane that asks nodes to load models and keeps warm standbys. It never runs in the request path. |
 | **R8** | A rule-based `Auto` route that maps request traits to routes. |
 | **R9** | A learned or adaptive router, and mixture-of-agents integration. |

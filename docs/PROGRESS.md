@@ -1562,6 +1562,89 @@ and returning.
   failed. The router has 149 (94 unit, 55 integration). The contract suite was
   47 passed, 2 skipped.
 
+## Router session affinity and observability, R6 (feature/router-session-observability)
+
+Built on `master` after v0.5.0 (`7c177d0`); v0.5.0 is untouched. R7 not
+started. Nothing here changes routing for a request without a session, or for
+any request while affinity is off (the default).
+
+- **Session id source.** Lightagent `7d95232` sends no session, conversation or
+  request id (its body is `model`, `messages`, `stream`, `stream_options`,
+  `tools`, `temperature`, `max_tokens`; its only header of note is the bearer
+  key). So the router reads an explicit, configurable header,
+  `X-Lightweight-Session`, and Lightagent was not modified. No session is ever
+  inferred from an address, a key, a user agent or the prompt.
+- **Affinity** (`affinity.rs`, `Selector::plan_with_affinity`): key = route +
+  keyed hash of the id (raw id never stored; 8-hex fingerprint in views);
+  value = deployment, created, last used. In memory, idle TTL (default 1800 s),
+  `max_entries` (default 10 000; expired first, then LRU), lazy expiry plus a
+  sweep task. Preferred only after health and the capability filter; a hit
+  takes no policy turn (no round-robin cursor draw, no least-busy comparison)
+  and the rest of the plan is the policy's failover order. Settles only on a
+  committed 2xx: first commit establishes (a racing first request does not
+  overwrite), a ruled-out or failed sticky deployment is reassigned with a
+  reason. No bounce-back on recovery.
+- **Observability** — measured, never read by routing: TTFT (receipt → first
+  relayed content/reasoning/tool-call delta; streams only), upstream TTFT,
+  request, planning (µs buckets), per-attempt response-head and committed
+  upstream-body histograms; affinity counters/gauges; `actual / estimated`
+  prompt-token ratio and signed error histograms from `usage.prompt_tokens`.
+  `RoutingTrace` per request in a bounded ring (`/api/router/v1/traces`);
+  `/api/router/v1/sessions`. Connect time is not measured (no client hook).
+- **Node request ids** (`lightweight_gateway::request_id`): the gateway logs a
+  forwarded `X-Request-Id` on its accepted/queued/admitted/refused/failed
+  lines and a new closing `request finished` line (outcome, ttft, total, queue
+  wait, tokens), and echoes it. It never invents one. The router reuses the
+  same validity rule.
+- **Bug found by a test, fixed before commit:** a thread-scoped log subscriber
+  in the shared test binary missed router lines intermittently (tracing's
+  per-callsite interest cache races across test threads). The log-correlation
+  test now has its own binary (`tests/request_correlation.rs`) with a global
+  subscriber; 5/5 and 6/6 repeat runs green.
+
+Verified by execution against two real gateways (`target/debug/hermes serve`,
+SmolLM2-135M, `--ctx 2048 --concurrency 2`), each in its own scratch
+`XDG_DATA_HOME` with catalog aliases `QwenCoder` (A, :18501) and `CoderBackup`
+(B, :18502), behind the real `hermes router` on :18500 with a round-robin
+`Coder` and affinity on:
+
+- One session, four streamed turns: all on A (`session_affinity`), while
+  sessionless requests rotated A, B, A — hits drew no cursor value. TTFT fell
+  from 1420 ms to about 66 ms on repeats, but node A was equally warm for a
+  sessionless repeat of the same prompt: that is llama.cpp's slot prompt
+  cache, not something affinity can claim.
+- A stopped by its PID: the next turn tried A (connection refused), failed over
+  to B in the same request, and the session moved (`sticky_failed`). A
+  restarted; with both nodes healthy (`available 2`) three more turns stayed on
+  B while sessionless traffic reached A again.
+- Failover between two live, logging nodes under one id: A's alias was renamed
+  through A's own scratch control API, so A answered `404 model_not_found`. A's
+  `gateway.log` has `request refused request_id="smoke-failover-1" status=404`,
+  B's has `generating` and `request finished` with the same id, and so does
+  the router's stderr. The alias was restored.
+- `request_id="smoke-s1-1"` appears in the client's response header, the
+  router's `routed` / `request finished` lines and node A's `generating` /
+  `request finished` lines (node TTFT 1414 ms against the router's 1420 ms).
+- A client leaving a 1500-token stream after 4 s: router trace `cancelled`
+  (status 200), node A `request finished outcome="cancelled"` under the same
+  id, router active requests back to 0.
+- Estimator, first real numbers: one-line prompts estimated 4 and counted 36
+  (template markup dominates; the ratio ladder was widened to 32 because of
+  it); a Lightagent turn with tools estimated 124 and counted 160.
+- **Unmodified Lightagent `7d95232`** in an isolated `LIGHTAGENT_HOME`:
+  `lightagent models` printed `Coder`, a chat streamed an answer under a
+  router-generated `rtr-…` id that node B logged, with no session (plain
+  round-robin). Its tree is unchanged.
+- The user's own gateway on 11434 was not touched; aliases were set by editing
+  the scratch catalogs so no alias command probed it. The scratch processes
+  were stopped by their recorded PIDs.
+- **Validation.** `./scripts/check.sh` passed in full: 1118 workspace tests, 0
+  failed (1070 at R5). The router has 192 (121 unit, 70 surface integration, 1
+  log-correlation binary); the gateway adds 2. Contract suite 47 passed, 2
+  skipped. Cross-platform proof is the PR's CI.
+
+**Next:** review of this branch. R7 (placement / warm standby) is not started.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:
