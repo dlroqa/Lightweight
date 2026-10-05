@@ -1,0 +1,11 @@
+use_default_settings: true
+
+server:
+  limiter: false
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    # Open WebUI uses this response format. Without it SearXNG answers 403.
+    - json

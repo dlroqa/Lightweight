@@ -1,0 +1,172 @@
+# Lightweight Workbench is intentionally a companion to the Lightweight
+# gateway.  The gateway continues to own model lifecycle, scheduling, rate
+# limits, and its OpenAI-compatible /v1 API.  This stack owns only the chat
+# experience and optional tools.
+#
+# Configure authenticated remote Lightweight routes in .env before starting
+# this companion stack. See README.md for the index-aligned route contract.
+name: lightweight-workbench
+
+services:
+  open-webui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    restart: unless-stopped
+    ports:
+      # The browser UI is deliberately local-only. Put it behind a TLS reverse
+      # proxy or private VPN before making it reachable from another machine.
+      - "${WORKBENCH_BIND:-127.0.0.1}:${WORKBENCH_PORT:-3000}:8080"
+    environment:
+      WEBUI_NAME: Lightweight Workbench
+      ENABLE_OLLAMA_API: "False"
+      ENABLE_OPENAI_API: "True"
+      # Semicolon-separated lists are index-aligned: URL 0 uses key 0 and
+      # config entry "0". Each route is an independently authenticated remote
+      # Lightweight OpenAI-compatible /v1 endpoint.
+      OPENAI_API_BASE_URLS: ${LIGHTWEIGHT_OPENAI_API_BASE_URLS:?Set remote Lightweight /v1 URLs in .env}
+      OPENAI_API_KEYS: ${LIGHTWEIGHT_OPENAI_API_KEYS:?Set matching Lightweight API keys in .env}
+      OPENAI_API_CONFIGS: ${LIGHTWEIGHT_OPENAI_API_CONFIGS:?Set route prefixes/configs in .env}
+
+      # Optional TypeSafe Jev advice for the selectable "Lightweight Auto"
+      # Open WebUI Pipe. It advises a model choice only; it never changes the
+      # gateway's authentication, scheduler, or remote-routing behavior.
+      JEV_ENABLED: ${JEV_ENABLED:-false}
+      JEV_API_URL: ${JEV_API_URL:-https://api.typesafe.ai/v1/systemone}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      JEV_MODEL: ${JEV_MODEL:-jev-latest}
+      JEV_TIMEOUT_SECONDS: ${JEV_TIMEOUT_SECONDS:-1.5}
+      JEV_MIN_CONFIDENCE: ${JEV_MIN_CONFIDENCE:-0.70}
+      JEV_MAX_PROMPT_CHARS: ${JEV_MAX_PROMPT_CHARS:-1200}
+      LIGHTWEIGHT_AUTO_DEFAULT_MODEL: ${LIGHTWEIGHT_AUTO_DEFAULT_MODEL:-}
+      LIGHTWEIGHT_AUTO_ALLOWED_MODELS: ${LIGHTWEIGHT_AUTO_ALLOWED_MODELS:-}
+      JEV_ROUTE_MODELS: ${JEV_ROUTE_MODELS:-{}}
+
+      # Private document retrieval: extraction, embeddings, vector search, and
+      # a final reranking pass all remain inside this Compose deployment.
+      VECTOR_DB: qdrant
+      QDRANT_URI: http://qdrant:6333
+      CONTENT_EXTRACTION_ENGINE: tika
+      TIKA_SERVER_URL: http://tika:9998
+      TIKA_SERVER_VERSION: "4"
+      RAG_EMBEDDING_ENGINE: openai
+      RAG_OPENAI_API_BASE_URL: http://infinity:7997/v1
+      RAG_OPENAI_API_KEY: local-embeddings
+      RAG_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
+      ENABLE_RAG_HYBRID_SEARCH: "True"
+      RAG_RERANKING_ENGINE: external
+      RAG_EXTERNAL_RERANKER_URL: http://infinity:7997/rerank
+      RAG_RERANKING_MODEL: BAAI/bge-reranker-v2-m3
+      RAG_TOP_K: "20"
+      RAG_TOP_K_RERANKER: "5"
+
+      # Private metasearch; search results are fetched by Open WebUI, never by
+      # the gateway. SearXNG needs egress to query its configured engines.
+      ENABLE_WEB_SEARCH: "True"
+      WEB_SEARCH_ENGINE: searxng
+      SEARXNG_QUERY_URL: http://searxng:8080/search
+      WEB_SEARCH_RESULT_COUNT: "5"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "4"
+      WEB_LOADER_CONCURRENT_REQUESTS: "4"
+
+    volumes:
+      - open_webui_data:/app/backend/data
+    depends_on:
+      qdrant:
+        condition: service_started
+      tika:
+        condition: service_started
+      searxng:
+        condition: service_started
+      infinity:
+        condition: service_healthy
+    networks:
+      - workbench
+      - egress
+
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:latest}
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [workbench]
+
+  tika:
+    image: ${TIKA_IMAGE:-apache/tika:latest-full}
+    restart: unless-stopped
+    networks: [workbench]
+
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
+      UWSGI_WORKERS: "2"
+      UWSGI_THREADS: "2"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng_cache:/var/cache/searxng
+    cap_drop: [ALL]
+    networks:
+      - workbench
+      - egress
+
+  infinity:
+    # CPU is the portable default, leaving the GPU or CPU that serves chat
+    # exclusively to Lightweight. Replace the image and command for an
+    # accelerator only after reserving memory for the loaded chat model.
+    image: ${INFINITY_IMAGE:-michaelf34/infinity:latest-cpu}
+    restart: unless-stopped
+    command:
+      - v2
+      - --engine
+      - optimum
+      - --model-id
+      - BAAI/bge-small-en-v1.5
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --port
+      - "7997"
+    volumes:
+      - infinity_cache:/app/.cache
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:7997/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks: [workbench]
+
+  open-terminal:
+    # Excluded unless an administrator explicitly uses the terminal profile.
+    # It is never auto-connected to Open WebUI.
+    profiles: [terminal]
+    image: ${OPEN_TERMINAL_IMAGE:-ghcr.io/open-webui/open-terminal:latest}
+    restart: unless-stopped
+    environment:
+      OPEN_TERMINAL_API_KEY: ${OPEN_TERMINAL_API_KEY:?Set OPEN_TERMINAL_API_KEY in .env}
+      OPEN_TERMINAL_PACKAGES: "ripgrep tree"
+    volumes:
+      - terminal_home:/home/user
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [workbench]
+
+networks:
+  # Database, extraction, embeddings, reranking and terminal calls cannot be
+  # reached from the host. The terminal has no egress path either.
+  workbench:
+    internal: true
+  # Only the UI and SearXNG attach here: one needs to fetch selected web pages,
+  # the other needs to query public search engines.
+  egress: {}
+
+volumes:
+  open_webui_data: {}
+  qdrant_data: {}
+  searxng_cache: {}
+  infinity_cache: {}
+  terminal_home: {}

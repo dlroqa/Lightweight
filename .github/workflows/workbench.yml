@@ -1,0 +1,44 @@
+# Validate the optional Open WebUI companion without pulling its large runtime
+# images. The product workflows own binary builds and panel rendering; this
+# job owns the Compose boundary and any Open WebUI Function source added here.
+name: workbench
+
+on:
+  push:
+    branches: [master, main, "release/**"]
+    paths:
+      - 'deploy/workbench/**'
+      - 'scripts/check-workbench.sh'
+      - '.github/workflows/workbench.yml'
+  pull_request:
+    paths:
+      - 'deploy/workbench/**'
+      - 'scripts/check-workbench.sh'
+      - '.github/workflows/workbench.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: workbench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate Compose and Open WebUI Functions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Validate the workbench
+        run: bash ./scripts/check-workbench.sh

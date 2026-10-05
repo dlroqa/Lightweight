@@ -521,6 +521,92 @@ async fn a_configured_key_is_enforced() {
 }
 
 #[tokio::test]
+async fn panel_chat_works_with_a_key_while_public_chat_stays_protected() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    for stream in [false, true] {
+        let response = Harness::client()
+            .post(format!("{}/api/v1/chat/completions", harness.base))
+            .header("Origin", &harness.base)
+            .json(&json!({"messages": [{"role": "user", "content": "hi"}], "stream": stream}))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 200);
+        if stream {
+            let events = read_stream(response).await;
+            assert!(events.last().expect("frames").is_done());
+        } else {
+            let body: Value = response.json().await.expect("json");
+            assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        }
+    }
+    let foreign = Harness::client()
+        .post(format!("{}/api/v1/chat/completions", harness.base))
+        .header("Origin", "https://foreign.example")
+        .json(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(foreign.status(), 403);
+    let public = Harness::client()
+        .post(format!("{}/v1/chat/completions", harness.base))
+        .header("x-lightweight-local-control", "1")
+        .json(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(public.status(), 401);
+}
+
+#[tokio::test]
+async fn remote_panel_chat_cannot_spoof_local_access() {
+    ensure_provider();
+    let harness = Harness::start(
+        MockConfig::default(),
+        GatewayConfig {
+            auth: AuthPolicy::with_static_key("shared-secret".into()),
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    // Inject a non-loopback socket peer before the router's trust middleware.
+    let app = lightweight_gateway::app(Arc::clone(&harness.state)).layer(axum::Extension(
+        axum::extract::ConnectInfo("192.0.2.1:12345".parse::<SocketAddr>().expect("peer")),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    for (key, status) in [
+        (None, 401),
+        (Some("wrong"), 401),
+        (Some("shared-secret"), 200),
+    ] {
+        let mut request = Harness::client()
+            .post(format!("http://{address}/api/v1/chat/completions"))
+            .header("x-lightweight-local-control", "1")
+            .json(&json!({"messages": [{"role": "user", "content": "hi"}]}));
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.expect("request");
+        assert_eq!(response.status(), status);
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn local_control_api_accepts_loopback_without_the_static_key() {
     ensure_provider();
     let harness = Harness::start(
