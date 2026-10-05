@@ -11,10 +11,13 @@ Lightagent ─ model="Coder" ─▶ router ─ model="QwenCoder" ─▶ node A  
                                      └ model="CoderBackup" ─▶ node B   (fallback)
 ```
 
-This document covers the first version, milestones R0 to R3: the domain model,
-a transparent proxy, a multi-node registry with health checks, and priority
-routing with failover before the response starts. The [roadmap](#roadmap) lists
-what comes after.
+This document covers milestones R0 to R4:
+
+- **R0–R3:** the domain model, a transparent proxy, a multi-node registry with
+  health checks, and priority routing with failover before the response starts.
+- **R4:** two load-balancing policies, round-robin and least-busy.
+
+The [roadmap](#roadmap) lists what comes after.
 
 ## Who owns what
 
@@ -49,8 +52,10 @@ Each concept maps to one type in `crates/lightweight-router/src/domain.rs`.
   operator configured.
 - **Decision** (`RoutingDecision`, `RoutingReason`, `RoutingFailure`). Where one
   attempt went and why, logged with every request.
-- **Policy** (`RoutePolicy`). Only `priority` exists. It is an enum, so each
-  later strategy is a new variant rather than a redesign.
+- **Policy** (`RoutePolicy`). `priority`, `round_robin` or `least_busy`, chosen
+  per route. See [Route policies](#route-policies). Each strategy is an enum
+  variant with its own ordering function, so a later one is an addition rather
+  than a redesign.
 
 The route name and the node alias are independent. `Coder → Coder` is allowed,
 and so is `Coder → QwenCoder`.
@@ -244,12 +249,147 @@ Nothing is probed during a request.
 - The first probe runs before the first request is accepted. A node that is
   offline then does not stop the router from starting.
 
-## Priority routing and failover
+## Route policies
 
-For each request, the router reads the health snapshot, takes the route's
-deployments in configured order, and drops every one that is not available. The first remaining deployment gets the request. Nothing
-is reordered by latency. When a primary recovers, it is first again on the very
-next request.
+Every request goes through the same four steps in the same order:
+
+1. **Eligibility.** `select::eligible` drops every deployment that cannot take
+   traffic now: a disabled node, an `unknown` or `unhealthy` node, or a node that
+   is not serving the deployment's model. This is the one availability rule. It
+   is shared by all three policies and by the route summaries in `/v1/models`
+   and `/v1/capabilities`. A policy never sees an ineligible deployment, however
+   idle it looks or whosever turn it would be.
+2. **Policy.** The route's `strategy` orders what is left. The first deployment
+   is the initial choice, and the rest, in order, are where failover goes.
+3. **Proxy.** The proxy only walks that order. It contains no policy logic.
+4. **Failover**, before commitment only, exactly as described
+   [below](#failover).
+
+| `strategy` | Initial choice | Failover order |
+|---|---|---|
+| `priority` (the default when `strategy` is omitted) | The first eligible deployment in configured order | The rest in configured order |
+| `round_robin` | The next turn in the eligible ring | The rest of the ring after that turn |
+| `least_busy` | The eligible deployment with the lowest `active / limit`; ties go to configured order | The rest in load order, as observed when the request was planned |
+
+An unknown `strategy` (`"fastest"`) is refused when the configuration is read.
+It is never treated as `priority`. Existing configurations, which use `priority`
+or omit the field, work unchanged. The policy never changes a route's public
+identity: `/v1/models` lists `Coder` whatever `Coder`'s strategy is, and
+`default` or an omitted `model` runs the default route's own policy.
+
+None of the policies looks at latency, time to first token, request duration,
+throughput, history, weights, sessions, the request's content, or the
+deployment's capabilities.
+
+```json
+{ "name": "Coder",   "strategy": "priority",    "deployments": [
+    { "node": "node-a", "model": "Coder" }, { "node": "node-b", "model": "CoderBackup" } ] }
+{ "name": "Fast",    "strategy": "round_robin", "deployments": [
+    { "node": "node-a", "model": "Fast" }, { "node": "node-b", "model": "Fast" }, { "node": "node-c", "model": "Fast" } ] }
+{ "name": "General", "strategy": "least_busy",  "deployments": [
+    { "node": "node-a", "model": "General" }, { "node": "node-b", "model": "General" } ] }
+```
+
+### Priority
+
+The first eligible deployment in configured order gets the request. When a
+primary recovers, it is first again on the very next request. Priority behaves
+exactly as it did in R3, and every R3 test passes as written.
+
+### Round-robin
+
+The **ring** is the route's eligible deployments in configured order. Each route
+has one cursor, an atomic counter. Each request draws exactly one value from it
+with a single `fetch_add`, and starts at `ring[cursor % ring.len()]`.
+
+- A rotation across A, B and C goes A B C A B C.
+- If B is unhealthy, the ring is A and C, so requests alternate between A and C.
+  The rotation never lands on B to keep a count.
+- When B recovers, it is back in the ring from the next request on.
+- **One step per client request.** A failover attempt does not advance the
+  cursor. It continues to the rest of the ring after the chosen deployment.
+  Three requests, one of which needed failover, leave the cursor at 3.
+- **Concurrency safety.** Two requests can never draw the same value, and no lock
+  is needed. 2400 concurrent plans over a ring of two split exactly 1200/1200.
+- The cursor lives in memory. A router restart resets the rotation, which is
+  harmless.
+
+The ring index wraps when the eligible set grows or shrinks, so the exact
+position after a health change is arbitrary. Equal steps over the current ring
+are what is guaranteed.
+
+### Least-busy
+
+**Load is the router's own count of in-flight upstream attempts** on each
+deployment, divided by the **concurrency limit** that deployment's node
+advertises. The router never infers capacity on its own.
+
+**What the limit means.** It is `limits.max_concurrent_requests` from the node's
+`/v1/capabilities`: the gateway scheduler's slot count. `hermes serve` sets that
+from the engine's confirmed parallel slots (`n_parallel`, via `--concurrency`).
+Requests beyond it queue inside the node, which owns its queue. The router reads
+the limit from the per-deployment observation it already keeps for capabilities,
+so there is no second capacity model.
+
+**Comparing loads.** `active_a / limit_a` against `active_b / limit_b` is
+computed exactly as `active_a × limit_b` against `active_b × limit_a` in `u128`:
+no division, no floating point, no overflow. Lower wins, and an exact tie goes to
+configured order (`least_busy_tiebreak`).
+
+- **2/8 beats 1/2.** That is 25% against 50%, even though 1 is fewer than 2.
+- **1/4 ties with 2/8,** so the deployment configured first wins.
+- **Everything full is still a tie.** With 4/4 and 2/2, configured order picks.
+  The router does no admission control of its own: the node owns its queue.
+
+**Unknown or zero limits.** A deployment whose limit is unknown, or advertised
+as 0, is never assumed to have room.
+
+- It ranks after every deployment with a known positive limit, even a full one,
+  but stays in the plan as a fallback.
+- Among such deployments, the one with fewer requests in flight goes first, then
+  configured order.
+- Nothing ever divides by zero.
+
+A Lightweight gateway never advertises 0: its scheduler clamps the count to at
+least 1. So in practice this rule only covers a race in which a deployment has
+no observation yet.
+
+**Choosing and reserving happen together.** For each route, the router reads the
+loads, orders them, and takes one slot on the first choice while holding that
+route's lock. A second concurrent request therefore sees the first one's slot
+already counted. Two requests can never both see an idle A and both take it.
+
+The lock is per route, so other routes never wait on it. Two routes that share a
+deployment each hold their own lock, so a request on one can momentarily miss a
+reservation made on the other. That costs one slightly uneven choice, never
+correctness.
+
+**Capacity-sensitive by construction, with no weights.** With limits of 4 and
+1, five requests held at once land 4/1, and ten land 8/2. That held whatever
+order the threads ran in. A higher-capacity node takes proportionally more work
+because its ratio rises more slowly.
+
+### In-flight accounting
+
+Every policy counts in-flight work, so the control API shows real numbers for
+priority and round-robin routes too.
+
+- A slot is taken when a deployment is **chosen for an upstream attempt**:
+  - for the first choice, when the plan is made;
+  - for a failover attempt, when that attempt starts.
+
+  Inspecting candidates takes no slot.
+- The slot is held by a `Lease`, which gives it back when dropped:
+  - a pre-commit failure drops it before the next deployment's slot is taken;
+  - a committed stream carries it in its body until the stream ends or the
+    client goes away;
+  - a whole body releases it once the body has been read.
+- Success, a `4xx`/`5xx` answer, failover, a stream failure, a connection
+  timeout, a client disconnect, a client timeout and a panic are all drops.
+  Tests cover each of these, and a real disconnect released the slot while the
+  node recorded the generation as `cancelled`.
+
+## Failover
 
 **Failover happens only before anything has been sent to the client.** The next
 deployment is tried when the current one:
@@ -279,8 +419,13 @@ mid-stream, the client receives one
 `data: {"error":{"code":"upstream_stream_interrupted",…}}` frame and no `[DONE]`.
 Another node is never asked to continue an answer it did not start.
 
-`RoutingReason` in the logs is one of `explicit_single_deployment`,
-`primary_healthy`, `primary_unavailable_fallback` or `primary_failed_fallback`.
+`RoutingReason` in the logs is one of these:
+
+| Policy | Reasons |
+|---|---|
+| `priority` | `explicit_single_deployment`, `primary_healthy`, `primary_unavailable_fallback`, `primary_failed_fallback` |
+| `round_robin` | `round_robin`, `round_robin_failover` |
+| `least_busy` | `least_busy`, `least_busy_tiebreak`, `least_busy_failover` |
 
 ## The control API (read-only)
 
@@ -290,24 +435,46 @@ only as `"bearer"` or `"none"`.
 | Endpoint | Shows |
 |---|---|
 | `GET /api/router/v1/nodes` | Each node's URL, `enabled`, health, consecutive failures, last check, last seen, last error, the model it is serving, and its version. |
-| `GET /api/router/v1/routes` | Each route's strategy, `available`, and its deployments with their priority, availability and reason. Also the `default_route`. |
-| `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, its availability, and its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`. |
+| `GET /api/router/v1/routes` | Each route's `strategy`, `available`, and its deployments with their configured position (`priority`), availability and reason. Also the `default_route`. |
+| `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, and its availability. Also its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`, and what least-busy reads: `active_requests` (the router's in-flight count) and `concurrency_limit`. |
 | `GET /api/router/v1/health` | Node and route health in one read, the probe settings, and active requests. |
 
 ## Observability
 
 Logs use the target `hermes::router` (filter with `HERMES_LOG=hermes::router=debug`)
 and go to stderr, never to the data directory's `gateway.log`. Each routed
-request logs `request_id`, `route`, `node`, `deployment`, `reason`,
-`routing_ms`, `upstream_status` and `failover_count`. Prompt text, credentials
-and file paths are never logged.
+request logs:
 
-Metrics: `router_requests_total{route,outcome}`, `router_failovers_total{route}`,
-`router_active_requests`, and `router_node_health{node}` (`1` healthy, `0`
-unhealthy, `-1` unknown). A request for an unconfigured route is counted under
+- `request_id`, `route`, `policy`, `node`, `deployment`, `reason`, `routing_ms`,
+  `upstream_status` and `failover_count`;
+- under round-robin, also `cursor` and `selected_index`;
+- under least-busy, also `active_before` and `concurrency_limit`.
+
+Prompt text, credentials and file paths are never logged.
+
+Metrics:
+
+- `router_requests_total{route,outcome}`
+- `router_failovers_total{route}`
+- `router_routing_decisions_total{route,policy,reason}`. Failovers by policy are
+  the `*_failover` reasons.
+- `router_active_requests`
+- `router_deployment_active_requests{deployment}`
+- `router_node_health{node}`: `1` healthy, `0` unhealthy, `-1` unknown. A request for an unconfigured route is counted under
 `route="_unknown"`, so clients cannot add labels by inventing model names.
 
 ## Limits of this version
+
+- **A node's advertised limit can be stale after a hot swap.** A gateway's
+  `/v1/capabilities` reports the slot count it started with, while a model
+  loaded at runtime can resize the scheduler (`/api/v1/gateway` reports the live
+  value). Until that node-side report is fixed, least-busy uses the startup
+  figure for such a node.
+- **A freshly started node briefly advertises its canonical id.** `hermes serve
+  <file>` starts answering before it has adopted the catalog alias, because
+  hashing the file takes seconds. For that moment, a deployment that names the
+  alias reads as `model_not_served` and gets no traffic. The next probe after
+  adoption makes it eligible. This was seen in the real smoke test.
 
 - **Lightagent with several routes and `model = "default"`.** When `/v1/models`
   lists more than one model, Lightagent asks for an explicit model and does not
@@ -384,12 +551,12 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-None of this is built yet. Each step builds on the types above without
-changing the public route identity.
+R4 (round-robin and least-busy) is built. Nothing after it is. Each later step
+builds on the types above without changing the public route identity.
 
 | Milestone | Scope |
 |---|---|
-| **R4** | More `RoutePolicy` variants: round-robin, weighted, least-busy (fed by node concurrency from the probe). |
+| **R4** | Done: `round_robin` and `least_busy`. Deliberately left out: weighted, random, latency/EWMA/P95/TTFT, and cost-aware selection. Any of these would be a new `RoutePolicy` variant with its own ordering function. |
 | **R5** | Capability-aware filtering: skip a deployment that cannot honour the request's features (tools, reasoning), and choose the deployment by context length. |
 | **R6** | Session affinity keyed by a client-supplied conversation id. Latency and TTFT histograms. Request ids in node logs. |
 | **R7** | Placement control: a control plane that asks nodes to load models and keeps warm standbys. It never runs in the request path. |

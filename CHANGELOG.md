@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router load balancing (R4).** Each route chooses its `strategy`:
+  `priority` (the default, unchanged), `round_robin`, or `least_busy`.
+  - **Round-robin** takes equal turns over the deployments that are currently
+    eligible, in configured order. The per-route cursor advances once per
+    request, so failover attempts do not move it.
+  - **Least-busy** picks the eligible deployment with the lowest
+    `in-flight / advertised concurrency limit`, compared exactly, with ties
+    going to configured order. A deployment whose capacity is unknown or zero is
+    used only as a fallback.
+  - Health eligibility is shared by every policy. The router keeps its own
+    in-flight count per deployment, and it is released on every exit path,
+    client disconnects included.
+  - The admin deployments view shows `active_requests` and `concurrency_limit`.
+    Logs carry the policy and how the choice was made. `/metrics` gains decision
+    counts by policy and a per-deployment in-flight gauge.
+  - An unknown `strategy` is refused at startup. No latency, weights, session
+    affinity or capability filtering is involved.
 - **User-defined model aliases.** Give any installed model a short name of your
   choosing (`Coder`, `Fast`, …) when adding it or at any time later, from the
   panel's Models screen, `hermes models alias`, or
