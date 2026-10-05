@@ -27,6 +27,7 @@
 pub mod config;
 pub mod domain;
 pub mod health;
+pub mod select;
 
 pub use config::{RouterConfig, load, validate};
 pub use domain::Topology;
