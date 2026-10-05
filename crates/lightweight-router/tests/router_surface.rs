@@ -3736,6 +3736,25 @@ async fn durations_are_recorded_once_for_every_way_a_request_ends() {
     let trace = trace_of(&router, "all-busy").await;
     assert_eq!(trace["status"], 503);
     assert_eq!(trace["outcome"], "server_error");
+
+    // Planning that fails outright is still planning time, and still a request.
+    a.withhold(|w| w.chat = true);
+    b.withhold(|w| w.chat = true);
+    router.probe().await;
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("nothing-fits"),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(count("router_routing_duration_seconds", &ROUTE), 5);
+    assert_eq!(count("router_request_duration_seconds", &ROUTE), 5);
+    assert_eq!(
+        trace_of(&router, "nothing-fits").await["outcome"],
+        "client_error"
+    );
     assert!(trace.get("final_deployment").is_none());
     for family in [
         "router_request_duration_seconds",

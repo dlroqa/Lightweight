@@ -12,8 +12,9 @@
 //!    [`crate::requirements`]. A request the gateway would refuse is refused
 //!    here with the gateway's own 400.
 //! 4. **Plan** from the health book: the route's available deployments, then
-//!    those that can serve this request, then the route's policy. No network
-//!    call is made to decide.
+//!    those that can serve this request, then — if the request names a session
+//!    whose last deployment is still among them — that deployment first, and
+//!    otherwise the route's policy. No network call is made to decide.
 //! 5. **Attempt** each candidate in turn, with `model` rewritten to that node's
 //!    local name and the node's own credential. A failure *before the node
 //!    answered* — refused connection, timeout, 502/503/504, or a node that no
@@ -26,6 +27,15 @@
 //!    the route's name, and a stream is relayed frame by frame. If the node
 //!    fails mid-stream the client is told so in-band; no other node is asked
 //!    to continue an answer it did not start.
+//!
+//! A session settles on the deployment that commits a **successful** answer:
+//! a first request establishes its affinity there, and a request whose sticky
+//! deployment was ruled out or failed before answering moves it there.
+//!
+//! Every routed request is measured as it goes — planning time, each attempt's
+//! time to a response head, time to first token, the whole duration, the
+//! node's own prompt count against the router's estimate — and ends as one
+//! [`RoutingTrace`]. None of it is read back by any routing decision.
 //!
 //! Cancellation needs no code of its own. A disconnecting client makes hyper
 //! drop the response body; the body owns the upstream stream; dropping that
@@ -425,7 +435,11 @@ async fn route_request(
     ) {
         Ok(plan) => plan,
         Err(failure) => {
-            tracker.trace.routing_ms = millis(received.elapsed());
+            let routing = received.elapsed();
+            tracker.trace.routing_ms = millis(routing);
+            state
+                .metrics
+                .observe_planning(route.name.as_str(), policy, routing);
             if let RoutingFailure::CapabilityMismatch { unfit, unmet, .. } = &failure {
                 record_unfit(state, request_id, &route.name, unfit);
                 tracker.trace.available = unfit.len();

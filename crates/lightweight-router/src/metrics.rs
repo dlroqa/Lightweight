@@ -117,10 +117,13 @@ pub const PLANNING: Ladder = Ladder {
 };
 
 /// `actual / estimated` prompt tokens, observed in thousandths. Above 1 means
-/// the router's lower bound underestimated, which it is built to do.
+/// the router's lower bound underestimated, which it is built to do. The top
+/// reaches 32: on a real node a one-line prompt measured 4 estimated against
+/// 36 counted, because the template's own markup dominates a short prompt.
 pub const RATIO: Ladder = Ladder {
     bounds: &[
         250, 500, 750, 1_000, 1_250, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000, 6_000, 8_000,
+        10_000, 16_000, 32_000,
     ],
     per_unit: 1_000,
 };
