@@ -438,6 +438,7 @@ async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -
                 "when": rule.when,
                 "condition": rule.when.summary(),
                 "route": rule.route.as_str(),
+                "classify": rule.classify,
                 "decisions": state.metrics.auto_decisions(&rule.name),
             })
         })
@@ -449,6 +450,19 @@ async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -
         "fallback_route": auto.fallback.as_str(),
         "fallback_decisions": state.metrics.auto_fallbacks(),
         "rules": rules,
+        // The classifier's settings: routes and limits only — it has no
+        // credential of its own, and its nodes' keys are never shown.
+        "classifier": auto.classifier.as_ref().map(|classifier| json!({
+            "route": classifier.route.as_str(),
+            "candidates": classifier.candidates,
+            "fallback_route": classifier.fallback.as_str(),
+            "min_confidence": classifier.min_confidence,
+            "timeout_ms": u64::try_from(classifier.timeout.as_millis()).unwrap_or(u64::MAX),
+            "max_input_chars": classifier.max_input_chars,
+            "invoked_by": auto.rules.iter().filter(|rule| rule.classify)
+                .map(|rule| rule.name.as_str()).collect::<Vec<_>>(),
+            "outcomes": state.metrics.classifier_outcomes(),
+        })),
     }))
     .into_response()
 }

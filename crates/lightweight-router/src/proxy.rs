@@ -77,7 +77,8 @@ use crate::requirements::{self, RequestRequirements};
 use crate::select::{Candidate, Selection, Sticky};
 use crate::sse::{FrameRewriter, rewrite_body_measuring};
 use crate::trace::{
-    AttemptTrace, ExcludedTrace, OverflowStep, OverflowTrace, RoutingTrace, SessionTrace,
+    AttemptTrace, ClassifierTrace, ExcludedTrace, OverflowStep, OverflowTrace, RoutingTrace,
+    SessionTrace,
 };
 
 /// The header a request is correlated by, from client to router to node.
@@ -434,6 +435,7 @@ async fn route_request(
     // The rule that chose the route — `Some(None)` for the fallback — when
     // the client asked for `Auto`.
     let mut auto_rule: Option<Option<String>> = None;
+    let mut classification = None;
     let resolution = match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
         Some(auto) => {
             match resolve_auto(
@@ -455,6 +457,7 @@ async fn route_request(
                     }
                     early_needs = Some(resolved.needs);
                     auto_rule = Some(resolved.rule);
+                    classification = resolved.classification;
                     resolved.route
                 }
                 Err(refusal) => return *refusal,
@@ -489,6 +492,26 @@ async fn route_request(
         tracker.trace.requested_route = AUTO_ROUTE.to_owned();
         tracker.trace.auto_fallback = rule.is_none();
         tracker.trace.auto_rule = rule;
+    }
+    if let (Some(classification), Some(classifier)) = (
+        classification,
+        state
+            .auto
+            .as_ref()
+            .and_then(|auto| auto.classifier.as_ref()),
+    ) {
+        tracker.trace.classifier = Some(ClassifierTrace {
+            route: classifier.route.to_string(),
+            outcome: classification.outcome.as_str(),
+            chosen_route: classification
+                .verdict
+                .as_ref()
+                .map(|verdict| verdict.route.to_string()),
+            confidence: classification.verdict.as_ref().map(|v| v.confidence),
+            duration_ms: millis(classification.duration),
+            request_id: classification.request_id,
+            input_truncated: classification.input_truncated,
+        });
     }
     tracker.trace.stream = request.get("stream") == Some(&Value::Bool(true));
     tracker.trace.deployments = route.deployments.len();
@@ -1007,6 +1030,28 @@ async fn resolve_auto<'a>(
         }
         None => None,
     };
+    if let (Some(classification), Some(classifier)) = (&classification, &auto.classifier) {
+        let chosen = classification.verdict.as_ref();
+        tracing::info!(
+            target: targets::ROUTER,
+            request_id,
+            auto_rule = decision.rule_label(),
+            classifier_route = %classifier.route,
+            classifier_outcome = classification.outcome.as_str(),
+            classifier_chosen = chosen.map(|verdict| verdict.route.as_str()),
+            classifier_confidence = chosen.map(|verdict| verdict.confidence),
+            classifier_duration_ms = millis(classification.duration),
+            input_truncated = classification.input_truncated,
+            resolved_route = %classification.route(classifier),
+            "auto route classified"
+        );
+        state.metrics.record_classification(
+            classification.outcome.as_str(),
+            (classification.outcome == crate::classifier::ClassifierOutcome::Chosen)
+                .then(|| classification.route(classifier).as_str()),
+            classification.duration,
+        );
+    }
     let resolved = match (&classification, &auto.classifier) {
         (Some(classification), Some(classifier)) => classification.route(classifier),
         _ => decision.route,

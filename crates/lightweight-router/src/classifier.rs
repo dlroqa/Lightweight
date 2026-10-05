@@ -311,6 +311,8 @@ pub struct Classification {
     /// The classification request's own id, in the router's and the node's
     /// logs.
     pub request_id: String,
+    /// The text sent was cut to `max_input_chars`.
+    pub input_truncated: bool,
 }
 
 impl Classification {
@@ -328,6 +330,7 @@ impl Classification {
             verdict: None,
             duration: Duration::ZERO,
             request_id: String::new(),
+            input_truncated: false,
         }
     }
 }
@@ -380,6 +383,7 @@ pub async fn classify(
         verdict,
         duration: started.elapsed(),
         request_id: nested_id,
+        input_truncated: input.truncated,
     }
 }
 
