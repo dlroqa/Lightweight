@@ -560,7 +560,12 @@ deployment is tried when the current one:
   last probe. The router forgets what that node was serving until the next
   probe, and the node's message is not shown to the client.
 
-Every other answer commits the deployment. That includes `400` and `500`.
+- answers `400 context_length_exceeded`, recognised by its `error.code` and
+  nothing looser, **and** a later deployment in the plan advertises a strictly
+  larger context. See [Context overflow](#context-overflow) below.
+
+Every other answer commits the deployment. That includes every other `400`, and
+every `500`.
 **A `500` is never retried elsewhere.** It may be a deterministic failure of this
 request or this model. Running the request again on another model could
 duplicate work, or hide a real application error behind a different model's
@@ -575,6 +580,42 @@ mid-stream, the client receives one
 `data: {"error":{"code":"upstream_stream_interrupted",…}}` frame and no `[DONE]`.
 Another node is never asked to continue an answer it did not start.
 
+### Context overflow
+
+The capability filter's context check is a lower bound, so a prompt can pass it
+and still be longer, by the node's own count, than the deployment chosen. The
+node then refuses it before generating anything:
+`400 {"error":{"code":"context_length_exceeded","type":"invalid_request_error","param":"messages",…}}`.
+A streamed request gets the same JSON refusal, because the node checks before
+it starts the stream.
+
+That one refusal is a capability miss the router could not see in advance, so
+it is not the end of the request when the plan holds a deployment that can do
+better:
+
+- Only deployments already in the plan are tried. They passed health and the
+  capability filter, so a deployment ruled out for tools, reasoning or its
+  endpoint never comes back.
+- Only a deployment advertising a **strictly larger** context than every one
+  that has overflowed is tried. Others are passed over in plan order. With 8K,
+  8K and 32K, an overflow on the first 8K goes straight to the 32K.
+- The plan is not made again. Round-robin's cursor does not move a second
+  time, and least-busy does not choose again. One request is one policy
+  decision. The overflowed deployment's in-flight slot is returned before the
+  next one is taken.
+- The attempt is logged `context_overflow_failover`, with the deployment that
+  overflowed and its context, the next one and its context, and the router's
+  `estimated_prompt_tokens`. It is counted in
+  `router_context_overflow_failovers_total{route}` and in
+  `router_failovers_total`.
+- When no larger deployment is left, the node's own `400
+  context_length_exceeded` is returned unchanged. It is not turned into
+  `route_unavailable` (the route is available) or `route_capability_mismatch`
+  (the router could not have known before sending).
+- Once anything has been relayed, nothing is retried. An overflow reported
+  inside a stream that has started reaches the client in-band, as any other
+  mid-stream error does.
+
 `RoutingReason` in the logs is one of these:
 
 | Policy | Reasons |
@@ -582,6 +623,7 @@ Another node is never asked to continue an answer it did not start.
 | `priority` | `explicit_single_deployment`, `primary_healthy`, `primary_unavailable_fallback`, `primary_failed_fallback` |
 | `round_robin` | `round_robin`, `round_robin_failover` |
 | `least_busy` | `least_busy`, `least_busy_tiebreak`, `least_busy_failover` |
+| any | `context_overflow_failover` |
 
 ## The control API (read-only)
 
@@ -632,6 +674,8 @@ Metrics:
   `reasoning_unsupported`, `context_too_small` and `unobserved`.
 - `router_capability_mismatch_total{route}`: requests refused with
   `route_capability_mismatch`.
+- `router_context_overflow_failovers_total{route}`: failovers to a larger
+  context after `context_length_exceeded`.
 - `router_node_health{node}`: `1` healthy, `0` unhealthy, `-1` unknown. A request for an unconfigured route is counted under
 `route="_unknown"`, so clients cannot add labels by inventing model names.
 
@@ -639,10 +683,12 @@ Metrics:
 
 - **The router's context check is a lower bound, not the node's count.** It
   rules out only what cannot fit. A prompt just over a deployment's window can
-  still be sent there, and the node answers `context_length_exceeded`, which is
-  a `400` and is not retried elsewhere. That error is the one the client would
-  get from that node directly. Exact per-model counting would need each
-  deployment's tokenizer and chat template.
+  still be sent there. The node answers `context_length_exceeded`, and the
+  request then moves to a deployment in the plan with a larger context, if
+  there is one ([Context overflow](#context-overflow)). That costs one
+  round trip to the smaller node, where it counts the prompt. Exact
+  per-model counting would need each deployment's tokenizer and chat
+  template.
 - **The output budget does not steer the choice.** A short prompt with
   `max_tokens: 20000` is eligible on an 8K deployment, where the node clamps
   the budget. It is never refused, but it can be answered with fewer tokens

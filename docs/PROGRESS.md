@@ -1528,6 +1528,40 @@ Verified by execution, with two real gateways running SmolLM2-135M: node A at
 - The user's own gateway on 11434 was not touched. The scratch processes were
   stopped by their recorded PIDs, and the Lightagent tree is unchanged.
 
+### Hardening: context-overflow failover
+
+The lower bound can let a prompt through to a deployment too small for it by
+the node's own count. That node answers `400 context_length_exceeded` (code
+from `BackendError::ContextOverflow`, `invalid_request_error`, `param`
+`messages`/`prompt`, sent before any stream starts).
+
+- **Detection.** The router reads every `400` body whole. Only that
+  structured `error.code` moves the request: to the next deployment in the
+  same plan whose observed context is strictly larger than every one that has
+  overflowed.
+- **Everything else is unchanged.** Every other `400` and every `500` still
+  stands, and nothing is retried once relayed.
+- **No re-planning.** There is no second round-robin step and no new
+  least-busy choice. The overflowed deployment's slot is returned first.
+- **No larger deployment.** The node's error is returned unchanged.
+- **Observability.** Reason `context_overflow_failover`, metric
+  `router_context_overflow_failovers_total{route}`.
+
+Tests: 7 new integration tests. They cover recovery (plain and streamed);
+equal and smaller contexts not tried (and 8K, 8K, 32K going straight to 32K);
+a tools-filtered 32K deployment never reached; other 400s, a free-text
+"context length" 400 and a 500 standing; a post-commit in-band overflow not
+failed over; round-robin's cursor moving once; and least-busy's slot moving
+and returning.
+
+- **Mutation checks.** Detection off fails 5 of them. Retrying regardless of
+  context fails the equal-context test and the R3 test
+  `a_client_error_from_the_node_stands_and_is_not_retried_elsewhere`, which
+  passes unmodified (equal contexts).
+- **Validation.** `./scripts/check.sh` passed: 1070 workspace tests, 0
+  failed. The router has 149 (94 unit, 55 integration). The contract suite was
+  47 passed, 2 skipped.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

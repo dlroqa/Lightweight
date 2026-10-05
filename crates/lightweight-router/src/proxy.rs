@@ -17,7 +17,10 @@
 //! 5. **Attempt** each candidate in turn, with `model` rewritten to that node's
 //!    local name and the node's own credential. A failure *before the node
 //!    answered* — refused connection, timeout, 502/503/504, or a node that no
-//!    longer serves the model — moves on to the next candidate.
+//!    longer serves the model — moves on to the next candidate. So does a
+//!    `400 context_length_exceeded`, but only to a candidate advertising a
+//!    strictly larger context: the router's estimate is a lower bound, and the
+//!    node's count is the one that decides.
 //! 6. **Commit** on the first answer that is not one of those. From here the
 //!    deployment is fixed: the response is returned with `model` rewritten to
 //!    the route's name, and a stream is relayed frame by frame. If the node
@@ -43,7 +46,7 @@ use lightweight_observability::targets;
 use serde_json::Value;
 
 use crate::RouterState;
-use crate::domain::{CapabilityGap, DeploymentId, Node, RouteName, RoutingFailure};
+use crate::domain::{CapabilityGap, DeploymentId, Node, RouteName, RoutingFailure, RoutingReason};
 use crate::error::{json_error, routing_failure, server_error};
 use crate::health::{Outcome as Probe, describe_transport};
 use crate::load::Lease;
@@ -138,7 +141,14 @@ enum Attempt {
     /// Try the next candidate. The node's refusal, if it sent one worth
     /// returning.
     Next(Option<Refusal>),
+    /// The node refused the prompt as longer than its context
+    /// (`400 context_length_exceeded`) before answering. Only a deployment with
+    /// a larger context can do better; the refusal is the answer if none can.
+    ContextOverflow(Refusal),
 }
+
+/// The code a Lightweight node answers a prompt too long for its context with.
+const CONTEXT_OVERFLOW: &str = "context_length_exceeded";
 
 /// Forward one generation request.
 pub async fn forward(
@@ -218,11 +228,15 @@ async fn route_request(
     // a slot reserved on the first choice - all in the selector. Nothing below
     // this line knows which policy the route uses or what was filtered; it
     // only walks the order it was handed.
+    //
+    // The observations are read once, so the contexts failover compares below
+    // are the ones the plan was made from.
+    let observed = state.health.deployment_snapshot();
     let mut plan = match state.selector.plan_request(
         &state.topology,
         route,
         &state.health.snapshot(),
-        &state.health.deployment_snapshot(),
+        &observed,
         &needs,
     ) {
         Ok(plan) => plan,
@@ -298,10 +312,39 @@ async fn route_request(
     let mut active = Some(active);
     let mut reservation = plan.reservation.take();
     let mut last_refusal = None;
+    // After a `context_length_exceeded`, the largest context known to be too
+    // small for this prompt. Only a candidate advertising more is worth trying.
+    let mut too_small: Option<u32> = None;
+    // Whether the attempt about to be made follows a context overflow.
+    let mut after_overflow = false;
+    let mut attempts_made = 0;
+    let context_of = |candidate: &Candidate| {
+        observed
+            .get(&candidate.deployment)
+            .map(|seen| seen.context_length)
+    };
+    let larger_than = |candidate: &Candidate, floor: Option<u32>| match floor {
+        None => true,
+        Some(floor) => context_of(candidate).is_some_and(|context| context > floor),
+    };
     for (attempt, candidate) in plan.candidates.iter().enumerate() {
-        let Some(decision) = plan.decision(attempt) else {
+        if !larger_than(candidate, too_small) {
+            tracing::debug!(
+                target: targets::ROUTER,
+                request_id,
+                route = %route.name,
+                deployment = %candidate.deployment,
+                context = context_of(candidate),
+                "not tried: its context is no larger than one this prompt overflowed"
+            );
+            continue;
+        }
+        let Some(mut decision) = plan.decision(attempt) else {
             break;
         };
+        if after_overflow {
+            decision.reason = RoutingReason::ContextOverflowFailover;
+        }
         let Some(node) = state.topology.node(&candidate.node) else {
             continue;
         };
@@ -326,15 +369,52 @@ async fn route_request(
             node,
             candidate,
         };
+        attempts_made += 1;
+        let rest = &plan.candidates[attempt + 1..];
         match attempt_one(&context, &request).await {
             Attempt::Next(refusal) => {
                 drop(lease);
+                after_overflow = false;
                 if refusal.is_some() {
                     last_refusal = refusal;
                 }
-                if attempt + 1 < plan.candidates.len() {
+                if rest.iter().any(|next| larger_than(next, too_small)) {
                     state.metrics.record_failover(route.name.as_str());
                 }
+            }
+            Attempt::ContextOverflow(refusal) => {
+                drop(lease);
+                let failed_context = context_of(candidate);
+                // A deployment whose context the router never saw cannot be
+                // compared with, so nothing is known to be larger than it.
+                too_small = Some(
+                    failed_context
+                        .unwrap_or(u32::MAX)
+                        .max(too_small.unwrap_or(0)),
+                );
+                last_refusal = Some(refusal);
+                let next = rest.iter().find(|next| larger_than(next, too_small));
+                tracing::warn!(
+                    target: targets::ROUTER,
+                    request_id,
+                    route = %route.name,
+                    deployment = %candidate.deployment,
+                    context = failed_context,
+                    next_deployment = next.map(|next| next.deployment.to_string()),
+                    next_context = next.and_then(&context_of),
+                    estimated_prompt_tokens = needs.prompt_tokens,
+                    "deployment refused the prompt as longer than its context"
+                );
+                if next.is_none() {
+                    // The node's own answer stands: the route is available, and
+                    // the router could not have known this before sending.
+                    break;
+                }
+                after_overflow = true;
+                state.metrics.record_failover(route.name.as_str());
+                state
+                    .metrics
+                    .record_context_overflow_failover(route.name.as_str());
             }
             Attempt::Committed(response) => {
                 tracing::info!(
@@ -360,7 +440,7 @@ async fn route_request(
                     filtered = filtered.as_str(),
                     routing_ms,
                     upstream_status = response.status().as_u16(),
-                    failover_count = attempt,
+                    failover_count = attempts_made - 1,
                     "routed"
                 );
                 state.metrics.record_request(
@@ -381,7 +461,7 @@ async fn route_request(
         }
     }
 
-    let tried = plan.candidates.len();
+    let tried = attempts_made;
     match last_refusal {
         Some(refusal) => {
             tracing::warn!(
@@ -489,6 +569,9 @@ async fn attempt_one(
     };
 
     let status = response.status();
+    if status == StatusCode::BAD_REQUEST {
+        return bad_request(response).await;
+    }
     if !matches!(
         status,
         StatusCode::NOT_FOUND
@@ -547,6 +630,46 @@ async fn attempt_one(
         retry_after,
         body,
     }))
+}
+
+/// A node's `400`.
+///
+/// A `400` is the node's answer to this request and stands, with one
+/// exception: `context_length_exceeded`, recognised by its structured
+/// `error.code` and nothing looser. It means the prompt, counted by the node's
+/// own tokenizer, is longer than that deployment's context — which the
+/// router's lower-bound estimate could not rule out — and nothing was
+/// generated. The caller decides whether a larger deployment is left to try.
+///
+/// The body is read whole either way. An error body is short, and the commit
+/// path reads a non-success body whole too; it is passed on byte for byte.
+async fn bad_request(response: reqwest::Response) -> Attempt {
+    let status = response.status();
+    let mut headers = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CACHE_CONTROL,
+        header::RETRY_AFTER,
+    ] {
+        if let Some(value) = response.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
+    let Ok(body) = response.bytes().await else {
+        return Attempt::Committed(upstream_unreadable());
+    };
+    if error_code(&body).as_deref() == Some(CONTEXT_OVERFLOW) {
+        return Attempt::ContextOverflow(Refusal {
+            status,
+            content_type: headers.get(header::CONTENT_TYPE).cloned(),
+            retry_after: headers.get(header::RETRY_AFTER).cloned(),
+            body,
+        });
+    }
+    let mut committed = Response::new(Body::from(body));
+    *committed.status_mut() = status;
+    *committed.headers_mut() = headers;
+    Attempt::Committed(committed)
 }
 
 /// Read a refusal body, up to [`REFUSAL_LIMIT`].

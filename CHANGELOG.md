@@ -41,9 +41,15 @@ All notable changes to this project are documented in this file.
     missing, never a node. That is distinct from `model_not_found` and
     `route_unavailable`. A request the gateway would refuse as malformed gets
     the gateway's own `400` from the router.
+  - A node's `400 context_length_exceeded`, which the router's lower-bound
+    estimate could not foresee, moves the request, before anything is sent,
+    to a deployment in the plan with a strictly larger context. If there is
+    none, the node's error is returned unchanged. Every other `400`, and every
+    `500`, still stands.
   - Logs carry each request's requirements and candidate counts before and
-    after filtering. `/metrics` gains `router_capability_filtered_total` and
-    `router_capability_mismatch_total`. Existing router configurations work
+    after filtering. `/metrics` gains `router_capability_filtered_total`,
+    `router_capability_mismatch_total` and
+    `router_context_overflow_failovers_total`. Existing router configurations work
     unchanged.
 - **User-defined model aliases.** Give any installed model a short name of your
   choosing (`Coder`, `Fast`, …) when adding it or at any time later, from the

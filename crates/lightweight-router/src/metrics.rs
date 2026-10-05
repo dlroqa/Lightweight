@@ -60,6 +60,9 @@ pub struct RouterMetrics {
     capability_filtered: Mutex<BTreeMap<(String, &'static str), u64>>,
     /// Requests refused with `route_capability_mismatch`, by route.
     capability_mismatches: Mutex<BTreeMap<String, u64>>,
+    /// Failovers taken because a deployment refused the prompt as longer than
+    /// its context, by route. Also counted in `failovers`.
+    context_overflow_failovers: Mutex<BTreeMap<String, u64>>,
     active: Arc<AtomicU64>,
 }
 
@@ -132,6 +135,24 @@ impl RouterMetrics {
 
     pub fn capability_mismatches(&self, route: &str) -> u64 {
         self.capability_mismatches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(route)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn record_context_overflow_failover(&self, route: &str) {
+        *self
+            .context_overflow_failovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(route.to_owned())
+            .or_default() += 1;
+    }
+
+    pub fn context_overflow_failovers(&self, route: &str) -> u64 {
+        self.context_overflow_failovers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(route)
@@ -273,6 +294,23 @@ impl RouterMetrics {
         }
 
         out.push_str(
+            "# HELP router_context_overflow_failovers_total Failovers to a larger-context deployment after context_length_exceeded.\n",
+        );
+        out.push_str("# TYPE router_context_overflow_failovers_total counter\n");
+        for (route, count) in self
+            .context_overflow_failovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_context_overflow_failovers_total{{route=\"{}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        out.push_str(
             "# HELP router_deployment_active_requests Upstream attempts this router has in flight, per deployment.\n",
         );
         out.push_str("# TYPE router_deployment_active_requests gauge\n");
@@ -324,6 +362,7 @@ mod tests {
         metrics.record_failover("Coder");
         metrics.record_capability_filtered("Coder", "tools_unsupported");
         metrics.record_capability_mismatch("Coder");
+        metrics.record_context_overflow_failover("Coder");
         let guard = metrics.enter();
         let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
         assert!(text.contains("router_requests_total{route=\"Coder\",outcome=\"ok\"} 2"));
@@ -333,6 +372,7 @@ mod tests {
             "router_capability_filtered_total{route=\"Coder\",reason=\"tools_unsupported\"} 1"
         ));
         assert!(text.contains("router_capability_mismatch_total{route=\"Coder\"} 1"));
+        assert!(text.contains("router_context_overflow_failovers_total{route=\"Coder\"} 1"));
         drop(guard);
         assert_eq!(metrics.active(), 0);
     }

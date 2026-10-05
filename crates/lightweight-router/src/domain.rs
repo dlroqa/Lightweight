@@ -447,6 +447,10 @@ pub enum RoutingReason {
     /// The least-busy choice failed before answering; this is the next in the
     /// load order observed when the request was planned.
     LeastBusyFailover,
+    /// The previous deployment refused the prompt as longer than its context
+    /// (`context_length_exceeded`), before answering, and this one advertises
+    /// a larger context. Any policy.
+    ContextOverflowFailover,
 }
 
 impl RoutingReason {
@@ -461,6 +465,7 @@ impl RoutingReason {
             Self::LeastBusy => "least_busy",
             Self::LeastBusyTiebreak => "least_busy_tiebreak",
             Self::LeastBusyFailover => "least_busy_failover",
+            Self::ContextOverflowFailover => "context_overflow_failover",
         }
     }
 }
