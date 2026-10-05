@@ -40,7 +40,7 @@ N_CTX = 4096
 
 
 @contextlib.contextmanager
-def _gateway(concurrency=1):
+def _gateway(concurrency=1, alias=None):
     """Start a mock gateway, yield what it printed, and stop it afterwards."""
     if not BINARY.exists():
         pytest.fail(
@@ -55,6 +55,7 @@ def _gateway(concurrency=1):
             "--ctx", str(N_CTX),
             "--model", "mock-model",
             "--concurrency", str(concurrency),
+            *(["--alias", alias] if alias is not None else []),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -107,6 +108,17 @@ def two_slot_gateway():
     """
     with _gateway(concurrency=2) as info:
         assert info["concurrency"] == 2, info
+        yield info
+
+
+@pytest.fixture(scope="module")
+def aliased_gateway():
+    """A gateway whose model the user has named `Coder`.
+
+    Its own process, so the session gateway keeps serving under its canonical
+    id and every test written against `mock-model@4k` still means what it did.
+    """
+    with _gateway(alias="Coder") as info:
         yield info
 
 

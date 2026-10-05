@@ -80,6 +80,17 @@ pub struct InstalledModel {
     /// The suffix belongs to a *loaded* model, because it encodes the context
     /// the engine was started with. A file on disk has no context.
     pub id: String,
+    /// The name the user chose for this model, if they chose one.
+    ///
+    /// Shown to API clients in place of `id` — `/v1/models` lists it and a
+    /// request may name it — and never derived from the file: an absent alias
+    /// stays absent until a person sets one. Changing it changes nothing else
+    /// about the model. See [`crate::alias`].
+    ///
+    /// `default` on read, so a catalog written before aliases existed loads
+    /// with every model unaliased rather than failing to parse.
+    #[serde(default)]
+    pub alias: Option<String>,
     /// What to show a person. The model's own `general.name` when it has one.
     pub name: String,
     pub path: PathBuf,
@@ -137,6 +148,7 @@ impl InstalledModel {
         Self {
             name: metadata.name.clone().unwrap_or_else(|| id.clone()),
             id,
+            alias: None,
             path: path.into(),
             bytes,
             sha256: sha256.into(),
@@ -152,6 +164,12 @@ impl InstalledModel {
             last_loaded_at: None,
             last_n_ctx: None,
         }
+    }
+
+    /// The name an API client knows this model by: the alias when there is
+    /// one, the catalog id otherwise.
+    pub fn public_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.id)
     }
 
     /// Whether this program may delete the model's file.
@@ -290,6 +308,7 @@ mod tests {
 
         let record = |source| InstalledModel {
             id: "m".into(),
+            alias: None,
             name: "m".into(),
             path: PathBuf::from("/models/m.gguf"),
             bytes: 1,
@@ -316,6 +335,7 @@ mod tests {
     fn a_record_round_trips_through_json() {
         let record = InstalledModel {
             id: "smollm2".into(),
+            alias: Some("Fast".into()),
             name: "SmolLM2".into(),
             path: PathBuf::from("/models/s.gguf"),
             bytes: 100,
@@ -343,6 +363,45 @@ mod tests {
     }
 
     #[test]
+    fn a_record_written_before_aliases_existed_still_loads_unaliased() {
+        // Byte for byte what a pre-alias catalog holds for one model. It must
+        // parse, keep every field it had, and come back with no alias rather
+        // than an invented one.
+        let legacy = r#"{
+            "id": "qwen3-8b-q4_k_m",
+            "name": "Qwen3 8B",
+            "path": "/models/Qwen3-8B-Q4_K_M.gguf",
+            "bytes": 5000,
+            "sha256": "ab12",
+            "integrity": "imported",
+            "source": {"kind": "import", "original_path": "/models/Qwen3-8B-Q4_K_M.gguf"},
+            "architecture": "qwen3",
+            "supported": true,
+            "added_at": 1700000000
+        }"#;
+        let record: InstalledModel = serde_json::from_str(legacy).expect("legacy record");
+        assert_eq!(record.id, "qwen3-8b-q4_k_m");
+        assert_eq!(record.alias, None);
+        assert_eq!(record.public_name(), "qwen3-8b-q4_k_m");
+        assert_eq!(record.sha256, "ab12");
+    }
+
+    #[test]
+    fn the_public_name_is_the_alias_when_there_is_one() {
+        let mut record: InstalledModel = serde_json::from_str(
+            r#"{"id":"long-technical-name-q8_0","name":"n","path":"/m.gguf","bytes":1,
+                "sha256":"aa","integrity":"imported",
+                "source":{"kind":"import","original_path":"/m.gguf"},
+                "architecture":"llama","supported":true,"added_at":0}"#,
+        )
+        .expect("record");
+        record.alias = Some("Coder".into());
+        assert_eq!(record.public_name(), "Coder");
+        // The id is untouched: the alias is a second name, not a rename.
+        assert_eq!(record.id, "long-technical-name-q8_0");
+    }
+
+    #[test]
     fn the_temporary_file_is_a_sibling_so_the_rename_stays_atomic() {
         // A rename is atomic only within one filesystem. Writing the temp file
         // to /tmp and renaming it into ~/.local/share would not be a rename at
@@ -357,6 +416,7 @@ mod tests {
     fn a_missing_file_is_reported_as_absent_rather_than_assumed_present() {
         let mut record = InstalledModel {
             id: "x".into(),
+            alias: None,
             name: "x".into(),
             path: PathBuf::from("/definitely/not/here.gguf"),
             bytes: 0,

@@ -466,8 +466,8 @@ Three decisions worth keeping:
 
 | Suite | Count | Notes |
 |---|---:|---|
-| Default (`cargo test --workspace`) | 750 | no network, no model downloads — checked with outbound HTTP blocked |
-| openai-SDK contract (`scripts/contract-test.sh`) | 32 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser; two clients driven at once from two threads |
+| Default (`cargo test --workspace`) | 905 | no network, no model downloads — checked with outbound HTTP blocked |
+| openai-SDK contract (`scripts/contract-test.sh`) | 45 | real `openai` package against the gateway over `MockBackend`; imports Hermes' own error parser; two clients driven at once from two threads |
 | Real model headers | 3 | needs `scripts/fetch-real-headers.sh`; `HERMES_REQUIRE_REAL_MODELS=1` makes absence a failure |
 | Real engine | 10 | needs `HERMES_TEST_MODEL=<path.gguf>`; downloads the pinned engine on first run |
 | Model downloads | 8 | needs `HERMES_TEST_NETWORK=1`; fetches a real 100 MB model from HuggingFace |
@@ -1233,6 +1233,44 @@ What those numbers decided, and what they refused:
   `fit.rs`'s module doc. In their place `hermes bench` now reports, per fit,
   whether the next load will use it — which is the question a person actually
   has, and the one whose wrong answer hid all of this.
+
+## User-defined model aliases (feature/user-model-aliases)
+
+Done and green locally: fmt, clippy `-D warnings`, `cargo test --workspace`
+(905 passed), the contract suite (43 passed, 2 skipped for the absent agent
+parser, as before), the panel build, and the version, dependency and secrets
+gates.
+
+- `InstalledModel.alias` (`#[serde(default)]`), validated and resolved in one
+  place: `lightweight_catalog::alias` (`validate_alias`, `ModelSelector`,
+  `same_name`) and `CatalogStore::{resolve, by_alias, set_alias}`. Lookup order
+  is `default`/empty → alias (case-insensitive) → canonical id.
+- The gateway's `ResidentModel` carries the alias; `public_id()` is what
+  `/v1/models`, `/v1/capabilities` and every response name the model by.
+  Metrics, `/health` and the control API keep the canonical id.
+- `PATCH /api/v1/models/{id}`; `alias` on import and download, checked before
+  the job starts; load, detail and delete accept an alias.
+- `model: "default"` restored (removed in `9bb2569`), and guarded by its own
+  matrix test (`default` and omitted `model`, chat and text completions, with
+  and without an alias) because Lightagent depends on it.
+- One namespace: `CatalogStore::check_alias` refuses an alias equal to any id;
+  `ensure_id_unaliased` refuses a fixed (pinned or link) id equal to an alias,
+  before the transfer and again at commit; generated import ids step around
+  aliases case-insensitively.
+- `hermes models alias` probes `127.0.0.1:<configured or default port>`; a
+  gateway reporting this profile's data directory takes the change over
+  `PATCH`, one that cannot be identified refuses the write, and anything that
+  is not a Lightweight gateway (the default port is Ollama's too) is ignored.
+- Smoke-tested for real on 2026-10-04: SmolLM2-135M on a real engine under an
+  isolated profile, Lightagent `7d95232` in an isolated home configured with
+  `default`. Through a logging proxy: Lightagent listed `Coder`, sent
+  `model: "Coder"`, and every response chunk said `Coder`. Lightagent sends the
+  advertised id rather than the literal `default` when one model is listed;
+  the literal `default` and an omitted model were checked against the same
+  engine directly.
+- Not done, deliberately: alias history, a fleet-manifest `alias` field, and
+  passing the alias to llama.cpp's `--alias` (the gateway never forwards the
+  engine's model name, so it would change nothing a client sees).
 
 ## Next step
 

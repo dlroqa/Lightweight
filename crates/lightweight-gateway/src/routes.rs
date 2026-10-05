@@ -181,7 +181,9 @@ pub async fn capabilities(State(state): State<Arc<GatewayState>>, headers: Heade
         return refusal;
     }
     let model = state.catalog.resident().await.map(|model| CapabilityModel {
-        id: model.id.to_string(),
+        // The same name `/v1/models` lists, so a client reading either finds
+        // one model under one id.
+        id: model.public_id(),
         context_length: model.n_ctx,
     });
     axum::Json(CapabilitiesBody::new(
@@ -406,7 +408,10 @@ async fn serve_completions(
     })?;
     // The builder is made first so the guard can be told what it is accounting
     // for. Naming it costs nothing and has no side effects.
-    let builder = CompletionChunkBuilder::new(completion_id(), model.id.to_string());
+    // Responses name the model as `/v1/models` does: by its alias when it has
+    // one. The guard below keeps the canonical id, because what it feeds is
+    // the operator's view of the engine, not a client's.
+    let builder = CompletionChunkBuilder::new(completion_id(), model.public_id());
     let mut guard = RequestGuard::new(cancel, Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
         .describing(builder.id(), model.id.to_string())
@@ -429,7 +434,7 @@ async fn serve_completions(
         queue,
         builder,
         guard,
-        model_id: model.id.to_string(),
+        model_id: model.public_id(),
         include_usage: request.wants_usage(),
     };
 
@@ -480,7 +485,7 @@ fn require_matching_model(model: &ResidentModel, requested: Option<&str>) -> Res
         ErrorEnvelope::invalid_request(
             format!(
                 "the model {requested:?} is not loaded; this gateway is serving {:?}",
-                model.id
+                model.public_id()
             ),
             "model_not_found",
         )
@@ -539,7 +544,9 @@ async fn serve_chat(
         state.scheduler().band_limits(),
     );
     let cancel = state.job_token();
-    let builder = ChunkBuilder::new(completion_id(), model.id.to_string());
+    // Named as `/v1/models` names it — the alias when there is one — on every
+    // chunk, queued or not. See `serve_completions`.
+    let builder = ChunkBuilder::new(completion_id(), model.public_id());
     tracing::info!(
         target: targets::INFERENCE,
         id = builder.id(),
@@ -782,7 +789,7 @@ async fn aggregate(
 
     let mut response = ChatCompletionResponse::new(
         builder.id().to_owned(),
-        model.id.to_string(),
+        model.public_id(),
         Choice {
             index: 0,
             message: ResponseMessage {

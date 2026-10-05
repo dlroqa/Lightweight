@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::catalog::Catalog;
 use crate::jobs::{Job, JobKind, JobState};
-use crate::manager::{self, LoadOptions};
+use crate::manager::{self, LoadOptions, ManagerError, ModelManager};
 use crate::routes::authorize;
 use crate::state::GatewayState;
 use crate::system::Probed;
@@ -168,6 +169,10 @@ pub struct DownloadBody {
     /// Expected digest, for a link whose host publishes none.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// The name to give the model once it is added. Optional: a model with no
+    /// alias is served under its catalog id, and one can be given later.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 /// `POST /api/v1/models/download` — start fetching, and return a job.
@@ -198,16 +203,25 @@ pub async fn download(
         }
         (None, None) => return bad_request("id", "name a pinned id or give a url"),
     };
+    let alias = match checked_alias(manager, body.alias).await {
+        Ok(alias) => alias,
+        Err(err) => return error_response(&err),
+    };
 
     let job = state
         .jobs()
         .start(JobKind::Download, &state.shutdown_token());
     let background = Arc::clone(&job);
     let manager = Arc::clone(manager);
+    let catalog = Arc::clone(&state.catalog);
     // Spawned rather than awaited: this is minutes of work, and the caller gets
     // a job id now and watches it.
     tokio::spawn(async move {
-        finish(&background, manager.install(&request, &background).await);
+        let added = manager.install(&request, &background).await;
+        finish(
+            &background,
+            name_added(&manager, &catalog, added, alias).await,
+        );
     });
     accepted(&job)
 }
@@ -216,6 +230,9 @@ pub async fn download(
 #[derive(Debug, Deserialize)]
 pub struct ImportBody {
     pub path: PathBuf,
+    /// The name to give the model once it is registered. Optional.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 /// `POST /api/v1/models/import` — register a file already on this machine.
@@ -234,16 +251,119 @@ pub async fn import(
         Ok(body) => body,
         Err(err) => return bad_request("path", &err.to_string()),
     };
+    let alias = match checked_alias(manager, body.alias).await {
+        Ok(alias) => alias,
+        Err(err) => return error_response(&err),
+    };
 
     let job = state.jobs().start(JobKind::Import, &state.shutdown_token());
     let background = Arc::clone(&job);
     let manager = Arc::clone(manager);
+    let catalog = Arc::clone(&state.catalog);
     // Hashing a multi-gigabyte file is minutes on this hardware, so an import
     // is a job too.
     tokio::spawn(async move {
-        finish(&background, manager.import(body.path, &background).await);
+        let added = manager.import(body.path, &background).await;
+        finish(
+            &background,
+            name_added(&manager, &catalog, added, alias).await,
+        );
     });
     accepted(&job)
+}
+
+/// An alias asked for alongside an add, checked before the job starts.
+///
+/// So that a name that is invalid or already taken is a 400 now, and not a
+/// failed job at the end of a download.
+async fn checked_alias(
+    manager: &ModelManager,
+    alias: Option<String>,
+) -> Result<Option<String>, ManagerError> {
+    match alias {
+        None => Ok(None),
+        Some(raw) => manager.check_new_alias(&raw).await.map(Some),
+    }
+}
+
+/// Give a model that has just been added the alias the user asked for.
+///
+/// The model stays added if the alias cannot be given — another request may
+/// have taken the name since it was checked — and the job then fails with that
+/// reason, so the user learns the name did not stick and can choose another
+/// without adding the model again.
+async fn name_added(
+    manager: &ModelManager,
+    catalog: &Catalog,
+    added: Result<InstalledModel, ManagerError>,
+    alias: Option<String>,
+) -> Result<InstalledModel, ManagerError> {
+    let model = added?;
+    let Some(alias) = alias else {
+        return Ok(model);
+    };
+    let named = manager.set_alias(&model.id, Some(&alias)).await?;
+    catalog.adopt_alias(&named).await;
+    Ok(named)
+}
+
+/// `PATCH /api/v1/models/{id}` — change what can be changed about a model.
+///
+/// Which today is its alias, and only its alias: `{"alias": "Coder"}` sets or
+/// renames it, `{"alias": null}` clears it. `{id}` may be the catalog id or the
+/// current alias. Nothing is reloaded — the engine never knew the name — so
+/// this is safe while the model is serving, and the next request may already
+/// use the new name.
+///
+/// The old alias stops resolving at once. No history is kept: a name that
+/// quietly kept working after being given up would be one the user can no
+/// longer see anywhere, and could not give to another model.
+pub async fn update(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(manager) = state.manager() else {
+        return no_manager();
+    };
+    let fields = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::Object(fields)) => fields,
+        Ok(_) => return bad_request("body", "send a JSON object such as {\"alias\": \"Coder\"}"),
+        Err(err) => return bad_request("body", &err.to_string()),
+    };
+    // Said rather than ignored: a field that is accepted and silently dropped
+    // reads as a change that was made.
+    if let Some(other) = fields.keys().find(|key| key.as_str() != "alias") {
+        return bad_request(other, "only `alias` can be changed on an installed model");
+    }
+    let alias = match fields.get("alias") {
+        None => {
+            return bad_request(
+                "alias",
+                "nothing to change: send {\"alias\": \"Coder\"}, or {\"alias\": null} to clear it",
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(alias)) => Some(alias.as_str()),
+        Some(_) => return bad_request("alias", "an alias is a string, or null to clear it"),
+    };
+
+    match manager.set_alias(&id, alias).await {
+        Ok(model) => {
+            state.catalog.adopt_alias(&model).await;
+            let loaded = state
+                .catalog
+                .resident()
+                .await
+                .is_some_and(|current| current.is_record(&model));
+            axum::Json(CatalogRow::describe(model, loaded)).into_response()
+        }
+        Err(err) => error_response(&err),
+    }
 }
 
 /// Body of `POST /api/v1/models/{id}/load`.
@@ -611,7 +731,7 @@ pub async fn model_detail(
         }
     };
 
-    let Some(model) = manager.get(&id).await else {
+    let Some(model) = manager.resolve(&id).await else {
         return error_response(&lightweight_catalog::CatalogError::UnknownModel { id });
     };
     let resident = state.catalog.resident().await;

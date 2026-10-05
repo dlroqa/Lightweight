@@ -145,12 +145,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut api_key: Option<String> = None;
     let mut script_file: Option<std::path::PathBuf> = None;
     let mut concurrency = 1_u32;
+    let mut alias: Option<String> = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--port" => port = args.next().unwrap_or_default().parse()?,
             "--ctx" => n_ctx = args.next().unwrap_or_default().parse()?,
             "--model" => model_id = args.next().unwrap_or_default(),
+            // The alias a user would have given the model in the catalog, so
+            // the contract suite can drive the real SDK through one.
+            "--alias" => alias = args.next(),
             "--api-key" => api_key = args.next(),
             "--script-file" => script_file = Some(args.next().unwrap_or_default().into()),
             "--concurrency" => concurrency = args.next().unwrap_or_default().parse()?,
@@ -170,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let catalog = Arc::new(Catalog::with_resident(ResidentModel {
         id: model,
+        alias,
         instance: loaded.instance,
         n_ctx,
         architecture: "mock".to_owned(),

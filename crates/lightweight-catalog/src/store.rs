@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::alias::{self, ModelSelector};
 use crate::error::CatalogError;
 use crate::record::InstalledModel;
 
@@ -108,6 +109,134 @@ impl CatalogStore {
         self.models.get_mut(id)
     }
 
+    /// The model a user named, by its alias or by its catalog id.
+    ///
+    /// The one lookup every "which model?" question goes through, so the CLI,
+    /// the control API and anything added later read a name the same way:
+    ///
+    /// 1. an alias, ignoring case;
+    /// 2. a catalog id, exactly.
+    ///
+    /// `default` and an empty name are not resolved here. They mean "whatever
+    /// is loaded", which is a fact about a running gateway, not about the
+    /// catalog — see [`ModelSelector`].
+    pub fn resolve(&self, name: &str) -> Option<&InstalledModel> {
+        let ModelSelector::Named(name) = ModelSelector::parse(Some(name)) else {
+            return None;
+        };
+        self.by_alias(name).or_else(|| self.models.get(name))
+    }
+
+    /// The model holding this alias, ignoring case.
+    pub fn by_alias(&self, alias: &str) -> Option<&InstalledModel> {
+        self.models.values().find(|model| {
+            model
+                .alias
+                .as_deref()
+                .is_some_and(|held| alias::same_name(held, alias))
+        })
+    }
+
+    /// Whether `raw` may become the alias of `for_id` — or, with `None`, of a
+    /// model that is about to be added. Returns the alias trimmed.
+    ///
+    /// The one check every way of naming a model goes through, so the
+    /// selector namespace stays unambiguous: `default`, then aliases, then
+    /// canonical ids, and **no name in more than one of them**. An alias may
+    /// not equal any model's id in any casing — its own included, which would
+    /// be a second spelling of one name — nor another model's alias.
+    pub fn check_alias(&self, raw: &str, for_id: Option<&str>) -> Result<String, CatalogError> {
+        let alias = alias::validate_alias(raw).map_err(|problem| CatalogError::InvalidAlias {
+            alias: raw.to_owned(),
+            problem,
+        })?;
+        if let Some(named) = self
+            .models
+            .values()
+            .find(|model| alias::same_name(&model.id, &alias))
+        {
+            return Err(CatalogError::AliasIsModelId {
+                alias,
+                id: named.id.clone(),
+            });
+        }
+        if let Some(owner) = self.models.values().find(|other| {
+            Some(other.id.as_str()) != for_id
+                && other
+                    .alias
+                    .as_deref()
+                    .is_some_and(|held| alias::same_name(held, &alias))
+        }) {
+            return Err(CatalogError::AliasInUse {
+                alias,
+                owner: owner.id.clone(),
+            });
+        }
+        Ok(alias)
+    }
+
+    /// Refuse a canonical id that some *other* model already uses as its
+    /// alias, ignoring case.
+    ///
+    /// The other direction of [`Self::check_alias`]. An id this catalog
+    /// chooses steps around aliases instead (see [`Self::free_id`]); this is
+    /// for the ids it cannot choose — a pinned model's manifest id, a link's
+    /// file name — which are refused before any bytes are fetched rather than
+    /// installed under a name that already means another model.
+    pub fn ensure_id_unaliased(&self, id: &str) -> Result<(), CatalogError> {
+        match self.models.values().find(|model| {
+            model.id != id
+                && model
+                    .alias
+                    .as_deref()
+                    .is_some_and(|held| alias::same_name(held, id))
+        }) {
+            Some(owner) => Err(CatalogError::ModelIdIsAlias {
+                id: id.to_owned(),
+                alias: owner.alias.clone().unwrap_or_default(),
+                owner: owner.id.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Give a model an alias, change it, or clear it with `None`.
+    ///
+    /// `id` is the catalog id. Refuses rather than adjusts: an alias that is
+    /// invalid, reserved, held by another model, or equal to any model's id is
+    /// an error naming the problem (see [`Self::check_alias`]), and the user's
+    /// choice is never rewritten into something that happens to be free.
+    ///
+    /// Touches nothing but the alias. Not saved here — callers save, as they
+    /// do after every other change to the store.
+    pub fn set_alias(
+        &mut self,
+        id: &str,
+        alias: Option<&str>,
+    ) -> Result<&InstalledModel, CatalogError> {
+        if !self.models.contains_key(id) {
+            return Err(CatalogError::UnknownModel { id: id.to_owned() });
+        }
+
+        let alias = match alias {
+            None => None,
+            Some(raw) => Some(self.check_alias(raw, Some(id))?),
+        };
+
+        let model = self
+            .models
+            .get_mut(id)
+            .ok_or_else(|| CatalogError::UnknownModel { id: id.to_owned() })?;
+        model.alias = alias;
+        Ok(model)
+    }
+
+    /// Whether `name` already identifies a model, as an id or as an alias,
+    /// ignoring case for both.
+    fn is_taken(&self, name: &str) -> bool {
+        self.models.keys().any(|id| alias::same_name(id, name)) || self.by_alias(name).is_some()
+    }
+
     /// The model with these exact bytes, if the catalog already has it.
     ///
     /// Lets a second import of the same file be recognised as the same model
@@ -146,13 +275,17 @@ impl CatalogStore {
     /// Two different files with the same name is an ordinary thing — the same
     /// model at two quantizations, or a re-download alongside the original — so
     /// it gets a suffix rather than a refusal.
+    ///
+    /// An id is ours to choose, so it also steps around every alias: a new
+    /// model whose id equalled someone's alias would make that name mean two
+    /// models.
     pub fn free_id(&self, base: &str) -> String {
-        if !self.models.contains_key(base) {
+        if !self.is_taken(base) {
             return base.to_owned();
         }
         (2u32..)
             .map(|n| format!("{base}-{n}"))
-            .find(|candidate| !self.models.contains_key(candidate))
+            .find(|candidate| !self.is_taken(candidate))
             .unwrap_or_else(|| base.to_owned())
     }
 
@@ -228,6 +361,7 @@ mod tests {
     fn model(id: &str, sha: &str) -> InstalledModel {
         InstalledModel {
             id: id.to_owned(),
+            alias: None,
             name: id.to_owned(),
             path: PathBuf::from(format!("/models/{id}.gguf")),
             bytes: 10,
@@ -334,6 +468,279 @@ mod tests {
         let mut store = CatalogStore::in_memory();
         let err = store.remove("ghost").expect_err("unknown");
         assert_eq!(err.code(), "unknown_model");
+    }
+
+    fn two_models() -> CatalogStore {
+        let mut store = CatalogStore::in_memory();
+        store
+            .insert(model("qwen3.5-9b-fable-5-v1-q8_0", "aa"))
+            .expect("insert");
+        store.insert(model("lfm2.5-1.2b", "bb")).expect("insert");
+        store
+    }
+
+    #[test]
+    fn an_alias_resolves_to_its_model_and_the_id_still_does_too() {
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("Coder"))
+            .expect("alias");
+
+        let by_alias = store.resolve("Coder").map(|m| m.id.as_str());
+        let by_id = store
+            .resolve("qwen3.5-9b-fable-5-v1-q8_0")
+            .map(|m| m.id.as_str());
+        assert_eq!(by_alias, Some("qwen3.5-9b-fable-5-v1-q8_0"));
+        assert_eq!(by_alias, by_id);
+        // Any casing of the alias, and surrounding whitespace, reach it.
+        assert_eq!(
+            store.resolve(" coder ").map(|m| m.id.as_str()),
+            Some("qwen3.5-9b-fable-5-v1-q8_0")
+        );
+        // The display casing is the one the user typed.
+        assert_eq!(
+            store
+                .get("qwen3.5-9b-fable-5-v1-q8_0")
+                .and_then(|m| m.alias.as_deref()),
+            Some("Coder")
+        );
+        assert!(store.resolve("Programming").is_none());
+    }
+
+    #[test]
+    fn default_is_never_resolved_against_the_catalog() {
+        // It means "whatever is loaded", which only a running gateway knows.
+        let store = two_models();
+        assert!(store.resolve("default").is_none());
+        assert!(store.resolve("").is_none());
+    }
+
+    #[test]
+    fn an_alias_held_by_another_model_is_refused_in_any_casing() {
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("Coder"))
+            .expect("alias");
+        for clash in ["Coder", "coder", "CODER", "  Coder  "] {
+            let err = store
+                .set_alias("lfm2.5-1.2b", Some(clash))
+                .expect_err("a second model may not take the same alias");
+            assert_eq!(err.code(), "alias_in_use", "{clash}");
+        }
+        // Refused, not adjusted: nothing was written to the second model.
+        assert_eq!(store.get("lfm2.5-1.2b").and_then(|m| m.alias.clone()), None);
+    }
+
+    #[test]
+    fn a_model_may_restate_or_recase_its_own_alias() {
+        let mut store = two_models();
+        store.set_alias("lfm2.5-1.2b", Some("Fast")).expect("alias");
+        store
+            .set_alias("lfm2.5-1.2b", Some("FAST"))
+            .expect("its own alias is not a clash with itself");
+        assert_eq!(
+            store.get("lfm2.5-1.2b").and_then(|m| m.alias.as_deref()),
+            Some("FAST")
+        );
+    }
+
+    #[test]
+    fn an_alias_may_not_be_another_models_id() {
+        // Otherwise that id would name two models.
+        let mut store = two_models();
+        let err = store
+            .set_alias("lfm2.5-1.2b", Some("QWEN3.5-9B-FABLE-5-V1-Q8_0"))
+            .expect_err("another model's id");
+        assert_eq!(err.code(), "alias_is_model_id");
+        // Nor its own id, in any casing: that would be one name spelled twice.
+        let err = store
+            .set_alias("lfm2.5-1.2b", Some("LFM2.5-1.2B"))
+            .expect_err("its own id");
+        assert_eq!(err.code(), "alias_is_model_id");
+    }
+
+    #[test]
+    fn an_id_that_is_already_an_alias_is_refused_in_any_casing() {
+        // Alias first, then an install whose id is fixed (pinned, or a link's
+        // file name) and would collide with it.
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("Coder"))
+            .expect("alias");
+        for clash in ["coder", "Coder", "CODER"] {
+            let err = store
+                .ensure_id_unaliased(clash)
+                .expect_err("shadows an alias");
+            assert_eq!(err.code(), "model_id_is_alias", "{clash}");
+            let said = err.to_string();
+            assert!(
+                said.contains("Coder") && said.contains("qwen3.5-9b-fable-5-v1-q8_0"),
+                "{said}"
+            );
+        }
+        // A model is never in conflict with its own record, and an unrelated
+        // id is free.
+        store
+            .ensure_id_unaliased("qwen3.5-9b-fable-5-v1-q8_0")
+            .expect("its own id");
+        store
+            .ensure_id_unaliased("research")
+            .expect("an unrelated id");
+    }
+
+    #[test]
+    fn a_generated_id_steps_around_an_alias_in_any_casing() {
+        // The import case: the catalog chooses the id, so it chooses another.
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("CODER"))
+            .expect("alias");
+        assert_eq!(store.free_id("coder"), "coder-2");
+        assert_eq!(store.free_id("research"), "research");
+    }
+
+    #[test]
+    fn a_new_alias_is_checked_against_every_name_already_in_use() {
+        let mut store = two_models();
+        store.set_alias("lfm2.5-1.2b", Some("Fast")).expect("alias");
+        assert_eq!(
+            store.check_alias(" Coder ", None).as_deref().ok(),
+            Some("Coder")
+        );
+        assert_eq!(
+            store.check_alias("FAST", None).map_err(|e| e.code()),
+            Err("alias_in_use")
+        );
+        assert_eq!(
+            store.check_alias("Lfm2.5-1.2B", None).map_err(|e| e.code()),
+            Err("alias_is_model_id")
+        );
+        assert_eq!(
+            store.check_alias("default", None).map_err(|e| e.code()),
+            Err("invalid_alias")
+        );
+    }
+
+    #[test]
+    fn an_invalid_or_reserved_alias_is_refused_before_anything_changes() {
+        let mut store = two_models();
+        for bad in ["default", "", "   ", "../model", "foo/bar", "foo\\bar"] {
+            let err = store
+                .set_alias("lfm2.5-1.2b", Some(bad))
+                .expect_err("invalid alias");
+            assert_eq!(err.code(), "invalid_alias", "{bad:?}");
+        }
+        assert_eq!(store.get("lfm2.5-1.2b").and_then(|m| m.alias.clone()), None);
+    }
+
+    #[test]
+    fn renaming_an_alias_retires_the_old_name() {
+        let mut store = two_models();
+        let id = "qwen3.5-9b-fable-5-v1-q8_0";
+        store.set_alias(id, Some("Coder")).expect("alias");
+        store.set_alias(id, Some("Programming")).expect("rename");
+
+        assert_eq!(
+            store.resolve("Programming").map(|m| m.id.as_str()),
+            Some(id)
+        );
+        assert!(store.resolve("Coder").is_none(), "no alias history is kept");
+        assert_eq!(store.resolve(id).map(|m| m.id.as_str()), Some(id));
+        // The old name is free for another model now.
+        store
+            .set_alias("lfm2.5-1.2b", Some("Coder"))
+            .expect("a retired alias can be reused");
+    }
+
+    #[test]
+    fn clearing_an_alias_leaves_the_model_reachable_by_id() {
+        let mut store = two_models();
+        store.set_alias("lfm2.5-1.2b", Some("Fast")).expect("alias");
+        store.set_alias("lfm2.5-1.2b", None).expect("clear");
+        assert!(store.resolve("Fast").is_none());
+        assert!(store.resolve("lfm2.5-1.2b").is_some());
+    }
+
+    #[test]
+    fn an_alias_on_a_model_that_is_not_there_says_so() {
+        let mut store = two_models();
+        let err = store
+            .set_alias("ghost", Some("Coder"))
+            .expect_err("unknown");
+        assert_eq!(err.code(), "unknown_model");
+    }
+
+    #[test]
+    fn removing_a_model_takes_its_alias_with_it() {
+        let mut store = two_models();
+        store.set_alias("lfm2.5-1.2b", Some("Fast")).expect("alias");
+        store.remove("lfm2.5-1.2b").expect("remove");
+        assert!(store.resolve("Fast").is_none());
+        assert!(store.by_alias("Fast").is_none());
+    }
+
+    #[test]
+    fn a_new_id_steps_around_an_alias_rather_than_shadowing_it() {
+        let mut store = two_models();
+        store
+            .set_alias("lfm2.5-1.2b", Some("Qwen3"))
+            .expect("alias");
+        assert_eq!(store.free_id("qwen3"), "qwen3-2");
+    }
+
+    #[test]
+    fn an_alias_survives_a_save_and_reopen() {
+        let temp = TempDir::new("alias");
+        let path = temp.0.join("catalog.json");
+
+        let mut store = CatalogStore::open(&path).expect("open");
+        store.insert(model("qwen3", "aa")).expect("insert");
+        store.set_alias("qwen3", Some("Coder")).expect("alias");
+        store.save().expect("save");
+
+        let reopened = CatalogStore::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.resolve("Coder").map(|m| m.id.as_str()),
+            Some("qwen3")
+        );
+        assert_eq!(reopened.get("qwen3").map(|m| m.sha256.as_str()), Some("aa"));
+    }
+
+    #[test]
+    fn a_catalog_written_before_aliases_loads_and_can_be_given_one() {
+        // The shape every existing installation has on disk: no alias field.
+        let temp = TempDir::new("legacy");
+        let path = temp.0.join("catalog.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"models":[{
+                "id":"qwen3-8b-q4_k_m","name":"Qwen3 8B","path":"/models/Qwen3-8B-Q4_K_M.gguf",
+                "bytes":5000,"sha256":"ab12","integrity":"imported",
+                "source":{"kind":"import","original_path":"/models/Qwen3-8B-Q4_K_M.gguf"},
+                "architecture":"qwen3","supported":true,"context_length":40960,
+                "added_at":1700000000,"last_loaded_at":1700000100,"last_n_ctx":8192}]}"#,
+        )
+        .expect("write legacy catalog");
+
+        let mut store = CatalogStore::open(&path).expect("a legacy catalog must load");
+        let legacy = store
+            .get("qwen3-8b-q4_k_m")
+            .expect("the model is still there");
+        assert_eq!(legacy.alias, None, "no alias is invented for an old record");
+        assert_eq!(legacy.last_n_ctx, Some(8192));
+        assert!(store.resolve("qwen3-8b-q4_k_m").is_some());
+
+        store
+            .set_alias("qwen3-8b-q4_k_m", Some("Coder"))
+            .expect("an old record can be given an alias");
+        store.save().expect("save");
+
+        let reopened = CatalogStore::open(&path).expect("reopen");
+        let model = reopened.resolve("Coder").expect("the alias persisted");
+        assert_eq!(model.id, "qwen3-8b-q4_k_m");
+        assert_eq!(model.sha256, "ab12");
+        assert_eq!(model.context_length, Some(40960));
+        assert_eq!(model.last_loaded_at, Some(1_700_000_100));
     }
 
     #[test]

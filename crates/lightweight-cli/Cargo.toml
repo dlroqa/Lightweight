@@ -39,3 +39,12 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+# A running gateway owns its catalog in memory, so `models alias` changes an
+# alias through it rather than under it. Both already in the tree via the
+# catalog; named here because the CLI now makes that one call itself.
+lightweight-download.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+lightweight-backend-mock.workspace = true
+lightweight-gguf = { workspace = true, features = ["fixtures"] }

@@ -248,6 +248,59 @@ impl ModelManager {
         self.catalog.lock().await.get(id).cloned()
     }
 
+    /// The model a caller named, by alias or by catalog id.
+    ///
+    /// What every control endpoint that takes a model uses, so `Coder` and the
+    /// id it stands for reach the same record everywhere. See
+    /// [`CatalogStore::resolve`].
+    pub async fn resolve(&self, name: &str) -> Option<InstalledModel> {
+        self.catalog.lock().await.resolve(name).cloned()
+    }
+
+    /// Set, change or clear the alias of the model `name` resolves to, and
+    /// save.
+    ///
+    /// Takes no operation lock: an alias is a name in the catalog file, so it
+    /// may change while a model is loading or downloading, and changing it
+    /// never touches the engine.
+    pub async fn set_alias(
+        &self,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<InstalledModel, ManagerError> {
+        let mut catalog = self.catalog.lock().await;
+        let id = catalog
+            .resolve(name)
+            .map(|model| model.id.clone())
+            .ok_or_else(|| CatalogError::UnknownModel {
+                id: name.to_owned(),
+            })?;
+        let previous = catalog.get(&id).and_then(|model| model.alias.clone());
+        let updated = catalog.set_alias(&id, alias)?.clone();
+        if let Err(err) = catalog.save() {
+            // Put it back: an alias that answered requests until the next
+            // restart and then vanished would be worse than a refusal now.
+            let _ = catalog.set_alias(&id, previous.as_deref());
+            return Err(err.into());
+        }
+        tracing::info!(
+            target: targets::MODEL,
+            id = %updated.id,
+            alias = ?updated.alias,
+            "model alias set"
+        );
+        Ok(updated)
+    }
+
+    /// Whether `alias` could be given to a model that is about to be added.
+    ///
+    /// Checked before a download or an import starts, so a name that is
+    /// invalid or already taken is refused in seconds rather than after a
+    /// multi-gigabyte transfer. Returns the alias trimmed.
+    pub async fn check_new_alias(&self, alias: &str) -> Result<String, ManagerError> {
+        Ok(self.catalog.lock().await.check_alias(alias, None)?)
+    }
+
     /// Download or link a model, reporting into `job`.
     ///
     /// The catalog lock is taken twice, briefly, and **never across the
@@ -281,6 +334,10 @@ impl ModelManager {
 
         if let Some(existing) = {
             let catalog = self.catalog.lock().await;
+            // Refused before the transfer, not after it: a fixed id that is
+            // already another model's alias would make one name mean two
+            // models. `commit` checks again under the lock.
+            catalog.ensure_id_unaliased(&plan.id)?;
             Installer::already_installed(&catalog, &plan)
         } {
             return Ok(existing);
@@ -331,7 +388,9 @@ impl ModelManager {
         resident: Option<&ModelId>,
     ) -> Result<Removal, ManagerError> {
         let mut catalog = self.catalog.lock().await;
-        let Some(model) = catalog.get(id) else {
+        // By alias or by id; whichever it was, what is removed is the record,
+        // and its alias goes with it.
+        let Some(model) = catalog.resolve(id) else {
             return Err(CatalogError::UnknownModel { id: id.to_owned() }.into());
         };
         if resident.is_some_and(|loaded| loaded.slug() == model.id) {
@@ -341,7 +400,8 @@ impl ModelManager {
             .into());
         }
 
-        let removed = catalog.remove(id)?;
+        let id = model.id.clone();
+        let removed = catalog.remove(&id)?;
         catalog.save()?;
 
         let file_deleted = delete_file
@@ -582,8 +642,10 @@ pub async fn load_model(
         .try_lock()
         .map_err(|_| ManagerError::Busy)?;
 
+    // By alias or by id. Everything past this line works on the record, so
+    // the engine and the scheduler never see the alias.
     let model = manager
-        .get(id)
+        .resolve(id)
         .await
         .ok_or_else(|| CatalogError::UnknownModel { id: id.to_owned() })?;
     if !model.is_present() {
@@ -867,6 +929,7 @@ pub async fn load_model(
 
     let resident = ResidentModel {
         id: loaded.model.clone(),
+        alias: model.alias.clone(),
         instance: loaded.instance,
         n_ctx: loaded.effective.n_ctx,
         architecture: model.architecture.clone(),

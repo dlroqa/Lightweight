@@ -347,7 +347,16 @@ enum ModelsAction {
     ///
     /// The file is referenced where it is, never copied, so importing a 4 GB
     /// model costs no extra disk.
-    Import { path: PathBuf },
+    Import {
+        path: PathBuf,
+        /// A short name to serve the model under, such as `Coder`.
+        ///
+        /// What `/v1/models` lists and what clients may send as `model`. The
+        /// file and its id are unchanged; set or change it later with
+        /// `models alias`.
+        #[arg(long)]
+        alias: Option<String>,
+    },
     /// Download a model.
     ///
     /// Either one of the pinned ids from `hermes models available`, whose
@@ -364,6 +373,31 @@ enum ModelsAction {
         /// Expected sha256, for a link that is not on HuggingFace.
         #[arg(long)]
         sha256: Option<String>,
+        /// A short name to serve the model under, such as `Coder`.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+    /// Give a model a short name, change it, or clear it.
+    ///
+    /// The alias is what API clients see in `/v1/models` and may send as
+    /// `model`, in place of the long id derived from the file. The file, its
+    /// id and its digest are never changed. Unique ignoring case; `default` is
+    /// reserved.
+    ///
+    /// A gateway serving this profile on its configured (or the default) port
+    /// owns the catalog while it runs, so the change is made through it and
+    /// takes effect at once. With no gateway there the catalog file is
+    /// changed directly; a gateway that answers but cannot be confirmed to be
+    /// a different profile's makes this refuse rather than write.
+    Alias {
+        /// The model's id, or its current alias.
+        model: String,
+        /// The new alias. Omit it with `--clear` to remove the alias.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        alias: Option<String>,
+        /// Remove the alias, so the model is served under its id again.
+        #[arg(long)]
+        clear: bool,
     },
     /// Remove a model from the catalog.
     Remove {
@@ -412,12 +446,39 @@ fn models_command(cli: &Cli, out: &mut String, action: &ModelsAction) -> Result<
                 models::available(out, &store);
             }
         }
-        ModelsAction::Import { path } => {
-            runtime()?.block_on(models::import(out, &paths, &mut store, path))?;
+        ModelsAction::Import { path, alias } => {
+            let alias = models::check_new_alias(&store, alias.as_deref())?;
+            let added = runtime()?.block_on(models::import(out, &paths, &mut store, path))?;
+            models::name_added(out, &mut store, &added, alias.as_deref())?;
         }
-        ModelsAction::Add { id, url, sha256 } => {
+        ModelsAction::Add {
+            id,
+            url,
+            sha256,
+            alias,
+        } => {
             let request = models::add_request(id.as_deref(), url.as_deref(), sha256.as_deref())?;
-            runtime()?.block_on(models::add(out, &paths, &mut store, &request))?;
+            let alias = models::check_new_alias(&store, alias.as_deref())?;
+            let added = runtime()?.block_on(models::add(out, &paths, &mut store, &request))?;
+            models::name_added(out, &mut store, &added, alias.as_deref())?;
+        }
+        ModelsAction::Alias {
+            model,
+            alias,
+            clear,
+        } => {
+            // The port a gateway serving this profile would be on, if it was
+            // started with the persisted or the default bind. `auto` cannot be
+            // found this way, and `alias_command` says so when it writes.
+            let port = lightweight_store::ApiConfigStore::new(paths.api_config_file())
+                .load()
+                .ok()
+                .and_then(|config| config.port)
+                .unwrap_or(lightweight_gateway::DEFAULT_PORT);
+            let alias = if *clear { None } else { alias.as_deref() };
+            runtime()?.block_on(models::alias_command(
+                out, &paths, port, &mut store, model, alias,
+            ))?;
         }
         ModelsAction::Remove { id, delete } => {
             models::remove(out, &mut store, id, *delete)?;

@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **User-defined model aliases.** Give any installed model a short name of your
+  choosing (`Coder`, `Fast`, …) when adding it or at any time later, from the
+  panel's Models screen, `hermes models alias`, or
+  `PATCH /api/v1/models/{id}` (`{"alias": null}` clears it). Renaming applies
+  at once without a reload. Aliases persist in the catalog, are never derived
+  from the file, and existing catalogs load unchanged with no alias set.
+- **Aliases are the public model ids.** `/v1/models`, `/v1/capabilities` and
+  every chat and text completion response, streamed chunks included, name an
+  aliased model by its alias; an unaliased model is listed by its canonical id
+  as before. The alias is a stable name with no `@context` suffix.
+- **Canonical ids remain supported.** Requests may name a model by its alias
+  (any casing), its canonical id, `default`, or not at all, and the control API
+  reports both `id` and `alias`. Aliases and canonical ids share one namespace:
+  an alias may not equal any model id, `default` is reserved, duplicates are
+  refused rather than renamed, and a pinned or linked model whose id is already
+  an alias is refused before it downloads.
+- **Lightagent compatibility.** Lightagent discovers the alias from
+  `/v1/models` and sends it back as `model` with no Lightagent change; verified
+  against a real engine.
+- `hermes models alias` changes an alias through a running gateway that serves
+  the same profile, rather than editing the catalog file under it.
+
+### Fixed
+
+- **`model: "default"` is accepted again.** It was dropped from the gateway in
+  the Lightagent split; it once more selects whichever model is resident, on
+  both `/v1/chat/completions` and `/v1/completions`.
+
 ## [0.4.1] - 2026-09-30
 
 ### Added
