@@ -597,6 +597,45 @@ mod tests {
         assert_eq!(observe(empty).expect("healthy").served, None);
     }
 
+    /// `/v1/capabilities` exactly as a v0.4.0 gateway wrote it.
+    fn v0_4_0_body() -> serde_json::Value {
+        serde_json::json!({
+            "object": "capability.list",
+            "protocol": {"name": "lightweight-public-inference", "version": 1, "compatible_versions": [1]},
+            "server": {"name": "Lightweight", "version": "0.4.0"},
+            "endpoints": {"models": "/v1/models", "chat_completions": "/v1/chat/completions",
+                          "completions": "/v1/completions"},
+            "features": {"streaming": true, "sse_done": true, "usage_chunk": true,
+                         "chat_completions": true, "completions": true, "tools": true,
+                         "tool_call_deltas": true, "tool_choice": true,
+                         "parallel_tool_calls": true, "reasoning_content": true},
+            "state": {"model_loaded": true, "model": {"id": "QwenCoder", "context_length": 8192}},
+            "limits": {"max_concurrent_requests": 1}
+        })
+    }
+
+    #[test]
+    fn a_node_from_an_earlier_release_states_every_capability_r5_filters_on() {
+        // Protocol v1 has required every feature flag since it shipped, so a
+        // node from any release is read in full: nothing is guessed.
+        let body: CapabilitiesBody = serde_json::from_value(v0_4_0_body()).expect("v1 body");
+        let seen = observe(body).expect("a Lightweight node");
+        let f = &seen.features.0;
+        assert!(
+            f.chat_completions && f.completions && f.tools && f.tool_choice && f.reasoning_content
+        );
+        assert_eq!(seen.served.unwrap().context_length, 8192);
+
+        // A body that leaves a flag out is not the v1 contract. It is never
+        // read as "supported": the probe fails, and the node takes no traffic.
+        let mut partial = v0_4_0_body();
+        partial["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        assert!(serde_json::from_value::<CapabilitiesBody>(partial).is_err());
+    }
+
     fn observed_serving(model: &str, tools: bool, context_length: u32) -> Observation {
         let mut features = CapabilitySet::none();
         features.0.streaming = true;

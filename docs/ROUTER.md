@@ -160,9 +160,16 @@ node whose model is the one being served. These records are never merged, and a
 route's summary never overwrites them. They survive the node going unhealthy,
 and are overwritten only by a later observation of the same deployment.
 `GET /api/router/v1/deployments` shows each deployment's own `observed` record.
-This is the data a later capability-aware selector (R5) needs: "the request uses
-tools, so deployment A is eligible and deployment B is not." No such selection is
-done yet.
+This is the data the capability filter reads: "the request uses tools, so
+deployment A is eligible and deployment B is not." See
+[Capability filtering](#capability-filtering).
+
+**The public summary and a request's eligibility answer different questions.**
+The summary says what *any* request can safely assume about a route, so it is
+the conservative intersection. A particular request is checked against each
+deployment's own figures. With an 8K and a 32K deployment, `Coder` advertises
+8K, and a 20K-token prompt is still served, by the 32K deployment alone. A
+request is never refused because of the route's summary.
 
 ### Model identity, both ways
 
@@ -251,7 +258,7 @@ Nothing is probed during a request.
 
 ## Route policies
 
-Every request goes through the same four steps in the same order:
+Every request goes through the same five steps in the same order:
 
 1. **Eligibility.** `select::eligible` drops every deployment that cannot take
    traffic now: a disabled node, an `unknown` or `unhealthy` node, or a node that
@@ -259,10 +266,12 @@ Every request goes through the same four steps in the same order:
    is shared by all three policies and by the route summaries in `/v1/models`
    and `/v1/capabilities`. A policy never sees an ineligible deployment, however
    idle it looks or whosever turn it would be.
-2. **Policy.** The route's `strategy` orders what is left. The first deployment
+2. **Capability.** `capability::filter` drops every deployment left that cannot
+   serve *this* request. See [Capability filtering](#capability-filtering).
+3. **Policy.** The route's `strategy` orders what is left. The first deployment
    is the initial choice, and the rest, in order, are where failover goes.
-3. **Proxy.** The proxy only walks that order. It contains no policy logic.
-4. **Failover**, before commitment only, exactly as described
+4. **Proxy.** The proxy only walks that order. It contains no policy logic.
+5. **Failover**, before commitment only, exactly as described
    [below](#failover).
 
 | `strategy` | Initial choice | Failover order |
@@ -279,7 +288,8 @@ identity: `/v1/models` lists `Coder` whatever `Coder`'s strategy is, and
 
 None of the policies looks at latency, time to first token, request duration,
 throughput, history, weights, sessions, the request's content, or the
-deployment's capabilities.
+deployment's capabilities. Capabilities are applied before a policy runs, so
+each policy orders a list that is already right for the request.
 
 ```json
 { "name": "Coder",   "strategy": "priority",    "deployments": [
@@ -391,6 +401,150 @@ priority and round-robin routes too.
   Tests cover each of these, and a real disconnect released the slot while the
   node recorded the generation as `cancelled`.
 
+## Capability filtering
+
+Between eligibility and policy, the router asks one more question: **can this
+deployment serve this particular request?** It is a yes or a no per deployment.
+Nothing is ranked, and a deployment is never preferred for supporting more.
+
+### What a request requires
+
+`requirements::extract` reads the request once, with the gateway's own request
+types and the same conversion the gateway runs before it generates. It reads
+only fields the client set, and never the meaning of a prompt.
+
+| Request | Requires of the deployment | Feature it reads |
+|---|---|---|
+| `POST /v1/chat/completions` | chat completions | `chat_completions` |
+| `POST /v1/completions` | text completions | `completions` |
+| `tools` with at least one entry | tool calling | `tools` |
+| `tools: []` or no `tools` | nothing (the gateway also reads `[]` as no tools) | — |
+| `tool_choice: "required"` or a named function | tool calling, and honouring `tool_choice` | `tools` and `tool_choice` |
+| `tool_choice: "none"` beside declared tools | tool calling, and honouring `tool_choice` (it forbids a call the model could make) | `tools` and `tool_choice` |
+| `tool_choice: "none"` with no tools | nothing | — |
+| `tool_choice: "auto"`, or none sent | tool calling only if tools are declared (`auto` is what a node does with tools anyway) | `tools` |
+| `reasoning_effort` set to an effort (`"low"`, `"high"`, …) | reasoning | `reasoning_content` |
+| `reasoning_effort: "none"`, or none sent | nothing (turning thinking off is something any model can do) | — |
+| any prompt | a context that can hold it | `state.model.context_length` |
+
+`chat_template_kwargs` (such as `enable_thinking`) is a template's own switch.
+The gateway forwards it without interpreting it, and so does the router: it is
+not read as a reasoning request.
+
+**Malformed requests** get the gateway's own `400`, from the router, before any
+deployment is chosen. That covers `tool_choice: "required"` with no tools, a
+named function that `tools` does not declare, an unknown `tool_choice`, a tool
+with no name, empty `messages`, and on `/v1/completions` a token-array prompt or
+an unsupported parameter. The code, `param` and message are the ones a node
+would send, so a malformed request is never treated differently depending on
+which node would have taken it. A body that does not even fit the request type
+is forwarded as before, with only its endpoint required, and the node answers
+it.
+
+### Context
+
+A Lightweight node refuses a request only when its prompt fills the window
+(`prompt_tokens >= n_ctx`, answered `400 context_length_exceeded`). The output
+budget (`max_tokens`, or `max_completion_tokens`, the smaller if both are set,
+or neither) is **clamped** to what is left, never refused, because real clients
+send budgets far larger than any window. Hermes sends 65536. The router keeps
+exactly that rule. A deployment can serve a prompt of `p` tokens when
+`p < context_length`. The budget is logged (`max_tokens`) and does not decide
+eligibility. Filtering on prompt plus budget would refuse, at the router,
+requests that every node would serve.
+
+The node counts `p` with the model's own tokenizer and chat template. The
+router has neither, and asking a node per request would put a network call in
+the request path. So the router computes a **lower bound**: the bytes of every
+message's text, divided by `BYTES_PER_TOKEN_CEILING` = 6. Tool declarations,
+replayed tool calls and the template's markup are left out. Whether a template
+renders them depends on the model, and a lower bound cannot count what may not
+be there. It rules out
+a deployment only when even that bound cannot fit. The bound is the same for
+every deployment, because the router has no per-model tokenizer. Near the
+boundary a request is let through, and the node, which stays the authority,
+answers with its own `context_length_exceeded`. That error is the same one a
+client gets talking to the node directly. The opposite mistake would be
+worse: refusing a request that a deployment could have served, with an error
+no node would ever have given.
+
+Measured, not assumed. Through a real node running SmolLM2-135M, each sample
+was sent as one user message with `max_tokens: 1`, and the node's own
+`usage.prompt_tokens` was read back:
+
+| Sample | Bytes | Prompt tokens | Bytes per token | Router's bound |
+|---|---|---|---|---|
+| English prose (README) | 6032 | 1561 | 3.86 | 1006 |
+| Markdown (this file) | 6036 | 1828 | 3.30 | 1006 |
+| Rust source | 6010 | 1629 | 3.69 | 1002 |
+| JSON | 6000 | 3117 | 1.92 | 1000 |
+| Indentation-heavy code | 6000 | 1595 | 3.76 | 1000 |
+| One word repeated | 6000 | 1231 | 4.87 | 1000 |
+| Base64 | 1500 | 1238 | 1.21 | 250 |
+| Japanese | 1680 | 950 | 1.77 | 280 |
+| Digits | 1500 | 1530 | 0.98 | 250 |
+| 8 tool declarations, "hi" | 1778 | 31 | — | 0 (tools not counted) |
+
+The bound was below the real count in every sample, and by a wide margin. The
+last row is why tool declarations are not counted: SmolLM2's template drops
+them, so they cost it nothing. Only one tokenizer was measured. A tokenizer
+averaging more than 6 bytes a token over a whole prompt would make the bound
+too high, and none measured came close.
+
+### Unknowns are never a yes
+
+- A deployment the router has never observed is never assumed capable. Every
+  request requires at least its endpoint, so such a deployment is passed by
+  (`unobserved`). In practice an available deployment always has an
+  observation, because both come from the same probe.
+- **Mixed versions.** Every flag the filter reads has been a required field of
+  the v1 `/v1/capabilities` contract since it shipped (v0.4.0), so a node from
+  any release states all of them, and nothing is inferred. A body that leaves a
+  flag out is not the v1 contract. Its probe fails, and the node takes no
+  traffic, rather than being read as supporting what it did not say.
+- **What real nodes report today.** A Lightweight gateway advertises chat,
+  completions, tools, `tool_choice` and reasoning as protocol features, all
+  `true`. Between Lightweight nodes, the context window is therefore what
+  actually separates deployments. The flags matter for any node that reports
+  `false`, and they cost nothing when every node reports `true`.
+
+### Policies after filtering
+
+- **Priority** takes the first capable deployment in configured order. A
+  deployment filtered out was never eligible, so the next one is a first
+  choice (`primary_unavailable_fallback`), not a failover.
+- **Round-robin** rotates over the capable deployments of each request. The
+  ring is the request's own eligible set, and its length can change from one
+  request to the next. The cursor still advances once per request, and the turn
+  is `cursor % len` of that request's ring. Fairness holds over the eligible set
+  of each request, not over a fixed physical ring.
+- **Least-busy** compares `active / limit` among the capable deployments only.
+  An idle deployment that cannot serve the request is never compared, so it
+  cannot win.
+- **Failover** walks only the plan, and the plan holds only capable
+  deployments. A filtered deployment is never tried, even when every capable one
+  has refused.
+
+### When nothing can serve it
+
+| Situation | Answer |
+|---|---|
+| No route has that name | `404 model_not_found` |
+| The route exists and no deployment is available | `503 route_unavailable`, with `Retry-After` |
+| Deployments are available, but none can serve this request | `400 route_capability_mismatch` |
+| Only an *unavailable* deployment was last seen able to serve it | `503 route_unavailable`: waiting fixes this, changing the request does not |
+
+```json
+{"error":{"message":"Route \"Coder\" has no available deployment that supports tool calling.",
+          "type":"invalid_request_error","param":"tools","code":"route_capability_mismatch"}}
+```
+
+The message names the route and the kinds of capability that were missing, all
+of them, joined with "and". It never names a node, a node-local alias, a
+canonical id or a file. `param` is set to `tools`, `tool_choice` or
+`reasoning_effort` when one of those is at fault. The router never moves the
+request to another route.
+
 ## Failover
 
 **Failover happens only before anything has been sent to the client.** The next
@@ -406,7 +560,12 @@ deployment is tried when the current one:
   last probe. The router forgets what that node was serving until the next
   probe, and the node's message is not shown to the client.
 
-Every other answer commits the deployment. That includes `400` and `500`.
+- answers `400 context_length_exceeded`, recognised by its `error.code` and
+  nothing looser, **and** a later deployment in the plan advertises a strictly
+  larger context. See [Context overflow](#context-overflow) below.
+
+Every other answer commits the deployment. That includes every other `400`, and
+every `500`.
 **A `500` is never retried elsewhere.** It may be a deterministic failure of this
 request or this model. Running the request again on another model could
 duplicate work, or hide a real application error behind a different model's
@@ -421,6 +580,42 @@ mid-stream, the client receives one
 `data: {"error":{"code":"upstream_stream_interrupted",…}}` frame and no `[DONE]`.
 Another node is never asked to continue an answer it did not start.
 
+### Context overflow
+
+The capability filter's context check is a lower bound, so a prompt can pass it
+and still be longer, by the node's own count, than the deployment chosen. The
+node then refuses it before generating anything:
+`400 {"error":{"code":"context_length_exceeded","type":"invalid_request_error","param":"messages",…}}`.
+A streamed request gets the same JSON refusal, because the node checks before
+it starts the stream.
+
+That one refusal is a capability miss the router could not see in advance, so
+it is not the end of the request when the plan holds a deployment that can do
+better:
+
+- Only deployments already in the plan are tried. They passed health and the
+  capability filter, so a deployment ruled out for tools, reasoning or its
+  endpoint never comes back.
+- Only a deployment advertising a **strictly larger** context than every one
+  that has overflowed is tried. Others are passed over in plan order. With 8K,
+  8K and 32K, an overflow on the first 8K goes straight to the 32K.
+- The plan is not made again. Round-robin's cursor does not move a second
+  time, and least-busy does not choose again. One request is one policy
+  decision. The overflowed deployment's in-flight slot is returned before the
+  next one is taken.
+- The attempt is logged `context_overflow_failover`, with the deployment that
+  overflowed and its context, the next one and its context, and the router's
+  `estimated_prompt_tokens`. It is counted in
+  `router_context_overflow_failovers_total{route}` and in
+  `router_failovers_total`.
+- When no larger deployment is left, the node's own `400
+  context_length_exceeded` is returned unchanged. It is not turned into
+  `route_unavailable` (the route is available) or `route_capability_mismatch`
+  (the router could not have known before sending).
+- Once anything has been relayed, nothing is retried. An overflow reported
+  inside a stream that has started reaches the client in-band, as any other
+  mid-stream error does.
+
 `RoutingReason` in the logs is one of these:
 
 | Policy | Reasons |
@@ -428,6 +623,7 @@ Another node is never asked to continue an answer it did not start.
 | `priority` | `explicit_single_deployment`, `primary_healthy`, `primary_unavailable_fallback`, `primary_failed_fallback` |
 | `round_robin` | `round_robin`, `round_robin_failover` |
 | `least_busy` | `least_busy`, `least_busy_tiebreak`, `least_busy_failover` |
+| any | `context_overflow_failover` |
 
 ## The control API (read-only)
 
@@ -450,7 +646,17 @@ request logs:
 - `request_id`, `route`, `policy`, `node`, `deployment`, `reason`, `routing_ms`,
   `upstream_status` and `failover_count`;
 - under round-robin, also `cursor` and `selected_index`;
-- under least-busy, also `active_before` and `concurrency_limit`.
+- under least-busy, also `active_before` and `concurrency_limit`;
+- what the request required: `endpoint` (`chat` or `completion`),
+  `requires_tools`, `tool_choice`, `requires_reasoning`, `required_context` and
+  `max_tokens`;
+- `eligible_before` and `eligible_after` the capability filter, and `filtered`,
+  how many deployments each requirement ruled out
+  (`tools_unsupported=1,context_too_small=1`).
+
+At `debug`, each ruled-out deployment is logged with all of its reasons. A
+refused request logs `no available deployment can serve this request` with
+the same fields and `unmet`.
 
 Prompt text, credentials and file paths are never logged.
 
@@ -462,10 +668,35 @@ Metrics:
   the `*_failover` reasons.
 - `router_active_requests`
 - `router_deployment_active_requests{deployment}`
+- `router_capability_filtered_total{route,reason}`: available deployments a
+  request's requirements ruled out. The reasons are `chat_unsupported`,
+  `completion_unsupported`, `tools_unsupported`, `tool_choice_unsupported`,
+  `reasoning_unsupported`, `context_too_small` and `unobserved`.
+- `router_capability_mismatch_total{route}`: requests refused with
+  `route_capability_mismatch`.
+- `router_context_overflow_failovers_total{route}`: failovers to a larger
+  context after `context_length_exceeded`.
 - `router_node_health{node}`: `1` healthy, `0` unhealthy, `-1` unknown. A request for an unconfigured route is counted under
 `route="_unknown"`, so clients cannot add labels by inventing model names.
 
 ## Limits of this version
+
+- **The router's context check is a lower bound, not the node's count.** It
+  rules out only what cannot fit. A prompt just over a deployment's window can
+  still be sent there. The node answers `context_length_exceeded`, and the
+  request then moves to a deployment in the plan with a larger context, if
+  there is one ([Context overflow](#context-overflow)). That costs one
+  round trip to the smaller node, where it counts the prompt. Exact
+  per-model counting would need each deployment's tokenizer and chat
+  template.
+- **The output budget does not steer the choice.** A short prompt with
+  `max_tokens: 20000` is eligible on an 8K deployment, where the node clamps
+  the budget. It is never refused, but it can be answered with fewer tokens
+  than a 32K deployment would allow. Preferring the larger deployment would be
+  a ranking, and R5 only filters.
+- **Capabilities are as fresh as the last probe.** After a hot swap, the router
+  uses the previous figures until it probes again. If they let a request
+  through, the node's own answer stands under the usual failover rules.
 
 - **A resized node's limit reaches the router on the next probe, not at once.**
   Between a hot swap and that probe, least-busy divides by the previous limit.
@@ -557,13 +788,13 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R4 (round-robin and least-busy) is built. Nothing after it is. Each later step
+R5 (capability filtering) is built. Nothing after it is. Each later step
 builds on the types above without changing the public route identity.
 
 | Milestone | Scope |
 |---|---|
 | **R4** | Done: `round_robin` and `least_busy`. Deliberately left out: weighted, random, latency/EWMA/P95/TTFT, and cost-aware selection. Any of these would be a new `RoutePolicy` variant with its own ordering function. |
-| **R5** | Capability-aware filtering: skip a deployment that cannot honour the request's features (tools, reasoning), and choose the deployment by context length. |
+| **R5** | Done: request-aware capability filtering between eligibility and policy, for endpoint, tools, `tool_choice`, reasoning and context. Deliberately left out: ranking by capability, routing on the output budget, per-model tokenization, and moving a request to another route. |
 | **R6** | Session affinity keyed by a client-supplied conversation id. Latency and TTFT histograms. Request ids in node logs. |
 | **R7** | Placement control: a control plane that asks nodes to load models and keeps warm standbys. It never runs in the request path. |
 | **R8** | A rule-based `Auto` route that maps request traits to routes. |

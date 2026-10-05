@@ -7,7 +7,11 @@
 //!    availability rule in [`crate::health`]. It is shared by every policy and
 //!    by the route summaries clients read, so no policy can reach a
 //!    deployment the others would refuse.
-//! 2. The route's policy orders what is left. The first deployment is the
+//! 2. [`crate::capability::filter`] removes every deployment left that cannot
+//!    serve *this* request — its endpoint, tools, `tool_choice`, reasoning, or
+//!    a prompt too long for its context. A plan made outside a request
+//!    requires nothing and removes nothing.
+//! 3. The route's policy orders what is left. The first deployment is the
 //!    initial choice; the rest, in order, are where pre-commit failover goes.
 //!    * [`order_priority`]: configured order.
 //!    * [`order_round_robin`]: the configured order rotated by a per-route
@@ -20,20 +24,24 @@
 //! in-flight counts) lives in [`Selector`] and [`crate::load::LoadBook`], and the
 //! proxy only walks the plan it is handed: it holds no policy of its own.
 //!
-//! Nothing here reads latency, history or the request's content.
+//! The policies never see a requirement: they are handed a candidate list that
+//! is already right for the request, and order it exactly as they did before
+//! capabilities existed. Nothing here reads latency, history or a prompt's
+//! meaning.
 
 use std::cmp::Ordering as Order;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::domain::CapabilitySet;
+use crate::domain::{CapabilityGap, CapabilitySet};
 use crate::domain::{
     DeploymentId, NodeId, Route, RouteName, RoutePolicy, RoutingDecision, RoutingFailure,
     RoutingReason, Topology, UnavailableReason,
 };
 use crate::health::{DeploymentObservation, NodeStatus, availability};
 use crate::load::{Lease, LoadBook};
+use crate::requirements::RequestRequirements;
 
 /// One deployment the plan may try.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +62,9 @@ pub struct Eligible {
     pub candidates: Vec<Candidate>,
     /// Deployments left out, and why, for the log line.
     pub skipped: Vec<(DeploymentId, UnavailableReason)>,
+    /// Deployments that could take traffic but not this request, and every
+    /// requirement each one fails. Filled by [`crate::capability::filter`].
+    pub unfit: Vec<(DeploymentId, Vec<CapabilityGap>)>,
     /// How many deployments the route has in total.
     pub route_size: usize,
 }
@@ -86,6 +97,9 @@ pub struct Plan {
     pub candidates: Vec<Candidate>,
     /// Deployments left out, and why, for the log line.
     pub skipped: Vec<(DeploymentId, UnavailableReason)>,
+    /// Available deployments this request's requirements ruled out. Never
+    /// tried, not even as a failover.
+    pub unfit: Vec<(DeploymentId, Vec<CapabilityGap>)>,
     pub selection: Selection,
     /// An in-flight slot already taken on `candidates[0]`, when the plan came
     /// from a [`Selector`]. Least-busy has to take it while it still holds the
@@ -102,6 +116,7 @@ impl Plan {
             policy,
             candidates: eligible.candidates,
             skipped: eligible.skipped,
+            unfit: eligible.unfit,
             selection,
             reservation: None,
             route_size: eligible.route_size,
@@ -186,6 +201,7 @@ pub fn eligible(
         route: route.name.clone(),
         candidates,
         skipped,
+        unfit: Vec::new(),
         route_size: route.deployments.len(),
     })
 }
@@ -348,8 +364,7 @@ impl Selector {
         Some(self.routes.get(index)?.cursor.load(Ordering::Relaxed))
     }
 
-    /// Plan one request: eligibility, then the route's policy, then a slot
-    /// reserved on the first choice.
+    /// Plan with nothing required of the deployments beyond availability.
     pub fn plan(
         &self,
         topology: &Topology,
@@ -357,7 +372,30 @@ impl Selector {
         health: &BTreeMap<NodeId, NodeStatus>,
         observed: &BTreeMap<DeploymentId, DeploymentObservation>,
     ) -> Result<Plan, RoutingFailure> {
+        self.plan_request(
+            topology,
+            route,
+            health,
+            observed,
+            &RequestRequirements::none(),
+        )
+    }
+
+    /// Plan one request: eligibility, then what this request needs, then the
+    /// route's policy, then a slot reserved on the first choice.
+    ///
+    /// The policy below is handed only deployments that passed both filters,
+    /// and does not know there were any.
+    pub fn plan_request(
+        &self,
+        topology: &Topology,
+        route: &Route,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+        needs: &RequestRequirements,
+    ) -> Result<Plan, RoutingFailure> {
         let eligible = eligible(topology, route, health)?;
+        let eligible = crate::capability::filter(eligible, needs, observed)?;
         let state = topology
             .routes()
             .iter()
@@ -1217,6 +1255,427 @@ mod tests {
             selector.cursor(&t, &t.routes()[0].name),
             Some(0),
             "priority keeps no cursor"
+        );
+    }
+
+    // --- R5: capability filtering before policy --------------------------
+
+    use crate::proxy::Endpoint;
+    use crate::requirements::{RequestRequirements, ToolChoiceRequirement};
+
+    /// What one deployment offers, in the ring of a, b, c.
+    #[derive(Clone, Copy)]
+    struct Offers {
+        tools: bool,
+        reasoning: bool,
+        context: u32,
+        limit: u32,
+    }
+
+    const FULL: Offers = Offers {
+        tools: true,
+        reasoning: true,
+        context: 32_768,
+        limit: 4,
+    };
+
+    fn offering(a: Offers, b: Offers, c: Offers) -> BTreeMap<DeploymentId, DeploymentObservation> {
+        [("a", "A", a), ("b", "B", b), ("c", "C", c)]
+            .into_iter()
+            .map(|(node, model, offers)| {
+                let mut capabilities = CapabilitySet::none();
+                let f = &mut capabilities.0;
+                f.streaming = true;
+                f.chat_completions = true;
+                f.completions = true;
+                f.tools = offers.tools;
+                f.tool_choice = offers.tools;
+                f.reasoning_content = offers.reasoning;
+                (
+                    DeploymentId::of(&NodeId::parse(node).unwrap(), model),
+                    DeploymentObservation {
+                        capabilities,
+                        context_length: offers.context,
+                        max_concurrent_requests: offers.limit,
+                        observed_at: SystemTime::now(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn chat_needing(tools: bool, reasoning: bool, prompt_tokens: u32) -> RequestRequirements {
+        RequestRequirements {
+            endpoint: Some(Endpoint::ChatCompletions),
+            tools,
+            reasoning,
+            prompt_tokens: Some(prompt_tokens),
+            ..RequestRequirements::none()
+        }
+    }
+
+    fn pick(
+        t: &Topology,
+        selector: &Selector,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+        needs: &RequestRequirements,
+    ) -> Plan {
+        selector
+            .plan_request(t, &t.routes()[0], health, observed, needs)
+            .expect("a plan")
+    }
+
+    fn nodes(plan: &Plan) -> Vec<&str> {
+        plan.candidates.iter().map(|c| c.node.as_str()).collect()
+    }
+
+    #[test]
+    fn priority_goes_straight_to_the_first_capable_deployment() {
+        let (t, selector) = ring("priority");
+        let no_tools = Offers {
+            tools: false,
+            ..FULL
+        };
+        let observed = offering(no_tools, FULL, FULL);
+        let plan = pick(
+            &t,
+            &selector,
+            &all_up(),
+            &observed,
+            &chat_needing(true, false, 10),
+        );
+        // a was never eligible for this request, so b is a first choice, not a
+        // fallback from a failure, and a is not even a failover.
+        assert_eq!(nodes(&plan), ["b", "c"]);
+        assert_eq!(
+            plan.decision(0).unwrap().reason,
+            RoutingReason::PrimaryUnavailableFallback
+        );
+        assert_eq!(
+            plan.unfit,
+            [(
+                DeploymentId::of(&NodeId::parse("a").unwrap(), "A"),
+                vec![CapabilityGap::ToolsUnsupported]
+            )]
+        );
+        // An ordinary request still starts at a.
+        let plan = pick(
+            &t,
+            &selector,
+            &all_up(),
+            &observed,
+            &chat_needing(false, false, 10),
+        );
+        assert_eq!(nodes(&plan), ["a", "b", "c"]);
+        assert!(plan.unfit.is_empty());
+    }
+
+    #[test]
+    fn round_robin_rotates_only_over_the_capable_ring() {
+        let (t, selector) = ring("round_robin");
+        let observed = offering(
+            FULL,
+            Offers {
+                tools: false,
+                ..FULL
+            },
+            FULL,
+        );
+        let tools = chat_needing(true, false, 10);
+        let picks: Vec<String> = (0..6)
+            .map(|_| nodes(&pick(&t, &selector, &all_up(), &observed, &tools))[0].to_owned())
+            .collect();
+        assert_eq!(picks, ["a", "c", "a", "c", "a", "c"], "b is never its turn");
+
+        // Mixed traffic: the ring is each request's own eligible set, so its
+        // length changes between requests, and nothing panics or picks b for
+        // a tool request.
+        for round in 0..30 {
+            let needs = chat_needing(round % 2 == 0, false, 10);
+            let plan = pick(&t, &selector, &all_up(), &observed, &needs);
+            if needs.tools {
+                assert_ne!(nodes(&plan)[0], "b");
+                assert_eq!(plan.candidates.len(), 2);
+            } else {
+                assert_eq!(plan.candidates.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn least_busy_compares_only_capable_deployments_however_idle_the_others() {
+        let (t, selector) = ring("least_busy");
+        // a 2/4 = 50%, b idle but without tools, c 1/4 = 25%.
+        let observed = offering(
+            FULL,
+            Offers {
+                tools: false,
+                ..FULL
+            },
+            FULL,
+        );
+        let load = selector.load();
+        let (a, c) = (
+            DeploymentId::of(&NodeId::parse("a").unwrap(), "A"),
+            DeploymentId::of(&NodeId::parse("c").unwrap(), "C"),
+        );
+        let _held = [load.acquire(&a), load.acquire(&a), load.acquire(&c)];
+        let plan = pick(
+            &t,
+            &selector,
+            &all_up(),
+            &observed,
+            &chat_needing(true, false, 10),
+        );
+        assert_eq!(nodes(&plan), ["c", "a"], "c, then a; never b");
+        assert_eq!(
+            plan.selection,
+            Selection::LeastBusy {
+                active_before: 1,
+                concurrency_limit: Some(4),
+                tied: false
+            }
+        );
+        // Without tools, the idle b wins as before.
+        drop(plan);
+        let plan = pick(
+            &t,
+            &selector,
+            &all_up(),
+            &observed,
+            &chat_needing(false, false, 10),
+        );
+        assert_eq!(nodes(&plan)[0], "b");
+    }
+
+    #[test]
+    fn requirements_are_intersected_and_more_capability_is_never_preferred() {
+        // The all-capabilities example: only c offers tools, reasoning and
+        // 20K together.
+        let observed = offering(
+            Offers {
+                reasoning: false,
+                ..FULL
+            },
+            Offers {
+                context: 8_192,
+                ..FULL
+            },
+            FULL,
+        );
+        for strategy in ["priority", "round_robin", "least_busy"] {
+            let (t, selector) = ring(strategy);
+            for _ in 0..3 {
+                let plan = pick(
+                    &t,
+                    &selector,
+                    &all_up(),
+                    &observed,
+                    &chat_needing(true, true, 20_000),
+                );
+                assert_eq!(nodes(&plan), ["c"], "{strategy}");
+                assert_eq!(plan.unfit.len(), 2);
+            }
+            // Pairs of requirements narrow to the deployments meeting both.
+            let tools_and_large = pick(
+                &t,
+                &selector,
+                &all_up(),
+                &observed,
+                &chat_needing(true, false, 20_000),
+            );
+            let mut got = nodes(&tools_and_large);
+            got.sort_unstable();
+            assert_eq!(got, ["a", "c"], "{strategy}");
+            let reasoning_and_small = pick(
+                &t,
+                &selector,
+                &all_up(),
+                &observed,
+                &chat_needing(false, true, 100),
+            );
+            let mut got = nodes(&reasoning_and_small);
+            got.sort_unstable();
+            assert_eq!(got, ["b", "c"], "{strategy}");
+        }
+
+        // A plain request keeps a plain deployment: capability is a floor.
+        let (t, selector) = ring("priority");
+        let plain = Offers {
+            tools: false,
+            reasoning: false,
+            ..FULL
+        };
+        let plan = pick(
+            &t,
+            &selector,
+            &all_up(),
+            &offering(plain, FULL, FULL),
+            &chat_needing(false, false, 10),
+        );
+        assert_eq!(nodes(&plan), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_request_no_available_deployment_can_serve_is_a_mismatch_naming_what_was_missing() {
+        let (t, selector) = ring("round_robin");
+        let observed = offering(
+            Offers {
+                tools: false,
+                ..FULL
+            },
+            Offers {
+                tools: false,
+                context: 1024,
+                ..FULL
+            },
+            Offers {
+                tools: false,
+                ..FULL
+            },
+        );
+        let failure = selector
+            .plan_request(
+                &t,
+                &t.routes()[0],
+                &all_up(),
+                &observed,
+                &chat_needing(true, false, 4096),
+            )
+            .unwrap_err();
+        let RoutingFailure::CapabilityMismatch {
+            route,
+            unmet,
+            unfit,
+        } = failure
+        else {
+            panic!("expected a mismatch, got {failure:?}");
+        };
+        assert_eq!(route.as_str(), "Coder");
+        assert_eq!(
+            unmet,
+            [
+                CapabilityGap::ToolsUnsupported,
+                CapabilityGap::ContextTooSmall
+            ]
+        );
+        assert_eq!(unfit.len(), 3);
+        // Nothing was reserved, and the cursor did not move.
+        assert!(selector.load().snapshot().values().all(|n| *n == 0));
+        assert_eq!(selector.cursor(&t, &t.routes()[0].name), Some(0));
+
+        // All down is still route_unavailable, whatever the request needs.
+        let all_down = with(with(with(all_up(), "a", down()), "b", down()), "c", down());
+        assert!(matches!(
+            selector.plan_request(
+                &t,
+                &t.routes()[0],
+                &all_down,
+                &observed,
+                &chat_needing(true, false, 10)
+            ),
+            Err(RoutingFailure::RouteUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn when_only_a_down_deployment_could_serve_it_the_route_is_unavailable_not_mismatched() {
+        let (t, selector) = ring("priority");
+        // Only c has tools, and c is down: waiting fixes this, changing the
+        // request does not.
+        let no_tools = Offers {
+            tools: false,
+            ..FULL
+        };
+        let observed = offering(no_tools, no_tools, FULL);
+        let failure = selector
+            .plan_request(
+                &t,
+                &t.routes()[0],
+                &with(all_up(), "c", down()),
+                &observed,
+                &chat_needing(true, false, 10),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(failure, RoutingFailure::RouteUnavailable { .. }),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_capability_change_is_seen_on_the_next_observation() {
+        let (t, selector) = ring("priority");
+        let needs = chat_needing(true, false, 10);
+        let before = offering(
+            Offers {
+                tools: false,
+                ..FULL
+            },
+            FULL,
+            FULL,
+        );
+        assert_eq!(
+            nodes(&pick(&t, &selector, &all_up(), &before, &needs))[0],
+            "b"
+        );
+        // a's node swapped to a model with tools; the next probe files it.
+        let after = offering(FULL, FULL, FULL);
+        assert_eq!(
+            nodes(&pick(&t, &selector, &all_up(), &after, &needs))[0],
+            "a"
+        );
+    }
+
+    #[test]
+    fn a_plan_outside_a_request_requires_nothing() {
+        let (t, selector) = ring("priority");
+        // No observations at all: plan() behaves exactly as before R5.
+        let plan = selector
+            .plan(&t, &t.routes()[0], &all_up(), &BTreeMap::new())
+            .unwrap();
+        assert_eq!(nodes(&plan), ["a", "b", "c"]);
+        // A real request must be vouched for: an unobserved deployment is not.
+        let failure = selector
+            .plan_request(
+                &t,
+                &t.routes()[0],
+                &all_up(),
+                &BTreeMap::new(),
+                &chat_needing(false, false, 1),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            RoutingFailure::CapabilityMismatch { ref unmet, .. } if unmet == &[CapabilityGap::Unobserved]
+        ));
+    }
+
+    #[test]
+    fn a_forced_tool_choice_skips_a_deployment_that_takes_tools_but_not_tool_choice() {
+        let (t, selector) = ring("round_robin");
+        let mut observed = offering(FULL, FULL, FULL);
+        let b = DeploymentId::of(&NodeId::parse("b").unwrap(), "B");
+        observed.get_mut(&b).unwrap().capabilities.0.tool_choice = false;
+        let forced = RequestRequirements {
+            tool_choice: ToolChoiceRequirement::Required,
+            ..chat_needing(true, false, 10)
+        };
+        let picks: Vec<String> = (0..4)
+            .map(|_| nodes(&pick(&t, &selector, &all_up(), &observed, &forced))[0].to_owned())
+            .collect();
+        assert_eq!(picks, ["a", "c", "a", "c"]);
+        // `auto` is what b does with tools anyway: b is back in the ring.
+        let auto = RequestRequirements {
+            tool_choice: ToolChoiceRequirement::Auto,
+            ..chat_needing(true, false, 10)
+        };
+        assert_eq!(
+            pick(&t, &selector, &all_up(), &observed, &auto)
+                .candidates
+                .len(),
+            3
         );
     }
 

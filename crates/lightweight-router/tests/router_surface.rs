@@ -165,6 +165,9 @@ enum Act {
     Refuse(u16, Value),
     /// Start a stream, send one chunk, then drop the connection.
     StreamThenDrop,
+    /// Start a stream, send one chunk, then report a context overflow in-band
+    /// and end — an error that arrives after the response has committed.
+    StreamThenOverflow,
     /// Stay in flight until the gate is opened, then answer. A streamed
     /// request gets its first chunk at once and the rest after the gate.
     Hold(Arc<tokio::sync::Semaphore>),
@@ -195,6 +198,9 @@ struct NodeScript {
     context_length: u32,
     /// The slot count the probe advertises.
     limit: u32,
+    /// What the probe stops advertising, changeable while the node runs, as a
+    /// hot swap would change it.
+    withheld: Arc<Mutex<Withheld>>,
     hits: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
     probes: Arc<Mutex<Vec<HeaderMap>>>,
@@ -235,6 +241,7 @@ impl FakeNode {
             tools,
             context_length,
             limit,
+            withheld: Arc::default(),
             hits: Arc::default(),
             seen: Arc::default(),
             probes: Arc::default(),
@@ -258,6 +265,11 @@ impl FakeNode {
         self.script.hits.load(Ordering::SeqCst)
     }
 
+    /// Change what the next probe is told.
+    fn withhold(&self, change: impl FnOnce(&mut Withheld)) {
+        change(&mut self.script.withheld.lock().unwrap());
+    }
+
     fn seen(&self) -> Vec<Seen> {
         self.script.seen.lock().unwrap().clone()
     }
@@ -277,7 +289,29 @@ async fn fake_capabilities(
         script.limit,
     );
     body.features.tools = script.tools;
+    let withheld = *script.withheld.lock().unwrap();
+    let features = &mut body.features;
+    features.chat_completions &= !withheld.chat;
+    features.completions &= !withheld.completions;
+    features.tools &= !withheld.tools;
+    features.tool_choice &= !withheld.tool_choice;
+    features.reasoning_content &= !withheld.reasoning;
+    if let (Some(context), Some(model)) = (withheld.context, body.state.model.as_mut()) {
+        model.context_length = context;
+    }
     axum::Json(body).into_response()
+}
+
+/// Features a scripted node stops advertising, and a context it reports
+/// instead of its own. Nothing withheld by default.
+#[derive(Clone, Copy, Debug, Default)]
+struct Withheld {
+    chat: bool,
+    completions: bool,
+    tools: bool,
+    tool_choice: bool,
+    reasoning: bool,
+    context: Option<u32>,
 }
 
 async fn fake_generate(
@@ -357,6 +391,15 @@ async fn fake_generate(
                          "finish_reason": "stop"}],
         }))
         .into_response(),
+        Act::StreamThenOverflow => {
+            let text = format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {"content": "partial"}}]}),
+                overflow_envelope(2048)
+            );
+            ([("content-type", "text/event-stream")], text).into_response()
+        }
         Act::StreamThenDrop => {
             let first = format!(
                 "data: {}\n\n",
@@ -2175,4 +2218,863 @@ async fn every_policy_answers_as_the_route_and_default_uses_the_routes_policy() 
             assert_eq!((a.hits(), b.hits()), (2, 2));
         }
     }
+}
+
+// --- R5: request-aware capability filtering ---------------------------------
+
+/// A chat request for `route` with `extra` merged in.
+fn chat_body(route: &str, extra: Value) -> Value {
+    let mut body = json!({"model": route, "messages": [{"role": "user", "content": "hi"}]});
+    if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+        body.extend(extra);
+    }
+    body
+}
+
+fn a_tool() -> Value {
+    json!([{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])
+}
+
+async fn send(router: &Router, path: &str, body: Value) -> (u16, Value) {
+    let response = router.post(path, body).await;
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+/// Every chunk of a streamed answer, as JSON, with `[DONE]` checked.
+async fn streamed(router: &Router, body: Value) -> Vec<Value> {
+    let response = router.post("/v1/chat/completions", body).await;
+    assert_eq!(response.status(), 200);
+    let events = decode(&response.bytes().await.unwrap());
+    assert!(events.last().unwrap().is_done());
+    events
+        .iter()
+        .filter(|event| !event.is_done())
+        .map(|event| serde_json::from_str(&event.data).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn priority_sends_a_tool_request_straight_to_the_first_deployment_with_tools() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| w.tools = true);
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("node-a", a.base(), "AliasA"),
+                ("node-b", b.base(), "AliasB"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"tools": a_tool()})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    // Never sent to a, not even to be refused: a was never a candidate.
+    assert_eq!((a.hits(), b.hits()), (0, 1));
+    assert_eq!(b.seen()[0].body["model"], "AliasB");
+    assert_eq!(b.seen()[0].body["tools"], a_tool(), "forwarded untouched");
+    assert_eq!(router.state.metrics.failovers("Coder"), 0);
+    assert_eq!(
+        router
+            .state
+            .metrics
+            .capability_filtered("Coder", "tools_unsupported"),
+        1
+    );
+
+    // Streamed, the route's name is on every chunk and no node's is anywhere.
+    let chunks = streamed(
+        &router,
+        chat_body("Coder", json!({"tools": a_tool(), "stream": true})),
+    )
+    .await;
+    assert!(chunks.iter().all(|chunk| chunk["model"] == "Coder"));
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| chunk.to_string().contains("Alias"))
+    );
+    assert_eq!((a.hits(), b.hits()), (0, 2));
+
+    // An ordinary request still goes to the primary.
+    let (status, _) = router.chat(Some("Coder")).await;
+    assert_eq!(status, 200);
+    assert_eq!((a.hits(), b.hits()), (1, 2));
+}
+
+#[tokio::test]
+async fn round_robin_rotates_tool_requests_over_the_capable_deployments_only() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    b.withhold(|w| w.tools = true);
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+    let nodes = [&a, &b, &c];
+
+    let mut order = Vec::new();
+    for _ in 0..6 {
+        let before = hits(&nodes);
+        let (status, body) = send(
+            &router,
+            "/v1/chat/completions",
+            chat_body("Coder", json!({"tools": a_tool()})),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["model"], "Coder");
+        order.push(["a", "b", "c"][which(&nodes, &before)]);
+    }
+    assert_eq!(order, ["a", "c", "a", "c", "a", "c"]);
+    assert_eq!(b.hits(), 0);
+
+    // Requests without tools rotate over all three again.
+    for _ in 0..3 {
+        router.chat(Some("Coder")).await;
+    }
+    assert!(b.hits() > 0, "b serves a request that does not need tools");
+}
+
+#[tokio::test]
+async fn least_busy_with_tools_never_picks_an_idle_deployment_without_them() {
+    ensure_provider();
+    let hold = gate();
+    let a = FakeNode::start_limited(0, "AliasA", Act::Hold(Arc::clone(&hold)), 4).await;
+    let b = FakeNode::start_limited(0, "AliasB", Act::Answer, 4).await;
+    b.withhold(|w| w.tools = true);
+    let c = FakeNode::start_limited(0, "AliasC", Act::Hold(Arc::clone(&hold)), 4).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[
+                    ("a", a.base(), "AliasA"),
+                    ("b", b.base(), "AliasB"),
+                    ("c", c.base(), "AliasC"),
+                ],
+            ),
+            &[],
+        )
+        .await,
+    );
+
+    // One at a time over a and c only:
+    //   0/4 vs 0/4 -> a;  1/4 vs 0/4 -> c;  1/4 vs 1/4 -> a;  2/4 vs 1/4 -> c.
+    // b sits at 0/4 throughout and is never compared.
+    let mut requests = Vec::new();
+    for (total, expected) in [(1, (1, 0)), (2, (1, 1)), (3, (2, 1)), (4, (2, 2))] {
+        let router_for_request = Arc::clone(&router);
+        requests.push(tokio::spawn(async move {
+            send(
+                &router_for_request,
+                "/v1/chat/completions",
+                chat_body("Coder", json!({"tools": a_tool()})),
+            )
+            .await
+        }));
+        poll("the tool request to be in flight", async || {
+            (a.hits() + c.hits() == total).then_some(())
+        })
+        .await;
+        let load = in_flight(&router);
+        assert_eq!((load["a/AliasA"], load["c/AliasC"]), expected, "{load:?}");
+        assert_eq!(load["b/AliasB"], 0);
+    }
+    assert_eq!(b.hits(), 0);
+
+    open(&hold);
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body["model"], "Coder");
+    }
+    all_released(&router, "slots after filtered least-busy requests").await;
+}
+
+#[tokio::test]
+async fn failover_stays_inside_the_capable_set() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| w.tools = true);
+    let b = FakeNode::start(
+        "AliasB",
+        Act::Refuse(
+            503,
+            json!({"error": {"message": "busy", "type": "server_error", "code": "server_busy"}}),
+        ),
+    )
+    .await;
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"tools": a_tool()})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    // b refused before answering, so the request moved on - to c, never to a,
+    // although a is healthy and first in the route.
+    assert_eq!((a.hits(), b.hits(), c.hits()), (0, 1, 1));
+    assert_eq!(router.state.metrics.failovers("Coder"), 1);
+
+    // With c gone too, the last refusal stands; a is still never asked.
+    let lone = Router::start(
+        policy_config(
+            "priority",
+            &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    let (status, body) = send(
+        &lone,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"tools": a_tool()})),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["code"], "server_busy");
+    assert_eq!(a.hits(), 0);
+}
+
+#[tokio::test]
+async fn a_long_prompt_narrows_to_the_deployment_whose_context_can_hold_it() {
+    ensure_provider();
+    let small = FakeNode::start_with("Small", Act::Answer, true, 2_048).await;
+    let large = FakeNode::start_with("Large", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[("s", small.base(), "Small"), ("l", large.base(), "Large")],
+        ),
+        &[],
+    )
+    .await;
+    // The route promises only what every deployment can: the smaller window.
+    let (_, caps) = router.get("/v1/capabilities").await;
+    assert_eq!(caps["state"]["model"]["context_length"], 2_048);
+
+    // ~20 KB of prompt is at least 3 334 tokens: more than 2 048 can hold.
+    let long = "word ".repeat(4_000);
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "Coder", "messages": [{"role": "user", "content": long}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((small.hits(), large.hits()), (0, 1));
+
+    // A short prompt with a huge budget still fits the small one: the node
+    // clamps max_tokens, it does not refuse it.
+    let (status, _) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"max_tokens": 65_536})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!((small.hits(), large.hits()), (1, 1));
+
+    // Too long for either: refused by the router, naming the route only.
+    let huge = "word ".repeat(40_000);
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "Coder", "messages": [{"role": "user", "content": huge}]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "route_capability_mismatch");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("\"Coder\"") && message.contains("context window"),
+        "{message}"
+    );
+    assert!(!message.contains("Small") && !message.contains("Large"));
+    assert_eq!((small.hits(), large.hits()), (1, 1));
+    assert_eq!(router.state.metrics.capability_mismatches("Coder"), 1);
+}
+
+#[tokio::test]
+async fn reasoning_is_required_only_of_requests_that_ask_for_it() {
+    ensure_provider();
+    let plain = FakeNode::start("Plain", Act::Answer).await;
+    plain.withhold(|w| w.reasoning = true);
+    let thinker = FakeNode::start("Thinker", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("p", plain.base(), "Plain"),
+                ("t", thinker.base(), "Thinker"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    router.chat(Some("Coder")).await;
+    assert_eq!((plain.hits(), thinker.hits()), (1, 0), "an ordinary chat");
+
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"reasoning_effort": "high"})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], "Coder");
+    assert_eq!((plain.hits(), thinker.hits()), (1, 1));
+
+    // "none" turns thinking off, which the plain one can do.
+    send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"reasoning_effort": "none"})),
+    )
+    .await;
+    assert_eq!((plain.hits(), thinker.hits()), (2, 1));
+
+    // No reasoning anywhere: a mismatch that names the field.
+    thinker.withhold(|w| w.reasoning = true);
+    router.probe().await;
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"reasoning_effort": "high"})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "route_capability_mismatch");
+    assert_eq!(body["error"]["param"], "reasoning_effort");
+}
+
+#[tokio::test]
+async fn each_endpoint_goes_only_to_deployments_that_offer_it() {
+    ensure_provider();
+    let chat_only = FakeNode::start("ChatOnly", Act::Answer).await;
+    chat_only.withhold(|w| w.completions = true);
+    let completion_only = FakeNode::start("TextOnly", Act::Answer).await;
+    completion_only.withhold(|w| w.chat = true);
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[
+                ("c", chat_only.base(), "ChatOnly"),
+                ("t", completion_only.base(), "TextOnly"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    for _ in 0..3 {
+        let (status, body) = router.chat(Some("Coder")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["model"], "Coder");
+    }
+    assert_eq!((chat_only.hits(), completion_only.hits()), (3, 0));
+
+    for _ in 0..3 {
+        let (status, body) = send(
+            &router,
+            "/v1/completions",
+            json!({"model": "Coder", "prompt": "Once upon"}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["model"], "Coder");
+    }
+    assert_eq!((chat_only.hits(), completion_only.hits()), (3, 3));
+}
+
+#[tokio::test]
+async fn unknown_unavailable_and_mismatched_are_three_different_answers() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| {
+        w.tools = true;
+        w.tool_choice = true;
+    });
+    let router = Router::start(
+        json!({
+            "nodes": [
+                {"id": "node-a", "url": a.base()},
+                {"id": "node-down", "url": "http://127.0.0.1:9"}
+            ],
+            "routes": [
+                {"name": "Coder", "deployments": [{"node": "node-a", "model": "AliasA"}]},
+                {"name": "Gone", "deployments": [{"node": "node-down", "model": "Whatever"}]}
+            ]
+        }),
+        &[],
+    )
+    .await;
+    let tools = |route: &str| chat_body(route, json!({"tools": a_tool()}));
+
+    let (status, body) = send(&router, "/v1/chat/completions", tools("Research")).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (404, Some("model_not_found"))
+    );
+
+    let (status, body) = send(&router, "/v1/chat/completions", tools("Gone")).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (503, Some("route_unavailable"))
+    );
+
+    let (status, body) = send(&router, "/v1/chat/completions", tools("Coder")).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (400, Some("route_capability_mismatch"))
+    );
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "tools");
+    let text = body.to_string();
+    assert!(text.contains("tool calling"), "{text}");
+    for secret in ["AliasA", "node-a", "127.0.0.1", "qwen", ".gguf"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    // Streamed, the refusal is the same JSON, before any stream starts.
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"tools": a_tool(), "stream": true})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (400, Some("route_capability_mismatch"))
+    );
+
+    // A malformed request is the gateway's own 400, from the router, before
+    // any node is chosen - the same whichever node would have taken it.
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body("Coder", json!({"tool_choice": "required"})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "invalid_tool_choice");
+    assert_eq!(body["error"]["param"], "tool_choice");
+    assert_eq!(a.hits(), 0);
+
+    // The request that needs nothing special is served as before.
+    let (status, body) = router.chat(Some("Coder")).await;
+    assert_eq!((status, body["model"].as_str()), (200, Some("Coder")));
+}
+
+#[tokio::test]
+async fn a_capability_a_node_gains_or_loses_is_seen_on_the_next_probe() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| w.tools = true);
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    let tool_request = || chat_body("Coder", json!({"tools": a_tool()}));
+
+    send(&router, "/v1/chat/completions", tool_request()).await;
+    assert_eq!((a.hits(), b.hits()), (0, 1));
+
+    // a hot-swaps to a model with tools. The router does not guess: until it
+    // probes, a is still without them.
+    a.withhold(|w| w.tools = false);
+    send(&router, "/v1/chat/completions", tool_request()).await;
+    assert_eq!((a.hits(), b.hits()), (0, 2));
+    router.probe().await;
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    let a_row = deployments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "a/AliasA")
+        .unwrap()
+        .clone();
+    assert_eq!(a_row["observed"]["capabilities"]["tools"], true);
+    send(&router, "/v1/chat/completions", tool_request()).await;
+    assert_eq!((a.hits(), b.hits()), (1, 2));
+
+    // And loses a window: a long prompt now goes past it.
+    a.withhold(|w| w.context = Some(512));
+    router.probe().await;
+    let long = "word ".repeat(1_000);
+    send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "Coder", "messages": [{"role": "user", "content": long}]}),
+    )
+    .await;
+    assert_eq!((a.hits(), b.hits()), (1, 3));
+}
+
+#[tokio::test]
+async fn real_gateways_are_filtered_by_the_context_they_report() {
+    ensure_provider();
+    // A real gateway serving at 4 096 tokens, and a node that reports 32 768.
+    let real = RealNode::start("QwenCoder", MockConfig::default(), GatewayConfig::default()).await;
+    let large = FakeNode::start_with("Large", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("real", real.base(), "QwenCoder"),
+                ("big", large.base(), "Large"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    // A real gateway advertises tools, tool_choice, reasoning and both
+    // endpoints: an ordinary or tool request stays on it.
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        chat_body(
+            "Coder",
+            json!({"tools": a_tool(), "tool_choice": "auto",
+                                  "reasoning_effort": "low"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    assert_eq!((real.backend.generation_count(), large.hits()), (1, 0));
+
+    // ~30 KB: at least 5 000 tokens, which 4 096 cannot hold.
+    let long = "word ".repeat(6_000);
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        json!({"model": "Coder", "messages": [{"role": "user", "content": long}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    assert_eq!((real.backend.generation_count(), large.hits()), (1, 1));
+}
+
+// --- R5: context overflow before commitment ---------------------------------
+
+/// What a Lightweight node answers a prompt too long for its context with,
+/// field for field.
+fn overflow_envelope(n_ctx: u32) -> Value {
+    json!({"error": {
+        "message": format!("the prompt is 9000 tokens, but this model's maximum context length is {n_ctx} tokens"),
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": "context_length_exceeded",
+        "hermes": {"remedies": [{"label": "Shorten the conversation, or start a new one"}]}
+    }})
+}
+
+fn overflows(n_ctx: u32) -> Act {
+    Act::Refuse(400, overflow_envelope(n_ctx))
+}
+
+/// A prompt the router's lower bound lets through every deployment below.
+fn long_enough_chat(extra: Value) -> Value {
+    chat_body("Coder", extra)
+}
+
+#[tokio::test]
+async fn a_context_overflow_moves_to_a_deployment_with_a_larger_context() {
+    ensure_provider();
+    let a = FakeNode::start_with("AliasA", overflows(8_192), true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+
+    let (status, body) = send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    assert!(!body.to_string().contains("Alias"));
+    assert_eq!((a.hits(), b.hits()), (1, 1));
+    assert_eq!(b.seen()[0].body["model"], "AliasB");
+    let metrics = &router.state.metrics;
+    assert_eq!(metrics.context_overflow_failovers("Coder"), 1);
+    assert_eq!(metrics.failovers("Coder"), 1);
+    assert_eq!(metrics.decisions("Coder", "context_overflow_failover"), 1);
+
+    // Streamed: the refusal came before any event, so the larger one streams.
+    let chunks = streamed(&router, long_enough_chat(json!({"stream": true}))).await;
+    assert!(chunks.iter().all(|chunk| chunk["model"] == "Coder"));
+    assert_eq!((a.hits(), b.hits()), (2, 2));
+    all_released(&router, "slots after context-overflow failovers").await;
+}
+
+#[tokio::test]
+async fn an_equal_or_smaller_context_is_never_tried_and_the_nodes_own_error_stands() {
+    ensure_provider();
+    for other in [8_192, 4_096] {
+        let a = FakeNode::start_with("AliasA", overflows(8_192), true, 8_192).await;
+        let b = FakeNode::start_with("AliasB", Act::Answer, true, other).await;
+        let router = Router::start(
+            policy_config(
+                "priority",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await;
+        let (status, body) =
+            send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+        // Exactly what A said: not route_unavailable, not a mismatch.
+        assert_eq!(status, 400, "{other}");
+        assert_eq!(body, overflow_envelope(8_192), "{other}");
+        assert_eq!((a.hits(), b.hits()), (1, 0), "{other}");
+        assert_eq!(router.state.metrics.failovers("Coder"), 0);
+        all_released(&router, "slots after an unrecoverable overflow").await;
+    }
+
+    // 8K, 8K, 32K: the second 8K is passed over on the way to the 32K.
+    let a = FakeNode::start_with("AliasA", overflows(8_192), true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 8_192).await;
+    let c = FakeNode::start_with("AliasC", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+    let (status, _) = send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+    assert_eq!(status, 200);
+    assert_eq!((a.hits(), b.hits(), c.hits()), (1, 0, 1));
+}
+
+#[tokio::test]
+async fn a_context_overflow_never_reaches_a_deployment_the_capability_filter_removed() {
+    ensure_provider();
+    let a = FakeNode::start_with("AliasA", overflows(8_192), true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+    b.withhold(|w| w.tools = true);
+    let c = FakeNode::start_with("AliasC", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+    let (status, body) = send(
+        &router,
+        "/v1/chat/completions",
+        long_enough_chat(json!({"tools": a_tool()})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "Coder");
+    // b has the larger context, but no tools: it was never in the plan.
+    assert_eq!((a.hits(), b.hits(), c.hits()), (1, 0, 1));
+}
+
+#[tokio::test]
+async fn any_other_400_and_any_500_still_stand_without_failover() {
+    ensure_provider();
+    let refusals = [
+        (
+            400,
+            json!({"error": {"message": "tool_choice names the function \"x\", which is not declared in tools",
+                               "type": "invalid_request_error", "param": "tool_choice",
+                               "code": "invalid_tool_choice"}}),
+        ),
+        // The words are no signal: only the structured code is.
+        (
+            400,
+            json!({"error": {"message": "this mentions the maximum context length",
+                               "type": "invalid_request_error", "code": "invalid_messages"}}),
+        ),
+        (400, json!({"detail": "not even our envelope"})),
+        (
+            500,
+            json!({"error": {"message": "the engine failed", "type": "server_error",
+                               "code": "generation_failed"}}),
+        ),
+    ];
+    for (status, envelope) in refusals {
+        let a = FakeNode::start_with("AliasA", Act::Refuse(status, envelope.clone()), true, 8_192)
+            .await;
+        let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+        let router = Router::start(
+            policy_config(
+                "priority",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await;
+        let (got, body) = send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+        assert_eq!(got, status, "{envelope}");
+        assert_eq!(body, envelope);
+        assert_eq!(b.hits(), 0, "{envelope}");
+        assert_eq!(router.state.metrics.failovers("Coder"), 0);
+    }
+}
+
+#[tokio::test]
+async fn an_overflow_reported_after_the_stream_started_is_never_failed_over() {
+    ensure_provider();
+    let a = FakeNode::start_with("AliasA", Act::StreamThenOverflow, true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "priority",
+            &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    let response = router
+        .post(
+            "/v1/chat/completions",
+            long_enough_chat(json!({"stream": true})),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let raw = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+    assert!(raw.contains("partial"), "{raw}");
+    assert!(
+        raw.contains("context_length_exceeded"),
+        "relayed in-band: {raw}"
+    );
+    assert_eq!(b.hits(), 0, "an answer A started is never finished by B");
+    assert_eq!(router.state.metrics.context_overflow_failovers("Coder"), 0);
+}
+
+#[tokio::test]
+async fn round_robin_draws_one_turn_for_a_request_that_overflowed() {
+    ensure_provider();
+    let a = FakeNode::start_with("AliasA", overflows(8_192), true, 8_192).await;
+    let b = FakeNode::start_with("AliasB", Act::Answer, true, 32_768).await;
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    let cursor = || {
+        router.state.selector.cursor(
+            &router.state.topology,
+            &router.state.topology.routes()[0].name,
+        )
+    };
+
+    // Turn 0 is a; it overflows, and b answers inside the same turn.
+    let (status, _) = send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+    assert_eq!(status, 200);
+    assert_eq!((a.hits(), b.hits()), (1, 1));
+    assert_eq!(cursor(), Some(1), "one request, one turn");
+    // Turn 1 is b's own.
+    send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await;
+    assert_eq!((a.hits(), b.hits()), (1, 2));
+    assert_eq!(cursor(), Some(2));
+}
+
+#[tokio::test]
+async fn least_busy_moves_the_slot_from_the_overflowed_deployment_and_returns_it() {
+    ensure_provider();
+    let hold = gate();
+    let a = FakeNode::start_full(0, "AliasA", overflows(8_192), true, 8_192, 4).await;
+    let b = FakeNode::start_full(0, "AliasB", Act::Hold(Arc::clone(&hold)), true, 32_768, 4).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await,
+    );
+
+    // 0/4 against 0/4: a, by configured order. It overflows; b takes the
+    // request and holds it.
+    let in_flight_request = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            send(&router, "/v1/chat/completions", long_enough_chat(json!({}))).await
+        })
+    };
+    poll("b to be holding the request", async || {
+        (b.hits() == 1).then_some(())
+    })
+    .await;
+    let load = in_flight(&router);
+    assert_eq!(
+        (load["a/AliasA"], load["b/AliasB"]),
+        (0, 1),
+        "a's slot went back: {load:?}"
+    );
+    assert_eq!(a.hits(), 1);
+
+    open(&hold);
+    let (status, body) = in_flight_request.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], "Coder");
+    all_released(&router, "slots after a least-busy overflow").await;
 }
