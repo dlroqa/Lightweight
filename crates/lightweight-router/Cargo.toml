@@ -34,4 +34,7 @@ getrandom.workspace = true
 [dev-dependencies]
 lightweight-backend-mock.workspace = true
 rustls.workspace = true
+# To read the log lines a request leaves on the router and on a real node, and
+# prove they carry one request id and no prompt.
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
