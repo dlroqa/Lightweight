@@ -30,6 +30,7 @@
 
 pub mod affinity;
 pub mod api;
+pub mod auto_route;
 pub mod capability;
 pub mod config;
 pub mod controller;
