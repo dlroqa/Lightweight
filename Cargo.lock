@@ -1086,6 +1086,7 @@ dependencies = [
  "lightweight-inference",
  "lightweight-memory",
  "lightweight-observability",
+ "lightweight-router",
  "lightweight-store",
  "lightweight-system-info",
  "release-update",
@@ -1197,6 +1198,31 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lightweight-router"
+version = "0.4.1"
+dependencies = [
+ "axum",
+ "futures-util",
+ "getrandom 0.4.3",
+ "lightweight-api",
+ "lightweight-backend-mock",
+ "lightweight-catalog",
+ "lightweight-core",
+ "lightweight-download",
+ "lightweight-gateway",
+ "lightweight-inference",
+ "lightweight-observability",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

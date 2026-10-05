@@ -1272,6 +1272,121 @@ gates.
   passing the alias to llama.cpp's `--alias` (the gateway never forwards the
   engine's model name, so it would change nothing a client sees).
 
+## Federated model router, R0-R3 (feature/federated-model-router)
+
+Green locally on 2026-10-05:
+
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+  are clean.
+- `cargo test --workspace`: **991 passed, 0 failed**. 71 of those are new:
+  48 router unit tests and 23 router integration tests. The other 920 ran
+  unchanged.
+- The openai-SDK contract suite: 47 passed, 2 skipped, as before.
+- The version, dependency and secrets gates pass.
+- One pre-existing timing race was seen once under full-workspace parallel load:
+  `supervision::a_segfaulting_engine_is_classified_as_a_crash` reported
+  `engine_start_timeout`. It passed 3 times out of 3 in isolation and in the
+  `--no-fail-fast` rerun, and the router does not touch that crate. It was left
+  unchanged.
+
+What was built:
+
+- New crate `lightweight-router`, run as `hermes router [--config] [--listen]`
+  and `hermes router validate-config`. `hermes serve` is untouched.
+- **Domain:** `NodeId`, `DeploymentId` (`node/model`), `RouteName` (alias
+  rules), `NodeAuth`/`Secret` (redacted `Debug`), `Deployment`, `Route`,
+  `RoutePolicy::Priority`, `NodeHealth`, `DeploymentHealth`/`UnavailableReason`,
+  `CapabilitySet`, `RoutingDecision`/`RoutingReason`, `RoutingFailure`, and a
+  `Topology` built only by validation.
+- **Configuration:** JSON, with unknown keys refused, keys taken only from
+  environment variables, and every problem reported at once.
+- **Health:** one `GET /v1/capabilities` probe per node per interval (default
+  5 s), a failure threshold (default 2), and an `unknown` state that is not
+  eligible for traffic.
+- **Routing and proxying:** priority selection, pre-response failover on
+  connect, timeout, 502/503/504 and stale `model_not_found`. `model` is
+  rewritten both ways, and SSE is relayed frame by frame.
+- **Supporting pieces:** request ids, the read-only `/api/router/v1/*`,
+  Prometheus `/metrics`, and the log target `hermes::router`.
+- Full description: `docs/ROUTER.md`.
+
+Verified by execution, against two real gateways (`target/debug/hermes serve`)
+each running SmolLM2-135M on the real engine. Each was in an isolated scratch
+profile, with node-local aliases `QwenCoder` (node A) and `CoderBackup`
+(node B), behind the real `hermes router` binary:
+
+- `/v1/models` listed only `Coder` and `Fast`, at context 2048.
+- A streamed `Coder` request was answered by node A, with every chunk saying
+  `Coder`. `model: "default"` on `/v1/completions` was answered by node B as
+  `Fast`.
+- Failover, step by step:
+  1. Both nodes healthy: `primary_healthy` to node A.
+  2. Node A stopped by its PID. The very next request got a refused connection
+     and went to node B (`primary_failed_fallback`, `failover_count=1`).
+  3. After the health probes, requests went straight to node B
+     (`primary_unavailable_fallback`).
+  4. Node A restarted on the same port. One probe later, requests were back on
+     node A (`primary_healthy`). The client always saw `Coder`.
+- A client disconnecting after 2 s of a 1500-token stream: node A's
+  `finish_reasons.cancelled` went 0 → 1, `running` returned to 0, and the
+  router's active-request count returned to 0.
+- **Lightagent `7d95232`, unmodified,** in an isolated `LIGHTAGENT_HOME` with
+  `--base-url` set to the router: `lightagent models` printed `Coder` and
+  `Fast`, a chat with `Coder` streamed an answer, and its status bar showed
+  `Coder`. The router logged both requests to `node-a/QwenCoder`.
+- The user's own gateway on port 11434 was not touched. The scratch processes
+  were stopped by their recorded PIDs.
+
+Final review pass (2026-10-05). R4 not started. `./scripts/check.sh` passes in
+full:
+
+- workspace tests: 1001 passed, 0 failed. The router has 81 of them (53 unit,
+  28 integration);
+- real-model header tests: 3;
+- the contract suite: 47 passed, 2 skipped;
+- the panel and desktop builds;
+- the cross-target `lightweight-sys` checks;
+- the version, dependency and secrets gates.
+
+- **Lightagent's runtime panel.** The only live consumer is the provider panel,
+  which reads `/api/v1/gateway` for `reasoning_content` and `/api/v1/models` for
+  the runtime catalog. The router serves neither, proxied or imitated. Imitating
+  `/api/v1/gateway` would mean inventing an engine `device`, and would open a
+  path to model placement through the router. The full table and the reasoning
+  are in `docs/ROUTER.md`.
+- **Per-deployment state.** Each deployment's capabilities, context and
+  concurrency limit are now filed and kept separately (`HealthBook::deployment`),
+  and shown in `/api/router/v1/deployments`.
+- **Route context.** The route's public context, features and limit come from
+  `select::summarize` over exactly the set `select::plan` would try. Before this,
+  `/v1/models` context counted every deployment last seen serving, including
+  unhealthy ones.
+- **New coverage.** Tests now cover:
+  - an identity-leak audit across every client surface and refusal;
+  - a single-deployment stale `model_not_found` answered as `route_unavailable`
+    without the alias;
+  - a 500 that is not retried;
+  - an `unknown` node at startup that gets no traffic until a probe sees it,
+    then serves without a restart;
+  - an immediate failover asserting that one failure is recorded and the
+    request did not wait for a probe.
+- **Cleanup audit.** The integration tests spawn no processes and write no
+  files. Killing the test binary with SIGINT or SIGKILL mid-run left no process
+  or listener behind. The disk growth was `target/debug/incremental`.
+- **Real re-smoke.** Unmodified Lightagent `7d95232` went through the router to
+  primary node-a. Node-a was then killed, and the next new Lightagent request
+  failed over in the same request to node-b (`primary_failed_fallback`,
+  `failover_count=1`). Lightagent showed `Coder` both times.
+
+Deliberately not built (see the `docs/ROUTER.md` roadmap):
+
+- strategies other than priority, and session affinity;
+- capability filtering, placement and warm standby;
+- `Auto` routing and mixture-of-agents;
+- latency/TTFT histograms;
+- proxying the node control plane;
+- consensus or external state stores.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:
