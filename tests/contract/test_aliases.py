@@ -12,6 +12,7 @@ the day one is set.
 """
 
 import json
+import urllib.request
 
 import pytest
 
@@ -175,3 +176,60 @@ def test_a_gateway_with_no_alias_still_lists_and_answers_the_canonical_id(client
         messages=[{"role": "user", "content": "hi"}],
     )
     assert completion.model == MODEL
+
+
+# ---------------------------------------------------------------------------
+# `default` and an omitted model: a compatibility contract Lightagent relies on
+# ---------------------------------------------------------------------------
+
+
+def _post_without_model(info, path, body):
+    """POST a body with no `model` key at all, as a minimal client sends it.
+
+    The SDK insists on a `model` argument, so this one goes over the wire by
+    hand; the response is still parsed from what the gateway actually sent.
+    """
+    sent = urllib.request.Request(
+        info["base_url"] + path,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(sent, timeout=10) as response:
+        return json.loads(response.read())
+
+
+@pytest.mark.parametrize("aliased", [False, True], ids=["no-alias", "alias"])
+def test_default_reaches_the_resident_model_on_both_endpoints(request, aliased):
+    openai = pytest.importorskip("openai")
+    info = request.getfixturevalue("aliased_gateway" if aliased else "gateway")
+    expected = ALIAS if aliased else MODEL
+    client = openai.OpenAI(
+        base_url=info["base_url"], api_key="no-key-required", max_retries=0, timeout=30.0
+    )
+
+    set_script(info, kind="content", fragments=["ok"])
+    chat = client.chat.completions.create(
+        model="default", messages=[{"role": "user", "content": "hi"}]
+    )
+    assert (chat.model, chat.choices[0].message.content) == (expected, "ok")
+
+    set_script(info, kind="content", fragments=["ok"])
+    text = client.completions.create(model="default", prompt="def f(", max_tokens=4)
+    assert (text.model, text.choices[0].text) == (expected, "ok")
+
+
+@pytest.mark.parametrize("aliased", [False, True], ids=["no-alias", "alias"])
+def test_an_omitted_model_reaches_the_resident_model_on_both_endpoints(request, aliased):
+    info = request.getfixturevalue("aliased_gateway" if aliased else "gateway")
+    expected = ALIAS if aliased else MODEL
+
+    set_script(info, kind="content", fragments=["ok"])
+    chat = _post_without_model(
+        info, "/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert chat["model"] == expected, chat
+
+    set_script(info, kind="content", fragments=["ok"])
+    text = _post_without_model(info, "/completions", {"prompt": "def f(", "max_tokens": 4})
+    assert text["model"] == expected, text

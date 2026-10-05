@@ -38,6 +38,15 @@ pub const MAX_ALIAS_CHARS: usize = 64;
 ///
 /// `default` is the selector for "the model that is loaded right now", used by
 /// clients that do not want to know which one that is.
+///
+/// **A compatibility contract, not a catalog name.** It is kept because
+/// OpenAI-compatible clients send it — Lightagent's provider defaults to it —
+/// and it was lost once already when the gateway dropped it in the Lightagent
+/// split. It is resolved by the running gateway to whatever is resident, never
+/// looked up in the catalog ([`crate::CatalogStore::resolve`] returns `None`
+/// for it), and never assignable as an alias. Removing it breaks every client
+/// that relies on it; `default_and_an_omitted_model_reach_the_resident_model_on_both_endpoints`
+/// in the gateway's `alias_surface` tests is what guards it.
 pub const RESERVED_SELECTORS: &[&str] = &["default"];
 
 /// What a client's `model` field asked for.

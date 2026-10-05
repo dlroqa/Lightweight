@@ -539,3 +539,174 @@ async fn an_import_can_name_the_model_and_a_taken_name_is_refused_up_front() {
     assert_eq!(f.server.load("Research").await["state"], "succeeded");
     assert_eq!(f.server.listed().await, vec!["Research".to_owned()]);
 }
+
+/// A pinned model whose digest is recorded, so planning it needs no network.
+fn a_pinned_id() -> &'static str {
+    lightweight_catalog::manifest::MODELS
+        .iter()
+        .find(|model| lightweight_catalog::manifest::is_recorded(model))
+        .map(|model| model.id)
+        .expect("at least one pinned model is recorded")
+}
+
+#[tokio::test]
+async fn a_pinned_model_whose_id_is_already_an_alias_is_refused_before_downloading() {
+    ensure_provider();
+    let f = fixture("pinned-clash").await;
+    let pinned = a_pinned_id();
+    // Alias first, in a different casing from the pinned id it will meet.
+    let shouted = pinned.to_uppercase();
+    assert_eq!(f.server.alias(&f.coder, Some(&shouted)).await.0, 200);
+
+    let accepted = f
+        .server
+        .post("/api/v1/models/download", json!({ "id": pinned }))
+        .await;
+    let settled = f.server.settle(accepted).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    assert_eq!(settled["error"]["code"], "model_id_is_alias", "{settled}");
+
+    // Nothing was added and nothing was fetched: the name still means one model.
+    let (_, listed) = f.server.get("/api/v1/models").await;
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(2), "{listed}");
+    assert!(
+        !f.dir.path().join("models").exists()
+            || std::fs::read_dir(f.dir.path().join("models"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true)
+    );
+    let (status, detail) = f.server.get(&format!("/api/v1/models/{pinned}")).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(
+        detail["id"],
+        f.coder.as_str(),
+        "the name still means the aliased model"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_spelled_like_any_model_id_is_refused() {
+    ensure_provider();
+    let f = fixture("id-clash").await;
+    // Model id first: an alias equal to another model's id, in any casing.
+    for clash in [f.fast.clone(), f.fast.to_uppercase()] {
+        let (status, body) = f.server.alias(&f.coder, Some(&clash)).await;
+        assert_eq!(status, 400, "{clash}: {body}");
+        assert_eq!(body["error"]["code"], "alias_is_model_id", "{body}");
+    }
+    // Its own id is not a usable alias either.
+    let (status, body) = f
+        .server
+        .alias(&f.coder, Some(&f.coder.to_uppercase()))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "alias_is_model_id");
+    assert_eq!(f.server.row(&f.coder).await["alias"], Value::Null);
+}
+
+#[tokio::test]
+async fn an_import_named_like_an_alias_gets_an_id_of_its_own() {
+    ensure_provider();
+    let f = fixture("import-clash").await;
+    assert_eq!(f.server.alias(&f.fast, Some("CODER")).await.0, 200);
+
+    // The file's slug would be `coder`, which is already an alias.
+    let clashing = f.dir.write(
+        "Coder.gguf",
+        &GgufBuilder::small_model("llama")
+            .kv("general.name", "named like an alias")
+            .build(),
+    );
+    let accepted = f
+        .server
+        .post("/api/v1/models/import", json!({ "path": clashing }))
+        .await;
+    let settled = f.server.settle(accepted).await;
+    assert_eq!(settled["state"], "succeeded", "{settled}");
+    let id = settled["model"].as_str().expect("an id").to_owned();
+    assert_eq!(id, "coder-2", "the generated id steps around the alias");
+
+    // Each name means exactly one model.
+    let (_, by_alias) = f.server.get("/api/v1/models/coder").await;
+    assert_eq!(by_alias["id"], f.fast.as_str());
+    let (_, by_id) = f.server.get("/api/v1/models/coder-2").await;
+    assert_eq!(by_id["id"], "coder-2");
+
+    // And a file that collides with nothing keeps the id it always would have.
+    let plain = f.dir.write(
+        "Research-7B.gguf",
+        &GgufBuilder::small_model("llama")
+            .kv("general.name", "no collision")
+            .build(),
+    );
+    let accepted = f
+        .server
+        .post("/api/v1/models/import", json!({ "path": plain }))
+        .await;
+    let settled = f.server.settle(accepted).await;
+    assert_eq!(settled["state"], "succeeded", "{settled}");
+    assert_eq!(settled["model"], "research-7b");
+}
+
+/// `model: "default"` and an omitted `model` are a compatibility contract:
+/// Lightagent sends `default` unless configured otherwise, and it was removed
+/// once already. Both endpoints, with and without an alias on the resident
+/// model, must reach that model and answer under its public name.
+#[tokio::test]
+async fn default_and_an_omitted_model_reach_the_resident_model_on_both_endpoints() {
+    ensure_provider();
+    let f = fixture("default-contract").await;
+
+    for alias in [None, Some("Coder")] {
+        f.server.alias(&f.coder, alias).await;
+        assert_eq!(f.server.load(&f.coder).await["state"], "succeeded");
+        let public = f.server.listed().await.remove(0);
+        match alias {
+            Some(alias) => assert_eq!(public, alias),
+            None => assert!(public.starts_with(&f.coder), "{public}"),
+        }
+
+        for selector in [Some("default"), None] {
+            let (status, body) = f.server.chat(selector).await;
+            assert_eq!(status, 200, "chat {alias:?}/{selector:?}: {body}");
+            assert_eq!(
+                body["model"],
+                public.as_str(),
+                "chat {alias:?}/{selector:?}"
+            );
+
+            let mut request = json!({ "prompt": "def fibonacci(", "max_tokens": 8 });
+            if let Some(selector) = selector {
+                request["model"] = json!(selector);
+            }
+            let (status, body) = f.server.post("/v1/completions", request).await;
+            assert_eq!(status, 200, "completions {alias:?}/{selector:?}: {body}");
+            assert_eq!(
+                body["model"],
+                public.as_str(),
+                "completions {alias:?}/{selector:?}"
+            );
+        }
+    }
+
+    // And `default` follows a swap rather than being pinned to a model.
+    assert_eq!(f.server.load(&f.fast).await["state"], "succeeded");
+    let (_, body) = f.server.chat(Some("default")).await;
+    assert!(
+        body["model"]
+            .as_str()
+            .is_some_and(|id| id.starts_with(&f.fast)),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn default_can_never_become_an_alias() {
+    ensure_provider();
+    let f = fixture("default-reserved").await;
+    for reserved in ["default", "Default", " DEFAULT "] {
+        let (status, body) = f.server.alias(&f.coder, Some(reserved)).await;
+        assert_eq!(status, 400, "{reserved:?}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_alias");
+    }
+}
