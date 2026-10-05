@@ -333,4 +333,24 @@ mod tests {
         assert!(rewrite_body(br#"{"error":{"message":"no"}}"#, "Coder").is_none());
         assert!(rewrite_body(b"not json", "Coder").is_none());
     }
+
+    #[test]
+    fn a_structured_model_on_an_error_frame_is_renamed_and_the_error_kept() {
+        let mut rewriter = FrameRewriter::new("Coder");
+        let frame = encode_data(
+            r#"{"model":"QwenCoder","error":{"message":"boom","type":"server_error","code":"generation_failed"}}"#,
+        );
+        let events = decode(&rewriter.push(frame.as_bytes()));
+        let value: Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(value["model"], "Coder");
+        assert_eq!(value["error"]["code"], "generation_failed");
+        assert_eq!(
+            value["error"]["message"], "boom",
+            "free text is never edited"
+        );
+        assert!(
+            rewriter.finish().is_empty(),
+            "still recognised as the node's error"
+        );
+    }
 }

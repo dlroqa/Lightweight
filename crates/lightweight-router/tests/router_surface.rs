@@ -178,6 +178,9 @@ struct Seen {
 struct NodeScript {
     serving: String,
     act: Act,
+    /// What the capabilities probe reports.
+    tools: bool,
+    context_length: u32,
     hits: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
     probes: Arc<Mutex<Vec<HeaderMap>>>,
@@ -190,9 +193,17 @@ struct FakeNode {
 
 impl FakeNode {
     async fn start(serving: &str, act: Act) -> Self {
+        Self::start_with(serving, act, true, 2048).await
+    }
+
+    /// A node reporting its own tool support and context, so two deployments
+    /// of one route can genuinely differ.
+    async fn start_with(serving: &str, act: Act, tools: bool, context_length: u32) -> Self {
         let script = NodeScript {
             serving: serving.to_owned(),
             act,
+            tools,
+            context_length,
             hits: Arc::default(),
             seen: Arc::default(),
             probes: Arc::default(),
@@ -226,15 +237,16 @@ async fn fake_capabilities(
     headers: HeaderMap,
 ) -> Response {
     script.probes.lock().unwrap().push(headers);
-    axum::Json(CapabilitiesBody::new(
+    let mut body = CapabilitiesBody::new(
         "0.4.1",
         Some(CapabilityModel {
             id: script.serving.clone(),
-            context_length: 2048,
+            context_length: script.context_length,
         }),
         1,
-    ))
-    .into_response()
+    );
+    body.features.tools = script.tools;
+    axum::Json(body).into_response()
 }
 
 async fn fake_generate(
@@ -855,7 +867,7 @@ async fn a_known_route_with_nothing_available_is_route_unavailable() {
 // --- failover ---------------------------------------------------------------
 
 #[tokio::test]
-async fn a_refused_connection_fails_over_before_anything_is_sent() {
+async fn a_refused_connection_fails_over_at_once_without_waiting_for_a_probe() {
     ensure_provider();
     let mut a = RealNode::start("QwenCoder", MockConfig::default(), GatewayConfig::default()).await;
     let b = RealNode::start(
@@ -870,7 +882,12 @@ async fn a_refused_connection_fails_over_before_anything_is_sent() {
     // The primary goes away between probes: the router still believes it is
     // healthy, tries it, and moves on.
     a.served.shutdown().await;
+    // The probe interval is an hour: the only thing that can move this
+    // request is the attempt itself, so a pass here proves the request did
+    // not wait for a health check.
+    let started = std::time::Instant::now();
     let (status, body) = router.chat(Some("Coder")).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body["model"], "Coder",
@@ -878,6 +895,16 @@ async fn a_refused_connection_fails_over_before_anything_is_sent() {
     );
     assert_eq!(b.backend.generation_count(), 1);
     assert_eq!(router.state.metrics.failovers("Coder"), 1);
+
+    // The failed attempt was recorded against the primary's health, and one
+    // failure is below the threshold, so it stays eligible: the snapshot said
+    // "eligible", the attempt said "not answering", and the request moved on.
+    let primary = router
+        .state
+        .health
+        .status(&NodeId::parse("node-a").unwrap());
+    assert_eq!(primary.consecutive_failures, 1);
+    assert_eq!(primary.health, NodeHealth::Healthy);
 }
 
 #[tokio::test]
@@ -1229,4 +1256,260 @@ async fn the_control_api_shows_routes_deployments_and_health() {
         metrics.contains("router_node_health{node=\"node-a\"} 1"),
         "{metrics}"
     );
+}
+
+// --- final review: capability state, identity, errors, recovery -------------
+
+#[tokio::test]
+async fn per_deployment_capabilities_survive_and_the_route_reports_the_eligible_set() {
+    ensure_provider();
+    let a = FakeNode::start_with("QwenCoder", Act::Answer, true, 32_768).await;
+    let mut b = FakeNode::start_with("CoderBackup", Act::Answer, false, 8_192).await;
+    let router = Router::start(two_node_config(&a.base(), &b.base()), &[]).await;
+
+    // Both eligible: the route promises the intersection, and the smaller
+    // context, because either may receive the request.
+    let (_, models) = router.get("/v1/models").await;
+    assert_eq!(models["data"][0]["context_length"], 8_192);
+    let (_, caps) = router.get("/v1/capabilities").await;
+    assert_eq!(caps["routes"][0]["features"]["tools"], false);
+    assert_eq!(caps["routes"][0]["context_length"], 8_192);
+
+    // Internally, each deployment still has its own figures.
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    let row = |id: &str| {
+        deployments["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let primary = row("node-a/QwenCoder");
+    assert_eq!(primary["observed"]["capabilities"]["tools"], true);
+    assert_eq!(primary["observed"]["context_length"], 32_768);
+    let backup = row("node-b/CoderBackup");
+    assert_eq!(backup["observed"]["capabilities"]["tools"], false);
+    assert_eq!(backup["observed"]["context_length"], 8_192);
+
+    // The backup leaves the eligible set: the route's context and features
+    // follow, from the same set routing uses.
+    b.served.shutdown().await;
+    router.probe().await;
+    router.probe().await;
+    let (_, models) = router.get("/v1/models").await;
+    assert_eq!(models["data"][0]["context_length"], 32_768);
+    let (_, caps) = router.get("/v1/capabilities").await;
+    assert_eq!(caps["routes"][0]["features"]["tools"], true);
+    // Fast's only deployment is gone, so it advertises no context at all.
+    assert!(models["data"][1].get("context_length").is_none());
+    // And the backup's own figures are still on record for a later selector.
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    let backup = deployments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "node-b/CoderBackup")
+        .unwrap();
+    assert_eq!(backup["available"], false);
+    assert_eq!(backup["observed"]["context_length"], 8_192);
+}
+
+#[tokio::test]
+async fn no_physical_identity_reaches_an_ordinary_client() {
+    ensure_provider();
+    let mut a = RealNode::start("QwenCoder", MockConfig::default(), GatewayConfig::default()).await;
+    let mut b = RealNode::start(
+        "CoderBackup",
+        MockConfig::default(),
+        GatewayConfig::default(),
+    )
+    .await;
+    let router = Router::start(two_node_config(&a.base(), &b.base()), &[]).await;
+    let forbidden = [
+        "node-a".to_owned(),
+        "node-b".to_owned(),
+        "127.0.0.1".to_owned(),
+        "QwenCoder".to_owned(),
+        "CoderBackup".to_owned(),
+        "qwen2.5-coder".to_owned(),
+        ".gguf".to_owned(),
+        "/models/".to_owned(),
+    ];
+    let check = |what: &str, text: &str| {
+        for leak in &forbidden {
+            assert!(
+                !text.contains(leak.as_str()),
+                "{what} leaked {leak:?}: {text}"
+            );
+        }
+    };
+
+    for path in ["/v1/models", "/v1/capabilities", "/health"] {
+        let text = client()
+            .get(format!("{}{path}", router.base))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        check(path, &text);
+    }
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "Coder", "messages": messages}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "Coder", "messages": messages, "stream": true,
+                   "stream_options": {"include_usage": true}}),
+        ),
+        ("/v1/chat/completions", json!({"messages": messages})),
+        ("/v1/completions", json!({"model": "Coder", "prompt": "x"})),
+        (
+            "/v1/completions",
+            json!({"model": "Coder", "prompt": "x", "stream": true}),
+        ),
+        // Refusals that talk about the model.
+        (
+            "/v1/chat/completions",
+            json!({"model": "Research", "messages": messages}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "QwenCoder", "messages": messages}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": 42, "messages": messages}),
+        ),
+    ] {
+        let response = router.post(path, body.clone()).await;
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        // The client's own word is echoed back in a refusal of it; that is
+        // not a leak, so the one case naming a node alias is checked for the
+        // other identities only.
+        if body["model"] == "QwenCoder" {
+            assert_eq!(status, 404);
+            assert!(!text.contains("CoderBackup") && !text.contains("node-a"));
+            continue;
+        }
+        check(&format!("{path} {body} -> {status}"), &text);
+    }
+
+    // And with every deployment down, the unavailable answer names only the route.
+    a.served.shutdown().await;
+    b.served.shutdown().await;
+    router.probe().await;
+    router.probe().await;
+    let response = router
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "Coder", "messages": messages}),
+        )
+        .await;
+    assert_eq!(response.status(), 503);
+    check("route_unavailable", &response.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_lone_deployment_that_lost_its_model_is_route_unavailable_without_the_alias() {
+    ensure_provider();
+    let gone = json!({"error": {
+        "message": "the model \"QwenCoder\" is not loaded; this gateway is serving \"Other\"",
+        "type": "invalid_request_error", "param": "model", "code": "model_not_found"
+    }});
+    let a = FakeNode::start("QwenCoder", Act::Refuse(404, gone)).await;
+    let router = Router::start(
+        json!({
+            "nodes": [{"id": "a", "url": a.base()}],
+            "routes": [{"name": "Coder", "deployments": [{"node": "a", "model": "QwenCoder"}]}]
+        }),
+        &[],
+    )
+    .await;
+
+    let response = router
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "Coder", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(response.status(), 503);
+    let text = response.text().await.unwrap();
+    assert!(!text.contains("QwenCoder"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["error"]["code"], "route_unavailable");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("\"Coder\"")
+    );
+}
+
+#[tokio::test]
+async fn a_500_is_returned_as_the_node_wrote_it_and_never_retried_elsewhere() {
+    ensure_provider();
+    let failed = json!({"error": {
+        "message": "the engine could not complete the generation",
+        "type": "server_error",
+        "code": "generation_failed"
+    }});
+    let a = FakeNode::start("QwenCoder", Act::Refuse(500, failed.clone())).await;
+    let b = FakeNode::start("CoderBackup", Act::Answer).await;
+    let router = Router::start(two_node_config(&a.base(), &b.base()), &[]).await;
+
+    let (status, body) = router.chat(Some("Coder")).await;
+    assert_eq!(status, 500);
+    assert_eq!(body, failed, "code and semantics preserved");
+    assert_eq!((a.hits(), b.hits()), (1, 0));
+    assert_eq!(router.state.metrics.failovers("Coder"), 0);
+}
+
+#[tokio::test]
+async fn a_node_offline_at_startup_gets_no_traffic_until_a_probe_sees_it() {
+    ensure_provider();
+    // Reserve a port, then free it, so the router starts against a node that
+    // is not there yet.
+    let port = {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        held.local_addr().unwrap().port()
+    };
+    let router = Router::start(
+        json!({
+            "nodes": [{"id": "late", "url": format!("http://127.0.0.1:{port}")}],
+            "routes": [{"name": "Coder", "deployments": [{"node": "late", "model": "QwenCoder"}]}]
+        }),
+        &[],
+    )
+    .await;
+    // One failed probe at startup, below the threshold of two: unknown, and
+    // the router is serving regardless.
+    assert_eq!(router.health("late"), NodeHealth::Unknown);
+    assert_eq!(router.get("/health").await.0, 200);
+
+    // The node comes up. Unknown is still not eligible, so nothing is sent to
+    // it until a probe has actually seen it.
+    let node = RealNode::start_on(
+        port,
+        "QwenCoder",
+        MockConfig::default(),
+        GatewayConfig::default(),
+    )
+    .await;
+    assert_eq!(router.chat(Some("Coder")).await.0, 503);
+    assert_eq!(node.backend.generation_count(), 0);
+
+    // One successful probe, no restart: it serves.
+    router.probe().await;
+    assert_eq!(router.health("late"), NodeHealth::Healthy);
+    let (status, body) = router.chat(Some("Coder")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(node.backend.generation_count(), 1);
 }
