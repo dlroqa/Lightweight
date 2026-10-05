@@ -848,13 +848,23 @@ router's planning plus any failed attempts before it.
 
 | Metric | From → to | Recorded for |
 |---|---|---|
-| `router_routing_duration_seconds{route,policy}` | request body in hand → plan made (parse, requirements, affinity lookup, eligibility, filter, policy) | every request that reached planning. Microsecond buckets: this is the router's own time, with no upstream wait in it. |
+| `router_routing_duration_seconds{route,policy}` | body parsed → plan made (route resolution, requirements, affinity lookup, eligibility, capability filter, policy) | every request whose body parsed, including one whose planning failed (`route_unavailable`, `route_capability_mismatch`, a refused request; an unknown route is recorded as `route="_unknown",policy="none"`). Microsecond buckets: the router's own work, with no upstream wait in it. |
 | `router_upstream_response_seconds{route,deployment}` | one attempt sent → its response head | every attempt that got a response, including refusals that failed over |
 | `router_upstream_duration_seconds{route,deployment}` | the committed attempt sent → its body ended (or the client left) | committed attempts only |
 | `router_request_duration_seconds{route,policy}` | request body in hand → response finished, refused, or abandoned | every request with a route, once |
 
-`routing_ms` against the upstream numbers is how a slow router is told apart
-from a slow model. Connection time is not measured separately: the HTTP client
+The three router-side clocks start at two different points, on purpose:
+
+| Name | Starts | Ends |
+|---|---|---|
+| `routing_ms` (log, trace) = `router_routing_duration_seconds` | after the request body is parsed — the same point as before R6 | when the plan is made, or planning fails |
+| TTFT (`ttft_ms`, `router_ttft_seconds`) | when the router has the complete request body | at the first generated output relayed (streams only) |
+| request duration (`duration_ms`, `router_request_duration_seconds`) | when the router has the complete request body | when the response ends, is refused, or is abandoned |
+
+So `routing_ms` is routing and planning work only; parsing the body is in TTFT
+and the request duration but in no routing figure, and is not measured on its
+own. `routing_ms` against the upstream numbers is how a slow router is told
+apart from a slow model. Connection time is not measured separately: the HTTP client
 exposes no connect hook, and an approximation would be a number nobody should
 trust. Durations come from a monotonic clock and cannot be negative.
 

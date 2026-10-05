@@ -45,6 +45,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -294,6 +295,25 @@ enum Attempt {
     ContextOverflow(Refusal),
 }
 
+/// Artificial pauses at the two edges of the planning window, so a test can
+/// prove where `routing_ms` starts and ends. Zero, and never configurable from
+/// a file, outside tests: each costs one atomic load per request.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct PhaseDelays {
+    /// Slept after the body is parsed and before planning starts.
+    pub before_planning_ms: AtomicU64,
+    /// Slept at the start of planning, inside the measured window.
+    pub during_planning_ms: AtomicU64,
+}
+
+async fn pause(delay: &AtomicU64) {
+    let ms = delay.load(Ordering::Relaxed);
+    if ms > 0 {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
 /// When one attempt was sent and what came back, for the trace.
 struct Sent {
     at: Instant,
@@ -301,6 +321,9 @@ struct Sent {
     head: Option<Duration>,
     status: Option<u16>,
 }
+
+/// The policy label planning time is recorded under when no route was found.
+const NO_POLICY: &str = "none";
 
 /// The code a Lightweight node answers a prompt too long for its context with.
 const CONTEXT_OVERFLOW: &str = "context_length_exceeded";
@@ -355,15 +378,28 @@ async fn route_request(
         }
     };
 
+    pause(&state.phase_delays.before_planning_ms).await;
+    // `routing_ms` starts here, after the body is parsed, as it always has:
+    // route resolution, requirements, the affinity lookup, eligibility, the
+    // capability filter and the policy. TTFT and the request duration start
+    // earlier, at `received`; they measure something else.
+    let planning_started = Instant::now();
+    pause(&state.phase_delays.during_planning_ms).await;
+
     let requested = request.get("model").and_then(Value::as_str);
     let route = match state.topology.resolve(requested) {
         Ok(route) => route,
         Err(failure) => {
+            let routing = planning_started.elapsed();
+            state
+                .metrics
+                .observe_planning(UNKNOWN_ROUTE, NO_POLICY, routing);
             tracing::info!(
                 target: targets::ROUTER,
                 request_id,
                 requested = requested.unwrap_or(""),
                 error = failure_code(&failure),
+                routing_ms = millis(routing),
                 "request not routed"
             );
             state
@@ -381,12 +417,18 @@ async fn route_request(
     let needs = match requirements::extract(endpoint, body) {
         Ok(needs) => needs,
         Err(refusal) => {
+            let routing = planning_started.elapsed();
+            tracker.trace.routing_ms = millis(routing);
+            state
+                .metrics
+                .observe_planning(route.name.as_str(), policy, routing);
             tracing::info!(
                 target: targets::ROUTER,
                 request_id,
                 route = %route.name,
                 endpoint = endpoint.as_str(),
                 upstream_status = refusal.status().as_u16(),
+                routing_ms = tracker.trace.routing_ms,
                 "request refused before routing"
             );
             state
@@ -435,7 +477,7 @@ async fn route_request(
     ) {
         Ok(plan) => plan,
         Err(failure) => {
-            let routing = received.elapsed();
+            let routing = planning_started.elapsed();
             tracker.trace.routing_ms = millis(routing);
             state
                 .metrics
@@ -492,7 +534,7 @@ async fn route_request(
         }
     };
     record_unfit(state, request_id, &route.name, &plan.unfit);
-    let routing = received.elapsed();
+    let routing = planning_started.elapsed();
     let routing_ms = millis(routing);
     state
         .metrics

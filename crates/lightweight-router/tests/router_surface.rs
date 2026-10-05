@@ -3997,3 +3997,112 @@ async fn the_estimate_is_compared_with_the_nodes_prompt_count_when_it_reports_on
     assert_eq!((ratio(), error()), (3, 3));
     assert_eq!(error_sum(), 580);
 }
+
+// --- R6: `routing_ms` keeps its R5 meaning --------------------------------------
+
+fn set_delays(router: &Router, before_ms: u64, during_ms: u64) {
+    let delays = &router.state.phase_delays;
+    delays
+        .before_planning_ms
+        .store(before_ms, Ordering::Relaxed);
+    delays
+        .during_planning_ms
+        .store(during_ms, Ordering::Relaxed);
+}
+
+#[tokio::test]
+async fn routing_time_excludes_work_before_planning_and_includes_planning() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+
+    // A pause after the body is parsed and before planning: in TTFT and the
+    // request's duration, never in routing time.
+    set_delays(&router, 300, 0);
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({"stream": true})),
+        None,
+        Some("slow-before"),
+    )
+    .await
+    .bytes()
+    .await;
+    let trace = trace_of(&router, "slow-before").await;
+    let routing = trace["routing_ms"].as_f64().unwrap();
+    assert!(
+        routing < 100.0,
+        "routing_ms {routing} includes the pre-planning pause"
+    );
+    assert!(
+        trace["ttft_ms"].as_f64().unwrap() >= 300.0,
+        "TTFT still starts at receipt: {trace}"
+    );
+    assert!(trace["duration_ms"].as_f64().unwrap() >= 300.0);
+    assert!(
+        metrics.histogram_sum("router_routing_duration_seconds", &ROUTE) < 100_000,
+        "the planning histogram (µs) excludes it too"
+    );
+
+    // A pause inside planning: in routing time.
+    set_delays(&router, 0, 200);
+    let _ = post_as(
+        &router,
+        chat_body("Coder", json!({})),
+        None,
+        Some("slow-planning"),
+    )
+    .await
+    .bytes()
+    .await;
+    let routing = trace_of(&router, "slow-planning").await["routing_ms"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        routing >= 200.0,
+        "routing_ms {routing} misses planning work"
+    );
+    assert!(metrics.histogram_sum("router_routing_duration_seconds", &ROUTE) >= 200_000);
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &ROUTE),
+        2
+    );
+}
+
+#[tokio::test]
+async fn planning_that_fails_still_records_its_routing_time() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    a.withhold(|w| w.tools = true);
+    let router = Router::start(single(&a), &[]).await;
+    let metrics = &router.state.metrics;
+    set_delays(&router, 0, 50);
+
+    // route_capability_mismatch.
+    let response = post_as(
+        &router,
+        chat_body("Coder", json!({"tools": a_tool()})),
+        None,
+        Some("no-tools-anywhere"),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let trace = trace_of(&router, "no-tools-anywhere").await;
+    assert!(trace["routing_ms"].as_f64().unwrap() >= 50.0, "{trace}");
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &ROUTE),
+        1
+    );
+
+    // model_not_found: no route, so no trace, but the planning time is still
+    // recorded, under the bounded `_unknown` label.
+    let response = post_as(&router, chat_body("NoSuchRoute", json!({})), None, None).await;
+    assert_eq!(response.status(), 404);
+    let unknown = [("route", "_unknown"), ("policy", "none")];
+    assert_eq!(
+        metrics.histogram_count("router_routing_duration_seconds", &unknown),
+        1
+    );
+    assert!(metrics.histogram_sum("router_routing_duration_seconds", &unknown) >= 50_000);
+}

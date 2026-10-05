@@ -81,6 +81,10 @@ pub struct RouterState {
     pub affinity: AffinityBook,
     /// The most recent routing traces.
     pub traces: TraceBook,
+    /// Test-only pauses around the planning window. Always zero in a router
+    /// started from a configuration file.
+    #[doc(hidden)]
+    pub phase_delays: crate::proxy::PhaseDelays,
     pub started: SystemTime,
 }
 
@@ -140,6 +144,7 @@ impl RouterState {
             selector,
             affinity: AffinityBook::new(config.affinity.clone()),
             traces: TraceBook::new(config.trace_capacity),
+            phase_delays: crate::proxy::PhaseDelays::default(),
             started: SystemTime::now(),
         })
     }

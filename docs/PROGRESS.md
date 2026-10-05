@@ -1643,6 +1643,14 @@ SmolLM2-135M, `--ctx 2048 --concurrency 2`), each in its own scratch
   log-correlation binary); the gateway adds 2. Contract suite 47 passed, 2
   skipped. Cross-platform proof is the PR's CI.
 
+- **`routing_ms` kept its R5 meaning** (review correction). R6 had moved its
+  start to the request's receipt, folding body parsing in. It starts again
+  after the body is parsed; TTFT and the request duration still start at
+  receipt. Planning that fails still records its time (an unknown route under
+  `_unknown`/`none`). Proven with test-only pauses before and inside the
+  planning window; with the R6 boundary put back, the new test fails
+  (`routing_ms 301.75 includes the pre-planning pause`).
+
 **Next:** review of this branch. R7 (placement / warm standby) is not started.
 
 ## Next step
