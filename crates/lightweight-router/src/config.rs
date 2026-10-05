@@ -318,6 +318,10 @@ pub struct RouteFile {
     pub name: String,
     #[serde(default)]
     pub strategy: RoutePolicy,
+    /// What the route is for. Optional, at most 200 characters; told only to
+    /// the `Auto` classifier.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub deployments: Vec<DeploymentFile>,
     /// Optional. Absent: no placement for this route.
@@ -485,6 +489,10 @@ pub enum ConfigError {
     BadAutoRoute { problem: String },
     #[error("auto_route rule {rule:?} {problem}")]
     BadAutoRule { rule: String, problem: String },
+    #[error("auto_route.classifier: {problem}")]
+    BadAutoClassifier { problem: String },
+    #[error("route {route:?}: {problem}")]
+    BadRouteDescription { route: String, problem: String },
 }
 
 /// Every reason a configuration was refused, in file order.
@@ -1022,8 +1030,19 @@ fn validate_routes(
             .placement
             .as_ref()
             .and_then(|raw| validate_route_placement(&name, raw, &members, &deployments, errors));
+        let description = entry.description.as_deref().and_then(|raw| {
+            crate::classifier::validate_description(raw)
+                .map_err(|problem| {
+                    errors.push(ConfigError::BadRouteDescription {
+                        route: name.as_str().to_owned(),
+                        problem,
+                    });
+                })
+                .ok()
+        });
         routes.push(Route {
             name,
+            description,
             policy: entry.strategy,
             deployments: members,
             placement,

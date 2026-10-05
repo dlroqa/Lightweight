@@ -29,6 +29,7 @@ use std::fmt::Write as _;
 use lightweight_catalog::alias;
 use serde::{Deserialize, Serialize};
 
+use crate::classifier::{ClassifierFile, RouteClassifier};
 use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
 use crate::proxy::Endpoint;
@@ -65,6 +66,10 @@ pub struct AutoRouteFile {
     pub fallback_route: String,
     #[serde(default)]
     pub rules: Vec<AutoRuleFile>,
+    /// The content classifier a rule may invoke (R9.1). Inert unless a rule
+    /// says `"classify": true`.
+    #[serde(default)]
+    pub classifier: Option<ClassifierFile>,
 }
 
 /// One rule, as written.
@@ -73,7 +78,12 @@ pub struct AutoRouteFile {
 pub struct AutoRuleFile {
     pub name: String,
     pub when: AutoCondition,
-    pub route: String,
+    /// The route the rule resolves to. Exactly one of this and `classify`.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Ask the classifier which route, instead of naming one (R9.1).
+    #[serde(default)]
+    pub classify: bool,
 }
 
 /// The endpoint a rule can ask for, in the words the router's logs use.
@@ -218,8 +228,12 @@ impl AutoCondition {
 pub struct AutoRule {
     pub name: String,
     pub when: AutoCondition,
-    /// A configured route, spelled as the route is configured.
+    /// A configured route, spelled as the route is configured. For a
+    /// classifying rule, the classifier's fallback: the route the rule
+    /// resolves to whenever classification does not choose one.
     pub route: RouteName,
+    /// The rule asks the classifier which route.
+    pub classify: bool,
 }
 
 /// The validated `auto_route` section.
@@ -229,6 +243,9 @@ pub struct AutoRoute {
     pub fallback: RouteName,
     /// In configured order, which is the order they are tried.
     pub rules: Vec<AutoRule>,
+    /// The classifier a classifying rule calls. Present whenever such a rule
+    /// is.
+    pub classifier: Option<RouteClassifier>,
 }
 
 /// The route `Auto` chose for one request, and why.
@@ -237,6 +254,9 @@ pub struct AutoDecision<'a> {
     pub route: &'a RouteName,
     /// The rule that matched; `None` when none did and the fallback was used.
     pub rule: Option<&'a str>,
+    /// The rule asks the classifier. `route` is then what the request
+    /// resolves to unless the classifier chooses.
+    pub classify: bool,
 }
 
 impl AutoDecision<'_> {
@@ -266,24 +286,36 @@ impl AutoRoute {
                 AutoDecision {
                     route: &self.fallback,
                     rule: None,
+                    classify: false,
                 },
                 |rule| AutoDecision {
                     route: &rule.route,
                     rule: Some(rule.name.as_str()),
+                    classify: rule.classify,
                 },
             )
     }
 
-    /// Every route `Auto` can resolve to, each once, rules first in order and
-    /// then the fallback.
+    /// Every route `Auto` can resolve to, each once, rules first in order
+    /// (a classifying rule's candidates, then its fallback) and then the
+    /// fallback.
     pub fn targets(&self) -> Vec<&RouteName> {
-        let mut targets: Vec<&RouteName> = Vec::new();
-        for route in self
-            .rules
+        let candidates = self
+            .classifier
             .iter()
-            .map(|rule| &rule.route)
-            .chain(std::iter::once(&self.fallback))
-        {
+            .flat_map(|classifier| classifier.candidates.iter().map(|c| &c.route));
+        let mut targets: Vec<&RouteName> = Vec::new();
+        let mut classified = false;
+        let mut ordered: Vec<&RouteName> = Vec::new();
+        for rule in &self.rules {
+            if rule.classify && !classified {
+                classified = true;
+                ordered.extend(candidates.clone());
+            }
+            ordered.push(&rule.route);
+        }
+        ordered.push(&self.fallback);
+        for route in ordered {
             if !targets.contains(&route) {
                 targets.push(route);
             }
@@ -295,7 +327,11 @@ impl AutoRoute {
     pub fn summary(&self) -> String {
         let mut out = String::new();
         for rule in &self.rules {
-            let _ = write!(out, "{} -> {}, ", rule.name, rule.route);
+            if rule.classify {
+                let _ = write!(out, "{} -> classify (else {}), ", rule.name, rule.route);
+            } else {
+                let _ = write!(out, "{} -> {}, ", rule.name, rule.route);
+            }
         }
         let _ = write!(out, "otherwise {}", self.fallback);
         out
@@ -328,6 +364,10 @@ pub(crate) fn validate(
         errors.push(ConfigError::BadAutoRoute {
             problem: format!("fallback_route {:?} {problem}", raw.fallback_route),
         });
+    });
+
+    let classifier = raw.classifier.as_ref().and_then(|classifier| {
+        crate::classifier::validate(classifier, routes, &raw.fallback_route, errors)
     });
 
     if raw.rules.len() > MAX_RULES {
@@ -364,7 +404,9 @@ pub(crate) fn validate(
         } else {
             seen.push(name.to_owned());
         }
-        if entry.when.is_empty() {
+        // A classifying rule may match everything: it is how classification
+        // becomes the semantic catch-all after the deterministic rules.
+        if entry.when.is_empty() && !entry.classify {
             fail(
                 "has no conditions, so it would match every request; \
                  use fallback_route for that"
@@ -385,18 +427,38 @@ pub(crate) fn validate(
             fail(format!("can never match: {problem}"));
             ok = false;
         }
-        let route = match target(&entry.route, routes) {
-            Ok(route) => Some(route),
-            Err(problem) => {
-                fail(format!("route {:?} {problem}", entry.route));
+        let route = match (&entry.route, entry.classify) {
+            (Some(_), true) => {
+                fail("has both \"route\" and \"classify\"; it needs exactly one".into());
                 None
             }
+            (None, false) => {
+                fail("needs a \"route\", or \"classify\": true".into());
+                None
+            }
+            (None, true) => match &classifier {
+                Some(classifier) => Some(classifier.fallback.clone()),
+                None => {
+                    if raw.classifier.is_none() {
+                        fail("asks to classify, but auto_route has no \"classifier\"".into());
+                    }
+                    None
+                }
+            },
+            (Some(name), false) => match target(name, routes) {
+                Ok(route) => Some(route),
+                Err(problem) => {
+                    fail(format!("route {name:?} {problem}"));
+                    None
+                }
+            },
         };
         if let (true, Some(route)) = (ok, route) {
             rules.push(AutoRule {
                 name: name.to_owned(),
                 when: entry.when.clone(),
                 route,
+                classify: entry.classify,
             });
         }
     }
@@ -408,6 +470,7 @@ pub(crate) fn validate(
         enabled: raw.enabled,
         fallback: fallback.ok()?,
         rules,
+        classifier,
     })
 }
 
