@@ -44,6 +44,24 @@ pub enum CatalogError {
     )]
     AliasInUse { alias: String, owner: String },
 
+    /// An alias spelled like a canonical id, which would make one name mean
+    /// two things depending on which was looked up first.
+    #[error(
+        "alias {alias:?} is the id of a model ({id}); an alias must differ from every model id, so choose a different alias"
+    )]
+    AliasIsModelId { alias: String, id: String },
+
+    /// The other direction: a model whose id cannot change — a pinned id, a
+    /// link's file name — would arrive under a name that is already an alias.
+    #[error(
+        "cannot add {id:?}: that id is already the alias {alias:?} of {owner}, and one name can only mean one model; rename or clear that alias first"
+    )]
+    ModelIdIsAlias {
+        id: String,
+        alias: String,
+        owner: String,
+    },
+
     #[error(transparent)]
     Download(#[from] DownloadError),
 
@@ -77,6 +95,8 @@ impl Actionable for CatalogError {
             Self::NotADigest { .. } => "not_a_digest",
             Self::InvalidAlias { .. } => "invalid_alias",
             Self::AliasInUse { .. } => "alias_in_use",
+            Self::AliasIsModelId { .. } => "alias_is_model_id",
+            Self::ModelIdIsAlias { .. } => "model_id_is_alias",
             Self::Download(err) => err.code(),
             Self::Io { .. } => "io_error",
         }
@@ -91,7 +111,9 @@ impl Actionable for CatalogError {
             | Self::NotAGguf { .. }
             | Self::NotADigest { .. }
             | Self::InvalidAlias { .. }
-            | Self::AliasInUse { .. } => ErrorKind::InvalidRequest,
+            | Self::AliasInUse { .. }
+            | Self::AliasIsModelId { .. }
+            | Self::ModelIdIsAlias { .. } => ErrorKind::InvalidRequest,
             // Not an error the caller can fix by retrying, and not a failure
             // either: unloading first is a real, ordered thing to do.
             Self::InUse { .. } => ErrorKind::InvalidRequest,
@@ -128,6 +150,12 @@ impl Actionable for CatalogError {
             )],
             Self::AliasInUse { owner, .. } => vec![Remedy::new(
                 format!("Choose a different alias, or clear the one on {owner} first"),
+                RemedyAction::OpenSettings {
+                    section: SettingsSection::Models,
+                },
+            )],
+            Self::ModelIdIsAlias { owner, alias, .. } => vec![Remedy::new(
+                format!("Rename or clear the alias {alias:?} on {owner}, then add the model again"),
                 RemedyAction::OpenSettings {
                     section: SettingsSection::Models,
                 },

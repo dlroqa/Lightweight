@@ -137,12 +137,75 @@ impl CatalogStore {
         })
     }
 
+    /// Whether `raw` may become the alias of `for_id` — or, with `None`, of a
+    /// model that is about to be added. Returns the alias trimmed.
+    ///
+    /// The one check every way of naming a model goes through, so the
+    /// selector namespace stays unambiguous: `default`, then aliases, then
+    /// canonical ids, and **no name in more than one of them**. An alias may
+    /// not equal any model's id in any casing — its own included, which would
+    /// be a second spelling of one name — nor another model's alias.
+    pub fn check_alias(&self, raw: &str, for_id: Option<&str>) -> Result<String, CatalogError> {
+        let alias = alias::validate_alias(raw).map_err(|problem| CatalogError::InvalidAlias {
+            alias: raw.to_owned(),
+            problem,
+        })?;
+        if let Some(named) = self
+            .models
+            .values()
+            .find(|model| alias::same_name(&model.id, &alias))
+        {
+            return Err(CatalogError::AliasIsModelId {
+                alias,
+                id: named.id.clone(),
+            });
+        }
+        if let Some(owner) = self.models.values().find(|other| {
+            Some(other.id.as_str()) != for_id
+                && other
+                    .alias
+                    .as_deref()
+                    .is_some_and(|held| alias::same_name(held, &alias))
+        }) {
+            return Err(CatalogError::AliasInUse {
+                alias,
+                owner: owner.id.clone(),
+            });
+        }
+        Ok(alias)
+    }
+
+    /// Refuse a canonical id that some *other* model already uses as its
+    /// alias, ignoring case.
+    ///
+    /// The other direction of [`Self::check_alias`]. An id this catalog
+    /// chooses steps around aliases instead (see [`Self::free_id`]); this is
+    /// for the ids it cannot choose — a pinned model's manifest id, a link's
+    /// file name — which are refused before any bytes are fetched rather than
+    /// installed under a name that already means another model.
+    pub fn ensure_id_unaliased(&self, id: &str) -> Result<(), CatalogError> {
+        match self.models.values().find(|model| {
+            model.id != id
+                && model
+                    .alias
+                    .as_deref()
+                    .is_some_and(|held| alias::same_name(held, id))
+        }) {
+            Some(owner) => Err(CatalogError::ModelIdIsAlias {
+                id: id.to_owned(),
+                alias: owner.alias.clone().unwrap_or_default(),
+                owner: owner.id.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Give a model an alias, change it, or clear it with `None`.
     ///
     /// `id` is the catalog id. Refuses rather than adjusts: an alias that is
-    /// invalid, reserved, held by another model, or equal to another model's
-    /// id is an error naming the problem, and the user's choice is never
-    /// rewritten into something that happens to be free.
+    /// invalid, reserved, held by another model, or equal to any model's id is
+    /// an error naming the problem (see [`Self::check_alias`]), and the user's
+    /// choice is never rewritten into something that happens to be free.
     ///
     /// Touches nothing but the alias. Not saved here — callers save, as they
     /// do after every other change to the store.
@@ -157,27 +220,7 @@ impl CatalogStore {
 
         let alias = match alias {
             None => None,
-            Some(raw) => {
-                let alias =
-                    alias::validate_alias(raw).map_err(|problem| CatalogError::InvalidAlias {
-                        alias: raw.to_owned(),
-                        problem,
-                    })?;
-                if let Some(owner) = self.models.values().find(|other| {
-                    other.id != id
-                        && (alias::same_name(&other.id, &alias)
-                            || other
-                                .alias
-                                .as_deref()
-                                .is_some_and(|held| alias::same_name(held, &alias)))
-                }) {
-                    return Err(CatalogError::AliasInUse {
-                        alias,
-                        owner: owner.id.clone(),
-                    });
-                }
-                Some(alias)
-            }
+            Some(raw) => Some(self.check_alias(raw, Some(id))?),
         };
 
         let model = self
@@ -188,9 +231,10 @@ impl CatalogStore {
         Ok(model)
     }
 
-    /// Whether `name` already identifies a model, as an id or as an alias.
+    /// Whether `name` already identifies a model, as an id or as an alias,
+    /// ignoring case for both.
     fn is_taken(&self, name: &str) -> bool {
-        self.models.contains_key(name) || self.by_alias(name).is_some()
+        self.models.keys().any(|id| alias::same_name(id, name)) || self.by_alias(name).is_some()
     }
 
     /// The model with these exact bytes, if the catalog already has it.
@@ -507,7 +551,74 @@ mod tests {
         let err = store
             .set_alias("lfm2.5-1.2b", Some("QWEN3.5-9B-FABLE-5-V1-Q8_0"))
             .expect_err("another model's id");
-        assert_eq!(err.code(), "alias_in_use");
+        assert_eq!(err.code(), "alias_is_model_id");
+        // Nor its own id, in any casing: that would be one name spelled twice.
+        let err = store
+            .set_alias("lfm2.5-1.2b", Some("LFM2.5-1.2B"))
+            .expect_err("its own id");
+        assert_eq!(err.code(), "alias_is_model_id");
+    }
+
+    #[test]
+    fn an_id_that_is_already_an_alias_is_refused_in_any_casing() {
+        // Alias first, then an install whose id is fixed (pinned, or a link's
+        // file name) and would collide with it.
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("Coder"))
+            .expect("alias");
+        for clash in ["coder", "Coder", "CODER"] {
+            let err = store
+                .ensure_id_unaliased(clash)
+                .expect_err("shadows an alias");
+            assert_eq!(err.code(), "model_id_is_alias", "{clash}");
+            let said = err.to_string();
+            assert!(
+                said.contains("Coder") && said.contains("qwen3.5-9b-fable-5-v1-q8_0"),
+                "{said}"
+            );
+        }
+        // A model is never in conflict with its own record, and an unrelated
+        // id is free.
+        store
+            .ensure_id_unaliased("qwen3.5-9b-fable-5-v1-q8_0")
+            .expect("its own id");
+        store
+            .ensure_id_unaliased("research")
+            .expect("an unrelated id");
+    }
+
+    #[test]
+    fn a_generated_id_steps_around_an_alias_in_any_casing() {
+        // The import case: the catalog chooses the id, so it chooses another.
+        let mut store = two_models();
+        store
+            .set_alias("qwen3.5-9b-fable-5-v1-q8_0", Some("CODER"))
+            .expect("alias");
+        assert_eq!(store.free_id("coder"), "coder-2");
+        assert_eq!(store.free_id("research"), "research");
+    }
+
+    #[test]
+    fn a_new_alias_is_checked_against_every_name_already_in_use() {
+        let mut store = two_models();
+        store.set_alias("lfm2.5-1.2b", Some("Fast")).expect("alias");
+        assert_eq!(
+            store.check_alias(" Coder ", None).as_deref().ok(),
+            Some("Coder")
+        );
+        assert_eq!(
+            store.check_alias("FAST", None).map_err(|e| e.code()),
+            Err("alias_in_use")
+        );
+        assert_eq!(
+            store.check_alias("Lfm2.5-1.2B", None).map_err(|e| e.code()),
+            Err("alias_is_model_id")
+        );
+        assert_eq!(
+            store.check_alias("default", None).map_err(|e| e.code()),
+            Err("invalid_alias")
+        );
     }
 
     #[test]

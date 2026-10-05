@@ -298,20 +298,7 @@ impl ModelManager {
     /// invalid or already taken is refused in seconds rather than after a
     /// multi-gigabyte transfer. Returns the alias trimmed.
     pub async fn check_new_alias(&self, alias: &str) -> Result<String, ManagerError> {
-        let checked = lightweight_catalog::validate_alias(alias).map_err(|problem| {
-            CatalogError::InvalidAlias {
-                alias: alias.to_owned(),
-                problem,
-            }
-        })?;
-        if let Some(owner) = self.catalog.lock().await.resolve(&checked) {
-            return Err(CatalogError::AliasInUse {
-                alias: checked,
-                owner: owner.id.clone(),
-            }
-            .into());
-        }
-        Ok(checked)
+        Ok(self.catalog.lock().await.check_alias(alias, None)?)
     }
 
     /// Download or link a model, reporting into `job`.
@@ -347,6 +334,10 @@ impl ModelManager {
 
         if let Some(existing) = {
             let catalog = self.catalog.lock().await;
+            // Refused before the transfer, not after it: a fixed id that is
+            // already another model's alias would make one name mean two
+            // models. `commit` checks again under the lock.
+            catalog.ensure_id_unaliased(&plan.id)?;
             Installer::already_installed(&catalog, &plan)
         } {
             return Ok(existing);

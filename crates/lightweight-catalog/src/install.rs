@@ -132,6 +132,7 @@ impl Installer {
     ) -> Result<InstalledModel, CatalogError> {
         let _ = progress.try_send(InstallProgress::Resolving);
         let plan = self.plan(request).await?;
+        store.ensure_id_unaliased(&plan.id)?;
         if let Some(existing) = Self::already_installed(store, &plan) {
             let _ = progress.try_send(InstallProgress::Done);
             return Ok(existing);
@@ -296,8 +297,15 @@ impl Installer {
             return Ok(existing.clone());
         }
 
+        // An id we choose steps around every existing name; one we were
+        // given cannot, and is refused if it is already someone's alias —
+        // checked again here, under the lock, because the alias may have been
+        // set while the download ran.
         let id = match &scanned.id {
-            Some(id) => id.clone(),
+            Some(id) => {
+                store.ensure_id_unaliased(id)?;
+                id.clone()
+            }
             None => store.free_id(&slug_for(&scanned.path)),
         };
         let replacing = scanned.id.is_some();
