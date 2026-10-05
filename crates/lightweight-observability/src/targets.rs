@@ -29,6 +29,10 @@ pub const SCHEDULER: &str = "hermes::scheduler";
 /// Model downloads and integrity verification.
 pub const DOWNLOAD: &str = "hermes::download";
 
+/// The federated model router: routing decisions, failover and node health.
+/// Never carries prompt text or credentials.
+pub const ROUTER: &str = "hermes::router";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,7 +41,7 @@ mod tests {
     fn every_target_shares_the_filterable_prefix() {
         // `HERMES_LOG=hermes=debug` must reach all of them.
         for target in [
-            STARTUP, BACKEND, MODEL, INFERENCE, MEMORY, API, SCHEDULER, DOWNLOAD,
+            STARTUP, BACKEND, MODEL, INFERENCE, MEMORY, API, SCHEDULER, DOWNLOAD, ROUTER,
         ] {
             assert!(target.starts_with("hermes::"), "{target} is not filterable");
         }
