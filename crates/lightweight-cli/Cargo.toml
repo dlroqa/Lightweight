@@ -29,6 +29,7 @@ serde.workspace = true
 lightweight-inference.workspace = true
 lightweight-backend-llamacpp.workspace = true
 lightweight-gateway.workspace = true
+lightweight-router.workspace = true
 lightweight-store.workspace = true
 lightweight-catalog.workspace = true
 lightweight-bench.workspace = true

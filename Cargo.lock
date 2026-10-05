@@ -1086,6 +1086,7 @@ dependencies = [
  "lightweight-inference",
  "lightweight-memory",
  "lightweight-observability",
+ "lightweight-router",
  "lightweight-store",
  "lightweight-system-info",
  "release-update",

@@ -21,6 +21,7 @@ mod banner;
 mod bench;
 mod fleet;
 mod models;
+mod router;
 mod serve;
 use lightweight_core::{Actionable, GgmlType, units::Bytes};
 use lightweight_gguf::{GgufFile, ModelMetadata};
@@ -300,6 +301,26 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    /// Serve stable model names over several gateways.
+    ///
+    /// One OpenAI-compatible endpoint in front of any number of Lightweight
+    /// gateways. Clients discover and send logical names such as `Coder`; the
+    /// router picks the first healthy deployment in priority order, rewrites
+    /// `model` to that node's own name, and relays the answer under the logical
+    /// name. Reads `router.json` from the config directory, or `--config`.
+    /// Node keys come from the environment variables the file names.
+    Router {
+        #[command(subcommand)]
+        action: Option<RouterAction>,
+        /// The configuration file. Defaults to `router.json` in the config
+        /// directory.
+        #[arg(long, value_name = "PATH", global = true)]
+        config: Option<PathBuf>,
+        /// Listen on this `host:port` instead of the file's `listen`.
+        /// Repeatable.
+        #[arg(long, value_name = "HOST:PORT")]
+        listen: Vec<String>,
+    },
     /// Update lightweight to the latest release.
     Update {
         /// Report whether an update is available without installing it.
@@ -329,6 +350,13 @@ enum KeyAction {
     List,
     /// Revoke a key by its id (from `key list`).
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+enum RouterAction {
+    /// Check the configuration and the environment variables it names, then
+    /// exit without listening or contacting a node.
+    ValidateConfig,
 }
 
 #[derive(Subcommand)]
@@ -797,6 +825,16 @@ fn run(
         Command::Key { action } => key_command(cli, out, action),
         Command::Config { action } => config_command(cli, out, action),
         Command::Fleet { config } => fleet::run(config.clone()),
+        Command::Router {
+            action: Some(RouterAction::ValidateConfig),
+            config,
+            ..
+        } => router::validate(config.clone(), out),
+        Command::Router {
+            action: None,
+            config,
+            listen,
+        } => router::run(config.clone(), listen),
         Command::Update { check, force } => {
             let invoker = personality.update_cli();
             runtime()?.block_on(release_update::run(
