@@ -1387,6 +1387,73 @@ Deliberately not built (see the `docs/ROUTER.md` roadmap):
 - proxying the node control plane;
 - consensus or external state stores.
 
+## Router load balancing, R4 (feature/router-load-balancing)
+
+`./scripts/check.sh` passed in full on 2026-10-05:
+
+- workspace tests: **1025 passed, 0 failed**. The router has 105 of them
+  (68 unit, 37 integration), up from 81;
+- real-model header tests: 3;
+- the contract suite: 47 passed, 2 skipped;
+- the panel and desktop builds;
+- the version, dependency and secrets gates.
+
+What was built:
+
+- **New policies.** `RoutePolicy::{RoundRobin, LeastBusy}` (`round_robin`,
+  `least_busy`) sit beside `Priority`, which is unchanged: every R3 test passes
+  as written.
+- **Selection order.** `select::eligible` is the one eligibility step. The pure
+  functions `order_priority`, `order_round_robin` and `order_least_busy` order
+  what is left. `Selector` holds per-route state: an atomic cursor, and a lock
+  that least-busy holds while it chooses and reserves.
+- **In-flight counts.** `load::LoadBook` counts in-flight work per deployment
+  with RAII `Lease`s. The proxy walks the plan and carries the lease. It
+  contains no policy logic.
+- **Least-busy rule.** Least-busy compares `active × other_limit` in `u128`.
+  Known positive capacity ranks before unknown or zero capacity, and ties go to
+  configured order. The limit is the node's scheduler slot count
+  (`--concurrency`, as confirmed by the engine's `n_parallel`).
+- **Mutation check.** Replacing the normalized comparison with raw counts fails
+  4 tests.
+
+Verified by execution against two real gateways running SmolLM2-135M. Node A
+ran with `--concurrency 2` and node B with `--concurrency 1`, both behind
+`hermes router`:
+
+- **Round-robin:** four requests went node-a, node-b, node-a, node-b
+  (cursor 0 to 3), and every response said `Coder`.
+- **Lightagent `7d95232`, unmodified:** two chats went to node-a and then
+  node-b (cursor 4, then 5), and its status bar showed `Coder`.
+- **Least-busy:**
+  - Two long streams went to node-a (a tie at 0/2 against 0/1, broken by
+    configured order) and node-b (node-a now at 1/2).
+  - A third request went to node-a with `active_before=1` and
+    `concurrency_limit=2`, because 50% is less than 100%.
+  - The in-flight counts read 1/1 during the streams and 0/0 afterwards.
+- **Disconnect:** a client disconnecting mid-stream released the slot to 0,
+  and node-a's `cancelled` went from 0 to 1.
+
+Observed, and documented in `docs/ROUTER.md` rather than changed here:
+
+- a freshly started `hermes serve <file>` briefly advertises its canonical id
+  before adopting its alias;
+- two routes sharing one deployment can make one slightly uneven simultaneous
+  choice (a future refinement; no global lock).
+
+Fixed before merge: `/v1/capabilities` reported the startup slot count
+(`GatewayConfig::max_concurrent_requests`) rather than the scheduler's live
+count, so least-busy could divide by a stale limit after a hot swap. It now
+reads `Scheduler::capacity()`, the value `load_model` resizes and
+`/api/v1/gateway` already reported. Covered by
+`the_capabilities_report_the_slots_the_running_engine_was_given` (a real load
+through the manager, 4 to 2) and
+`least_busy_follows_a_node_whose_scheduler_was_resized_after_the_next_probe`
+(a real gateway resized, the router's next probe adopting 2, and the third
+request going to B at 25% rather than A at 50%). Both fail without the fix.
+After the fix, `./scripts/check.sh` passed again: 1027 workspace tests passed,
+0 failed (the router now has 106), and the contract suite 47 passed, 2 skipped.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

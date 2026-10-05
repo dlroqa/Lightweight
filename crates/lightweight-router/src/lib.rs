@@ -17,8 +17,9 @@
 //! Those stay on the node, and nothing here can reach them — the router only
 //! speaks the node's public `/v1` surface.
 //!
-//! Selection is deterministic in this version: priority order, filtered by
-//! health. See `docs/ROUTER.md` for the roadmap beyond it.
+//! Selection is deterministic: health decides which deployments are eligible,
+//! then the route's policy — priority, round-robin or least-busy — orders
+//! them. See `docs/ROUTER.md` for the roadmap beyond it.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -29,6 +30,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod health;
+pub mod load;
 pub mod metrics;
 pub mod proxy;
 pub mod select;
@@ -47,7 +49,9 @@ pub use domain::Topology;
 
 use crate::config::HealthPolicy;
 use crate::health::HealthBook;
+use crate::load::LoadBook;
 use crate::metrics::RouterMetrics;
+use crate::select::Selector;
 
 /// Everything a request handler needs.
 #[derive(Debug)]
@@ -61,6 +65,8 @@ pub struct RouterState {
     /// Shared by probes and requests, so connections to a node are pooled.
     pub client: reqwest::Client,
     pub metrics: RouterMetrics,
+    /// Per-route policy state and the per-deployment in-flight counts.
+    pub selector: Selector,
     pub started: SystemTime,
 }
 
@@ -109,6 +115,7 @@ impl RouterState {
 
         let topology = Arc::new(config.topology.clone());
         let health = Arc::new(HealthBook::new(&topology, config.health.failure_threshold));
+        let selector = Selector::new(&topology, Arc::new(LoadBook::new(&topology)));
         Ok(Self {
             topology,
             health,
@@ -116,6 +123,7 @@ impl RouterState {
             auth,
             client,
             metrics: RouterMetrics::default(),
+            selector,
             started: SystemTime::now(),
         })
     }

@@ -606,8 +606,10 @@ its own service unit instead.
 
 `hermes router` is a separate process that puts one OpenAI-compatible endpoint
 in front of several gateways. Clients list and send logical names such as
-`Coder`. The router sends each request to the first healthy deployment in the
-order you configured, rewrites `model` to that node's own alias, and relays the
+`Coder`. The router sends each request to a healthy deployment, chosen by the route's
+`strategy`: the first in the order you configured (`priority`, the default),
+equal turns (`round_robin`), or the lowest in-flight load relative to each
+node's capacity (`least_busy`). It rewrites `model` to that node's own alias, and relays the
 answer, streamed or not, under the logical name. If a node fails before it has
 answered, the next deployment is tried. Once the answer has started, the
 deployment is never switched.

@@ -165,6 +165,18 @@ enum Act {
     Refuse(u16, Value),
     /// Start a stream, send one chunk, then drop the connection.
     StreamThenDrop,
+    /// Stay in flight until the gate is opened, then answer. A streamed
+    /// request gets its first chunk at once and the rest after the gate.
+    Hold(Arc<tokio::sync::Semaphore>),
+}
+
+/// A gate a held request waits behind.
+fn gate() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(0))
+}
+
+fn open(gate: &tokio::sync::Semaphore) {
+    gate.add_permits(10_000);
 }
 
 /// What reached a scripted node.
@@ -181,6 +193,8 @@ struct NodeScript {
     /// What the capabilities probe reports.
     tools: bool,
     context_length: u32,
+    /// The slot count the probe advertises.
+    limit: u32,
     hits: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
     probes: Arc<Mutex<Vec<HeaderMap>>>,
@@ -199,11 +213,28 @@ impl FakeNode {
     /// A node reporting its own tool support and context, so two deployments
     /// of one route can genuinely differ.
     async fn start_with(serving: &str, act: Act, tools: bool, context_length: u32) -> Self {
+        Self::start_full(0, serving, act, tools, context_length, 1).await
+    }
+
+    /// A node advertising `limit` concurrent requests, on `port` (0 for any).
+    async fn start_limited(port: u16, serving: &str, act: Act, limit: u32) -> Self {
+        Self::start_full(port, serving, act, true, 2048, limit).await
+    }
+
+    async fn start_full(
+        port: u16,
+        serving: &str,
+        act: Act,
+        tools: bool,
+        context_length: u32,
+        limit: u32,
+    ) -> Self {
         let script = NodeScript {
             serving: serving.to_owned(),
             act,
             tools,
             context_length,
+            limit,
             hits: Arc::default(),
             seen: Arc::default(),
             probes: Arc::default(),
@@ -214,7 +245,7 @@ impl FakeNode {
             .route("/v1/completions", post(fake_generate))
             .with_state(script.clone());
         Self {
-            served: Served::start(app, 0).await,
+            served: Served::start(app, port).await,
             script,
         }
     }
@@ -243,7 +274,7 @@ async fn fake_capabilities(
             id: script.serving.clone(),
             context_length: script.context_length,
         }),
-        1,
+        script.limit,
     );
     body.features.tools = script.tools;
     axum::Json(body).into_response()
@@ -262,6 +293,43 @@ async fn fake_generate(
     });
     let model = body["model"].clone();
     match script.act {
+        Act::Hold(ref gate) if body["stream"] == true => {
+            let gate = Arc::clone(gate);
+            let first = format!(
+                "data: {}\n\n",
+                json!({"id": "c1", "object": "chat.completion.chunk", "model": model,
+                       "choices": [{"index": 0, "delta": {"content": "held"}}]})
+            );
+            let stream = futures_util::stream::unfold(0_u8, move |step| {
+                let (gate, first) = (Arc::clone(&gate), first.clone());
+                async move {
+                    match step {
+                        0 => Some((Ok::<_, std::io::Error>(first), 1)),
+                        1 => {
+                            let _ = gate.acquire().await;
+                            Some((Ok("data: [DONE]\n\n".to_owned()), 2))
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Act::Hold(ref gate) => {
+            let _ = gate.acquire().await;
+            axum::Json(json!({
+                "id": "c1",
+                "object": "chat.completion",
+                "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "held"},
+                             "finish_reason": "stop"}],
+            }))
+            .into_response()
+        }
         Act::Refuse(status, ref envelope) => (
             StatusCode::from_u16(status).unwrap(),
             axum::Json(envelope.clone()),
@@ -1512,4 +1580,599 @@ async fn a_node_offline_at_startup_gets_no_traffic_until_a_probe_sees_it() {
     let (status, body) = router.chat(Some("Coder")).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(node.backend.generation_count(), 1);
+}
+
+// --- R4: round-robin and least-busy over real sockets ----------------------
+
+/// One route, `Coder`, over `nodes` under `strategy`. Each node is
+/// `(id, url, node-local model)`.
+fn policy_config(strategy: &str, nodes: &[(&str, String, &str)]) -> Value {
+    json!({
+        "default_route": "Coder",
+        "nodes": nodes
+            .iter()
+            .map(|(id, url, _)| json!({"id": id, "url": url}))
+            .collect::<Vec<_>>(),
+        "routes": [{
+            "name": "Coder",
+            "strategy": strategy,
+            "deployments": nodes
+                .iter()
+                .map(|(id, _, model)| json!({"node": id, "model": model}))
+                .collect::<Vec<_>>(),
+        }]
+    })
+}
+
+/// In-flight counts by deployment id.
+fn in_flight(router: &Router) -> std::collections::BTreeMap<String, u64> {
+    router
+        .state
+        .selector
+        .load()
+        .snapshot()
+        .into_iter()
+        .map(|(id, active)| (id.as_str().to_owned(), active))
+        .collect()
+}
+
+/// Wait until every slot the router took has been given back.
+async fn all_released(router: &Router, what: &str) {
+    poll(what, async || {
+        (in_flight(router).values().all(|active| *active == 0)
+            && router.state.metrics.active() == 0)
+            .then_some(())
+    })
+    .await;
+}
+
+/// Which of `nodes` took the last request, by hit counts before and after.
+fn which(nodes: &[&FakeNode], before: &[u32]) -> usize {
+    let changed: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, node)| node.hits() != before[*index])
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(changed.len(), 1, "exactly one node should have answered");
+    changed[0]
+}
+
+fn hits(nodes: &[&FakeNode]) -> Vec<u32> {
+    nodes.iter().map(|node| node.hits()).collect()
+}
+
+#[tokio::test]
+async fn round_robin_takes_turns_in_configured_order_and_answers_as_the_route() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+    let nodes = [&a, &b, &c];
+
+    let mut turns = Vec::new();
+    for request in 0..6 {
+        let before = hits(&nodes);
+        let stream = request % 2 == 1;
+        let response = router
+            .post(
+                "/v1/chat/completions",
+                json!({"model": "Coder", "stream": stream,
+                       "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("\"model\":\"Coder\""), "{text}");
+        for leak in ["AliasA", "AliasB", "AliasC", "127.0.0.1"] {
+            assert!(!text.contains(leak), "{leak} leaked: {text}");
+        }
+        turns.push(which(&nodes, &before));
+    }
+    assert_eq!(turns, [0, 1, 2, 0, 1, 2], "A B C A B C");
+    assert_eq!(
+        router.state.metrics.decisions("Coder", "round_robin"),
+        6,
+        "every request decided by the rotation"
+    );
+    all_released(&router, "slots after round-robin requests").await;
+}
+
+#[tokio::test]
+async fn round_robin_rotates_over_healthy_deployments_and_takes_a_recovered_one_back() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let mut b = FakeNode::start("AliasB", Act::Answer).await;
+    let b_port = b.served.port;
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+
+    // B goes down and the probes see it.
+    b.served.shutdown().await;
+    router.probe().await;
+    router.probe().await;
+    assert_eq!(router.health("b"), NodeHealth::Unhealthy);
+
+    let mut turns = Vec::new();
+    for _ in 0..4 {
+        let before = [a.hits(), c.hits()];
+        assert_eq!(router.chat(Some("Coder")).await.0, 200);
+        turns.push(if a.hits() != before[0] { "a" } else { "c" });
+    }
+    turns.dedup();
+    assert_eq!(turns.len(), 4, "alternating, never two in a row: {turns:?}");
+
+    // B comes back on the same address; one probe and it is in the ring.
+    let b = FakeNode::start_limited(b_port, "AliasB", Act::Answer, 1).await;
+    router.probe().await;
+    for _ in 0..3 {
+        assert_eq!(router.chat(Some("Coder")).await.0, 200);
+    }
+    assert_eq!(
+        b.hits(),
+        1,
+        "one full turn includes the recovered deployment"
+    );
+}
+
+#[tokio::test]
+async fn round_robin_failover_uses_the_rest_of_the_ring_and_advances_once_per_request() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let mut b = FakeNode::start("AliasB", Act::Answer).await;
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Router::start(
+        policy_config(
+            "round_robin",
+            &[
+                ("a", a.base(), "AliasA"),
+                ("b", b.base(), "AliasB"),
+                ("c", c.base(), "AliasC"),
+            ],
+        ),
+        &[],
+    )
+    .await;
+    // B dies between probes: still eligible, so its turn comes and fails.
+    b.served.shutdown().await;
+
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        statuses.push(router.chat(Some("Coder")).await.0);
+    }
+    assert_eq!(statuses, [200, 200, 200]);
+    // 1 -> A. 2 -> B, refused, failover to C. 3 -> C, the rotation's own turn.
+    assert_eq!((a.hits(), c.hits()), (1, 2));
+    assert_eq!(
+        router.state.selector.cursor(
+            &router.state.topology,
+            &router.state.topology.routes()[0].name
+        ),
+        Some(3),
+        "three requests, three steps - the failover attempt took none"
+    );
+    assert_eq!(
+        router
+            .state
+            .metrics
+            .decisions("Coder", "round_robin_failover"),
+        1
+    );
+    all_released(&router, "slots after a round-robin failover").await;
+}
+
+#[tokio::test]
+async fn round_robin_shares_concurrent_requests_exactly() {
+    ensure_provider();
+    let a = FakeNode::start("AliasA", Act::Answer).await;
+    let b = FakeNode::start("AliasB", Act::Answer).await;
+    let c = FakeNode::start("AliasC", Act::Answer).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "round_robin",
+                &[
+                    ("a", a.base(), "AliasA"),
+                    ("b", b.base(), "AliasB"),
+                    ("c", c.base(), "AliasC"),
+                ],
+            ),
+            &[],
+        )
+        .await,
+    );
+    let requests: Vec<_> = (0..30)
+        .map(|_| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move { router.chat(Some("Coder")).await.0 })
+        })
+        .collect();
+    for request in requests {
+        assert_eq!(request.await.unwrap(), 200);
+    }
+    // Thirty distinct cursor values over a ring of three, whatever order the
+    // requests were planned in.
+    assert_eq!((a.hits(), b.hits(), c.hits()), (10, 10, 10));
+    all_released(&router, "slots after concurrent round-robin").await;
+}
+
+#[tokio::test]
+async fn least_busy_puts_concurrent_work_where_the_capacity_is_and_releases_it() {
+    ensure_provider();
+    let hold = gate();
+    let a = FakeNode::start_limited(0, "AliasA", Act::Hold(Arc::clone(&hold)), 4).await;
+    let b = FakeNode::start_limited(0, "AliasB", Act::Hold(Arc::clone(&hold)), 1).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await,
+    );
+
+    let requests: Vec<_> = (0..5)
+        .map(|_| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move { router.chat(Some("Coder")).await })
+        })
+        .collect();
+    poll("all five requests in flight", async || {
+        (a.hits() + b.hits() == 5).then_some(())
+    })
+    .await;
+    // Over 4 + 1 slots, five requests fill both exactly: 4/4 and 1/1.
+    let load = in_flight(&router);
+    assert_eq!(load["a/AliasA"], 4, "{load:?}");
+    assert_eq!(load["b/AliasB"], 1, "{load:?}");
+
+    // The admin view shows the same numbers, with each node's own limit.
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    let a_row = deployments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "a/AliasA")
+        .unwrap();
+    assert_eq!(a_row["active_requests"], 4);
+    assert_eq!(a_row["concurrency_limit"], 4);
+    let (_, routes) = router.get("/api/router/v1/routes").await;
+    assert_eq!(routes["data"][0]["strategy"], "least_busy");
+
+    open(&hold);
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body["model"], "Coder");
+    }
+    all_released(&router, "slots after held least-busy requests").await;
+}
+
+/// The concurrency limit the admin view shows for one deployment.
+async fn concurrency_limit(router: &Router, deployment: &str) -> Value {
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    deployments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == deployment)
+        .unwrap()["concurrency_limit"]
+        .clone()
+}
+
+#[tokio::test]
+async fn least_busy_follows_a_node_whose_scheduler_was_resized_after_the_next_probe() {
+    ensure_provider();
+    // A is a real gateway, so the limit the router sees is the one its own
+    // `/v1/capabilities` publishes. Its engine holds every request in prefill
+    // long enough for the three below to be in flight together.
+    let a = RealNode::start(
+        "AliasA",
+        MockConfig {
+            prefill: Duration::from_secs(3),
+            ..MockConfig::default()
+        },
+        GatewayConfig {
+            max_concurrent_requests: 4,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let hold = gate();
+    let b = FakeNode::start_limited(0, "AliasB", Act::Hold(Arc::clone(&hold)), 4).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await,
+    );
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 4);
+
+    // What a hot swap does once the new engine is up: the scheduler takes the
+    // slot count that engine was started with.
+    a.state.scheduler().set_capacity(2);
+    // The router does not guess; until it probes, it still holds the old answer.
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 4);
+    router.probe().await;
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 2);
+
+    // One at a time, so each choice sees the one before it in flight.
+    //   1st: A 0/2 vs B 0/4, a tie       -> A, by configured order
+    //   2nd: A 1/2 vs B 0/4              -> B
+    //   3rd: A 1/2 = 50% vs B 1/4 = 25%  -> B
+    // Had the router kept A's stale 4, the 3rd would be 1/4 against 1/4, a
+    // tie, and go to A.
+    let mut requests = Vec::new();
+    for expected in [(1, 0), (1, 1), (1, 2)] {
+        let router_for_request = Arc::clone(&router);
+        requests.push(tokio::spawn(async move {
+            router_for_request.chat(Some("Coder")).await
+        }));
+        poll("the request to be in flight", async || {
+            let load = in_flight(&router);
+            (load["a/AliasA"] + load["b/AliasB"] == expected.0 + expected.1).then_some(())
+        })
+        .await;
+        let load = in_flight(&router);
+        assert_eq!(
+            (load["a/AliasA"], load["b/AliasB"]),
+            expected,
+            "least-busy must divide by A's live limit of 2: {load:?}"
+        );
+    }
+
+    open(&hold);
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["model"], "Coder");
+    }
+    all_released(&router, "slots after a resized node's requests").await;
+}
+
+#[tokio::test]
+async fn least_busy_failover_moves_the_slot_to_the_deployment_doing_the_work() {
+    ensure_provider();
+    let hold = gate();
+    // A has far more capacity, so least-busy picks it - but it is gone.
+    let mut a = FakeNode::start_limited(0, "AliasA", Act::Answer, 8).await;
+    let b = FakeNode::start_limited(0, "AliasB", Act::Hold(Arc::clone(&hold)), 1).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await,
+    );
+    a.served.shutdown().await;
+
+    let request = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.chat(Some("Coder")).await })
+    };
+    poll("the failover attempt to reach B", async || {
+        (b.hits() == 1).then_some(())
+    })
+    .await;
+    let load = in_flight(&router);
+    assert_eq!(load["a/AliasA"], 0, "the failed attempt gave its slot back");
+    assert_eq!(load["b/AliasB"], 1, "the working attempt holds one");
+
+    open(&hold);
+    let (status, body) = request.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], "Coder");
+    assert_eq!(
+        router
+            .state
+            .metrics
+            .decisions("Coder", "least_busy_failover"),
+        1
+    );
+    all_released(&router, "slots after a least-busy failover").await;
+}
+
+#[tokio::test]
+async fn no_exit_path_leaks_an_in_flight_slot() {
+    ensure_provider();
+    let busy = json!({"error": {"message": "busy", "type": "server_error", "code": "server_busy"}});
+    let broken =
+        json!({"error": {"message": "boom", "type": "server_error", "code": "generation_failed"}});
+
+    // Each case: what the first-choice node does, and whether a second node
+    // that answers stands behind it.
+    let cases: Vec<(&str, Act, bool)> = vec![
+        ("success", Act::Answer, false),
+        ("upstream 500", Act::Refuse(500, broken), false),
+        ("upstream 503 then failover", Act::Refuse(503, busy), true),
+        ("stream failure after output", Act::StreamThenDrop, false),
+    ];
+    for (case, act, with_backup) in cases {
+        let first = FakeNode::start_limited(0, "AliasA", act, 8).await;
+        let backup = FakeNode::start_limited(0, "AliasB", Act::Answer, 1).await;
+        let mut nodes = vec![("a", first.base(), "AliasA")];
+        if with_backup {
+            nodes.push(("b", backup.base(), "AliasB"));
+        }
+        let router = Router::start(policy_config("least_busy", &nodes), &[]).await;
+        for stream in [false, true] {
+            let response = router
+                .post(
+                    "/v1/chat/completions",
+                    json!({"model": "Coder", "stream": stream,
+                           "messages": [{"role": "user", "content": "hi"}]}),
+                )
+                .await;
+            let _ = response.bytes().await;
+            all_released(&router, case).await;
+        }
+    }
+
+    // Connection refused, then failover.
+    let mut gone = FakeNode::start_limited(0, "AliasA", Act::Answer, 8).await;
+    let backup = FakeNode::start_limited(0, "AliasB", Act::Answer, 1).await;
+    let router = Router::start(
+        policy_config(
+            "least_busy",
+            &[("a", gone.base(), "AliasA"), ("b", backup.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    gone.served.shutdown().await;
+    assert_eq!(router.chat(Some("Coder")).await.0, 200);
+    all_released(&router, "connection refused then failover").await;
+
+    // A client that walks away mid-stream, and one that gives up waiting.
+    let hold = gate();
+    let slow = FakeNode::start_limited(0, "AliasA", Act::Hold(Arc::clone(&hold)), 4).await;
+    let router = Router::start(
+        policy_config("least_busy", &[("a", slow.base(), "AliasA")]),
+        &[],
+    )
+    .await;
+    let mut response = router
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "Coder", "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    let first = response.chunk().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("held"));
+    assert_eq!(in_flight(&router)["a/AliasA"], 1, "counted while streaming");
+    drop(response);
+    all_released(&router, "client disconnect mid-stream").await;
+
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let timed_out = impatient
+        .post(format!("{}/v1/chat/completions", router.base))
+        .json(&json!({"model": "Coder", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await;
+    assert!(timed_out.is_err(), "the client gave up");
+    all_released(&router, "client timeout while the node was still working").await;
+    open(&hold);
+}
+
+#[tokio::test]
+async fn a_node_reporting_no_capacity_is_only_a_fallback() {
+    ensure_provider();
+    let a = FakeNode::start_limited(0, "AliasA", Act::Answer, 1).await;
+    let zero = FakeNode::start_limited(0, "AliasB", Act::Answer, 0).await;
+    let router = Router::start(
+        policy_config(
+            "least_busy",
+            &[("a", a.base(), "AliasA"), ("b", zero.base(), "AliasB")],
+        ),
+        &[],
+    )
+    .await;
+    for _ in 0..3 {
+        assert_eq!(router.chat(Some("Coder")).await.0, 200);
+    }
+    assert_eq!(
+        (a.hits(), zero.hits()),
+        (3, 0),
+        "zero capacity is never assumed to have room"
+    );
+    let mut a = a;
+    a.served.shutdown().await;
+    router.probe().await;
+    router.probe().await;
+    assert_eq!(router.chat(Some("Coder")).await.0, 200);
+    assert_eq!(
+        zero.hits(),
+        1,
+        "but it still serves when it is all there is"
+    );
+}
+
+#[tokio::test]
+async fn every_policy_answers_as_the_route_and_default_uses_the_routes_policy() {
+    ensure_provider();
+    for strategy in ["priority", "round_robin", "least_busy"] {
+        let a = FakeNode::start("QwenCoder", Act::Answer).await;
+        let b = FakeNode::start("CoderBackup", Act::Answer).await;
+        let router = Router::start(
+            policy_config(
+                strategy,
+                &[
+                    ("node-a", a.base(), "QwenCoder"),
+                    ("node-b", b.base(), "CoderBackup"),
+                ],
+            ),
+            &[],
+        )
+        .await;
+        for (model, stream) in [
+            (json!("Coder"), false),
+            (json!("Coder"), true),
+            (json!("default"), false),
+            (Value::Null, true),
+        ] {
+            let mut body =
+                json!({"stream": stream, "messages": [{"role": "user", "content": "hi"}]});
+            if !model.is_null() {
+                body["model"] = model.clone();
+            }
+            let response = router.post("/v1/chat/completions", body).await;
+            assert_eq!(response.status(), 200, "{strategy} {model}");
+            let text = response.text().await.unwrap();
+            assert!(text.contains("\"model\":\"Coder\""), "{strategy}: {text}");
+            for leak in ["QwenCoder", "CoderBackup", "node-a", "node-b"] {
+                assert!(!text.contains(leak), "{strategy} leaked {leak}: {text}");
+            }
+        }
+        // `default` went through the route's own policy, not priority.
+        let (_, models) = router.get("/v1/models").await;
+        assert_eq!(models["data"][0]["id"], "Coder");
+        let expected = match strategy {
+            "round_robin" => "round_robin",
+            "least_busy" => "least_busy_tiebreak",
+            _ => "primary_healthy",
+        };
+        assert!(
+            router.state.metrics.decisions("Coder", expected) >= 2,
+            "{strategy}: default and omitted model used the {expected} path"
+        );
+        if strategy == "round_robin" {
+            assert_eq!((a.hits(), b.hits()), (2, 2));
+        }
+    }
 }

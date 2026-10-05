@@ -259,7 +259,9 @@ async fn metrics(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> R
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.metrics.to_prometheus(&state.health.snapshot()),
+        state
+            .metrics
+            .to_prometheus(&state.health.snapshot(), &state.selector.load().snapshot()),
     )
         .into_response()
 }
@@ -380,6 +382,10 @@ async fn deployments(State(state): State<Arc<RouterState>>, headers: HeaderMap) 
                 "available": available,
                 "unavailable_reason": reason,
                 "observed": observed,
+                // What least-busy reads: the router's own in-flight count, and
+                // the slot count this deployment's node last advertised.
+                "active_requests": state.selector.load().active(&deployment.id),
+                "concurrency_limit": observed.as_ref().map(|seen| seen.max_concurrent_requests),
                 "observed_at": observed.as_ref().map(|seen| unix(seen.observed_at)),
             })
         })

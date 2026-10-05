@@ -189,7 +189,10 @@ pub async fn capabilities(State(state): State<Arc<GatewayState>>, headers: Heade
     axum::Json(CapabilitiesBody::new(
         env!("CARGO_PKG_VERSION"),
         model,
-        state.config.max_concurrent_requests,
+        // The scheduler's live slot count, not the one we started with: a load
+        // resizes it, and a router balancing on this number must see the
+        // engine that is actually running.
+        state.scheduler().capacity(),
     ))
     .into_response()
 }

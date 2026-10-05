@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::domain::{NodeHealth, NodeId};
+use crate::domain::{DeploymentId, NodeHealth, NodeId};
 use crate::health::NodeStatus;
 
 /// The label a request for an unconfigured route is counted under.
@@ -51,6 +51,10 @@ impl Outcome {
 pub struct RouterMetrics {
     requests: Mutex<BTreeMap<(String, Outcome), u64>>,
     failovers: Mutex<BTreeMap<String, u64>>,
+    /// Committed routing decisions by route, policy and reason. Failovers
+    /// show up here under their own reasons (`*_failover`), so decisions and
+    /// failovers by policy are both one query away.
+    decisions: Mutex<BTreeMap<(String, &'static str, &'static str), u64>>,
     active: Arc<AtomicU64>,
 }
 
@@ -73,6 +77,25 @@ impl RouterMetrics {
             .unwrap_or_else(PoisonError::into_inner)
             .entry((route.to_owned(), outcome))
             .or_default() += 1;
+    }
+
+    pub fn record_decision(&self, route: &str, policy: &'static str, reason: &'static str) {
+        *self
+            .decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((route.to_owned(), policy, reason))
+            .or_default() += 1;
+    }
+
+    pub fn decisions(&self, route: &str, reason: &str) -> u64 {
+        self.decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|((r, _, why), _)| r == route && *why == reason)
+            .map(|(_, count)| count)
+            .sum()
     }
 
     pub fn record_failover(&self, route: &str) {
@@ -111,7 +134,11 @@ impl RouterMetrics {
             .unwrap_or_default()
     }
 
-    pub fn to_prometheus(&self, health: &BTreeMap<NodeId, NodeStatus>) -> String {
+    pub fn to_prometheus(
+        &self,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        load: &BTreeMap<DeploymentId, u64>,
+    ) -> String {
         let mut out = String::new();
 
         out.push_str(
@@ -154,6 +181,35 @@ impl RouterMetrics {
         let _ = writeln!(out, "router_active_requests {}", self.active());
 
         out.push_str(
+            "# HELP router_routing_decisions_total Committed routing decisions, by route, policy and reason.\n",
+        );
+        out.push_str("# TYPE router_routing_decisions_total counter\n");
+        for ((route, policy, reason), count) in self
+            .decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_routing_decisions_total{{route=\"{}\",policy=\"{policy}\",reason=\"{reason}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        out.push_str(
+            "# HELP router_deployment_active_requests Upstream attempts this router has in flight, per deployment.\n",
+        );
+        out.push_str("# TYPE router_deployment_active_requests gauge\n");
+        for (deployment, active) in load {
+            let _ = writeln!(
+                out,
+                "router_deployment_active_requests{{deployment=\"{}\"}} {active}",
+                escape(deployment.as_str())
+            );
+        }
+
+        out.push_str(
             "# HELP router_node_health 1 if the node is healthy, 0 if not, -1 if not yet known.\n",
         );
         out.push_str("# TYPE router_node_health gauge\n");
@@ -192,7 +248,7 @@ mod tests {
         metrics.record_request("Coder", Outcome::Ok);
         metrics.record_failover("Coder");
         let guard = metrics.enter();
-        let text = metrics.to_prometheus(&BTreeMap::new());
+        let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
         assert!(text.contains("router_requests_total{route=\"Coder\",outcome=\"ok\"} 2"));
         assert!(text.contains("router_failovers_total{route=\"Coder\"} 1"));
         assert!(text.contains("router_active_requests 1"));
