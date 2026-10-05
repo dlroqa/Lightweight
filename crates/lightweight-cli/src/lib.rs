@@ -382,8 +382,13 @@ enum ModelsAction {
     /// The alias is what API clients see in `/v1/models` and may send as
     /// `model`, in place of the long id derived from the file. The file, its
     /// id and its digest are never changed. Unique ignoring case; `default` is
-    /// reserved. A running gateway keeps its own copy of the catalog, so set
-    /// aliases there (the panel or `PATCH /api/v1/models/<id>`) while it runs.
+    /// reserved.
+    ///
+    /// A gateway serving this profile on its configured (or the default) port
+    /// owns the catalog while it runs, so the change is made through it and
+    /// takes effect at once. With no gateway there the catalog file is
+    /// changed directly; a gateway that answers but cannot be confirmed to be
+    /// a different profile's makes this refuse rather than write.
     Alias {
         /// The model's id, or its current alias.
         model: String,
@@ -462,12 +467,18 @@ fn models_command(cli: &Cli, out: &mut String, action: &ModelsAction) -> Result<
             alias,
             clear,
         } => {
-            models::alias(
-                out,
-                &mut store,
-                model,
-                if *clear { None } else { alias.as_deref() },
-            )?;
+            // The port a gateway serving this profile would be on, if it was
+            // started with the persisted or the default bind. `auto` cannot be
+            // found this way, and `alias_command` says so when it writes.
+            let port = lightweight_store::ApiConfigStore::new(paths.api_config_file())
+                .load()
+                .ok()
+                .and_then(|config| config.port)
+                .unwrap_or(lightweight_gateway::DEFAULT_PORT);
+            let alias = if *clear { None } else { alias.as_deref() };
+            runtime()?.block_on(models::alias_command(
+                out, &paths, port, &mut store, model, alias,
+            ))?;
         }
         ModelsAction::Remove { id, delete } => {
             models::remove(out, &mut store, id, *delete)?;

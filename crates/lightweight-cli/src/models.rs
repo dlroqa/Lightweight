@@ -153,17 +153,10 @@ pub fn check_new_alias(
     let Some(raw) = alias else {
         return Ok(None);
     };
-    let checked = lightweight_catalog::validate_alias(raw)
-        .map_err(|problem| format!("{raw:?} cannot be used as an alias: {problem}"))?;
-    if let Some(owner) = store.resolve(&checked) {
-        return Err(crate::serve::describe(
-            lightweight_catalog::CatalogError::AliasInUse {
-                alias: checked,
-                owner: owner.id.clone(),
-            },
-        ));
-    }
-    Ok(Some(checked))
+    store
+        .check_alias(raw, None)
+        .map(Some)
+        .map_err(crate::serve::describe)
 }
 
 /// Give a model that was just added the alias asked for with `--alias`.
@@ -177,6 +170,194 @@ pub fn name_added(
         Some(alias) => set_alias(out, store, &added.id, Some(alias)),
         None => Ok(()),
     }
+}
+
+/// How long to wait for a local gateway before concluding there is none.
+///
+/// Loopback, so a gateway that is there answers in milliseconds; this only
+/// bounds the case where something holds the port and never replies.
+const GATEWAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What is listening where a gateway serving this profile would be.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LocalGateway {
+    /// Nothing answered: the catalog file is nobody else's right now.
+    Absent,
+    /// A gateway serving this very catalog, at this base URL. It owns the
+    /// catalog in memory and will overwrite the file on its next save, so an
+    /// alias must be changed through it.
+    Ours(String),
+    /// A gateway serving a *different* profile. Its catalog is not this one.
+    OtherProfile,
+}
+
+/// Look for a gateway serving this profile on `127.0.0.1:port`.
+///
+/// No discovery beyond the one port a gateway with this profile's bind
+/// settings would use: `GET /api/v1/gateway` reports the data directory it
+/// serves, which is compared with ours. Loopback control requests need no key.
+/// Anything that answers but cannot be read as a gateway report is an error,
+/// because writing the file under a process that may own it is the outcome
+/// this exists to avoid.
+pub async fn local_gateway(paths: &DataPaths, port: u16) -> Result<LocalGateway, String> {
+    if port == 0 {
+        return Ok(LocalGateway::Absent);
+    }
+    let base = format!("http://127.0.0.1:{port}");
+    let client = lightweight_download::client("lightweight-cli").map_err(crate::serve::describe)?;
+    let response = match client
+        .get(format!("{base}/api/v1/gateway"))
+        .timeout(GATEWAY_PROBE_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        // Refused or silent: no gateway is serving there.
+        Err(err) if err.is_connect() => return Ok(LocalGateway::Absent),
+        Err(err) => return Err(gateway_in_the_way(port, &err.to_string())),
+    };
+    let status = response.status();
+    let report: Option<serde_json::Value> = if status.is_success() {
+        response.json().await.ok()
+    } else {
+        None
+    };
+    let Some(data) = report
+        .as_ref()
+        .and_then(|report| report["paths"]["data"].as_str())
+    else {
+        // Something holds the port without describing a profile. The default
+        // port is also Ollama's, so it is only in the way if it says it is a
+        // Lightweight gateway — one demanding a key, or an older build.
+        return if is_a_lightweight_gateway(&client, &base).await {
+            Err(gateway_in_the_way(port, &format!("it answered {status}")))
+        } else {
+            Ok(LocalGateway::Absent)
+        };
+    };
+    if same_dir(Path::new(data), paths.data_dir()) {
+        Ok(LocalGateway::Ours(base))
+    } else {
+        Ok(LocalGateway::OtherProfile)
+    }
+}
+
+/// Whether whatever is at `base` says it is a Lightweight gateway.
+///
+/// `/version` is answered unauthenticated by every build of the gateway, with a
+/// `build` that has started `hermes-gateway-` since M3.
+async fn is_a_lightweight_gateway(client: &reqwest::Client, base: &str) -> bool {
+    let Ok(response) = client
+        .get(format!("{base}/version"))
+        .timeout(GATEWAY_PROBE_TIMEOUT)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body["build"]
+                .as_str()
+                .map(|build| build.starts_with("hermes-gateway-"))
+        })
+        .unwrap_or(false)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+fn gateway_in_the_way(port: u16, why: &str) -> String {
+    format!(
+        "A Lightweight gateway appears to be running on 127.0.0.1:{port}, but this command \
+         could not confirm which catalog it serves ({why}).\n\
+         Use the panel or PATCH /api/v1/models/<id> to change aliases, or stop the gateway \
+         before modifying the catalog with the CLI. The alias was not changed."
+    )
+}
+
+/// `hermes models alias`, made through the running gateway when there is one.
+///
+/// A gateway holds the catalog in memory and saves it whole, so a change
+/// written under it would be invisible to it now and overwritten by its next
+/// save. When it is serving this profile the change goes through its control
+/// API instead, which validates, persists and applies it at once. Otherwise the
+/// file is changed directly, and the output says that is what happened.
+pub async fn alias_command(
+    out: &mut String,
+    paths: &DataPaths,
+    port: u16,
+    store: &mut CatalogStore,
+    model: &str,
+    alias: Option<&str>,
+) -> Result<(), String> {
+    match local_gateway(paths, port).await? {
+        LocalGateway::Ours(base) => alias_through_gateway(out, &base, model, alias).await,
+        LocalGateway::Absent | LocalGateway::OtherProfile => {
+            self::alias(out, store, model, alias)?;
+            let _ = writeln!(
+                out,
+                "  changed in {} directly: no gateway serving this profile answered on \
+                 127.0.0.1:{port}. One running on another port must be restarted to see it.",
+                store.path().display()
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn alias_through_gateway(
+    out: &mut String,
+    base: &str,
+    model: &str,
+    alias: Option<&str>,
+) -> Result<(), String> {
+    let mut url = reqwest::Url::parse(base).map_err(|err| err.to_string())?;
+    url.path_segments_mut()
+        .map_err(|()| format!("{base} cannot carry a path"))?
+        .extend(["api", "v1", "models", model]);
+    let client = lightweight_download::client("lightweight-cli").map_err(crate::serve::describe)?;
+    let response = client
+        .patch(url)
+        .json(&serde_json::json!({ "alias": alias }))
+        .timeout(GATEWAY_PROBE_TIMEOUT * 5)
+        .send()
+        .await
+        .map_err(|err| {
+            format!("the gateway at {base} stopped answering ({err}); the alias was not changed")
+        })?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        // The gateway's own sentence: it is the authority on why.
+        return Err(body["error"]["message"].as_str().map_or_else(
+            || format!("the gateway refused the change ({status})"),
+            str::to_owned,
+        ));
+    }
+
+    let id = body["id"].as_str().unwrap_or(model);
+    match body["alias"].as_str() {
+        Some(alias) => {
+            let _ = writeln!(out, "{id} is now served as {alias:?}");
+        }
+        None => {
+            let _ = writeln!(out, "{id} has no alias; it is served under its id");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  changed through the running gateway at {base}, which saved it and applies it now"
+    );
+    Ok(())
 }
 
 /// `hermes models alias <model> <alias>` and `hermes models alias <model> --clear`.
@@ -481,6 +662,206 @@ mod tests {
         remove(&mut out, &mut store, "Fast", false).expect("remove");
         assert!(store.is_empty());
         assert!(store.resolve("Fast").is_none());
+    }
+
+    mod running_gateway {
+        use super::super::*;
+        use std::sync::Arc;
+
+        use lightweight_backend_mock::MockBackend;
+        use lightweight_gateway::manager::{ModelManager, RuntimeDefaults};
+        use lightweight_gateway::{GatewayConfig, GatewayState};
+        use lightweight_gguf::fixture::{GgufBuilder, TempDir};
+
+        /// A profile with one imported model, and the id it was given.
+        async fn profile(tag: &str) -> (TempDir, DataPaths, String) {
+            let dir = TempDir::new(tag);
+            let paths = DataPaths::rooted_at(dir.path());
+            let file = dir.write(
+                "Qwen3-8B-Q4_K_M.gguf",
+                &GgufBuilder::small_model("llama").build(),
+            );
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+            let installer =
+                Installer::new(paths.models_dir(), paths.downloads_dir()).expect("installer");
+            let (tx, _rx) = mpsc::channel(64);
+            let id = installer
+                .import(&mut store, &file, &tx)
+                .await
+                .expect("import")
+                .id;
+            (dir, paths, id)
+        }
+
+        /// A real gateway over `paths`' catalog, as `hermes serve` builds one.
+        async fn serve(paths: &DataPaths) -> (u16, Arc<GatewayState>) {
+            let manager = Arc::new(ModelManager::new(
+                CatalogStore::open(paths.catalog_file()).expect("catalog"),
+                Installer::new(paths.models_dir(), paths.downloads_dir()).expect("installer"),
+                RuntimeDefaults::default(),
+            ));
+            let state = Arc::new(
+                GatewayState::new(
+                    Arc::new(MockBackend::default()),
+                    lightweight_gateway::catalog::shared(None),
+                    GatewayConfig {
+                        paths: Some(paths.clone()),
+                        ..GatewayConfig::default()
+                    },
+                )
+                .with_manager(manager),
+            );
+            let app = lightweight_gateway::app(Arc::clone(&state));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, lightweight_gateway::service(app)).await;
+            });
+            (port, state)
+        }
+
+        /// A port nothing is listening on.
+        async fn closed_port() -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            listener.local_addr().expect("addr").port()
+        }
+
+        fn alias_on_disk(paths: &DataPaths, id: &str) -> Option<String> {
+            CatalogStore::open(paths.catalog_file())
+                .expect("catalog")
+                .get(id)
+                .and_then(|model| model.alias.clone())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_gateway_serving_this_profile_makes_the_change_itself() {
+            let (_dir, paths, id) = profile("cli-ours").await;
+            let (port, state) = serve(&paths).await;
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+
+            let mut out = String::new();
+            alias_command(&mut out, &paths, port, &mut store, &id, Some("Coder"))
+                .await
+                .expect("through the gateway");
+            assert!(out.contains("running gateway"), "{out}");
+
+            // The running gateway knows it now, and saved it.
+            let held = state.manager().expect("manager").resolve("Coder").await;
+            assert_eq!(held.map(|model| model.id), Some(id.clone()));
+            assert_eq!(alias_on_disk(&paths, &id).as_deref(), Some("Coder"));
+
+            // A refusal is the gateway's, reported as a failure, not a success.
+            let err = alias_command(&mut out, &paths, port, &mut store, &id, Some("default"))
+                .await
+                .expect_err("reserved");
+            assert!(err.contains("default"), "{err}");
+            assert_eq!(alias_on_disk(&paths, &id).as_deref(), Some("Coder"));
+
+            // Cleared through it too, by the alias it currently has.
+            alias_command(&mut out, &paths, port, &mut store, "Coder", None)
+                .await
+                .expect("clear");
+            assert_eq!(alias_on_disk(&paths, &id), None);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn with_no_gateway_the_file_is_changed_and_the_output_says_so() {
+            let (_dir, paths, id) = profile("cli-absent").await;
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+            let mut out = String::new();
+            alias_command(
+                &mut out,
+                &paths,
+                closed_port().await,
+                &mut store,
+                &id,
+                Some("Coder"),
+            )
+            .await
+            .expect("direct");
+            assert!(out.contains("directly"), "{out}");
+            assert_eq!(alias_on_disk(&paths, &id).as_deref(), Some("Coder"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_gateway_for_another_profile_is_not_this_catalogs_owner() {
+            let (_dir, paths, id) = profile("cli-mine").await;
+            let (_other_dir, other_paths, _) = profile("cli-theirs").await;
+            let (port, _state) = serve(&other_paths).await;
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+            let mut out = String::new();
+            alias_command(&mut out, &paths, port, &mut store, &id, Some("Coder"))
+                .await
+                .expect("direct");
+            assert_eq!(alias_on_disk(&paths, &id).as_deref(), Some("Coder"));
+            assert_eq!(alias_on_disk(&other_paths, &id), None, "theirs untouched");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn another_kind_of_server_on_the_port_is_not_in_the_way() {
+            // The default port is Ollama's too. Something that is not a
+            // Lightweight gateway owns no catalog of ours.
+            let (_dir, paths, id) = profile("cli-ollama").await;
+            let app = axum::Router::new().route(
+                "/api/version",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "version": "0.5" }))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+            let mut out = String::new();
+            alias_command(&mut out, &paths, port, &mut store, &id, Some("Coder"))
+                .await
+                .expect("direct");
+            assert!(out.contains("directly"), "{out}");
+            assert_eq!(alias_on_disk(&paths, &id).as_deref(), Some("Coder"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn something_that_cannot_be_confirmed_stops_the_write() {
+            let (_dir, paths, id) = profile("cli-unknown").await;
+            // Holds the port and refuses to say what it serves, as a gateway
+            // demanding a key would.
+            let app = axum::Router::new()
+                .route(
+                    "/api/v1/gateway",
+                    axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+                )
+                .route(
+                    "/version",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({ "build": "hermes-gateway-9.9.9" }))
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let mut store = CatalogStore::open(paths.catalog_file()).expect("catalog");
+            let mut out = String::new();
+            let err = alias_command(&mut out, &paths, port, &mut store, &id, Some("Coder"))
+                .await
+                .expect_err("must not write under an unknown gateway");
+            assert!(err.contains("appears to be running"), "{err}");
+            assert!(err.contains("stop the gateway"), "{err}");
+            assert_eq!(alias_on_disk(&paths, &id), None, "nothing was written");
+        }
     }
 
     #[test]
