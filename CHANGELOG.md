@@ -16,7 +16,11 @@ All notable changes to this project are documented in this file.
   control API reports both `id` and `alias`, and its load, detail and delete
   routes accept either. Aliases are persisted in the catalog, unique ignoring
   case, never derived from the file, and refused rather than adjusted on a
-  clash; existing catalogs load unchanged with no alias set.
+  clash; existing catalogs load unchanged with no alias set. Aliases and
+  canonical ids share one namespace: an alias may not equal any model id, and
+  a pinned or linked model whose id is already an alias is refused before it
+  downloads. `hermes models alias` goes through a running gateway serving the
+  same profile rather than editing the catalog under it.
 
 ### Fixed
 

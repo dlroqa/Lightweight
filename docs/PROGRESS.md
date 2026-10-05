@@ -1250,7 +1250,24 @@ gates.
   Metrics, `/health` and the control API keep the canonical id.
 - `PATCH /api/v1/models/{id}`; `alias` on import and download, checked before
   the job starts; load, detail and delete accept an alias.
-- `model: "default"` restored (removed in `9bb2569`).
+- `model: "default"` restored (removed in `9bb2569`), and guarded by its own
+  matrix test (`default` and omitted `model`, chat and text completions, with
+  and without an alias) because Lightagent depends on it.
+- One namespace: `CatalogStore::check_alias` refuses an alias equal to any id;
+  `ensure_id_unaliased` refuses a fixed (pinned or link) id equal to an alias,
+  before the transfer and again at commit; generated import ids step around
+  aliases case-insensitively.
+- `hermes models alias` probes `127.0.0.1:<configured or default port>`; a
+  gateway reporting this profile's data directory takes the change over
+  `PATCH`, one that cannot be identified refuses the write, and anything that
+  is not a Lightweight gateway (the default port is Ollama's too) is ignored.
+- Smoke-tested for real on 2026-10-04: SmolLM2-135M on a real engine under an
+  isolated profile, Lightagent `7d95232` in an isolated home configured with
+  `default`. Through a logging proxy: Lightagent listed `Coder`, sent
+  `model: "Coder"`, and every response chunk said `Coder`. Lightagent sends the
+  advertised id rather than the literal `default` when one model is listed;
+  the literal `default` and an omitted model were checked against the same
+  engine directly.
 - Not done, deliberately: alias history, a fleet-manifest `alias` field, and
   passing the alias to llama.cpp's `--alias` (the gateway never forwards the
   engine's model name, so it would change nothing a client sees).

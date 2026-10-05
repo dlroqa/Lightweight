@@ -275,10 +275,14 @@ an omitted `model` keep working beside it. Nothing is ever derived
 automatically, the file and its digest never change, and renaming takes effect
 at once without a reload — the old name stops resolving. Aliases are unique
 ignoring case, at most 64 characters, may not contain `/`, `\`, `@` or control
-characters, and `default` is reserved. They are stored in the catalog, so they
-survive restarts; while a gateway is running, set them through it (the panel
-or the control API below) rather than with the CLI, which edits the file the
-running gateway does not re-read.
+characters, and `default` is reserved. One name means one model: an alias can
+never equal any model's id, and a pinned or linked model whose fixed id is
+already someone's alias is refused before it downloads (an import is simply
+given a different id). Aliases are stored in the catalog, so they survive
+restarts. When a gateway serving the same profile is running on its configured
+port, `hermes models alias` makes the change through it, so it applies at once
+and is not overwritten; with none running it edits the catalog file and says
+so.
 
 A HuggingFace link is verified against the sha256 the site publishes for the
 file. Any other link is **recorded, not verified** unless you pass `--sha256`,
