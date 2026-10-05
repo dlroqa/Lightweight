@@ -18,13 +18,17 @@
 //! speaks the node's public `/v1` surface.
 //!
 //! Selection is deterministic: health decides which deployments are eligible,
-//! then the route's policy — priority, round-robin or least-busy — orders
-//! them. See `docs/ROUTER.md` for the roadmap beyond it.
+//! then the request's requirements, then — when the request names a session —
+//! that session's last deployment is preferred if it survived both, and
+//! otherwise the route's policy — priority, round-robin or least-busy — orders
+//! them. Latency, TTFT and estimator accuracy are measured and never consulted.
+//! See `docs/ROUTER.md` for the roadmap beyond it.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod affinity;
 pub mod api;
 pub mod capability;
 pub mod config;
@@ -37,6 +41,7 @@ pub mod proxy;
 pub mod requirements;
 pub mod select;
 pub mod sse;
+pub mod trace;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,11 +54,13 @@ use tokio_util::sync::CancellationToken;
 pub use config::{RouterConfig, load, validate};
 pub use domain::Topology;
 
+use crate::affinity::AffinityBook;
 use crate::config::HealthPolicy;
 use crate::health::HealthBook;
 use crate::load::LoadBook;
 use crate::metrics::RouterMetrics;
 use crate::select::Selector;
+use crate::trace::TraceBook;
 
 /// Everything a request handler needs.
 #[derive(Debug)]
@@ -69,6 +76,11 @@ pub struct RouterState {
     pub metrics: RouterMetrics,
     /// Per-route policy state and the per-deployment in-flight counts.
     pub selector: Selector,
+    /// Which deployment each live session prefers. Empty, and never written,
+    /// while affinity is off.
+    pub affinity: AffinityBook,
+    /// The most recent routing traces.
+    pub traces: TraceBook,
     pub started: SystemTime,
 }
 
@@ -126,6 +138,8 @@ impl RouterState {
             client,
             metrics: RouterMetrics::default(),
             selector,
+            affinity: AffinityBook::new(config.affinity.clone()),
+            traces: TraceBook::new(config.trace_capacity),
             started: SystemTime::now(),
         })
     }
@@ -192,6 +206,36 @@ impl BoundRouter {
             stop.clone(),
         );
 
+        // Expired affinities are also dropped when looked up and when the book
+        // is full; this only stops sessions that never return from sitting in
+        // memory until then.
+        let sweeper = state.affinity.enabled().then(|| {
+            let state = Arc::clone(&state);
+            let stopping = stop.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(state.affinity.sweep_interval());
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        () = stopping.cancelled() => break,
+                        _ = tick.tick() => {
+                            state.affinity.sweep();
+                        }
+                    }
+                }
+            })
+        });
+        if state.affinity.enabled() {
+            let policy = state.affinity.policy();
+            tracing::info!(
+                target: targets::ROUTER,
+                header = policy.header.as_str(),
+                idle_ttl_secs = policy.idle_ttl.as_secs(),
+                max_entries = policy.max_entries,
+                "session affinity is on"
+            );
+        }
+
         let mut servers = Vec::with_capacity(self.listeners.len());
         for listener in self.listeners {
             let app = api::app(Arc::clone(&state));
@@ -212,6 +256,9 @@ impl BoundRouter {
         }
         stop.cancel();
         let _ = monitor.await;
+        if let Some(sweeper) = sweeper {
+            let _ = sweeper.await;
+        }
         failure.map_or(Ok(()), Err)
     }
 }

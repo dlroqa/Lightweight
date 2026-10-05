@@ -5,12 +5,23 @@
 //! route, a node — never anything a client typed: a request for a route that
 //! does not exist is counted under `_unknown`, so a client cannot grow the
 //! label set by inventing model names.
+//!
+//! The same discipline holds for everything added for observability: labels
+//! are a route, a route's policy, a configured deployment, or a reason from a
+//! fixed list. Never a session, a request id, a prompt, a tool name or an
+//! address.
+//!
+//! Every duration and ratio here is **measured, never consulted**: no policy
+//! reads a histogram. They exist so an operator can tell a slow router from a
+//! slow model, and so a later release can change a heuristic on evidence.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
+use crate::affinity::AffinityBook;
 use crate::domain::{DeploymentId, NodeHealth, NodeId};
 use crate::health::NodeStatus;
 
@@ -64,6 +75,260 @@ pub struct RouterMetrics {
     /// its context, by route. Also counted in `failovers`.
     context_overflow_failovers: Mutex<BTreeMap<String, u64>>,
     active: Arc<AtomicU64>,
+    /// Requests whose session's sticky deployment was still a candidate and
+    /// went first, by route.
+    affinity_hits: Mutex<BTreeMap<String, u64>>,
+    /// Requests naming a session with no usable affinity — none yet, expired,
+    /// or its deployment no longer valid — by route.
+    affinity_misses: Mutex<BTreeMap<String, u64>>,
+    /// Sessions moved to another deployment, by route and reason.
+    affinity_reassignments: Mutex<BTreeMap<(String, &'static str), u64>>,
+    histograms: Histograms,
+}
+
+/// A histogram's bucket ladder: upper bounds in the integer unit values are
+/// observed in, and how many of that unit make one of the exposed unit.
+///
+/// Integers so a bucket is chosen by comparison, with no float rounding
+/// deciding which side of a boundary a value lands on (the gateway's rule).
+#[derive(Clone, Copy, Debug)]
+pub struct Ladder {
+    pub bounds: &'static [i64],
+    pub per_unit: i64,
+}
+
+/// Request-scale durations, observed in milliseconds and exposed in seconds.
+/// From 5 ms to five minutes: a CPU prefill of a long prompt genuinely reaches
+/// minutes, and a ladder that stopped at ten seconds would measure nothing
+/// about it.
+pub const SECONDS: Ladder = Ladder {
+    bounds: &[
+        5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000,
+    ],
+    per_unit: 1_000,
+};
+
+/// The router's own planning time, observed in microseconds and exposed in
+/// seconds. Planning reads memory and takes a lock or two; a millisecond
+/// ladder would put every observation in its first bucket.
+pub const PLANNING: Ladder = Ladder {
+    bounds: &[10, 25, 50, 100, 250, 500, 1_000, 2_500, 10_000, 50_000],
+    per_unit: 1_000_000,
+};
+
+/// `actual / estimated` prompt tokens, observed in thousandths. Above 1 means
+/// the router's lower bound underestimated, which it is built to do.
+pub const RATIO: Ladder = Ladder {
+    bounds: &[
+        250, 500, 750, 1_000, 1_250, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000, 6_000, 8_000,
+    ],
+    per_unit: 1_000,
+};
+
+/// `actual − estimated` prompt tokens. Signed: a negative value is an
+/// overestimate, which would mean the lower bound is not one.
+pub const TOKENS: Ladder = Ladder {
+    bounds: &[
+        -4_096, -1_024, -256, -64, -16, 0, 16, 64, 256, 1_024, 4_096, 16_384, 65_536,
+    ],
+    per_unit: 1,
+};
+
+/// One labelled histogram series.
+#[derive(Debug)]
+struct Series {
+    /// Per bucket, not cumulative; the `+Inf` overflow is the last.
+    buckets: Vec<AtomicU64>,
+    count: AtomicU64,
+    sum: AtomicI64,
+}
+
+impl Series {
+    fn new(ladder: Ladder) -> Self {
+        Self {
+            buckets: (0..=ladder.bounds.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            count: AtomicU64::new(0),
+            sum: AtomicI64::new(0),
+        }
+    }
+
+    fn observe(&self, ladder: Ladder, value: i64) {
+        let index = ladder.bounds.partition_point(|bound| *bound < value);
+        if let Some(bucket) = self.buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+}
+
+type Labels = Vec<(&'static str, String)>;
+
+/// One histogram family: a name, its ladder, and a series per label set.
+#[derive(Debug)]
+struct Family {
+    name: &'static str,
+    help: &'static str,
+    ladder: Ladder,
+    series: Mutex<BTreeMap<Labels, Series>>,
+}
+
+impl Family {
+    const fn new(name: &'static str, help: &'static str, ladder: Ladder) -> Self {
+        Self {
+            name,
+            help,
+            ladder,
+            series: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn observe(&self, labels: Labels, value: i64) {
+        self.series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(labels)
+            .or_insert_with(|| Series::new(self.ladder))
+            .observe(self.ladder, value);
+    }
+
+    /// How many observations a series has, for tests and the admin view.
+    fn count(&self, labels: &Labels) -> u64 {
+        self.series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(labels)
+            .map_or(0, |series| series.count.load(Ordering::Relaxed))
+    }
+
+    fn sum(&self, labels: &Labels) -> i64 {
+        self.series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(labels)
+            .map_or(0, |series| series.sum.load(Ordering::Relaxed))
+    }
+
+    fn render(&self, out: &mut String) {
+        let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
+        let _ = writeln!(out, "# TYPE {} histogram", self.name);
+        let per_unit = self.ladder.per_unit as f64;
+        for (labels, series) in self
+            .series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let base: String = labels
+                .iter()
+                .map(|(key, value)| format!("{key}=\"{}\",", escape(value)))
+                .collect();
+            let mut running = 0;
+            for (index, bucket) in series.buckets.iter().enumerate() {
+                running += bucket.load(Ordering::Relaxed);
+                let le = self
+                    .ladder
+                    .bounds
+                    .get(index)
+                    .map_or_else(|| "+Inf".to_owned(), |b| format_unit(*b as f64 / per_unit));
+                let _ = writeln!(out, "{}_bucket{{{base}le=\"{le}\"}} {running}", self.name);
+            }
+            let trimmed = base.trim_end_matches(',');
+            let _ = writeln!(
+                out,
+                "{}_sum{{{trimmed}}} {}",
+                self.name,
+                format_unit(series.sum.load(Ordering::Relaxed) as f64 / per_unit)
+            );
+            let _ = writeln!(
+                out,
+                "{}_count{{{trimmed}}} {}",
+                self.name,
+                series.count.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+/// A number in the exposition format, without trailing zeros.
+fn format_unit(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() || text == "-" {
+        "0".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Every histogram the router keeps.
+#[derive(Debug)]
+struct Histograms {
+    request: Family,
+    planning: Family,
+    ttft: Family,
+    upstream_ttft: Family,
+    upstream_response: Family,
+    upstream_duration: Family,
+    estimation_ratio: Family,
+    estimation_error: Family,
+}
+
+impl Default for Histograms {
+    fn default() -> Self {
+        Self {
+            request: Family::new(
+                "router_request_duration_seconds",
+                "From the router having the request to the end of its response, by route and policy. Includes failed and cancelled requests.",
+                SECONDS,
+            ),
+            planning: Family::new(
+                "router_routing_duration_seconds",
+                "Time the router spent deciding where a request goes (parse, requirements, plan), by route and policy. Excludes every upstream wait.",
+                PLANNING,
+            ),
+            ttft: Family::new(
+                "router_ttft_seconds",
+                "Streaming only: from the router having the request to the first content, reasoning or tool-call delta relayed to the client, by route and policy.",
+                SECONDS,
+            ),
+            upstream_ttft: Family::new(
+                "router_upstream_ttft_seconds",
+                "Streaming only: from sending to the committed deployment to its first content, reasoning or tool-call delta, by route and deployment.",
+                SECONDS,
+            ),
+            upstream_response: Family::new(
+                "router_upstream_response_seconds",
+                "From sending one attempt to a deployment to its response head, for every attempt that got one, by route and deployment.",
+                SECONDS,
+            ),
+            upstream_duration: Family::new(
+                "router_upstream_duration_seconds",
+                "From sending to the committed deployment to the end of its response body (or the client leaving), by route and deployment.",
+                SECONDS,
+            ),
+            estimation_ratio: Family::new(
+                "router_context_estimation_ratio",
+                "Node-counted prompt tokens divided by the router's lower-bound estimate, when the node reported usage and the estimate was positive. Above 1 is an underestimate.",
+                RATIO,
+            ),
+            estimation_error: Family::new(
+                "router_context_estimation_error_tokens",
+                "Node-counted prompt tokens minus the router's lower-bound estimate, when the node reported usage.",
+                TOKENS,
+            ),
+        }
+    }
+}
+
+fn millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn micros(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }
 
 /// Counts one request as active until dropped — which, for a stream, is when
@@ -196,6 +461,150 @@ impl RouterMetrics {
             .unwrap_or_default()
     }
 
+    pub fn record_affinity_hit(&self, route: &str) {
+        bump(&self.affinity_hits, route.to_owned());
+    }
+
+    pub fn record_affinity_miss(&self, route: &str) {
+        bump(&self.affinity_misses, route.to_owned());
+    }
+
+    pub fn record_affinity_reassignment(&self, route: &str, reason: &'static str) {
+        bump(&self.affinity_reassignments, (route.to_owned(), reason));
+    }
+
+    pub fn affinity_hits(&self, route: &str) -> u64 {
+        read(&self.affinity_hits, &route.to_owned())
+    }
+
+    pub fn affinity_misses(&self, route: &str) -> u64 {
+        read(&self.affinity_misses, &route.to_owned())
+    }
+
+    pub fn affinity_reassignments(&self, route: &str, reason: &'static str) -> u64 {
+        read(&self.affinity_reassignments, &(route.to_owned(), reason))
+    }
+
+    pub fn observe_request(&self, route: &str, policy: &'static str, elapsed: Duration) {
+        self.histograms
+            .request
+            .observe(route_policy(route, policy), millis(elapsed));
+    }
+
+    pub fn observe_planning(&self, route: &str, policy: &'static str, elapsed: Duration) {
+        self.histograms
+            .planning
+            .observe(route_policy(route, policy), micros(elapsed));
+    }
+
+    pub fn observe_ttft(&self, route: &str, policy: &'static str, elapsed: Duration) {
+        self.histograms
+            .ttft
+            .observe(route_policy(route, policy), millis(elapsed));
+    }
+
+    pub fn observe_upstream_ttft(&self, route: &str, deployment: &str, elapsed: Duration) {
+        self.histograms
+            .upstream_ttft
+            .observe(route_deployment(route, deployment), millis(elapsed));
+    }
+
+    pub fn observe_upstream_response(&self, route: &str, deployment: &str, elapsed: Duration) {
+        self.histograms
+            .upstream_response
+            .observe(route_deployment(route, deployment), millis(elapsed));
+    }
+
+    pub fn observe_upstream_duration(&self, route: &str, deployment: &str, elapsed: Duration) {
+        self.histograms
+            .upstream_duration
+            .observe(route_deployment(route, deployment), millis(elapsed));
+    }
+
+    /// Compare the router's prompt estimate with the node's own count.
+    ///
+    /// The error is recorded whenever the node reported a count. The ratio is
+    /// `actual / estimate`, recorded only when the estimate is positive: a
+    /// ratio over zero is not a number, and inventing one would put an
+    /// infinity in a histogram.
+    pub fn observe_estimate(&self, route: &str, estimated: u32, actual: u32) {
+        let labels = vec![("route", route.to_owned())];
+        self.histograms
+            .estimation_error
+            .observe(labels.clone(), i64::from(actual) - i64::from(estimated));
+        if estimated > 0 {
+            let thousandths = i64::from(actual) * 1_000 / i64::from(estimated);
+            self.histograms
+                .estimation_ratio
+                .observe(labels, thousandths);
+        }
+    }
+
+    /// How many observations a histogram has for one label set — for tests.
+    /// `family` is the exposed name; labels in the order they are exposed.
+    pub fn histogram_count(&self, family: &str, labels: &[(&'static str, &str)]) -> u64 {
+        self.family(family).map_or(0, |found| {
+            found.count(&labels.iter().map(|(k, v)| (*k, (*v).to_owned())).collect())
+        })
+    }
+
+    /// The sum of a histogram's observations, in its observed integer unit
+    /// (milliseconds, microseconds, thousandths or tokens) — for tests.
+    pub fn histogram_sum(&self, family: &str, labels: &[(&'static str, &str)]) -> i64 {
+        self.family(family).map_or(0, |found| {
+            found.sum(&labels.iter().map(|(k, v)| (*k, (*v).to_owned())).collect())
+        })
+    }
+
+    fn family(&self, name: &str) -> Option<&Family> {
+        let h = &self.histograms;
+        [
+            &h.request,
+            &h.planning,
+            &h.ttft,
+            &h.upstream_ttft,
+            &h.upstream_response,
+            &h.upstream_duration,
+            &h.estimation_ratio,
+            &h.estimation_error,
+        ]
+        .into_iter()
+        .find(|family| family.name == name)
+    }
+
+    /// The affinity book's gauges and eviction counts, in the same format.
+    pub fn affinity_to_prometheus(book: &AffinityBook) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "# HELP router_session_affinity_enabled 1 if session affinity is configured on.\n",
+        );
+        out.push_str("# TYPE router_session_affinity_enabled gauge\n");
+        let _ = writeln!(
+            out,
+            "router_session_affinity_enabled {}",
+            u8::from(book.enabled())
+        );
+        out.push_str(
+            "# HELP router_session_affinity_entries Sessions with a live affinity, across routes.\n",
+        );
+        out.push_str("# TYPE router_session_affinity_entries gauge\n");
+        let _ = writeln!(out, "router_session_affinity_entries {}", book.len());
+        let (expired, capacity) = book.evictions();
+        out.push_str(
+            "# HELP router_session_affinity_evictions_total Affinities removed, by reason: idle past the TTL, or to stay within max_entries.\n",
+        );
+        out.push_str("# TYPE router_session_affinity_evictions_total counter\n");
+        let _ = writeln!(
+            out,
+            "router_session_affinity_evictions_total{{reason=\"expired\"}} {expired}"
+        );
+        let _ = writeln!(
+            out,
+            "router_session_affinity_evictions_total{{reason=\"capacity\"}} {capacity}"
+        );
+        out
+    }
+
     pub fn to_prometheus(
         &self,
         health: &BTreeMap<NodeId, NodeStatus>,
@@ -310,6 +719,55 @@ impl RouterMetrics {
             );
         }
 
+        for (name, help, map) in [
+            (
+                "router_session_affinity_hits_total",
+                "Requests whose session's sticky deployment was still valid and went first, by route.",
+                &self.affinity_hits,
+            ),
+            (
+                "router_session_affinity_misses_total",
+                "Requests naming a session with no usable affinity (new, expired, or its deployment no longer valid), by route.",
+                &self.affinity_misses,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            for (route, count) in map.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+                let _ = writeln!(out, "{name}{{route=\"{}\"}} {count}", escape(route));
+            }
+        }
+        out.push_str(
+            "# HELP router_session_affinity_reassignments_total Sessions moved off their sticky deployment, by route and reason.\n",
+        );
+        out.push_str("# TYPE router_session_affinity_reassignments_total counter\n");
+        for ((route, reason), count) in self
+            .affinity_reassignments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_session_affinity_reassignments_total{{route=\"{}\",reason=\"{reason}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        let h = &self.histograms;
+        for family in [
+            &h.request,
+            &h.planning,
+            &h.ttft,
+            &h.upstream_ttft,
+            &h.upstream_response,
+            &h.upstream_duration,
+            &h.estimation_ratio,
+            &h.estimation_error,
+        ] {
+            family.render(&mut out);
+        }
+
         out.push_str(
             "# HELP router_deployment_active_requests Upstream attempts this router has in flight, per deployment.\n",
         );
@@ -340,6 +798,32 @@ impl RouterMetrics {
         }
         out
     }
+}
+
+fn bump<K: Ord>(map: &Mutex<BTreeMap<K, u64>>, key: K) {
+    *map.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(key)
+        .or_default() += 1;
+}
+
+fn read<K: Ord>(map: &Mutex<BTreeMap<K, u64>>, key: &K) -> u64 {
+    map.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn route_policy(route: &str, policy: &'static str) -> Labels {
+    vec![("route", route.to_owned()), ("policy", policy.to_owned())]
+}
+
+fn route_deployment(route: &str, deployment: &str) -> Labels {
+    vec![
+        ("route", route.to_owned()),
+        ("deployment", deployment.to_owned()),
+    ]
 }
 
 /// Escape a label value per the exposition format.
@@ -375,6 +859,86 @@ mod tests {
         assert!(text.contains("router_context_overflow_failovers_total{route=\"Coder\"} 1"));
         drop(guard);
         assert_eq!(metrics.active(), 0);
+    }
+
+    #[test]
+    fn histograms_render_cumulative_buckets_in_seconds() {
+        let metrics = RouterMetrics::default();
+        metrics.observe_ttft("Coder", "round_robin", Duration::from_millis(40));
+        metrics.observe_ttft("Coder", "round_robin", Duration::from_millis(400));
+        metrics.observe_planning("Coder", "round_robin", Duration::from_micros(30));
+        let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
+        assert!(text.contains("# TYPE router_ttft_seconds histogram"));
+        assert!(text.contains(
+            "router_ttft_seconds_bucket{route=\"Coder\",policy=\"round_robin\",le=\"0.05\"} 1"
+        ));
+        assert!(text.contains(
+            "router_ttft_seconds_bucket{route=\"Coder\",policy=\"round_robin\",le=\"0.5\"} 2"
+        ));
+        assert!(text.contains(
+            "router_ttft_seconds_bucket{route=\"Coder\",policy=\"round_robin\",le=\"+Inf\"} 2"
+        ));
+        assert!(
+            text.contains("router_ttft_seconds_sum{route=\"Coder\",policy=\"round_robin\"} 0.44")
+        );
+        assert!(
+            text.contains("router_ttft_seconds_count{route=\"Coder\",policy=\"round_robin\"} 2")
+        );
+        assert!(text.contains(
+            "router_routing_duration_seconds_bucket{route=\"Coder\",policy=\"round_robin\",le=\"0.00005\"} 1"
+        ));
+    }
+
+    #[test]
+    fn the_estimate_comparison_never_divides_by_zero() {
+        let metrics = RouterMetrics::default();
+        // Underestimated by a factor of three.
+        metrics.observe_estimate("Coder", 100, 300);
+        // Exact.
+        metrics.observe_estimate("Coder", 50, 50);
+        // An empty prompt: no ratio, but the (zero) error is still a fact.
+        metrics.observe_estimate("Coder", 0, 0);
+        metrics.observe_estimate("Coder", 0, 7);
+        let route = [("route", "Coder")];
+        assert_eq!(
+            metrics.histogram_count("router_context_estimation_ratio", &route),
+            2
+        );
+        assert_eq!(
+            metrics.histogram_sum("router_context_estimation_ratio", &route),
+            4_000
+        );
+        assert_eq!(
+            metrics.histogram_count("router_context_estimation_error_tokens", &route),
+            4
+        );
+        assert_eq!(
+            metrics.histogram_sum("router_context_estimation_error_tokens", &route),
+            207
+        );
+        let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
+        assert!(!text.contains("inf\n") && !text.contains("NaN"));
+        assert!(text.contains(
+            "router_context_estimation_error_tokens_bucket{route=\"Coder\",le=\"-16\"} 0"
+        ));
+    }
+
+    #[test]
+    fn affinity_counters_carry_only_route_and_reason() {
+        let metrics = RouterMetrics::default();
+        metrics.record_affinity_hit("Coder");
+        metrics.record_affinity_miss("Coder");
+        metrics.record_affinity_reassignment("Coder", "sticky_unhealthy");
+        let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
+        assert!(text.contains("router_session_affinity_hits_total{route=\"Coder\"} 1"));
+        assert!(text.contains("router_session_affinity_misses_total{route=\"Coder\"} 1"));
+        assert!(text.contains(
+            "router_session_affinity_reassignments_total{route=\"Coder\",reason=\"sticky_unhealthy\"} 1"
+        ));
+        let book = AffinityBook::new(crate::config::AffinityPolicy::default());
+        let gauges = RouterMetrics::affinity_to_prometheus(&book);
+        assert!(gauges.contains("router_session_affinity_entries 0"));
+        assert!(gauges.contains("router_session_affinity_enabled 0"));
     }
 
     #[test]
