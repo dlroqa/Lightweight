@@ -77,6 +77,33 @@ pub struct RequestGuard {
     /// The prompt the engine counted, for the roster.
     prompt_tokens: u32,
     started: Instant,
+    /// The caller's `X-Request-Id`, when it sent one: written on this
+    /// request's log lines so a router's log and this node's agree.
+    request_id: Option<String>,
+    /// How the request ended, for its closing log line only. Never read by the
+    /// metrics, which keep their own record.
+    ending: Ending,
+}
+
+/// How a request ended, as its closing log line reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Ending {
+    /// Neither completed nor failed before the guard went: the client left,
+    /// or the gateway is shutting down.
+    #[default]
+    Cancelled,
+    Completed,
+    Failed,
+}
+
+impl Ending {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 impl RequestGuard {
@@ -90,7 +117,34 @@ impl RequestGuard {
             model: None,
             prompt_tokens: 0,
             started: Instant::now(),
+            request_id: None,
+            ending: Ending::default(),
         }
+    }
+
+    /// Carry the request id the caller sent, if any. Additive like
+    /// `describing`: a guard never told logs exactly as before.
+    #[must_use]
+    pub fn correlating(mut self, request_id: Option<&str>) -> Self {
+        self.request_id = request_id.map(str::to_owned);
+        self
+    }
+
+    /// The caller's request id, for a log line written about this request.
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// The response was produced in full.
+    pub fn completed(&mut self) {
+        if self.ending == Ending::Cancelled {
+            self.ending = Ending::Completed;
+        }
+    }
+
+    /// The request failed, before or after its response began.
+    pub fn failed(&mut self) {
+        self.ending = Ending::Failed;
     }
 
     /// The same guard, reporting what it measured when it is dropped.
@@ -197,6 +251,32 @@ impl RequestGuard {
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
+        // One closing line per described request: what it was, how it ended,
+        // and what it cost — under the caller's request id, so the router's
+        // trace and this line are one `grep` apart. Never the prompt.
+        if let Some(id) = &self.id {
+            let ending = if self.record.finish_reason == Some(FinishReason::Error) {
+                Ending::Failed
+            } else {
+                self.ending
+            };
+            tracing::info!(
+                target: targets::INFERENCE,
+                request_id = self.request_id.as_deref(),
+                id = id.as_str(),
+                outcome = ending.as_str(),
+                finish_reason = self.record.finish_reason.map(FinishReason::as_str),
+                prompt_tokens = self.prompt_tokens,
+                completion_tokens = self.record.completion_tokens,
+                queue_wait_ms = self.record.queue_wait.as_millis() as u64,
+                ttft_ms = self
+                    .record
+                    .time_to_first_token
+                    .map(|ttft| ttft.as_millis() as u64),
+                total_ms = self.started.elapsed().as_millis() as u64,
+                "request finished"
+            );
+        }
         self.cancel.cancel();
         if let Some(metrics) = &self.metrics {
             self.record.total = self.started.elapsed();
@@ -407,6 +487,7 @@ async fn wait_for_a_slot(encoder: &mut Encoder) {
                     drop(ticket);
                     tracing::info!(
                         target: targets::SCHEDULER,
+                        request_id = encoder.guard.request_id(),
                         id = encoder.builder.id(),
                         waited_ms = waited.as_millis() as u64,
                         "admitted after waiting"
@@ -425,6 +506,7 @@ async fn wait_for_a_slot(encoder: &mut Encoder) {
         () = tokio::time::sleep_until(deadline) => {
             tracing::warn!(
                 target: targets::SCHEDULER,
+                request_id = encoder.guard.request_id(),
                 id = encoder.builder.id(),
                 waited_ms = ticket.waited().as_millis() as u64,
                 position = ticket.position(),
@@ -527,9 +609,12 @@ fn fail(encoder: &mut Encoder, err: &BackendError) {
 fn fail_with(encoder: &mut Encoder, code: &str, envelope: ErrorEnvelope) {
     tracing::warn!(
         target: targets::INFERENCE,
+        request_id = encoder.guard.request_id(),
+        id = encoder.builder.id(),
         code,
         "generation failed after the response had started"
     );
+    encoder.guard.failed();
     encoder.guard.record_mut().finish_reason = Some(FinishReason::Error);
     let frame = encoder.builder.error(envelope.to_value()).to_sse_frame();
     encoder.pending.push_back(frame);
@@ -578,11 +663,13 @@ fn close(encoder: &mut Encoder, finish_reason: FinishReason) {
         // usually a sampler or template problem that is otherwise invisible.
         tracing::warn!(
             target: targets::INFERENCE,
+            request_id = encoder.guard.request_id(),
             id = encoder.builder.id(),
             finish_reason = finish_reason.as_str(),
             "the model produced no content and no tool calls"
         );
     }
+    encoder.guard.completed();
 
     // Cancellation is idempotent and the permit is released either way; this
     // just does it as soon as the work is done rather than when the client

@@ -42,6 +42,7 @@ use crate::auth::AuthFailure;
 use crate::catalog::ResidentModel;
 use crate::completions::{self as completions_run, PendingCompletion};
 use crate::metrics::{Endpoint, Outcome};
+use crate::request_id;
 use crate::scheduler::{Band, PeerKey};
 use crate::state::GatewayState;
 use crate::stream::{self as sse_stream, RequestGuard, StartGeneration};
@@ -67,6 +68,19 @@ impl ApiError {
             status,
             envelope: Box::new(envelope),
         }
+    }
+
+    /// The response, after one log line saying the request was refused and
+    /// why — status and code, never the request — under the caller's id.
+    fn logged(self, request_id: Option<&str>) -> Response {
+        tracing::info!(
+            target: targets::API,
+            request_id,
+            status = self.status.as_u16(),
+            code = self.envelope.error.code.as_str(),
+            "request refused"
+        );
+        self.into_response()
     }
 
     /// Build from any workspace error, taking its own idea of the status.
@@ -244,13 +258,18 @@ pub async fn chat_completions(
     peer: PeerKey,
     body: Bytes,
 ) -> Response {
+    // The caller's id, when it sent one — a router always does — on every log
+    // line about this request and echoed on its response. Never invented
+    // here: see `crate::request_id`.
+    let request_id = request_id::from_headers(&headers);
+    let request_id = request_id.as_deref();
     if let Some(refusal) = admit_request(&state, &headers) {
-        return refusal;
+        return request_id::echo(refusal, request_id);
     }
 
     let request: ChatCompletionRequest = match parse_body(&body) {
         Ok(request) => request,
-        Err(err) => return err.into_response(),
+        Err(err) => return request_id::echo(err.logged(request_id), request_id),
     };
 
     // Logged once per request at debug, never at a level that would fill a
@@ -260,20 +279,21 @@ pub async fn chat_completions(
     if !ignored.is_empty() {
         tracing::debug!(
             target: targets::API,
+            request_id,
             fields = ignored.join(","),
             "accepted request fields that this gateway does not act on"
         );
     }
 
     let metrics = Arc::clone(&state);
-    let response = match serve_chat(state, request, peer).await {
+    let response = match serve_chat(state, request, peer, request_id).await {
         Ok(response) => response,
-        Err(err) => err.into_response(),
+        Err(err) => err.logged(request_id),
     };
     metrics
         .metrics()
         .record_request(Endpoint::ChatCompletions, outcome_of(response.status()));
-    response
+    request_id::echo(response, request_id)
 }
 
 /// `POST /v1/completions`.
@@ -287,33 +307,36 @@ pub async fn completions(
     peer: PeerKey,
     body: Bytes,
 ) -> Response {
+    let request_id = request_id::from_headers(&headers);
+    let request_id = request_id.as_deref();
     if let Some(refusal) = admit_request(&state, &headers) {
-        return refusal;
+        return request_id::echo(refusal, request_id);
     }
 
     let request: CompletionRequest = match parse_body(&body) {
         Ok(request) => request,
-        Err(err) => return err.into_response(),
+        Err(err) => return request_id::echo(err.logged(request_id), request_id),
     };
 
     let ignored = request.ignored_keys();
     if !ignored.is_empty() {
         tracing::debug!(
             target: targets::API,
+            request_id,
             fields = ignored.join(","),
             "accepted request fields that this gateway does not act on"
         );
     }
 
     let metrics = Arc::clone(&state);
-    let response = match serve_completions(state, request, peer).await {
+    let response = match serve_completions(state, request, peer, request_id).await {
         Ok(response) => response,
-        Err(err) => err.into_response(),
+        Err(err) => err.logged(request_id),
     };
     metrics
         .metrics()
         .record_request(Endpoint::Completions, outcome_of(response.status()));
-    response
+    request_id::echo(response, request_id)
 }
 
 /// How a status code counts.
@@ -336,6 +359,7 @@ async fn serve_completions(
     state: Arc<GatewayState>,
     request: CompletionRequest,
     peer: PeerKey,
+    request_id: Option<&str>,
 ) -> Result<Response, ApiError> {
     let model = state
         .catalog
@@ -417,6 +441,7 @@ async fn serve_completions(
     let builder = CompletionChunkBuilder::new(completion_id(), model.public_id());
     let mut guard = RequestGuard::new(cancel, Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
+        .correlating(request_id)
         .describing(builder.id(), model.id.to_string())
         .in_band(band)
         .counting(largest_prompt);
@@ -424,6 +449,7 @@ async fn serve_completions(
 
     tracing::info!(
         target: targets::INFERENCE,
+        request_id,
         id = builder.id(),
         model = %model.id,
         completions = queue.len(),
@@ -501,6 +527,7 @@ async fn serve_chat(
     state: Arc<GatewayState>,
     request: ChatCompletionRequest,
     peer: PeerKey,
+    request_id: Option<&str>,
 ) -> Result<Response, ApiError> {
     let model = state
         .catalog
@@ -552,6 +579,7 @@ async fn serve_chat(
     let builder = ChunkBuilder::new(completion_id(), model.public_id());
     tracing::info!(
         target: targets::INFERENCE,
+        request_id,
         id = builder.id(),
         model = %model.id,
         prompt_tokens,
@@ -571,8 +599,9 @@ async fn serve_chat(
         // generation, and report any failure to start as an HTTP status,
         // because nothing has been written to the client yet.
         Ok(permit) => {
-            let guard = RequestGuard::new(cancel.clone(), Some(permit))
+            let mut guard = RequestGuard::new(cancel.clone(), Some(permit))
                 .reporting_to(Arc::clone(state.metrics()))
+                .correlating(request_id)
                 .describing(builder.id(), model.id.to_string())
                 .in_band(band)
                 .counting(prompt_tokens);
@@ -580,7 +609,10 @@ async fn serve_chat(
                 .backend
                 .generate(model.instance, generation, cancel)
                 .await
-                .map_err(|err| ApiError::from_backend(&err))?;
+                .map_err(|err| {
+                    guard.failed();
+                    ApiError::from_backend(&err)
+                })?;
             return Ok(if request.stream {
                 streamed_response(sse_stream::encode(
                     events,
@@ -600,6 +632,7 @@ async fn serve_chat(
     // else waits here and is told 503 if the wait runs out.
     tracing::info!(
         target: targets::SCHEDULER,
+        request_id,
         id = builder.id(),
         band = band.as_str(),
         waiting = state.scheduler().snapshot().waiting,
@@ -610,6 +643,7 @@ async fn serve_chat(
         let deadline = tokio::time::Instant::now() + state.config.queue_timeout;
         let guard = RequestGuard::new(cancel.clone(), None)
             .reporting_to(Arc::clone(state.metrics()))
+            .correlating(request_id)
             .describing(builder.id(), model.id.to_string())
             .in_band(band)
             .counting(prompt_tokens);
@@ -644,6 +678,7 @@ async fn serve_chat(
     })?;
     let mut guard = RequestGuard::new(cancel.clone(), Some(permit))
         .reporting_to(Arc::clone(state.metrics()))
+        .correlating(request_id)
         .describing(builder.id(), model.id.to_string())
         .in_band(band)
         .counting(prompt_tokens);
@@ -653,7 +688,10 @@ async fn serve_chat(
         .backend
         .generate(model.instance, generation, cancel)
         .await
-        .map_err(|err| ApiError::from_backend(&err))?;
+        .map_err(|err| {
+            guard.failed();
+            ApiError::from_backend(&err)
+        })?;
 
     Ok(aggregate(events, builder, guard, &model).await)
 }
@@ -776,6 +814,7 @@ async fn aggregate(
             Err(err) => {
                 // Nothing has been sent yet, so this can still be an honest
                 // HTTP status rather than a half-written body.
+                guard.failed();
                 guard.record_mut().finish_reason = Some(FinishReason::Error);
                 return ApiError::from_backend(&err).into_response();
             }
@@ -785,10 +824,12 @@ async fn aggregate(
     if content.is_empty() && tool_calls.is_empty() {
         tracing::warn!(
             target: targets::INFERENCE,
+            request_id = guard.request_id(),
             id = builder.id(),
             "the model produced no content and no tool calls"
         );
     }
+    guard.completed();
 
     let mut response = ChatCompletionResponse::new(
         builder.id().to_owned(),

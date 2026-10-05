@@ -24,6 +24,7 @@ pub mod limits;
 pub mod logs;
 pub mod manager;
 pub mod metrics;
+pub mod request_id;
 pub mod routes;
 pub mod scheduler;
 pub mod state;
