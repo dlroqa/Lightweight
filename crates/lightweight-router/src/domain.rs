@@ -309,6 +309,61 @@ impl UnavailableReason {
     }
 }
 
+/// Why an available deployment cannot serve one particular request.
+///
+/// Distinct from [`UnavailableReason`]: that one is about the deployment and
+/// holds for every request; this one is about a request and the deployment's
+/// last-observed capabilities. A deployment can have several at once. Ordered
+/// so a set of them always reads in the same order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityGap {
+    /// A chat request, and the node does not offer `/v1/chat/completions`.
+    ChatUnsupported,
+    /// A text completion, and the node does not offer `/v1/completions`.
+    CompletionUnsupported,
+    /// The request declares tools, and the node does not take them.
+    ToolsUnsupported,
+    /// The request's `tool_choice` needs the node to honour it, and the node
+    /// does not say it does.
+    ToolChoiceUnsupported,
+    /// The request asks for reasoning, and the node does not offer it.
+    ReasoningUnsupported,
+    /// The prompt cannot fit in the context this deployment is served at.
+    ContextTooSmall,
+    /// The router has never observed this deployment's capabilities, so it
+    /// cannot vouch for any of them.
+    Unobserved,
+}
+
+impl CapabilityGap {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatUnsupported => "chat_unsupported",
+            Self::CompletionUnsupported => "completion_unsupported",
+            Self::ToolsUnsupported => "tools_unsupported",
+            Self::ToolChoiceUnsupported => "tool_choice_unsupported",
+            Self::ReasoningUnsupported => "reasoning_unsupported",
+            Self::ContextTooSmall => "context_too_small",
+            Self::Unobserved => "unobserved",
+        }
+    }
+
+    /// The requirement in words, for a client's error message. Names a kind of
+    /// capability, never a node or a model.
+    pub const fn requirement(self) -> &'static str {
+        match self {
+            Self::ChatUnsupported => "chat completions",
+            Self::CompletionUnsupported => "text completions",
+            Self::ToolsUnsupported => "tool calling",
+            Self::ToolChoiceUnsupported => "the requested tool_choice",
+            Self::ReasoningUnsupported => "reasoning (reasoning_effort)",
+            Self::ContextTooSmall => "a context window large enough for this prompt",
+            Self::Unobserved => "capabilities the router has observed",
+        }
+    }
+}
+
 /// Whether a deployment can take traffic right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeploymentHealth {
@@ -429,6 +484,15 @@ pub enum RoutingFailure {
     NoDefaultRoute,
     /// The route exists, and no deployment of it can take the request.
     RouteUnavailable { route: RouteName },
+    /// The route exists and has deployments that can take traffic, but none of
+    /// them can serve what this request asks for. `unmet` is every gap seen,
+    /// in a fixed order, so the client is told what to change; `unfit` is each
+    /// deployment's own gaps, for the operator's log and never for the client.
+    CapabilityMismatch {
+        route: RouteName,
+        unmet: Vec<CapabilityGap>,
+        unfit: Vec<(DeploymentId, Vec<CapabilityGap>)>,
+    },
 }
 
 /// Everything the operator configured, validated and immutable.

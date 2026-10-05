@@ -7,13 +7,18 @@
 //!    `tools`, `max_tokens` or `reasoning_effort` mean.
 //! 2. **Resolve** `model` to a route, through the same `default` rules the
 //!    gateway applies.
-//! 3. **Plan** from the health book: the route's deployments in priority order,
-//!    ineligible ones removed. No network call is made to decide.
-//! 4. **Attempt** each candidate in turn, with `model` rewritten to that node's
+//! 3. **Require**: what the request needs of a deployment — its endpoint,
+//!    tools, `tool_choice`, reasoning, and room for its prompt — read once by
+//!    [`crate::requirements`]. A request the gateway would refuse is refused
+//!    here with the gateway's own 400.
+//! 4. **Plan** from the health book: the route's available deployments, then
+//!    those that can serve this request, then the route's policy. No network
+//!    call is made to decide.
+//! 5. **Attempt** each candidate in turn, with `model` rewritten to that node's
 //!    local name and the node's own credential. A failure *before the node
 //!    answered* — refused connection, timeout, 502/503/504, or a node that no
 //!    longer serves the model — moves on to the next candidate.
-//! 5. **Commit** on the first answer that is not one of those. From here the
+//! 6. **Commit** on the first answer that is not one of those. From here the
 //!    deployment is fixed: the response is returned with `model` rewritten to
 //!    the route's name, and a stream is relayed frame by frame. If the node
 //!    fails mid-stream the client is told so in-band; no other node is asked
@@ -38,11 +43,12 @@ use lightweight_observability::targets;
 use serde_json::Value;
 
 use crate::RouterState;
-use crate::domain::{Node, RouteName, RoutingFailure};
+use crate::domain::{CapabilityGap, DeploymentId, Node, RouteName, RoutingFailure};
 use crate::error::{json_error, routing_failure, server_error};
 use crate::health::{Outcome as Probe, describe_transport};
 use crate::load::Lease;
 use crate::metrics::{ActiveGuard, Outcome, UNKNOWN_ROUTE};
+use crate::requirements;
 use crate::select::{Candidate, Selection};
 use crate::sse::{FrameRewriter, rewrite_body};
 
@@ -68,6 +74,14 @@ impl Endpoint {
         match self {
             Self::ChatCompletions => "/v1/chat/completions",
             Self::Completions => "/v1/completions",
+        }
+    }
+
+    /// The endpoint's name in a log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat",
+            Self::Completions => "completion",
         }
     }
 }
@@ -181,17 +195,64 @@ async fn route_request(
         }
     };
 
-    // Eligibility, then the route's policy, then a slot reserved on the first
-    // choice - all in the selector. Nothing below this line knows which policy
-    // the route uses; it only walks the order it was handed.
-    let mut plan = match state.selector.plan(
+    // What the request needs, read once, before any deployment is looked at.
+    let needs = match requirements::extract(endpoint, body) {
+        Ok(needs) => needs,
+        Err(refusal) => {
+            tracing::info!(
+                target: targets::ROUTER,
+                request_id,
+                route = %route.name,
+                endpoint = endpoint.as_str(),
+                upstream_status = refusal.status().as_u16(),
+                "request refused before routing"
+            );
+            state
+                .metrics
+                .record_request(route.name.as_str(), Outcome::ClientError);
+            return *refusal;
+        }
+    };
+
+    // Eligibility, then what this request needs, then the route's policy, then
+    // a slot reserved on the first choice - all in the selector. Nothing below
+    // this line knows which policy the route uses or what was filtered; it
+    // only walks the order it was handed.
+    let mut plan = match state.selector.plan_request(
         &state.topology,
         route,
         &state.health.snapshot(),
         &state.health.deployment_snapshot(),
+        &needs,
     ) {
         Ok(plan) => plan,
         Err(failure) => {
+            if let RoutingFailure::CapabilityMismatch { unfit, unmet, .. } = &failure {
+                record_unfit(state, request_id, &route.name, unfit);
+                tracing::warn!(
+                    target: targets::ROUTER,
+                    request_id,
+                    route = %route.name,
+                    endpoint = endpoint.as_str(),
+                    requires_tools = needs.tools,
+                    tool_choice = needs.tool_choice.as_str(),
+                    requires_reasoning = needs.reasoning,
+                    required_context = needs.required_context(),
+                    eligible_before = unfit.len(),
+                    eligible_after = 0,
+                    filtered = filtered_counts(unfit),
+                    unmet = unmet.iter().map(|gap| gap.as_str()).collect::<Vec<_>>().join(","),
+                    error = failure_code(&failure),
+                    "no available deployment can serve this request"
+                );
+                state
+                    .metrics
+                    .record_capability_mismatch(route.name.as_str());
+                state
+                    .metrics
+                    .record_request(route.name.as_str(), Outcome::ClientError);
+                return routing_failure(&failure, state.policy.interval);
+            }
             tracing::warn!(
                 target: targets::ROUTER,
                 request_id,
@@ -205,6 +266,7 @@ async fn route_request(
             return routing_failure(&failure, state.policy.interval);
         }
     };
+    record_unfit(state, request_id, &route.name, &plan.unfit);
     let routing_ms = started.elapsed().as_secs_f64() * 1000.0;
     for (deployment, reason) in &plan.skipped {
         tracing::debug!(
@@ -216,6 +278,9 @@ async fn route_request(
             "deployment skipped"
         );
     }
+    let eligible_after = plan.candidates.len();
+    let eligible_before = eligible_after + plan.unfit.len();
+    let filtered = filtered_counts(&plan.unfit);
 
     let (cursor, selected_index, active_before, concurrency_limit) = match plan.selection {
         Selection::Priority => (None, None, None, None),
@@ -284,6 +349,15 @@ async fn route_request(
                     selected_index,
                     active_before,
                     concurrency_limit,
+                    endpoint = endpoint.as_str(),
+                    requires_tools = needs.tools,
+                    tool_choice = needs.tool_choice.as_str(),
+                    requires_reasoning = needs.reasoning,
+                    required_context = needs.required_context(),
+                    max_tokens = needs.max_tokens,
+                    eligible_before,
+                    eligible_after,
+                    filtered = filtered.as_str(),
                     routing_ms,
                     upstream_status = response.status().as_u16(),
                     failover_count = attempt,
@@ -647,11 +721,50 @@ fn parse(body: &[u8]) -> Result<serde_json::Map<String, Value>, Box<Response>> {
     Ok(object)
 }
 
+/// Log and count the deployments a request's requirements ruled out.
+fn record_unfit(
+    state: &RouterState,
+    request_id: &str,
+    route: &RouteName,
+    unfit: &[(DeploymentId, Vec<CapabilityGap>)],
+) {
+    for (deployment, gaps) in unfit {
+        tracing::debug!(
+            target: targets::ROUTER,
+            request_id,
+            route = %route,
+            deployment = %deployment,
+            reasons = gaps.iter().map(|gap| gap.as_str()).collect::<Vec<_>>().join(","),
+            "deployment cannot serve this request"
+        );
+        for gap in gaps {
+            state
+                .metrics
+                .record_capability_filtered(route.as_str(), gap.as_str());
+        }
+    }
+}
+
+/// `tools_unsupported=1,context_too_small=2`: how many deployments each
+/// requirement ruled out, for one log field.
+fn filtered_counts(unfit: &[(DeploymentId, Vec<CapabilityGap>)]) -> String {
+    let mut counts = std::collections::BTreeMap::<CapabilityGap, usize>::new();
+    for gap in unfit.iter().flat_map(|(_, gaps)| gaps) {
+        *counts.entry(*gap).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(gap, count)| format!("{}={count}", gap.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 const fn failure_code(failure: &RoutingFailure) -> &'static str {
     match failure {
         RoutingFailure::UnknownRoute { .. } => "model_not_found",
         RoutingFailure::NoDefaultRoute => "no_default_route",
         RoutingFailure::RouteUnavailable { .. } => "route_unavailable",
+        RoutingFailure::CapabilityMismatch { .. } => "route_capability_mismatch",
     }
 }
 

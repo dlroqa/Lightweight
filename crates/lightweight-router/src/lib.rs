@@ -26,6 +26,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod api;
+pub mod capability;
 pub mod config;
 pub mod domain;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod health;
 pub mod load;
 pub mod metrics;
 pub mod proxy;
+pub mod requirements;
 pub mod select;
 pub mod sse;
 

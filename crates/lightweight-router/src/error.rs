@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use lightweight_api::error::{ErrorBody, ErrorEnvelope};
 use lightweight_gateway::auth::AuthFailure;
 
-use crate::domain::RoutingFailure;
+use crate::domain::{CapabilityGap, RoutingFailure};
 
 /// Send `envelope` with `status`.
 pub fn json_error(status: StatusCode, envelope: &ErrorEnvelope) -> Response {
@@ -47,6 +47,10 @@ pub fn server_error(message: impl Into<String>, code: impl Into<String>) -> Erro
 /// * A known route with nothing available is `route_unavailable`, a 503 with
 ///   `Retry-After` set to the probe interval — the soonest the answer can
 ///   change.
+/// * A known route whose available deployments cannot serve *this* request is
+///   `route_capability_mismatch`, a 400: the request, not the route's health,
+///   is what has to change. The message names the route and the kinds of
+///   capability that were missing, never a node or a model.
 pub fn routing_failure(failure: &RoutingFailure, retry_after: Duration) -> Response {
     match failure {
         RoutingFailure::UnknownRoute { requested } => json_error(
@@ -81,6 +85,40 @@ pub fn routing_failure(failure: &RoutingFailure, retry_after: Duration) -> Respo
             }
             response
         }
+        RoutingFailure::CapabilityMismatch { route, unmet, .. } => {
+            let wanted: Vec<&str> = unmet.iter().map(|gap| gap.requirement()).collect();
+            let mut envelope = ErrorEnvelope::invalid_request(
+                format!(
+                    "Route {:?} has no available deployment that supports {}.",
+                    route.as_str(),
+                    join(&wanted)
+                ),
+                "route_capability_mismatch",
+            );
+            if let Some(param) = unmet.iter().find_map(|gap| param_of(*gap)) {
+                envelope = envelope.with_param(param);
+            }
+            json_error(StatusCode::BAD_REQUEST, &envelope)
+        }
+    }
+}
+
+/// The request field a gap is about, when there is exactly one.
+const fn param_of(gap: CapabilityGap) -> Option<&'static str> {
+    match gap {
+        CapabilityGap::ToolsUnsupported => Some("tools"),
+        CapabilityGap::ToolChoiceUnsupported => Some("tool_choice"),
+        CapabilityGap::ReasoningUnsupported => Some("reasoning_effort"),
+        _ => None,
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join(items: &[&str]) -> String {
+    match items {
+        [] => "this request".to_owned(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
