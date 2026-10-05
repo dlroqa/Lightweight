@@ -25,6 +25,7 @@ use std::time::Duration;
 use lightweight_catalog::alias;
 use serde::Deserialize;
 
+use crate::auto_route::{AutoRoute, AutoRouteFile};
 use crate::domain::{
     Deployment, DeploymentId, Node, NodeAuth, NodeId, Route, RouteName, RoutePlacement,
     RoutePolicy, Secret, Topology,
@@ -127,6 +128,10 @@ pub struct RouterFile {
     /// `placement` target; these settings alone start nothing.
     #[serde(default)]
     pub placement: PlacementFile,
+    /// Optional. Absent means no `Auto`: a request naming it is answered as
+    /// any unknown model is, exactly as before R8.
+    #[serde(default)]
+    pub auto_route: Option<AutoRouteFile>,
     #[serde(default)]
     pub nodes: Vec<NodeFile>,
     #[serde(default)]
@@ -400,6 +405,8 @@ pub struct RouterConfig {
     /// How many recent routing traces to keep. `0` keeps none.
     pub trace_capacity: usize,
     pub placement: PlacementPolicy,
+    /// The `auto_route` section, when the file has one — on or off.
+    pub auto: Option<AutoRoute>,
 }
 
 /// One reason a configuration was refused.
@@ -470,6 +477,14 @@ pub enum ConfigError {
     BackoffMaxBelowInitial,
     #[error("route {route:?}: placement {problem}")]
     BadRoutePlacement { route: String, problem: String },
+    #[error(
+        "route {name:?}: `Auto` is the router's own name while \"auto_route\" is configured; rename the route"
+    )]
+    AutoRouteNameTaken { name: String },
+    #[error("auto_route: {problem}")]
+    BadAutoRoute { problem: String },
+    #[error("auto_route rule {rule:?} {problem}")]
+    BadAutoRule { rule: String, problem: String },
 }
 
 /// Every reason a configuration was refused, in file order.
@@ -577,6 +592,11 @@ pub fn validate(
         found
     });
 
+    let auto = file
+        .auto_route
+        .as_ref()
+        .and_then(|raw| crate::auto_route::validate(raw, &routes, &mut errors));
+
     if !errors.is_empty() {
         return Err(ConfigErrors(errors));
     }
@@ -595,6 +615,7 @@ pub fn validate(
         affinity,
         trace_capacity: file.traces.capacity,
         placement,
+        auto,
     })
 }
 

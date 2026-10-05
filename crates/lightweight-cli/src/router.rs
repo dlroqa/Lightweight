@@ -68,6 +68,14 @@ fn summarize(config: &RouterConfig, out: &mut String) {
             deployments.join(", ")
         ));
     }
+    if let Some(auto) = &config.auto {
+        out.push_str(&format!(
+            "  auto  {:<16} {} -> {}\n",
+            lightweight_router::auto_route::AUTO_ROUTE,
+            if auto.enabled { "on" } else { "off" },
+            auto.summary()
+        ));
+    }
 }
 
 /// `hermes router`: validate, bind, and serve until interrupted.

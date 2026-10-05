@@ -6,6 +6,36 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router rule-based `Auto` model (R8).** Off unless the configuration has an
+  `auto_route` section with `"enabled": true`; without one, `Auto` is an
+  unknown model exactly as before.
+  - A request with `"model": "Auto"` has its logical route chosen by ordered
+    rules over its structure, read by the same extractor capability filtering
+    uses: `endpoint` (`chat` / `completion`), `requires_tools`, `tool_choice`,
+    `requires_reasoning`, and `min_prompt_tokens` / `max_prompt_tokens` on the
+    router's prompt estimate. Conditions in a rule are ANDed, `false` means
+    the trait is absent, the first matching rule wins, and no match goes to
+    the required `fallback_route`.
+  - Only the route is chosen. Health, capability filtering, session affinity
+    (keyed by the resolved route), priority / round-robin / least-busy,
+    failover and context-overflow fallback run inside it unchanged. If the
+    chosen route cannot serve the request, its own error is returned; no
+    other route is tried, nothing waits for or triggers a model load.
+  - The response's `model` — whole bodies, every stream chunk, tool answers —
+    is the route that answered, never a node-local name.
+  - `/v1/models` lists `Auto` (with no context of its own);
+    `/v1/capabilities` describes it under `auto` by the routes it can resolve
+    to. Routing traces and log lines carry `requested_route`, `auto_rule` and
+    `auto_fallback`; `router_auto_route_decisions_total{rule,route}`,
+    `router_auto_route_fallback_total{route}`; and `GET /api/router/v1/auto`
+    shows the rules in order with their decision counts.
+  - Startup refuses unknown or reserved targets, `Auto` targeting itself, a
+    route named `Auto`, duplicate or label-unsafe rule names, rules with no
+    conditions, zero thresholds, rules no request could match, and more than
+    64 rules.
+  - Not learned routing: no prompt-content classification, scores, history,
+    latency or cost.
+
 - **Router placement and warm standby (R7).** Off unless a route has a
   `placement` target.
   - A route declares `min_ready`, `warm_standby` and the `allowed_nodes` it may

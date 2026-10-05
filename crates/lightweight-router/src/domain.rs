@@ -574,6 +574,11 @@ impl Topology {
         self.default_route.and_then(|index| self.routes.get(index))
     }
 
+    /// The route with exactly this configured name.
+    pub fn route(&self, name: &RouteName) -> Option<&Route> {
+        self.routes.iter().find(|route| &route.name == name)
+    }
+
     /// The routes that list a deployment, in configured order.
     pub fn routes_using(&self, deployment: &DeploymentId) -> Vec<&RouteName> {
         self.routes

@@ -6,8 +6,8 @@
 //!   to. It names routes and nothing else: no node, no address, no node-local
 //!   model name, no file.
 //! * **`/api/router/v1`** is the operator's read-only view of what is behind
-//!   the routes — nodes, deployments, health, session affinity and recent
-//!   routing traces. It shares `/v1`'s credential and never shows a node's
+//!   the routes — nodes, deployments, health, session affinity, `Auto`'s
+//!   rules and recent routing traces. It shares `/v1`'s credential and never shows a node's
 //!   key, a session id (only a keyed fingerprint) or any request content.
 
 use std::collections::BTreeMap;
@@ -49,6 +49,7 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/health", get(health_detail))
         .route("/api/router/v1/sessions", get(sessions))
         .route("/api/router/v1/traces", get(traces))
+        .route("/api/router/v1/auto", get(auto_rules))
         .route("/api/router/v1/placement", get(placement))
         .route("/api/router/v1/placement/reconcile", post(reconcile))
         .fallback(not_found)
@@ -131,8 +132,23 @@ async fn models(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Re
             }
             row
         })
+        .chain(enabled_auto(&state).map(|_| {
+            // The router's own choice, not a model: no context, because that
+            // belongs to whichever route a request resolves to.
+            json!({
+                "id": crate::auto_route::AUTO_ROUTE,
+                "object": "model",
+                "created": created,
+                "owned_by": OWNED_BY,
+            })
+        }))
         .collect();
     axum::Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+/// `Auto`, when it is configured and on.
+fn enabled_auto(state: &RouterState) -> Option<&crate::auto_route::AutoRoute> {
+    state.auto.as_ref().filter(|auto| auto.enabled)
 }
 
 /// `GET /v1/capabilities`: the gateway's contract, answered for routes.
@@ -146,6 +162,10 @@ async fn models(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Re
 /// **every deployment it could send a request to right now** supports it, and
 /// the router as a whole only what every available route supports. A route
 /// with nothing available claims nothing.
+///
+/// `Auto` is not a route and is not listed under `routes`: what it can serve
+/// is whatever the route a request resolves to can. It is described under
+/// `auto` by the routes it can resolve to, and claims nothing of its own.
 async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
         return refusal;
@@ -197,7 +217,7 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
         object.insert("model".into(), model);
     }
 
-    axum::Json(json!({
+    let mut body = json!({
         "object": "capability.list",
         "protocol": {
             "name": PROTOCOL_NAME,
@@ -219,8 +239,18 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
             "max_concurrent_requests": max_concurrent.unwrap_or(0),
         },
         "routes": routes,
-    }))
-    .into_response()
+    });
+    if let (Some(auto), Some(object)) = (enabled_auto(&state), body.as_object_mut()) {
+        object.insert(
+            "auto".into(),
+            json!({
+                "id": crate::auto_route::AUTO_ROUTE,
+                "router_resolved": true,
+                "routes": auto.targets().iter().map(|route| route.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    axum::Json(body).into_response()
 }
 
 /// `GET /health`: never refused, and says only whether routes are available.
@@ -385,6 +415,42 @@ async fn reconcile(State(state): State<Arc<RouterState>>, headers: HeaderMap) ->
         axum::Json(json!({"reconcile": "scheduled"})),
     )
         .into_response()
+}
+
+/// `GET /api/router/v1/auto`: `Auto`'s rules in the order they are tried,
+/// each with the route it chooses and how often it has. Read-only: rules
+/// change only with the configuration file.
+async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(auto) = &state.auto else {
+        return axum::Json(json!({"configured": false, "enabled": false})).into_response();
+    };
+    let rules: Vec<Value> = auto
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            json!({
+                "position": index + 1,
+                "name": rule.name,
+                "when": rule.when,
+                "condition": rule.when.summary(),
+                "route": rule.route.as_str(),
+                "decisions": state.metrics.auto_decisions(&rule.name),
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "configured": true,
+        "enabled": auto.enabled,
+        "name": crate::auto_route::AUTO_ROUTE,
+        "fallback_route": auto.fallback.as_str(),
+        "fallback_decisions": state.metrics.auto_fallbacks(),
+        "rules": rules,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]

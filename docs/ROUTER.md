@@ -11,7 +11,7 @@ Lightagent ─ model="Coder" ─▶ router ─ model="QwenCoder" ─▶ node A  
                                      └ model="CoderBackup" ─▶ node B   (fallback)
 ```
 
-This document covers milestones R0 to R7:
+This document covers milestones R0 to R8:
 
 - **R0–R3:** the domain model, a transparent proxy, a multi-node registry with
   health checks, and priority routing with failover before the response starts.
@@ -26,6 +26,11 @@ This document covers milestones R0 to R7:
 - **R7:** a placement controller that keeps each opted-in route at a target
   number of ready deployments by loading installed models onto empty nodes
   ahead of demand — outside the request path. See [Placement](#placement).
+- **R8:** an optional, rule-based `Auto` model. A client that sends
+  `model: "Auto"` asks the router to choose the logical route by the
+  request's structure; the route then chooses the deployment exactly as
+  before. See [Auto routing](#auto-routing). **R8 is not learned routing:**
+  no classifier, embedding, score, history, latency or cost is involved.
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -33,7 +38,8 @@ The [roadmap](#roadmap) lists what comes after.
 
 | Layer | Decides | Owns |
 |---|---|---|
-| Client (Lightagent) | which capability it wants | a route name such as `Coder` |
+| Client (Lightagent) | which capability it wants | a route name such as `Coder`, or `Auto` |
+| Auto rules (in the router, R8) | which logical route, when the client sent `Auto` | ordered rules over the request's structure — never a deployment or a node |
 | **Router** | where the request goes | routes, the deployment registry, node health, routing policy, forwarding, stream relaying, failover, router logs and metrics |
 | Node (`hermes serve`) | how the model runs | its aliases, canonical ids, GGUF files, RAM admission, the scheduler and the engine |
 | Placement controller (in the router process, R7) | where a route is prepared | load requests to empty nodes, readiness confirmation, backoff — never a request's path |
@@ -122,6 +128,10 @@ silently ignored.
 | `placement.load_timeout_secs` | 600 | How long one load may take, from the request to observed readiness. |
 | `placement.backoff_secs` / `backoff_max_secs` | 30 / 600 | The wait after a failed load, doubled per consecutive failure, never above the maximum. |
 | `traces.capacity` | 200 | How many recent routing traces `GET /api/router/v1/traces` keeps in memory. `0` keeps none; at most 10 000. |
+| `auto_route` | none | `{"enabled": true, "fallback_route": "General", "rules": [...]}`: serve `Auto`. Without the section, `Auto` is an unknown model, exactly as before R8. See [Auto routing](#auto-routing). |
+| `auto_route.enabled` | `false` | Off unless set. A section that is present but off is still checked. |
+| `auto_route.fallback_route` | required | The route an `Auto` request goes to when no rule matches. |
+| `auto_route.rules[]` | `[]` | `{"name": "tools", "when": {...}, "route": "Coder"}`, tried in order. At most 64. |
 
 **Secrets are never written in the file.** Each node names its own environment
 variable, and nothing falls back to a shared key. A URL that contains a
@@ -146,7 +156,15 @@ any:
 - a session header that is not a valid header name or already means something
   else, an affinity TTL or entry limit out of range, or a trace capacity over
   the limit. These are checked even while affinity is off, so turning it on is
-  never the moment a typo surfaces.
+  never the moment a typo surfaces;
+- with an `auto_route` section, on or off: a route named `Auto`; a
+  `fallback_route` or rule `route` that is not a configured route, is
+  `default`, or is `Auto` itself; a rule name that is empty, longer than 64
+  characters, used twice (ignoring case), does not start with a letter or
+  digit, or has characters outside `[A-Za-z0-9._-]`; a rule with no
+  conditions; a prompt threshold of 0; and a rule no request could ever match
+  (see [Rule validation](#rule-validation)). A top-level `default_route` of
+  `Auto` is refused too: `Auto` is not a route.
 
 A configuration being valid and a node being up are separate questions. The
 router starts even when every node is offline, and reports those nodes as
@@ -156,8 +174,8 @@ unhealthy.
 
 | Endpoint | Behaviour |
 |---|---|
-| `GET /v1/models` | Lists every configured route, including routes with nothing available right now. Each row has `owned_by: "lightweight-router"`. When a route's context is known it is given under the gateway's names (`context_length`, `n_ctx`, `max_tokens`, `max_output_tokens`), using the **smallest** context among the deployments the route could send a request to right now (see below). No node, address, node-local name or file appears. |
-| `GET /v1/capabilities` | The gateway's contract, with the same protocol name and version (`lightweight-public-inference`, v1) and the same top-level fields, plus a `routes` array. |
+| `GET /v1/models` | Lists every configured route, including routes with nothing available right now, and `Auto` when it is on — with no context fields, since its context is the resolved route's. Each row has `owned_by: "lightweight-router"`. When a route's context is known it is given under the gateway's names (`context_length`, `n_ctx`, `max_tokens`, `max_output_tokens`), using the **smallest** context among the deployments the route could send a request to right now (see below). No node, address, node-local name or file appears. |
+| `GET /v1/capabilities` | The gateway's contract, with the same protocol name and version (`lightweight-public-inference`, v1) and the same top-level fields, plus a `routes` array, and an `auto` object when `Auto` is on (see [Auto routing](#auto-routing)). |
 | `POST /v1/chat/completions`, `POST /v1/completions` | Routed and proxied, streamed or not. |
 | `GET /health` | Never refused. Returns `ok`, `degraded` or `unavailable` with route counts, and nothing more. |
 | `GET /metrics` | Prometheus text, behind the client key. |
@@ -230,6 +248,8 @@ a message that names only what the client itself asked for.
 | `default`, empty, or no `model` | `default_route`. If there is none: `400 no_default_route`. |
 | Anything else, including a node-local alias | `404 model_not_found`, the gateway's own code. No other route is substituted. |
 | A route with no available deployment | `503 route_unavailable`, with `Retry-After` set to the probe interval. |
+| `Auto`, in any casing, with `auto_route` on | The route its rules choose; then exactly as if that route had been named. The response's `model` is that route. |
+| `Auto`, with no `auto_route` or with it off | `404 model_not_found`, like any unknown name. |
 
 ### Streaming and cancellation
 
@@ -276,6 +296,197 @@ also on every line. Both sides share one rule for a usable id
 (`lightweight_gateway::request_id`), so neither rewrites what the other
 accepts. `grep <id>` then finds the request in the client's, the router's
 (stderr) and the node's (`gateway.log`) logs.
+
+## Auto routing
+
+`Auto` is a model a client can select like any route, but it has no
+deployments. A request that sends `model: "Auto"` asks the router to choose
+**which logical route** handles it. The chosen route then chooses **which of
+its deployments** answers, exactly as if the client had named the route. The
+two decisions never mix:
+
+```text
+Request ─▶ model == "Auto"? ── no ──▶ resolve by name ─┐
+               │ yes                                    │
+               ▼                                        ▼
+       request requirements (R5)               logical route
+               ▼                                        │
+       first matching rule, or fallback ───────────────▶│
+                                                        ▼
+            health ─▶ capability filter ─▶ session affinity
+                 ─▶ priority | round_robin | least_busy ─▶ deployment
+```
+
+`crates/lightweight-router/src/auto_route.rs` owns the first decision and
+nothing else; `select.rs`, `capability.rs`, `affinity.rs` and `placement.rs`
+are unchanged.
+
+### Configuration
+
+```json
+"auto_route": {
+  "enabled": true,
+  "fallback_route": "General",
+  "rules": [
+    { "name": "agentic",   "when": { "requires_tools": true, "requires_reasoning": true }, "route": "AgenticReasoner" },
+    { "name": "tools",     "when": { "requires_tools": true },          "route": "Coder" },
+    { "name": "reasoning", "when": { "requires_reasoning": true },      "route": "Reasoning" },
+    { "name": "long",      "when": { "min_prompt_tokens": 12000 },      "route": "LongContext" },
+    { "name": "text",      "when": { "endpoint": "completion" },        "route": "Completion" }
+  ]
+}
+```
+
+The fallback is `fallback_route` rather than `default_route` because the
+top-level `default_route` already means what `"model": "default"` resolves to.
+The two are independent.
+
+### Rules and their order
+
+Rules are tried **in configured order, and the first that matches wins**. If
+none matches, the request goes to `fallback_route`. Nothing is scored or
+weighed: the same request against the same file always reaches the same
+route. A request with tools and reasoning in the example above reaches
+`AgenticReasoner` because that rule comes first; move `tools` above it and the
+same request reaches `Coder`. That is intentional. Express OR by giving two
+rules the same `route`.
+
+Every condition in one `when` must hold (AND). A condition that is not written
+is not looked at. A boolean condition set to `false` is a condition, not an
+absence: `"requires_tools": false` matches only a request without tools.
+
+| Condition | Matches when | Read from |
+|---|---|---|
+| `endpoint` | `"chat"` (`/v1/chat/completions`) or `"completion"` (`/v1/completions`) | the endpoint the request was sent to |
+| `requires_tools` | the request declares at least one tool (`true`), or none (`false`). `"tools": []` declares none. | `tools` |
+| `tool_choice` | the request's `tool_choice` is exactly `unspecified` (not sent), `auto`, `none`, `required` or `function` (a named function) | `tool_choice` |
+| `requires_reasoning` | the request sends a `reasoning_effort` other than `none` (`true`), or does not (`false`). A template's own `chat_template_kwargs` switch is not read. | `reasoning_effort` |
+| `min_prompt_tokens`, `max_prompt_tokens` | the router's prompt estimate is at least / at most this many tokens (both inclusive) | the message text |
+
+These are exactly the facts [capability filtering](#what-a-request-requires)
+reads, from the same extractor (`requirements::extract`), run **once** per
+request: its result decides the route and is then reused to filter that
+route's deployments. The prompt estimate is the router's **lower bound**
+(message bytes ÷ 6, see [Context](#context)), not the model's own
+tokenization; a threshold compares against that bound. A body the router could
+not read well enough to count matches no threshold.
+
+**Nothing reads a prompt for meaning.** There is no "looks like code", "asks
+for maths" or "is research" condition, and no rule inspects message text for
+words such as "tool" or "function". Every condition is a field the client set
+or the endpoint it used.
+
+A request the gateway would refuse — `tool_choice: "required"` with no tools,
+say — is refused with the gateway's own `400` before any route is chosen,
+exactly as for a named route.
+
+### Rule validation
+
+At startup, with the section on or off, the router refuses:
+
+- a `fallback_route` or rule `route` that is not a configured route, is
+  `default`, or is `Auto` itself. `Auto` can therefore never resolve to `Auto`,
+  directly or through another rule; routes have no aliases or indirection, so
+  no longer cycle can exist;
+- a configured route called `Auto` (ignoring case) — it could never be reached
+  once `Auto` is on. **Without** an `auto_route` section, a route called `Auto`
+  is an ordinary route, as before R8;
+- duplicate rule names (ignoring case), and names that are empty, over 64
+  characters, not starting with a letter or digit, or outside
+  `[A-Za-z0-9._-]`. A rule name is a metric label, so it is held to the node
+  id's alphabet; `_fallback` is reserved for the fallback;
+- a rule with no conditions (it would match every request: that is what
+  `fallback_route` is for), a prompt threshold of `0`, and a rule no request can
+  meet: `min_prompt_tokens` above `max_prompt_tokens`; `endpoint: "completion"`
+  with `requires_tools: true`, `requires_reasoning: true` or any `tool_choice`
+  but `unspecified` (a text completion carries none of them); and
+  `requires_tools: false` with `tool_choice` `required` or `function`, which the
+  gateway refuses;
+- more than 64 rules.
+
+A rule that an earlier rule always pre-empts is not detected; order is the
+operator's to choose.
+
+### What `Auto` does not do
+
+- **It never chooses a deployment.** Capability filtering still runs inside
+  the chosen route: a `tools → Coder` rule does not prove every `Coder`
+  deployment takes tools, and one that does not is passed over as for any
+  request. If none can, the answer is `Coder`'s `route_capability_mismatch`.
+- **It never tries another route.** If the chosen route has nothing available,
+  the client gets that route's `503 route_unavailable` — not the fallback, and
+  not the next rule. Context-overflow failover stays inside the chosen route
+  too. Cross-route fallback would be multi-route failover; R8 has none.
+- **It never waits or loads.** A route that placement is still loading answers
+  `route_unavailable` at once. `Auto` has no placement of its own and never
+  asks for a load; the chosen route's placement target is the one that applies.
+- **It keeps no state.** No affinity, cursor, load count or health belongs to
+  `Auto`. Every one belongs to the resolved route.
+
+### Interaction with the rest
+
+- **Session affinity** is keyed by the **resolved** route and the session. A
+  session whose ordinary chat resolves to `General` and whose tool request
+  resolves to `Coder` has two independent affinities, one per route — the same
+  ones a direct request for `General` or `Coder` with that session uses. There
+  is never an `Auto` bucket, and `Auto` decides the route per request, so a
+  session is never held to the route of its previous turn.
+- **Priority, round-robin and least-busy** order only the chosen route's
+  deployments. Round-robin advances only on that route's requests (there is no
+  ring across routes) and least-busy compares only that route's deployments.
+- **Placement** works per route, as before. `Auto → Coder` is served by
+  `Coder`'s ready deployments and `Coder`'s target.
+
+### Response identity
+
+The client asked for `Auto`; **the response names the route that answered**:
+`"model": "Coder"` in a whole body, in every streamed chunk including the usage
+chunk, and in a tool-call answer. The choice is useful to the client and true;
+hiding it behind `Auto` would make an answer from `Coder` and one from
+`General` look alike. Node-local aliases and canonical ids are never shown,
+exactly as for a named route. A refusal from the chosen route names that route
+(`No healthy deployment is available for route "Coder".`).
+
+### Discovery
+
+- `GET /v1/models` lists `Auto` while it is on, as `object: "model"`,
+  `owned_by: "lightweight-router"`, with **no** context fields: its context is
+  whichever route a request resolves to.
+- `GET /v1/capabilities` does **not** list `Auto` under `routes`, and it does
+  not change the top-level `features` (which already cover every available
+  route). It adds:
+
+  ```json
+  "auto": { "id": "Auto", "router_resolved": true, "routes": ["AgenticReasoner", "Coder", "Reasoning", "LongContext", "Completion", "General"] }
+  ```
+
+  — the routes it can resolve to, rules first in order, then the fallback. No
+  rule name and no deployment is shown to a client.
+
+### Observability
+
+Every `Auto` request logs one line before it is planned:
+
+```text
+auto route resolved request_id="rtr-…" requested_route="Auto" auto_rule="tools" resolved_route=Coder
+  endpoint="chat" requires_tools=true tool_choice="unspecified" requires_reasoning=false estimated_prompt_tokens=840
+```
+
+`auto_rule` is `_fallback` when no rule matched. No prompt content is logged.
+The `routed` and `request finished` lines carry `requested_route` and
+`auto_rule` beside the route and deployment they already had, and the
+[routing trace](#routing-traces) gains `requested_route`, `auto_rule` and
+`auto_fallback`. The metrics are
+`router_auto_route_decisions_total{rule,route}` (rule a configured name or
+`_fallback`) and `router_auto_route_fallback_total{route}`, counted when the
+route is chosen, whatever the route then answers. A request refused before a
+route was chosen is counted under `route="Auto"` in `router_requests_total`.
+`GET /api/router/v1/auto` shows the rules (see [The control API](#the-control-api)).
+
+Choosing is a walk over at most 64 in-memory rules, comparing fields already
+read: no network call, no model, and nothing asynchronous. Ten thousand
+decisions that try every rule take well under the half second the unit test
+allows on a debug build.
 
 ## Health
 
@@ -930,6 +1141,7 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
 | `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
 | `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
+| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `decisions`. Read-only; rules change only with the file. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
 ## Observability
@@ -1044,7 +1256,7 @@ one attempt went and why; a trace says what happened over the whole request:
 ```json
 {
   "request_id": "rtr-…", "received_at": 1791221798, "route": "Coder",
-  "endpoint": "chat", "stream": true, "policy": "round_robin",
+  "requested_route": "Coder", "endpoint": "chat", "stream": true, "policy": "round_robin",
   "session": {"fingerprint": "d7630584", "affinity": "reassigned",
               "sticky": "node-a/QwenCoder", "reassignment": "sticky_failed"},
   "deployments": 2, "available": 2, "capable": 2,
@@ -1067,6 +1279,13 @@ one attempt went and why; a trace says what happened over the whole request:
 off or sent an in-band error) or `cancelled` (the client went away). A
 `context_overflow` object appears after an overflow failover. No trace holds a
 prompt, a message, a tool argument, a credential or a session id.
+
+`route` is the logical route that handled the request, and `requested_route`
+what the client asked for. They differ only for `Auto`, which also records
+`auto_rule` (the rule that chose the route) or `auto_fallback: true`. The
+route decision and the deployment decision are then both on record: `Auto`
+chose `route`, and `policy`, `selected`, `selection_reason`, `attempts` and
+`final_deployment` are the deployment decision inside it, unchanged.
 
 ### Metrics
 
@@ -1103,6 +1322,9 @@ or an address.
   `router_placement_failures_total{route,reason}`, and the histogram
   `router_placement_reconcile_duration_seconds` (one pass, without the loads
   it starts).
+- `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
+  `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
+  — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
 - Histograms (`_bucket`, `_sum`, `_count`): `router_request_duration_seconds`,
   `router_routing_duration_seconds`, `router_ttft_seconds`
   (`{route,policy}`); `router_upstream_ttft_seconds`,
@@ -1167,6 +1389,20 @@ clients cannot add labels by inventing model names.
   they are deliberately not counted.
 - **Upstream connection time is not separated** from the response-head time;
   see [Latency](#latency).
+- **`Auto` sees structure only.** It can tell a tool request from a plain chat,
+  but not a coding question from a poem. Content-aware choice would need a
+  classifier, which belongs to a later milestone.
+- **`Auto`'s prompt threshold is the router's lower bound.** A prompt the model
+  counts at 14 000 tokens may be estimated at 9 000, and miss a
+  `min_prompt_tokens: 12000` rule. Set thresholds against the estimate; the
+  trace shows both figures for real traffic.
+- **No cross-route fallback.** If the route `Auto` chose is down, the request
+  fails even when another route could have answered it. That is deliberate
+  ([What `Auto` does not do](#what-auto-does-not-do)).
+- **Lightagent `7d95232` sends its tool set with every turn.** Behind `Auto`,
+  every Lightagent chat therefore matches a `requires_tools: true` rule; a
+  plain-chat rule only ever sees other clients. Its status bar shows the model
+  it selected (`Auto`), not the route that answered.
 
 ## Lightagent's runtime panel
 
@@ -1229,7 +1465,7 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R7 (placement and warm standby) is built. Nothing after it is. Each
+R8 (rule-based `Auto`) is built. Nothing after it is. Each
 later step builds on the types above without changing the public route
 identity.
 
@@ -1239,7 +1475,7 @@ identity.
 | **R5** | Done: request-aware capability filtering between eligibility and policy, for endpoint, tools, `tool_choice`, reasoning and context. Deliberately left out: ranking by capability, routing on the output budget, per-model tokenization, and moving a request to another route. |
 | **R6** | Done: optional session affinity (explicit header, route-scoped, bounded, idle TTL, a preference only over valid candidates); TTFT, latency and planning histograms; one request id from client to node log, across failover; per-request routing traces; estimate-versus-node prompt-token telemetry. Deliberately left out: using any of it to route, soft affinity, persistence, and inferring sessions. |
 | **R7** | Done: per-route `min_ready` / `warm_standby` targets on allowed nodes, a reconciliation loop that loads installed models onto empty nodes through each node's control API, readiness by the router's own probe, the node's admission as the authority, bounded backoff, `/api/router/v1/placement`. Deliberately left out: unloading, swapping, rebalancing, downloading, and any use of latency or traffic. |
-| **R8** | A rule-based `Auto` route that maps request traits to routes. |
+| **R8** | Done: an opt-in `Auto` model that chooses the logical route by ordered, first-match rules over the R5 request requirements (endpoint, tools, `tool_choice`, reasoning, prompt estimate), with an explicit fallback; the route's own pipeline chooses the deployment; route-scoped affinity; the resolved route on every response; `requested_route`/`auto_rule` in traces, decision metrics and `/api/router/v1/auto`. Deliberately left out: prompt-content classification, scores, history, latency or cost, cross-route fallback, and live rule editing. |
 | **R9** | A learned or adaptive router, and mixture-of-agents integration. |
 
 Out of scope for every one of these: a request-path model load, splicing one

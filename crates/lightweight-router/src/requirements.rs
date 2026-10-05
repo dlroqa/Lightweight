@@ -62,7 +62,11 @@ pub const BYTES_PER_TOKEN_CEILING: usize = 6;
 /// The function a request names is not kept: whether a deployment can force a
 /// call does not depend on which one, and a function name has no place in a
 /// metric or a log field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Spelled in a configuration file as [`Self::as_str`] does, for an `Auto`
+/// rule that matches on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolChoiceRequirement {
     /// Not sent.
     #[default]

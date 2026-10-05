@@ -875,6 +875,77 @@ async fn placement_leaves_policies_and_capability_filtering_as_they_were() {
 }
 
 #[tokio::test]
+async fn auto_resolves_to_a_route_still_loading_without_waiting_switching_or_loading() {
+    ensure_provider();
+    let general = ScriptedNode::start("GeneralModel", SERVING).await;
+    let a = ScriptedNode::start(
+        "QwenCoder",
+        Setup {
+            load_delay_ms: 2_000,
+            ..EMPTY
+        },
+    )
+    .await;
+    let mut config = coder(
+        "priority",
+        &[("a", &a.base, "QwenCoder")],
+        Some(json!({"allowed_nodes": ["a"]})),
+    );
+    config["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "g", "url": general.base}));
+    config["routes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "General", "deployments": [{"node": "g", "model": "GeneralModel"}]}));
+    config["auto_route"] = json!({"enabled": true, "fallback_route": "General",
+        "rules": [{"name": "tools", "when": {"requires_tools": true}, "route": "Coder"}]});
+    let router = Router::start(config, &[]).await;
+    let tool_request = json!({"model": "Auto", "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]});
+
+    router.reconcile().await;
+    poll("the load to start", 10, async || {
+        (router.coder().await["deployments"][0]["state"] == "loading").then_some(())
+    })
+    .await;
+
+    // Auto resolves to Coder, and Coder has nothing ready: Coder's own answer,
+    // at once. Not held for the load, and not sent to General instead.
+    let started = Instant::now();
+    let response = router.chat(tool_request.clone()).await;
+    assert_eq!(response.status(), 503);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "route_unavailable");
+    assert!(body["error"]["message"].as_str().unwrap().contains("Coder"));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the request waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!((a.hits(), general.hits()), (0, 0));
+
+    // An ordinary Auto request meanwhile resolves to General, which is ready.
+    let response = router
+        .chat(json!({"model": "Auto", "messages": [{"role": "user", "content": "hi"}]}))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(general.hits(), 1);
+
+    // Once placement has made Coder ready, the same request is served there.
+    router.until_ready(1).await;
+    let response = router.chat(tool_request).await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "Coder");
+    assert_eq!(a.hits(), 1);
+    // The controller's one load, and none for any request.
+    assert_eq!(a.loads(), 1);
+    assert_eq!(general.loads(), 0);
+}
+
+#[tokio::test]
 async fn without_a_placement_target_nothing_is_controlled() {
     ensure_provider();
     let a = ScriptedNode::start("QwenCoder", EMPTY).await;
