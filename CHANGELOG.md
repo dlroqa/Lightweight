@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-05
+
 ### Added
 
 - **Router load balancing (R4).** Each route chooses its `strategy`:
@@ -326,7 +328,9 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dlroqa/Lightweight/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/dlroqa/Lightweight/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dlroqa/Lightweight/compare/v0.2.4...v0.4.0
 [0.2.4]: https://github.com/dlroqa/Lightweight/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/dlroqa/Lightweight/compare/v0.2.2...v0.2.3
