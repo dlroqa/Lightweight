@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router placement and warm standby (R7).** Off unless a route has a
+  `placement` target.
+  - A route declares `min_ready`, `warm_standby` and the `allowed_nodes` it may
+    be loaded on. A controller beside the router — never in a request — keeps
+    the route at `min_ready + warm_standby` ready deployments by asking empty,
+    healthy, allowed nodes to load the model they already have installed,
+    through each node's own control API and credential.
+  - A deployment counts as ready only once the router's own probe sees it
+    serving, by the same rule requests use. The node's admission control
+    decides every load; a refusal is recorded (`admission_failed`, with the
+    node's code) and backed off, doubling to a configured maximum.
+  - Nothing is downloaded, swapped, unloaded or rebalanced; latency and
+    traffic play no part. A request for a route with nothing ready is refused
+    `route_unavailable` immediately, even while a load is in progress.
+  - `GET /api/router/v1/placement`, `POST /api/router/v1/placement/reconcile`,
+    and per-route ready/target/loading gauges, action and failure counters and
+    a reconcile-duration histogram.
+
 - **Router session affinity (R6).** Off unless `session_affinity.enabled` is
   set. A client names a session in `X-Lightweight-Session` (configurable);
   the router never infers one from an address, a key or the prompt.

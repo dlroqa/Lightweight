@@ -1653,6 +1653,72 @@ SmolLM2-135M, `--ctx 2048 --concurrency 2`), each in its own scratch
 
 **Next:** review of this branch. R7 (placement / warm standby) is not started.
 
+## Router placement and warm standby, R7 (feature/router-placement-controller)
+
+R6 was merged first (PR #34, merge commit `dace9df`) and master validated:
+`./scripts/check.sh` 1120 tests, 0 failed; all eight CI jobs green (the
+three Linux jobs needed re-running after a GitHub Actions incident in which
+no hosted runner picked them up — no step had run). A post-merge smoke test
+(Lightagent → router → two scratch nodes) passed. R7 is branched from that
+master. R8 not started.
+
+What the nodes actually offer, read before any code: `POST
+/api/v1/models/{id}/load` (empty body accepted) starts a **job** and answers
+`202 {"job": n}`; `GET /api/v1/jobs/{n}` reports `status.state`
+`running|succeeded|failed|cancelled`, a failure carrying the structured
+`error.code`; `GET /api/v1/models` lists the catalog with `state`
+`loaded|available|missing`. A load runs the node's own admission
+(`insufficient_memory`), and on a node already serving a model it is a hot
+swap (pause, drain, replace) — one model per gateway. The `/api/v1` surface
+takes the node's ordinary key (keys are unscoped), and a client sending no
+`Origin` passes its cross-origin guard. So R7 loads only onto healthy
+**empty** nodes and never swaps.
+
+- **Domain/config:** `routes[].placement {min_ready, warm_standby,
+  allowed_nodes}` (`RoutePlacement`), top-level `placement {interval_secs,
+  load_timeout_secs, backoff_secs, backoff_max_secs}`. Unreachable targets,
+  unknown or duplicate allowed nodes, and bad timings are refused at startup.
+- **Planner** (`placement.rs`, pure): deployment states ready / loading /
+  empty / occupied / unavailable; ready counted over every deployment of the
+  route; one load per node, never more than the shortfall, configured order.
+- **Controller** (`controller.rs`): the loop (interval, a finished load, or the
+  reconcile endpoint), loads as owned tasks: catalog check → load job → job
+  polled → node probed until available by the request path's rule. Failure
+  reasons from the node's codes; doubling bounded backoff.
+- **Request path untouched.** `proxy.rs`, `select.rs` and the policies are not
+  changed by R7.
+- **Bug found by a test:** a real node with no alias advertises
+  `<id>@<ctx>`, so a deployment named by bare catalog id never becomes
+  available (the pre-existing R0 rule). The controller reports it as
+  `load_timeout` / `not_ready` rather than retrying blindly; the tests name the
+  alias, as real deployments do. The rule itself is unchanged.
+- **Mutation check:** with backoff disabled, the admission test saw 33 load
+  attempts instead of 1.
+
+Verified by execution against three real gateways (`target/debug/hermes
+serve`, SmolLM2-135M), each in its own scratch `XDG_DATA_HOME`: node A started
+with the model (`QwenCoder`), nodes B (`CoderBackup`) and C (`CoderStandby`)
+started **empty** with the model installed, behind the real `hermes router`
+with a priority `Coder`, `min_ready 1, warm_standby 1`, all three allowed:
+
+- At start the controller saw 1 of 2 ready and loaded **B** through B's control
+  API: ready, confirmed by probe, in 1540 ms. C was left empty.
+- A stopped by its PID: the next request tried A, failed over and was answered
+  by B in the same request (2.14 s, spent on A's attempt while it shut down; no
+  load was involved). The controller then loaded **C** — C's own log shows its
+  `admission verdict` (SAFE, 687.9 MiB) and `model loaded` — and counted it
+  ready after 6723 ms. The route was `satisfied` again, with A `unavailable`.
+- **Unmodified Lightagent `7d95232`** listed `Coder` and streamed a chat
+  (answered by B, no session); placement is invisible to it. Its tree is
+  unchanged.
+- The user's own gateway on 11434 was not touched. Aliases were written into
+  the scratch catalogs directly. Processes were stopped by recorded PIDs.
+- **Validation.** `./scripts/check.sh` passed in full: 1146 workspace tests, 0
+  failed (1120 on master). The router has 220 (136 unit, 72 surface, 11
+  placement, 1 log-correlation). Contract suite 47 passed, 2 skipped.
+
+**Next:** review of this branch. R8 (rule-based `Auto` route) is not started.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

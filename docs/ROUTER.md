@@ -11,7 +11,7 @@ Lightagent ─ model="Coder" ─▶ router ─ model="QwenCoder" ─▶ node A  
                                      └ model="CoderBackup" ─▶ node B   (fallback)
 ```
 
-This document covers milestones R0 to R6:
+This document covers milestones R0 to R7:
 
 - **R0–R3:** the domain model, a transparent proxy, a multi-node registry with
   health checks, and priority routing with failover before the response starts.
@@ -23,6 +23,9 @@ This document covers milestones R0 to R6:
   routing traces, and the router's prompt estimate compared with the node's
   own count. **Everything R6 measures is measured only: no routing decision
   reads latency, TTFT, estimator error or history.**
+- **R7:** a placement controller that keeps each opted-in route at a target
+  number of ready deployments by loading installed models onto empty nodes
+  ahead of demand — outside the request path. See [Placement](#placement).
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -33,12 +36,15 @@ The [roadmap](#roadmap) lists what comes after.
 | Client (Lightagent) | which capability it wants | a route name such as `Coder` |
 | **Router** | where the request goes | routes, the deployment registry, node health, routing policy, forwarding, stream relaying, failover, router logs and metrics |
 | Node (`hermes serve`) | how the model runs | its aliases, canonical ids, GGUF files, RAM admission, the scheduler and the engine |
+| Placement controller (in the router process, R7) | where a route is prepared | load requests to empty nodes, readiness confirmation, backoff — never a request's path |
 
 The router speaks only to a node's public `/v1` surface, the same surface any
 client uses. It never parses GGUF, estimates memory, loads or unloads a model,
 or reads a node's alias-to-canonical mapping. If a node is not serving the model
-a deployment names, that deployment is unavailable. The router never asks the
-node to load the model.
+a deployment names, that deployment is unavailable. **A request** never causes
+a load. Since R7, a separate [placement controller](#placement) may ask an
+empty node to load a route's model ahead of demand, through the node's own
+control API, when the operator configured a placement target for that route.
 
 ## Concepts
 
@@ -83,6 +89,7 @@ silently ignored.
   "request": { "connect_timeout_secs": 5 },
   "session_affinity": { "enabled": true, "header": "X-Lightweight-Session", "idle_ttl_secs": 1800, "max_entries": 10000 },
   "traces": { "capacity": 200 },
+  "placement": { "interval_secs": 15, "load_timeout_secs": 600, "backoff_secs": 30, "backoff_max_secs": 600 },
   "nodes": [
     { "id": "dell-7820", "url": "http://192.0.2.10:11434", "api_key_env": "LIGHTWEIGHT_DELL_KEY" },
     { "id": "t420",      "url": "http://192.0.2.11:11434", "api_key_env": "LIGHTWEIGHT_T420_KEY", "enabled": true }
@@ -110,6 +117,10 @@ silently ignored.
 | `session_affinity.header` | `X-Lightweight-Session` | The request header a session id is read from. Compared ignoring case. `Authorization`, `Cookie`, `X-Request-Id` and other headers that already mean something are refused. |
 | `session_affinity.idle_ttl_secs` | 1800 | How long a session may sit unused before its affinity is forgotten. 1 to 86 400. |
 | `session_affinity.max_entries` | 10 000 | The most sessions held at once (at most 1 000 000). When full, expired entries go first, then the least recently used. |
+| `routes[].placement` | none | `{"min_ready": 1, "warm_standby": 1, "allowed_nodes": ["dell-7820", "t420"]}`: keep this many of the route's deployments loaded. Without it, the controller never acts for the route. See [Placement](#placement). |
+| `placement.interval_secs` | 15 | How often the controller compares routes with their targets. It runs only if some route has a target. |
+| `placement.load_timeout_secs` | 600 | How long one load may take, from the request to observed readiness. |
+| `placement.backoff_secs` / `backoff_max_secs` | 30 / 600 | The wait after a failed load, doubled per consecutive failure, never above the maximum. |
 | `traces.capacity` | 200 | How many recent routing traces `GET /api/router/v1/traces` keeps in memory. `0` keeps none; at most 10 000. |
 
 **Secrets are never written in the file.** Each node names its own environment
@@ -128,6 +139,10 @@ any:
   credentials, a query or a fragment;
 - an environment variable that is missing or empty;
 - out-of-range health or request timings;
+- a placement with `min_ready` 0, no `allowed_nodes`, an allowed node with no
+  deployment in that route, a node listed twice, or a target larger than the
+  route's deployment count (it could never be met); placement timings below 1
+  second, or a backoff maximum below the initial backoff;
 - a session header that is not a valid header name or already means something
   else, an affinity TTL or entry limit out of range, or a trace capacity over
   the limit. These are checked even while affinity is off, so turning it on is
@@ -774,7 +789,134 @@ better:
 | `least_busy` | `least_busy`, `least_busy_tiebreak`, `least_busy_failover` |
 | any | `context_overflow_failover`, `session_affinity` (first choice was the session's sticky deployment) |
 
-## The control API (read-only)
+## Placement
+
+R7 keeps routes ready before requests need them. It does not make routing any
+smarter. The two questions stay apart:
+
+| | Answers | Runs |
+|---|---|---|
+| **Routing** (R0–R6) | which already-ready deployment serves this request? | in the request, in microseconds |
+| **Placement** (R7) | where should this route be prepared? | on its own loop, every `placement.interval_secs` |
+
+**A request never waits for a load.** A route with nothing ready is refused
+`503 route_unavailable` at once, exactly as before — even while a load for it
+is in progress. Once the controller has seen the load finish, the next request
+finds a ready deployment.
+
+### Targets and warm standby
+
+A route opts in:
+
+```json
+{ "name": "Coder", "strategy": "priority",
+  "deployments": [ {"node": "node-a", "model": "QwenCoder"},
+                   {"node": "node-b", "model": "CoderBackup"},
+                   {"node": "node-c", "model": "CoderStandby"} ],
+  "placement": { "min_ready": 1, "warm_standby": 1,
+                 "allowed_nodes": ["node-a", "node-b", "node-c"] } }
+```
+
+- **`min_ready`** (default 1): ready deployments the route should never fall
+  below.
+- **`warm_standby`** (default 0): ready deployments to keep beyond that.
+- **`allowed_nodes`** (required): the nodes the controller may load the
+  route's model on. Each must already host one of the route's deployments; the
+  controller loads exactly that deployment's model there, by that
+  deployment's name, and never anything on a node not listed.
+
+The target is `min_ready + warm_standby`, counted over **every** ready
+deployment of the route, whoever loaded it. What the states mean:
+
+| State | Meaning |
+|---|---|
+| ready primary / ready warm standby | loaded and available by the router's own probe. A standby is an ordinary deployment: it takes traffic as the route's policy orders it (under priority, after the primary). Nothing is hidden from routing. |
+| loading | a load this controller asked for is in progress |
+| empty — a cold standby | the node is healthy and serving nothing; the model may be installed there. **Not** warm: it cannot take a request. |
+| occupied | the node serves another model. Never swapped. |
+| unavailable | the node is disabled, unhealthy, or not yet probed |
+
+`GET /api/router/v1/placement` reports each route's `status`: `satisfied`,
+`below_target` (the warm standby is short) or `below_min`.
+
+### Reconciliation
+
+Each pass, every `interval_secs` (and at once after a load finishes, or on
+`POST /api/router/v1/placement/reconcile`):
+
+1. **Observe** — the health book the router already keeps; no extra probes.
+2. **Compare** — each route's ready and loading deployments with its target.
+3. **Plan** — routes in configured order; within a route its allowed
+   deployments in configured order. A deployment is chosen only if its node is
+   healthy and **empty**, it is not backing off, and no other load is in
+   progress — or chosen in this pass — on that node. Never more loads than the
+   route is short. Deterministic; nothing about speed, latency or history is
+   read.
+4. **Act** — each load is its own task:
+   1. `GET /api/v1/models` on the node: the model must be in its catalog, by id
+      or alias, with its file present. Nothing is downloaded. If the node
+      already reports it `loaded`, nothing is loaded; readiness is confirmed.
+   2. `POST /api/v1/models/{id}/load`, empty body: the node chooses context,
+      slots and threads as it does for any load.
+   3. `GET /api/v1/jobs/{job}` until the job ends.
+   4. The node is probed, by the health monitor's own probe, until the
+      deployment is available by the request path's own rule. **Only then is it
+      counted ready.** A load call returning, or a job succeeding, is not
+      enough.
+5. **Wait** for the next pass.
+
+### What the controller will not do
+
+- **Swap a model out.** A Lightweight gateway holds one model; a node serving
+  anything else — another route's model included — is left alone. Two routes
+  wanting the same empty node: the first in configured order gets it.
+- **Unload** anything, or move a model to rebalance. R7 is additive only.
+- **Download** a model. A model not in the node's catalog is
+  `model_not_installed`.
+- **Estimate memory.** The node's admission control judges every load; a
+  refusal (`insufficient_memory`) is `admission_failed`. The router does not
+  try to outsmart it.
+- **Use R6's measurements.** TTFT, latency and traces are for operators;
+  nothing slow is moved automatically.
+
+### Failures and backoff
+
+| Reason | When |
+|---|---|
+| `model_not_installed` | not in the node's catalog, or its file is missing |
+| `admission_failed` | the node's admission refused it (`insufficient_memory`) |
+| `node_busy` | the node was already in a model operation (`model_operation_in_progress`, `drain_timed_out`) |
+| `node_unhealthy` | the node could not be reached for the control request |
+| `load_rejected` | the node refused the control request (credential, no catalog) |
+| `load_timeout` | load plus readiness took longer than `load_timeout_secs` (`code: not_ready` when the job succeeded but the deployment never became available — for example a deployment naming something the node does not advertise) |
+| `model_failed` | the engine failed to start, or the job was cancelled |
+
+A failed deployment is not tried again until its backoff passes:
+`backoff_secs`, doubled for each consecutive failure, at most
+`backoff_max_secs`. A success resets it. The node's own error code is kept
+beside the reason.
+
+### Credentials
+
+The controller uses each node's own key (`api_key_env`) — the same one probes
+and requests use — on the node's `/api/v1` control API. The router's client
+key is never sent to a node. A node's key is not scoped, so a node that
+should not be controlled should simply not be listed in any `allowed_nodes`.
+
+### Interaction with the rest
+
+- **Health, capabilities, policies:** unchanged. A deployment placement
+  loaded is filtered for each request like any other (tools, reasoning,
+  context, endpoint), and priority, round-robin and least-busy order the ready
+  ones as before.
+- **Session affinity:** unchanged. A session that moved off a dead deployment
+  stays where it moved after placement brings the old one back.
+- **State:** in memory. A restart forgets loads in progress (a node that
+  accepted one finishes it on its own), results and backoff.
+- **Shutdown:** stopping the router stops the controller and aborts its load
+  tasks. The router starts no process of its own, so nothing is left behind.
+
+## The control API
 
 All of these use the client key. None of them shows a key: `auth` is reported
 only as `"bearer"` or `"none"`.
@@ -786,6 +928,8 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, and its availability. Also its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`, and what least-busy reads: `active_requests` (the router's in-flight count) and `concurrency_limit`. |
 | `GET /api/router/v1/health` | Node and route health in one read, the probe settings, and active requests. |
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
+| `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
+| `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
 ## Observability
@@ -951,6 +1095,14 @@ or an address.
   `router_session_affinity_reassignments_total{route,reason}`,
   `router_session_affinity_entries`, `router_session_affinity_enabled`,
   `router_session_affinity_evictions_total{reason="expired"|"capacity"}`.
+- Placement (only for routes with a target):
+  `router_placement_ready_deployments{route}`,
+  `router_placement_target_deployments{route}`,
+  `router_placement_loading_deployments{route}`,
+  `router_placement_actions_total{route,action,result}`,
+  `router_placement_failures_total{route,reason}`, and the histogram
+  `router_placement_reconcile_duration_seconds` (one pass, without the loads
+  it starts).
 - Histograms (`_bucket`, `_sum`, `_count`): `router_request_duration_seconds`,
   `router_routing_duration_seconds`, `router_ttft_seconds`
   (`{route,policy}`); `router_upstream_ttft_seconds`,
@@ -1077,7 +1229,7 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R6 (session affinity and observability) is built. Nothing after it is. Each
+R7 (placement and warm standby) is built. Nothing after it is. Each
 later step builds on the types above without changing the public route
 identity.
 
@@ -1086,7 +1238,7 @@ identity.
 | **R4** | Done: `round_robin` and `least_busy`. Deliberately left out: weighted, random, latency/EWMA/P95/TTFT, and cost-aware selection. Any of these would be a new `RoutePolicy` variant with its own ordering function. |
 | **R5** | Done: request-aware capability filtering between eligibility and policy, for endpoint, tools, `tool_choice`, reasoning and context. Deliberately left out: ranking by capability, routing on the output budget, per-model tokenization, and moving a request to another route. |
 | **R6** | Done: optional session affinity (explicit header, route-scoped, bounded, idle TTL, a preference only over valid candidates); TTFT, latency and planning histograms; one request id from client to node log, across failover; per-request routing traces; estimate-versus-node prompt-token telemetry. Deliberately left out: using any of it to route, soft affinity, persistence, and inferring sessions. |
-| **R7** | Placement control: a control plane that asks nodes to load models and keeps warm standbys. It never runs in the request path. |
+| **R7** | Done: per-route `min_ready` / `warm_standby` targets on allowed nodes, a reconciliation loop that loads installed models onto empty nodes through each node's control API, readiness by the router's own probe, the node's admission as the authority, bounded backoff, `/api/router/v1/placement`. Deliberately left out: unloading, swapping, rebalancing, downloading, and any use of latency or traffic. |
 | **R8** | A rule-based `Auto` route that maps request traits to routes. |
 | **R9** | A learned or adaptive router, and mixture-of-agents integration. |
 

@@ -260,6 +260,30 @@ pub struct Route {
     /// the ring under [`RoutePolicy::RoundRobin`], and the tie-break under
     /// [`RoutePolicy::LeastBusy`]. Never empty.
     pub deployments: Vec<DeploymentId>,
+    /// How many of this route's deployments the placement controller keeps
+    /// loaded, and where it may load them. `None`: the controller never acts
+    /// for this route, and the route is served exactly as before R7.
+    pub placement: Option<RoutePlacement>,
+}
+
+/// A route's availability target, read by the placement controller and by
+/// nothing in the request path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutePlacement {
+    /// Ready deployments the route should never fall below.
+    pub min_ready: u32,
+    /// Ready deployments to keep beyond `min_ready`, loaded ahead of need.
+    pub warm_standby: u32,
+    /// The route's deployments the controller may load, in configured order.
+    /// Only nodes the operator listed in `allowed_nodes`.
+    pub allowed: Vec<DeploymentId>,
+}
+
+impl RoutePlacement {
+    /// Ready deployments wanted in all: `min_ready + warm_standby`.
+    pub const fn target(&self) -> u32 {
+        self.min_ready.saturating_add(self.warm_standby)
+    }
 }
 
 /// Whether a node is answering as a Lightweight gateway.

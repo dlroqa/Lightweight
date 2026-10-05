@@ -83,6 +83,10 @@ pub struct RouterMetrics {
     affinity_misses: Mutex<BTreeMap<String, u64>>,
     /// Sessions moved to another deployment, by route and reason.
     affinity_reassignments: Mutex<BTreeMap<(String, &'static str), u64>>,
+    /// Placement actions finished, by route, action and result.
+    placement_actions: Mutex<BTreeMap<(String, &'static str, &'static str), u64>>,
+    /// Placement actions that failed, by route and reason.
+    placement_failures: Mutex<BTreeMap<(String, &'static str), u64>>,
     histograms: Histograms,
 }
 
@@ -239,15 +243,20 @@ impl Family {
                 let _ = writeln!(out, "{}_bucket{{{base}le=\"{le}\"}} {running}", self.name);
             }
             let trimmed = base.trim_end_matches(',');
+            let braces = if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{{{trimmed}}}")
+            };
             let _ = writeln!(
                 out,
-                "{}_sum{{{trimmed}}} {}",
+                "{}_sum{braces} {}",
                 self.name,
                 format_unit(series.sum.load(Ordering::Relaxed) as f64 / per_unit)
             );
             let _ = writeln!(
                 out,
-                "{}_count{{{trimmed}}} {}",
+                "{}_count{braces} {}",
                 self.name,
                 series.count.load(Ordering::Relaxed)
             );
@@ -277,6 +286,7 @@ struct Histograms {
     upstream_duration: Family,
     estimation_ratio: Family,
     estimation_error: Family,
+    reconcile: Family,
 }
 
 impl Default for Histograms {
@@ -321,6 +331,11 @@ impl Default for Histograms {
                 "router_context_estimation_error_tokens",
                 "Node-counted prompt tokens minus the router's lower-bound estimate, when the node reported usage.",
                 TOKENS,
+            ),
+            reconcile: Family::new(
+                "router_placement_reconcile_duration_seconds",
+                "One placement pass: reading health, comparing each route with its target, and starting loads. Loads themselves run afterwards and are not included.",
+                PLANNING,
             ),
         }
     }
@@ -476,6 +491,86 @@ impl RouterMetrics {
         bump(&self.affinity_reassignments, (route.to_owned(), reason));
     }
 
+    pub fn record_placement_action(&self, route: &str, action: &'static str, result: &'static str) {
+        bump(&self.placement_actions, (route.to_owned(), action, result));
+    }
+
+    pub fn record_placement_failure(&self, route: &str, reason: &'static str) {
+        bump(&self.placement_failures, (route.to_owned(), reason));
+    }
+
+    pub fn placement_actions(
+        &self,
+        route: &str,
+        action: &'static str,
+        result: &'static str,
+    ) -> u64 {
+        read(&self.placement_actions, &(route.to_owned(), action, result))
+    }
+
+    pub fn placement_failures(&self, route: &str, reason: &'static str) -> u64 {
+        read(&self.placement_failures, &(route.to_owned(), reason))
+    }
+
+    pub fn observe_reconcile(&self, elapsed: Duration) {
+        self.histograms
+            .reconcile
+            .observe(Vec::new(), micros(elapsed));
+    }
+
+    pub fn reconcile_passes(&self) -> u64 {
+        self.histograms.reconcile.count(&Vec::new())
+    }
+
+    /// Each route's placement target and ready deployments, read at scrape
+    /// time from what the router has observed. Routes without a target are
+    /// not listed.
+    pub fn placement_to_prometheus(
+        topology: &crate::domain::Topology,
+        health: &BTreeMap<NodeId, NodeStatus>,
+        loading: &std::collections::BTreeSet<DeploymentId>,
+    ) -> String {
+        let mut out = String::new();
+        let assessments: Vec<_> = topology
+            .routes()
+            .iter()
+            .filter_map(|route| crate::placement::assess(topology, route, health, loading))
+            .collect();
+        if assessments.is_empty() {
+            return out;
+        }
+        for (name, help, value) in [
+            (
+                "router_placement_ready_deployments",
+                "Deployments of the route the router observes ready, placed by the controller or not.",
+                (|a: &crate::placement::Assessment| a.ready())
+                    as fn(&crate::placement::Assessment) -> u32,
+            ),
+            (
+                "router_placement_target_deployments",
+                "The route's placement target: min_ready plus warm_standby.",
+                |a| a.target(),
+            ),
+            (
+                "router_placement_loading_deployments",
+                "Loads the controller has in progress for the route.",
+                |a| a.loading(),
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for assessment in &assessments {
+                let _ = writeln!(
+                    out,
+                    "{name}{{route=\"{}\"}} {}",
+                    escape(assessment.route.as_str()),
+                    value(assessment)
+                );
+            }
+        }
+        out
+    }
+
     pub fn affinity_hits(&self, route: &str) -> u64 {
         read(&self.affinity_hits, &route.to_owned())
     }
@@ -570,6 +665,7 @@ impl RouterMetrics {
             &h.upstream_duration,
             &h.estimation_ratio,
             &h.estimation_error,
+            &h.reconcile,
         ]
         .into_iter()
         .find(|family| family.name == name)
@@ -757,6 +853,39 @@ impl RouterMetrics {
             );
         }
 
+        out.push_str(
+            "# HELP router_placement_actions_total Placement actions finished, by route, action and result.\n",
+        );
+        out.push_str("# TYPE router_placement_actions_total counter\n");
+        for ((route, action, result), count) in self
+            .placement_actions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_placement_actions_total{{route=\"{}\",action=\"{action}\",result=\"{result}\"}} {count}",
+                escape(route)
+            );
+        }
+        out.push_str(
+            "# HELP router_placement_failures_total Placement actions that failed, by route and reason.\n",
+        );
+        out.push_str("# TYPE router_placement_failures_total counter\n");
+        for ((route, reason), count) in self
+            .placement_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_placement_failures_total{{route=\"{}\",reason=\"{reason}\"}} {count}",
+                escape(route)
+            );
+        }
+
         let h = &self.histograms;
         for family in [
             &h.request,
@@ -767,6 +896,7 @@ impl RouterMetrics {
             &h.upstream_duration,
             &h.estimation_ratio,
             &h.estimation_error,
+            &h.reconcile,
         ] {
             family.render(&mut out);
         }
@@ -942,6 +1072,26 @@ mod tests {
         let gauges = RouterMetrics::affinity_to_prometheus(&book);
         assert!(gauges.contains("router_session_affinity_entries 0"));
         assert!(gauges.contains("router_session_affinity_enabled 0"));
+    }
+
+    #[test]
+    fn an_unlabelled_histogram_renders_without_empty_braces() {
+        let metrics = RouterMetrics::default();
+        metrics.observe_reconcile(Duration::from_micros(40));
+        metrics.record_placement_action("Coder", "load", "succeeded");
+        metrics.record_placement_failure("Coder", "admission_failed");
+        let text = metrics.to_prometheus(&BTreeMap::new(), &BTreeMap::new());
+        assert!(
+            text.contains("router_placement_reconcile_duration_seconds_bucket{le=\"0.00005\"} 1")
+        );
+        assert!(text.contains("router_placement_reconcile_duration_seconds_count 1"));
+        assert!(!text.contains("{}"));
+        assert!(text.contains(
+            "router_placement_actions_total{route=\"Coder\",action=\"load\",result=\"succeeded\"} 1"
+        ));
+        assert!(text.contains(
+            "router_placement_failures_total{route=\"Coder\",reason=\"admission_failed\"} 1"
+        ));
     }
 
     #[test]

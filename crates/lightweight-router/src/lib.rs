@@ -32,11 +32,13 @@ pub mod affinity;
 pub mod api;
 pub mod capability;
 pub mod config;
+pub mod controller;
 pub mod domain;
 pub mod error;
 pub mod health;
 pub mod load;
 pub mod metrics;
+pub mod placement;
 pub mod proxy;
 pub mod requirements;
 pub mod select;
@@ -85,6 +87,9 @@ pub struct RouterState {
     /// started from a configuration file.
     #[doc(hidden)]
     pub phase_delays: crate::proxy::PhaseDelays,
+    /// Placement's loads in progress, last results and backoff. Read by the
+    /// placement controller and the admin view, never by a request.
+    pub placement: crate::placement::PlacementBook,
     pub started: SystemTime,
 }
 
@@ -145,6 +150,7 @@ impl RouterState {
             affinity: AffinityBook::new(config.affinity.clone()),
             traces: TraceBook::new(config.trace_capacity),
             phase_delays: crate::proxy::PhaseDelays::default(),
+            placement: crate::placement::PlacementBook::new(config.placement),
             started: SystemTime::now(),
         })
     }
@@ -241,6 +247,10 @@ impl BoundRouter {
             );
         }
 
+        // Off unless a route has a placement target. It shares the health book
+        // with the monitor and the client with requests, and nothing else.
+        let placer = controller::spawn(Arc::clone(&state), stop.clone());
+
         let mut servers = Vec::with_capacity(self.listeners.len());
         for listener in self.listeners {
             let app = api::app(Arc::clone(&state));
@@ -263,6 +273,9 @@ impl BoundRouter {
         let _ = monitor.await;
         if let Some(sweeper) = sweeper {
             let _ = sweeper.await;
+        }
+        if let Some(placer) = placer {
+            let _ = placer.await;
         }
         failure.map_or(Ok(()), Err)
     }

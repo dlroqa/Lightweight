@@ -49,6 +49,8 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/health", get(health_detail))
         .route("/api/router/v1/sessions", get(sessions))
         .route("/api/router/v1/traces", get(traces))
+        .route("/api/router/v1/placement", get(placement))
+        .route("/api/router/v1/placement/reconcile", post(reconcile))
         .fallback(not_found)
         .with_state(state)
 }
@@ -269,6 +271,11 @@ async fn metrics(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> R
             text.push_str(&crate::metrics::RouterMetrics::affinity_to_prometheus(
                 &state.affinity,
             ));
+            text.push_str(&crate::metrics::RouterMetrics::placement_to_prometheus(
+                &state.topology,
+                &state.health.snapshot(),
+                &state.placement.loading(),
+            ));
             text
         },
     )
@@ -297,6 +304,87 @@ async fn sessions(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> 
         "data": entries,
     }))
     .into_response()
+}
+
+/// `GET /api/router/v1/placement`: each route's target against what is ready,
+/// and where every deployment stands.
+async fn placement(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let health = state.health.snapshot();
+    let loading = state.placement.loading();
+    let now = std::time::Instant::now();
+    let policy = state.placement.policy();
+    let routes: Vec<Value> = state
+        .topology
+        .routes()
+        .iter()
+        .filter_map(|route| crate::placement::assess(&state.topology, route, &health, &loading))
+        .map(|assessment| {
+            let deployments: Vec<Value> = assessment
+                .deployments
+                .iter()
+                .map(|(id, node, deployment_state, allowed)| {
+                    let record = state.placement.view(id, now);
+                    json!({
+                        "deployment": id,
+                        "node": node,
+                        "state": deployment_state.as_str(),
+                        "allowed": allowed,
+                        "loading_for_secs": record.loading_for.map(|d| d.as_secs()),
+                        "last_result": record.last,
+                        "consecutive_failures": record.failures,
+                        "retry_in_secs": record.retry_in.map(|d| d.as_secs()),
+                    })
+                })
+                .collect();
+            json!({
+                "route": assessment.route.as_str(),
+                "min_ready": assessment.min_ready,
+                "warm_standby": assessment.warm_standby,
+                "target": assessment.target(),
+                "ready": assessment.ready(),
+                "ready_standby": assessment.standby(),
+                "loading": assessment.loading(),
+                "pending_loads": assessment.shortfall(),
+                "status": assessment.status(),
+                "deployments": deployments,
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "enabled": crate::placement::configured(&state.topology),
+        "interval_secs": policy.interval.as_secs(),
+        "load_timeout_secs": policy.load_timeout.as_secs(),
+        "last_pass": state.placement.last_pass().map(unix),
+        "routes": routes,
+    }))
+    .into_response()
+}
+
+/// `POST /api/router/v1/placement/reconcile`: run a placement pass now rather
+/// than at the next interval. It plans exactly what the interval would — it
+/// cannot force a load, skip a backoff, or name a node.
+async fn reconcile(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    if !crate::placement::configured(&state.topology) {
+        return json_error(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::invalid_request(
+                "no route has a placement target, so there is nothing to reconcile",
+                "placement_not_configured",
+            ),
+        );
+    }
+    state.placement.wake.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(json!({"reconcile": "scheduled"})),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]

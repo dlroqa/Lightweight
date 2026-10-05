@@ -26,8 +26,8 @@ use lightweight_catalog::alias;
 use serde::Deserialize;
 
 use crate::domain::{
-    Deployment, DeploymentId, Node, NodeAuth, NodeId, Route, RouteName, RoutePolicy, Secret,
-    Topology,
+    Deployment, DeploymentId, Node, NodeAuth, NodeId, Route, RouteName, RoutePlacement,
+    RoutePolicy, Secret, Topology,
 };
 
 /// The port a router listens on when the file names none.
@@ -65,6 +65,19 @@ pub const DEFAULT_SESSION_MAX_ENTRIES: usize = 10_000;
 /// The most a configuration may ask to hold. An entry is a few dozen bytes;
 /// this bounds the map at tens of megabytes whatever the file says.
 pub const MAX_SESSION_ENTRIES: usize = 1_000_000;
+/// How often the placement controller compares each route with its target,
+/// by default. Slower than health probing: a load takes seconds to minutes,
+/// and re-deciding faster than one can finish only adds control traffic.
+pub const DEFAULT_PLACEMENT_INTERVAL: Duration = Duration::from_secs(15);
+/// How long one load may take, from the request to observed readiness, by
+/// default. A CPU node can spend minutes starting a large model.
+pub const DEFAULT_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// The first wait after a failed placement action, by default. Doubled on
+/// each further failure of the same deployment.
+pub const DEFAULT_PLACEMENT_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest wait between attempts on a failing deployment, by default.
+pub const DEFAULT_PLACEMENT_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
 /// How many recent routing traces are kept for `/api/router/v1/traces`, by
 /// default.
 pub const DEFAULT_TRACE_CAPACITY: usize = 200;
@@ -110,6 +123,10 @@ pub struct RouterFile {
     pub session_affinity: SessionAffinityFile,
     #[serde(default)]
     pub traces: TracesFile,
+    /// How the placement controller runs. It runs only when some route has a
+    /// `placement` target; these settings alone start nothing.
+    #[serde(default)]
+    pub placement: PlacementFile,
     #[serde(default)]
     pub nodes: Vec<NodeFile>,
     #[serde(default)]
@@ -223,6 +240,60 @@ const fn default_trace_capacity() -> usize {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PlacementFile {
+    #[serde(default = "default_placement_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_load_timeout_secs")]
+    pub load_timeout_secs: u64,
+    #[serde(default = "default_backoff_secs")]
+    pub backoff_secs: u64,
+    #[serde(default = "default_backoff_max_secs")]
+    pub backoff_max_secs: u64,
+}
+
+impl Default for PlacementFile {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_placement_interval_secs(),
+            load_timeout_secs: default_load_timeout_secs(),
+            backoff_secs: default_backoff_secs(),
+            backoff_max_secs: default_backoff_max_secs(),
+        }
+    }
+}
+
+const fn default_placement_interval_secs() -> u64 {
+    DEFAULT_PLACEMENT_INTERVAL.as_secs()
+}
+const fn default_load_timeout_secs() -> u64 {
+    DEFAULT_LOAD_TIMEOUT.as_secs()
+}
+const fn default_backoff_secs() -> u64 {
+    DEFAULT_PLACEMENT_BACKOFF.as_secs()
+}
+const fn default_backoff_max_secs() -> u64 {
+    DEFAULT_PLACEMENT_BACKOFF_MAX.as_secs()
+}
+
+/// A route's placement target, as written.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutePlacementFile {
+    #[serde(default = "one")]
+    pub min_ready: u32,
+    #[serde(default)]
+    pub warm_standby: u32,
+    /// Required: the controller never loads a model on a node the operator
+    /// did not name for this route.
+    pub allowed_nodes: Vec<String>,
+}
+
+const fn one() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeFile {
     pub id: String,
     pub url: String,
@@ -244,6 +315,9 @@ pub struct RouteFile {
     pub strategy: RoutePolicy,
     #[serde(default)]
     pub deployments: Vec<DeploymentFile>,
+    /// Optional. Absent: no placement for this route.
+    #[serde(default)]
+    pub placement: Option<RoutePlacementFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +367,26 @@ impl Default for AffinityPolicy {
     }
 }
 
+/// How the placement controller runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementPolicy {
+    pub interval: Duration,
+    pub load_timeout: Duration,
+    pub backoff: Duration,
+    pub backoff_max: Duration,
+}
+
+impl Default for PlacementPolicy {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_PLACEMENT_INTERVAL,
+            load_timeout: DEFAULT_LOAD_TIMEOUT,
+            backoff: DEFAULT_PLACEMENT_BACKOFF,
+            backoff_max: DEFAULT_PLACEMENT_BACKOFF_MAX,
+        }
+    }
+}
+
 /// A configuration that passed every check.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
@@ -305,6 +399,7 @@ pub struct RouterConfig {
     pub affinity: AffinityPolicy,
     /// How many recent routing traces to keep. `0` keeps none.
     pub trace_capacity: usize,
+    pub placement: PlacementPolicy,
 }
 
 /// One reason a configuration was refused.
@@ -369,6 +464,12 @@ pub enum ConfigError {
     },
     #[error("traces.capacity must be at most {maximum}")]
     BadTraceCapacity { maximum: usize },
+    #[error("placement.{field} must be at least {minimum}")]
+    BadPlacementTiming { field: &'static str, minimum: u64 },
+    #[error("placement.backoff_max_secs must not be less than placement.backoff_secs")]
+    BackoffMaxBelowInitial,
+    #[error("route {route:?}: placement {problem}")]
+    BadRoutePlacement { route: String, problem: String },
 }
 
 /// Every reason a configuration was refused, in file order.
@@ -443,6 +544,7 @@ pub fn validate(
         errors.push(ConfigError::BadConnectTimeout);
     }
     let affinity = validate_affinity(&file.session_affinity, &mut errors);
+    let placement = validate_placement(&file.placement, &mut errors);
     if file.traces.capacity > MAX_TRACE_CAPACITY {
         errors.push(ConfigError::BadTraceCapacity {
             maximum: MAX_TRACE_CAPACITY,
@@ -492,7 +594,95 @@ pub fn validate(
         connect_timeout: Duration::from_secs(file.request.connect_timeout_secs),
         affinity,
         trace_capacity: file.traces.capacity,
+        placement,
     })
+}
+
+fn validate_placement(raw: &PlacementFile, errors: &mut Vec<ConfigError>) -> PlacementPolicy {
+    for (field, value, minimum) in [
+        ("interval_secs", raw.interval_secs, 1),
+        ("load_timeout_secs", raw.load_timeout_secs, 1),
+        ("backoff_secs", raw.backoff_secs, 1),
+    ] {
+        if value < minimum {
+            errors.push(ConfigError::BadPlacementTiming { field, minimum });
+        }
+    }
+    if raw.backoff_max_secs < raw.backoff_secs {
+        errors.push(ConfigError::BackoffMaxBelowInitial);
+    }
+    PlacementPolicy {
+        interval: Duration::from_secs(raw.interval_secs),
+        load_timeout: Duration::from_secs(raw.load_timeout_secs),
+        backoff: Duration::from_secs(raw.backoff_secs),
+        backoff_max: Duration::from_secs(raw.backoff_max_secs),
+    }
+}
+
+/// Check one route's placement against the deployments it actually has.
+fn validate_route_placement(
+    route: &RouteName,
+    raw: &RoutePlacementFile,
+    members: &[DeploymentId],
+    deployments: &[Deployment],
+    errors: &mut Vec<ConfigError>,
+) -> Option<RoutePlacement> {
+    let mut fail = |problem: String| {
+        errors.push(ConfigError::BadRoutePlacement {
+            route: route.as_str().to_owned(),
+            problem,
+        });
+    };
+    if raw.min_ready == 0 {
+        fail("min_ready must be at least 1".into());
+        return None;
+    }
+    if raw.allowed_nodes.is_empty() {
+        fail("allowed_nodes must name at least one node".into());
+        return None;
+    }
+    let mut allowed = Vec::new();
+    let mut named = BTreeSet::new();
+    for node in &raw.allowed_nodes {
+        if !named.insert(node.to_ascii_lowercase()) {
+            fail(format!("allowed_nodes lists {node:?} more than once"));
+            return None;
+        }
+        // Only a node this route already has a deployment on: placement
+        // loads the model the route names there, never a model on a node the
+        // route does not use.
+        let found: Vec<&DeploymentId> = members
+            .iter()
+            .filter(|id| {
+                deployments
+                    .iter()
+                    .any(|d| &d.id == *id && d.node.as_str().eq_ignore_ascii_case(node))
+            })
+            .collect();
+        if found.is_empty() {
+            fail(format!(
+                "allowed_nodes names {node:?}, which has no deployment in this route"
+            ));
+            return None;
+        }
+        allowed.extend(found.into_iter().cloned());
+    }
+    // Configured order, whatever order allowed_nodes was written in.
+    allowed.sort_by_key(|id| members.iter().position(|member| member == id));
+    let placement = RoutePlacement {
+        min_ready: raw.min_ready,
+        warm_standby: raw.warm_standby,
+        allowed,
+    };
+    let reachable = members.len();
+    if placement.target() as usize > reachable {
+        fail(format!(
+            "asks for {} ready deployments, but the route has only {reachable}",
+            placement.target()
+        ));
+        return None;
+    }
+    Some(placement)
 }
 
 /// Check the affinity settings. They are checked even while affinity is off,
@@ -807,10 +997,15 @@ fn validate_routes(
             members.push(id);
         }
 
+        let placement = entry
+            .placement
+            .as_ref()
+            .and_then(|raw| validate_route_placement(&name, raw, &members, &deployments, errors));
         routes.push(Route {
             name,
             policy: entry.strategy,
             deployments: members,
+            placement,
         });
     }
 
@@ -1163,6 +1358,84 @@ mod tests {
         }));
         let mut file = valid();
         file["session_affinity"] = json!({"bogus": true});
+        assert!(
+            serde_json::from_value::<RouterFile>(file).is_err(),
+            "unknown keys are refused"
+        );
+    }
+
+    #[test]
+    fn placement_is_absent_unless_a_route_asks_for_it() {
+        let config = validate(parse(valid()), &env_with(KEYS)).expect("valid");
+        assert!(
+            config
+                .topology
+                .routes()
+                .iter()
+                .all(|route| route.placement.is_none())
+        );
+        assert_eq!(config.placement, PlacementPolicy::default());
+    }
+
+    #[test]
+    fn a_route_placement_is_read_in_configured_order() {
+        let mut file = valid();
+        file["routes"][0]["placement"] =
+            json!({"min_ready": 1, "warm_standby": 1, "allowed_nodes": ["t420", "dell-7820"]});
+        file["placement"] = json!({"interval_secs": 5, "load_timeout_secs": 120,
+                                   "backoff_secs": 10, "backoff_max_secs": 300});
+        let config = validate(parse(file), &env_with(KEYS)).expect("valid");
+        let placement = config.topology.routes()[0].placement.clone().unwrap();
+        assert_eq!(placement.target(), 2);
+        let allowed: Vec<&str> = placement.allowed.iter().map(DeploymentId::as_str).collect();
+        assert_eq!(allowed, ["dell-7820/QwenCoder", "t420/CoderBackup"]);
+        assert_eq!(config.placement.interval, Duration::from_secs(5));
+        assert_eq!(config.placement.backoff_max, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn an_unreachable_or_unbounded_placement_is_refused() {
+        let cases = [
+            (json!({"allowed_nodes": []}), "allowed_nodes must name"),
+            (
+                json!({"min_ready": 0, "allowed_nodes": ["t420"]}),
+                "min_ready",
+            ),
+            (
+                json!({"allowed_nodes": ["nowhere"]}),
+                "no deployment in this route",
+            ),
+            // Fast has one deployment; two ready can never happen.
+            (
+                json!({"warm_standby": 1, "allowed_nodes": ["t420"]}),
+                "has only 1",
+            ),
+            (json!({"allowed_nodes": ["t420", "T420"]}), "more than once"),
+        ];
+        for (placement, expected) in cases {
+            let mut file = valid();
+            file["routes"][1]["placement"] = placement.clone();
+            let errors = validate(parse(file), &env_with(KEYS)).unwrap_err().0;
+            assert!(
+                matches!(&errors[..], [ConfigError::BadRoutePlacement { problem, .. }] if problem.contains(expected)),
+                "{placement}: {errors:?}"
+            );
+        }
+        // dell-7820 has no deployment in Fast.
+        let mut file = valid();
+        file["routes"][1]["placement"] = json!({"allowed_nodes": ["dell-7820"]});
+        assert!(validate(parse(file), &env_with(KEYS)).is_err());
+
+        let mut file = valid();
+        file["placement"] = json!({"interval_secs": 0, "backoff_secs": 60, "backoff_max_secs": 30});
+        let errors = validate(parse(file), &env_with(KEYS)).unwrap_err().0;
+        assert!(errors.contains(&ConfigError::BadPlacementTiming {
+            field: "interval_secs",
+            minimum: 1
+        }));
+        assert!(errors.contains(&ConfigError::BackoffMaxBelowInitial));
+        let mut file = valid();
+        file["routes"][0]["placement"] = json!({"allowed_nodes": ["t420"], "max": 3});
         assert!(
             serde_json::from_value::<RouterFile>(file).is_err(),
             "unknown keys are refused"
