@@ -1873,6 +1873,92 @@ async fn least_busy_puts_concurrent_work_where_the_capacity_is_and_releases_it()
     all_released(&router, "slots after held least-busy requests").await;
 }
 
+/// The concurrency limit the admin view shows for one deployment.
+async fn concurrency_limit(router: &Router, deployment: &str) -> Value {
+    let (_, deployments) = router.get("/api/router/v1/deployments").await;
+    deployments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == deployment)
+        .unwrap()["concurrency_limit"]
+        .clone()
+}
+
+#[tokio::test]
+async fn least_busy_follows_a_node_whose_scheduler_was_resized_after_the_next_probe() {
+    ensure_provider();
+    // A is a real gateway, so the limit the router sees is the one its own
+    // `/v1/capabilities` publishes. Its engine holds every request in prefill
+    // long enough for the three below to be in flight together.
+    let a = RealNode::start(
+        "AliasA",
+        MockConfig {
+            prefill: Duration::from_secs(3),
+            ..MockConfig::default()
+        },
+        GatewayConfig {
+            max_concurrent_requests: 4,
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let hold = gate();
+    let b = FakeNode::start_limited(0, "AliasB", Act::Hold(Arc::clone(&hold)), 4).await;
+    let router = Arc::new(
+        Router::start(
+            policy_config(
+                "least_busy",
+                &[("a", a.base(), "AliasA"), ("b", b.base(), "AliasB")],
+            ),
+            &[],
+        )
+        .await,
+    );
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 4);
+
+    // What a hot swap does once the new engine is up: the scheduler takes the
+    // slot count that engine was started with.
+    a.state.scheduler().set_capacity(2);
+    // The router does not guess; until it probes, it still holds the old answer.
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 4);
+    router.probe().await;
+    assert_eq!(concurrency_limit(&router, "a/AliasA").await, 2);
+
+    // One at a time, so each choice sees the one before it in flight.
+    //   1st: A 0/2 vs B 0/4, a tie       -> A, by configured order
+    //   2nd: A 1/2 vs B 0/4              -> B
+    //   3rd: A 1/2 = 50% vs B 1/4 = 25%  -> B
+    // Had the router kept A's stale 4, the 3rd would be 1/4 against 1/4, a
+    // tie, and go to A.
+    let mut requests = Vec::new();
+    for expected in [(1, 0), (1, 1), (1, 2)] {
+        let router_for_request = Arc::clone(&router);
+        requests.push(tokio::spawn(async move {
+            router_for_request.chat(Some("Coder")).await
+        }));
+        poll("the request to be in flight", async || {
+            let load = in_flight(&router);
+            (load["a/AliasA"] + load["b/AliasB"] == expected.0 + expected.1).then_some(())
+        })
+        .await;
+        let load = in_flight(&router);
+        assert_eq!(
+            (load["a/AliasA"], load["b/AliasB"]),
+            expected,
+            "least-busy must divide by A's live limit of 2: {load:?}"
+        );
+    }
+
+    open(&hold);
+    for request in requests {
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["model"], "Coder");
+    }
+    all_released(&router, "slots after a resized node's requests").await;
+}
+
 #[tokio::test]
 async fn least_busy_failover_moves_the_slot_to_the_deployment_doing_the_work() {
     ensure_provider();

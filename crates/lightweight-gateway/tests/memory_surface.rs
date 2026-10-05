@@ -36,13 +36,31 @@ async fn gateway(
     available_mib: u64,
     backend: MockBackend,
 ) -> (TempDir, Arc<GatewayState>, String) {
+    gateway_started_with(
+        tag,
+        available_mib,
+        backend,
+        GatewayConfig::default(),
+        RuntimeDefaults::default(),
+    )
+    .await
+}
+
+/// The same, started with a config and load defaults the test chooses.
+async fn gateway_started_with(
+    tag: &str,
+    available_mib: u64,
+    backend: MockBackend,
+    config: GatewayConfig,
+    defaults: RuntimeDefaults,
+) -> (TempDir, Arc<GatewayState>, String) {
     let dir = TempDir::new(tag);
     let model_path = dir.write("fixture.gguf", &GgufBuilder::small_model("llama").build());
 
     let manager = Arc::new(ModelManager::new(
         CatalogStore::open(dir.path().join("catalog.json")).expect("catalog"),
         Installer::new(dir.path().join("models"), dir.path().join("downloads")).expect("installer"),
-        RuntimeDefaults::default(),
+        defaults,
     ));
     let installed = manager
         .register_at_startup(model_path)
@@ -57,7 +75,7 @@ async fn gateway(
                 // A data directory of its own, so a test can store a setting
                 // and then watch a load obey it.
                 paths: Some(lightweight_system_info::DataPaths::rooted_at(dir.path())),
-                ..GatewayConfig::default()
+                ..config
             },
         )
         .with_manager(Arc::clone(&manager))
@@ -730,4 +748,49 @@ async fn a_damaged_calibration_file_costs_nobody_their_estimate() {
     let (status, report) = server.get("/api/v1/gateway").await;
     assert_eq!(status, 200, "{report}");
     assert_eq!(report["calibration"]["state"], "unreadable");
+}
+
+#[tokio::test]
+async fn the_capabilities_report_the_slots_the_running_engine_was_given() {
+    ensure_provider();
+
+    // Started with four slots, as `hermes serve --concurrency 4` would be, and
+    // then handed a model whose load resolves two. The router balances on the
+    // number `/v1/capabilities` publishes, so it must be the scheduler's live
+    // count and not the one this process happened to start with.
+    let (_dir, state, id) = gateway_started_with(
+        "mem-live-slots",
+        32_768,
+        MockBackend::default(),
+        GatewayConfig {
+            max_concurrent_requests: 4,
+            ..GatewayConfig::default()
+        },
+        RuntimeDefaults {
+            concurrency: Some(2),
+            ..RuntimeDefaults::default()
+        },
+    )
+    .await;
+    let server = Server::start(state).await;
+
+    let (status, before) = server.get("/v1/capabilities").await;
+    assert_eq!(status, 200, "{before}");
+    assert_eq!(before["limits"]["max_concurrent_requests"], 4, "{before}");
+
+    let loaded = server.load(&id, serde_json::json!({})).await;
+    assert_eq!(loaded["state"], "succeeded", "{loaded}");
+
+    let (status, after) = server.get("/v1/capabilities").await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        after["limits"]["max_concurrent_requests"], 2,
+        "the load resized the scheduler, so the advertised limit must follow: {after}"
+    );
+    // The control plane reads the same scheduler, so the two agree.
+    let (_, report) = server.get("/api/v1/gateway").await;
+    assert_eq!(
+        report["concurrency"]["max_concurrent_requests"], 2,
+        "{report}"
+    );
 }

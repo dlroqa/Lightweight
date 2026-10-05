@@ -327,7 +327,9 @@ advertises. The router never infers capacity on its own.
 **What the limit means.** It is `limits.max_concurrent_requests` from the node's
 `/v1/capabilities`: the gateway scheduler's slot count. `hermes serve` sets that
 from the engine's confirmed parallel slots (`n_parallel`, via `--concurrency`).
-Requests beyond it queue inside the node, which owns its queue. The router reads
+It is the scheduler's *live* count, so when a model loaded at runtime resizes the
+scheduler, the node's next answer carries the new limit and the router adopts it
+on its next probe. Requests beyond it queue inside the node, which owns its queue. The router reads
 the limit from the per-deployment observation it already keeps for capabilities,
 so there is no second capacity model.
 
@@ -465,11 +467,15 @@ Metrics:
 
 ## Limits of this version
 
-- **A node's advertised limit can be stale after a hot swap.** A gateway's
-  `/v1/capabilities` reports the slot count it started with, while a model
-  loaded at runtime can resize the scheduler (`/api/v1/gateway` reports the live
-  value). Until that node-side report is fixed, least-busy uses the startup
-  figure for such a node.
+- **A resized node's limit reaches the router on the next probe, not at once.**
+  Between a hot swap and that probe, least-busy divides by the previous limit.
+  The router does not estimate it in the meantime; the node is the authority.
+- **Two routes sharing a deployment can make one slightly uneven choice.** Each
+  route holds its own least-busy lock (see [Least-busy](#least-busy)), so two
+  simultaneous requests on different routes can both pick the same deployment.
+  In-flight counts stay exact and the node queues the excess, so nothing runs
+  incorrectly. A future load-balancing refinement could reserve across routes;
+  a global router lock is deliberately not used.
 - **A freshly started node briefly advertises its canonical id.** `hermes serve
   <file>` starts answering before it has adopted the catalog alias, because
   hashing the file takes seconds. For that moment, a deployment that names the

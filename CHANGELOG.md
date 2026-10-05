@@ -72,6 +72,10 @@ All notable changes to this project are documented in this file.
 - **`model: "default"` is accepted again.** It was dropped from the gateway in
   the Lightagent split; it once more selects whichever model is resident, on
   both `/v1/chat/completions` and `/v1/completions`.
+- **`/v1/capabilities` reports the live concurrency limit.**
+  `limits.max_concurrent_requests` was the slot count the gateway started with.
+  It is now the scheduler's current count, so it follows a model load that
+  resizes it, and the router's least-busy policy picks it up on its next probe.
 
 ## [0.4.1] - 2026-09-30
 

@@ -1438,8 +1438,21 @@ Observed, and documented in `docs/ROUTER.md` rather than changed here:
 
 - a freshly started `hermes serve <file>` briefly advertises its canonical id
   before adopting its alias;
-- `/v1/capabilities` reports the startup slot count, not the live one, after a
-  hot swap.
+- two routes sharing one deployment can make one slightly uneven simultaneous
+  choice (a future refinement; no global lock).
+
+Fixed before merge: `/v1/capabilities` reported the startup slot count
+(`GatewayConfig::max_concurrent_requests`) rather than the scheduler's live
+count, so least-busy could divide by a stale limit after a hot swap. It now
+reads `Scheduler::capacity()`, the value `load_model` resizes and
+`/api/v1/gateway` already reported. Covered by
+`the_capabilities_report_the_slots_the_running_engine_was_given` (a real load
+through the manager, 4 to 2) and
+`least_busy_follows_a_node_whose_scheduler_was_resized_after_the_next_probe`
+(a real gateway resized, the router's next probe adopting 2, and the third
+request going to B at 25% rather than A at 50%). Both fail without the fix.
+After the fix, `./scripts/check.sh` passed again: 1027 workspace tests passed,
+0 failed (the router now has 106), and the contract suite 47 passed, 2 skipped.
 
 ## Next step
 
