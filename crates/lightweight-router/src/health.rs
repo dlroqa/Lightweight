@@ -33,7 +33,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{
-    CapabilitySet, Deployment, DeploymentHealth, Node, NodeHealth, NodeId, Topology,
+    CapabilitySet, Deployment, DeploymentHealth, DeploymentId, Node, NodeHealth, NodeId, Topology,
     UnavailableReason,
 };
 
@@ -107,11 +107,34 @@ pub fn apply(status: &mut NodeStatus, outcome: Outcome, threshold: u32, at: Syst
     }
 }
 
+/// What was last observed about one deployment, kept for that deployment
+/// alone.
+///
+/// Recorded whenever a probe finds the deployment's node serving the
+/// deployment's model, and never merged with another deployment's. A route's
+/// public answer is a conservative combination of these, computed on read; the
+/// per-deployment values themselves are never narrowed to it. That is what a
+/// later selector needs to say "this request uses tools, so only the
+/// deployments that support tools are eligible".
+#[derive(Clone, Debug, Serialize)]
+pub struct DeploymentObservation {
+    pub capabilities: CapabilitySet,
+    pub context_length: u32,
+    pub max_concurrent_requests: u32,
+    #[serde(skip)]
+    pub observed_at: SystemTime,
+}
+
 /// The router's current belief about every configured node.
 #[derive(Debug)]
 pub struct HealthBook {
     threshold: u32,
     nodes: RwLock<BTreeMap<NodeId, NodeStatus>>,
+    /// Each node's deployments and the model each one names. Fixed by the
+    /// topology; used to file an observation under every deployment it is
+    /// about.
+    deployments_of: BTreeMap<NodeId, Vec<(DeploymentId, String)>>,
+    deployments: RwLock<BTreeMap<DeploymentId, DeploymentObservation>>,
 }
 
 impl HealthBook {
@@ -121,14 +144,71 @@ impl HealthBook {
             .iter()
             .map(|node| (node.id.clone(), NodeStatus::default()))
             .collect();
+        let mut deployments_of: BTreeMap<NodeId, Vec<(DeploymentId, String)>> = BTreeMap::new();
+        for deployment in topology.deployments() {
+            deployments_of
+                .entry(deployment.node.clone())
+                .or_default()
+                .push((deployment.id.clone(), deployment.remote_model.clone()));
+        }
         Self {
             threshold,
             nodes: RwLock::new(nodes),
+            deployments_of,
+            deployments: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// What was last observed about one deployment, if it has ever been seen
+    /// served.
+    pub fn deployment(&self, id: &DeploymentId) -> Option<DeploymentObservation> {
+        self.deployments
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    pub fn deployment_snapshot(&self) -> BTreeMap<DeploymentId, DeploymentObservation> {
+        self.deployments
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// File a successful probe under the deployments it describes: those on
+    /// `node` whose model is the one the node said it serves.
+    fn observe_deployments(&self, node: &NodeId, observation: &Observation, at: SystemTime) {
+        let Some(served) = &observation.served else {
+            return;
+        };
+        let Some(listed) = self.deployments_of.get(node) else {
+            return;
+        };
+        let mut deployments = self
+            .deployments
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (id, model) in listed {
+            if alias::same_name(model, &served.id) {
+                deployments.insert(
+                    id.clone(),
+                    DeploymentObservation {
+                        capabilities: observation.features.clone(),
+                        context_length: served.context_length,
+                        max_concurrent_requests: observation.max_concurrent_requests,
+                        observed_at: at,
+                    },
+                );
+            }
         }
     }
 
     /// Record an outcome for a node. A node not in the topology is ignored.
     pub fn record(&self, node: &NodeId, outcome: Outcome) {
+        if let Outcome::Success(observation) = &outcome {
+            self.observe_deployments(node, observation, SystemTime::now());
+        }
         let mut nodes = self.nodes.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(status) = nodes.get_mut(node) {
             let was = status.health;
@@ -515,5 +595,85 @@ mod tests {
 
         let empty = CapabilitiesBody::new("0.4.1", None, 1);
         assert_eq!(observe(empty).expect("healthy").served, None);
+    }
+
+    fn observed_serving(model: &str, tools: bool, context_length: u32) -> Observation {
+        let mut features = CapabilitySet::none();
+        features.0.streaming = true;
+        features.0.tools = tools;
+        Observation {
+            served: Some(ServedModel {
+                id: model.to_owned(),
+                context_length,
+            }),
+            features,
+            max_concurrent_requests: 1,
+            version: "0.4.1".into(),
+        }
+    }
+
+    fn two_deployment_topology() -> Topology {
+        let file: crate::config::RouterFile = serde_json::from_value(serde_json::json!({
+            "nodes": [
+                {"id": "a", "url": "http://192.0.2.10:11434"},
+                {"id": "b", "url": "http://192.0.2.11:11434"}
+            ],
+            "routes": [{"name": "Coder", "deployments": [
+                {"node": "a", "model": "QwenCoder"},
+                {"node": "b", "model": "CoderBackup"}
+            ]}]
+        }))
+        .unwrap();
+        crate::config::validate(file, &|_| None).unwrap().topology
+    }
+
+    #[test]
+    fn each_deployment_keeps_its_own_capabilities() {
+        let topology = two_deployment_topology();
+        let book = HealthBook::new(&topology, 2);
+        let (a, b) = (NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap());
+        book.record(
+            &a,
+            Outcome::Success(observed_serving("QwenCoder", true, 32_768)),
+        );
+        book.record(
+            &b,
+            Outcome::Success(observed_serving("CoderBackup", false, 8_192)),
+        );
+
+        let primary = book.deployment(&DeploymentId::of(&a, "QwenCoder")).unwrap();
+        let backup = book
+            .deployment(&DeploymentId::of(&b, "CoderBackup"))
+            .unwrap();
+        assert!(primary.capabilities.0.tools);
+        assert_eq!(primary.context_length, 32_768);
+        assert!(!backup.capabilities.0.tools);
+        assert_eq!(backup.context_length, 8_192);
+    }
+
+    #[test]
+    fn a_deployment_observation_is_only_ever_written_by_its_own_model() {
+        let topology = two_deployment_topology();
+        let book = HealthBook::new(&topology, 1);
+        let a = NodeId::parse("a").unwrap();
+        let primary = DeploymentId::of(&a, "QwenCoder");
+        book.record(
+            &a,
+            Outcome::Success(observed_serving("QwenCoder", true, 32_768)),
+        );
+
+        // The node swaps to a model no deployment names, then fails: the
+        // deployment's own figures are neither overwritten nor erased.
+        book.record(&a, Outcome::Success(observed_serving("Other", false, 512)));
+        book.record(&a, Outcome::Failure("could not connect".into()));
+        book.forget_model(&a);
+        let kept = book.deployment(&primary).unwrap();
+        assert!(kept.capabilities.0.tools);
+        assert_eq!(kept.context_length, 32_768);
+        // And it is not available, because availability is read from the node.
+        assert_eq!(
+            book.availability(&topology.nodes()[0], &topology.deployments()[0]),
+            DeploymentHealth::Unavailable(UnavailableReason::NodeUnhealthy)
+        );
     }
 }

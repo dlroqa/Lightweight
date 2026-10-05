@@ -13,11 +13,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::CapabilitySet;
 use crate::domain::{
     DeploymentId, NodeId, Route, RouteName, RoutePolicy, RoutingDecision, RoutingFailure,
     RoutingReason, Topology, UnavailableReason,
 };
-use crate::health::{NodeStatus, availability};
+use crate::health::{DeploymentObservation, NodeStatus, availability};
 
 /// One deployment the plan may try.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +122,77 @@ fn priority(
         skipped,
         route_size: route.deployments.len(),
     })
+}
+
+/// What a route can promise a client right now.
+#[derive(Clone, Debug)]
+pub struct RouteSummary {
+    pub available: bool,
+    /// The smallest context among the deployments a request could be sent to
+    /// now. `None` when that is no deployment, or when any of them has no
+    /// observed context: a number the router cannot vouch for is not
+    /// advertised.
+    pub context_length: Option<u32>,
+    /// What every deployment a request could be sent to now supports.
+    pub capabilities: CapabilitySet,
+    pub max_concurrent_requests: Option<u32>,
+}
+
+/// Summarize a route over **exactly** the deployments [`plan`] would try.
+///
+/// One eligible set for routing and for reporting, so the invariant holds by
+/// construction: a route never advertises more context, or a feature, than a
+/// deployment it might currently send the request to can serve. The
+/// per-deployment observations are read, never narrowed: the summary is
+/// computed on each call and stored nowhere.
+pub fn summarize(
+    topology: &Topology,
+    route: &Route,
+    health: &BTreeMap<NodeId, NodeStatus>,
+    observed: &BTreeMap<DeploymentId, DeploymentObservation>,
+) -> RouteSummary {
+    let Ok(plan) = plan(topology, route, health) else {
+        return RouteSummary {
+            available: false,
+            context_length: None,
+            capabilities: CapabilitySet::none(),
+            max_concurrent_requests: None,
+        };
+    };
+    let mut context: Option<u32> = None;
+    let mut capabilities: Option<CapabilitySet> = None;
+    let mut concurrency: Option<u32> = None;
+    let mut every_one_observed = true;
+    for candidate in &plan.candidates {
+        let Some(seen) = observed.get(&candidate.deployment) else {
+            every_one_observed = false;
+            continue;
+        };
+        context = Some(context.map_or(seen.context_length, |c| c.min(seen.context_length)));
+        capabilities = Some(match capabilities {
+            Some(so_far) => so_far.intersect(&seen.capabilities),
+            None => seen.capabilities.clone(),
+        });
+        concurrency = Some(concurrency.map_or(seen.max_concurrent_requests, |c| {
+            c.min(seen.max_concurrent_requests)
+        }));
+    }
+    if !every_one_observed {
+        // An eligible deployment the router has no figures for could be sent
+        // the request, so nothing narrower than "unknown" is safe to claim.
+        return RouteSummary {
+            available: true,
+            context_length: None,
+            capabilities: CapabilitySet::none(),
+            max_concurrent_requests: None,
+        };
+    }
+    RouteSummary {
+        available: true,
+        context_length: context,
+        capabilities: capabilities.unwrap_or_else(CapabilitySet::none),
+        max_concurrent_requests: concurrency,
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +398,82 @@ mod tests {
         assert_eq!(
             without_default.resolve(None).unwrap_err(),
             RoutingFailure::NoDefaultRoute
+        );
+    }
+
+    fn observation(tools: bool, context_length: u32) -> DeploymentObservation {
+        let mut capabilities = CapabilitySet::none();
+        capabilities.0.streaming = true;
+        capabilities.0.tools = tools;
+        DeploymentObservation {
+            capabilities,
+            context_length,
+            max_concurrent_requests: 1,
+            observed_at: SystemTime::now(),
+        }
+    }
+
+    fn observed() -> BTreeMap<DeploymentId, DeploymentObservation> {
+        BTreeMap::from([
+            (
+                DeploymentId::of(&NodeId::parse("dell").unwrap(), "QwenCoder"),
+                observation(true, 32_768),
+            ),
+            (
+                DeploymentId::of(&NodeId::parse("t420").unwrap(), "CoderBackup"),
+                observation(false, 8_192),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_route_promises_only_what_every_eligible_deployment_can_serve() {
+        let t = topology([true, true]);
+        let both = summarize(
+            &t,
+            route(&t, "Coder"),
+            &health(serving("QwenCoder"), serving("CoderBackup")),
+            &observed(),
+        );
+        assert!(both.available);
+        assert_eq!(both.context_length, Some(8_192), "the smaller of the two");
+        assert!(!both.capabilities.0.tools, "the backup has no tools");
+        assert!(both.capabilities.0.streaming);
+
+        // With the backup out of the eligible set, the route promises what the
+        // primary alone can do - context and tools both.
+        let primary_only = summarize(
+            &t,
+            route(&t, "Coder"),
+            &health(serving("QwenCoder"), down()),
+            &observed(),
+        );
+        assert_eq!(primary_only.context_length, Some(32_768));
+        assert!(primary_only.capabilities.0.tools);
+
+        // The per-deployment figures the summary was built from are unchanged.
+        let kept = observed();
+        assert!(kept.values().any(|seen| seen.capabilities.0.tools));
+    }
+
+    #[test]
+    fn a_route_with_nothing_eligible_or_unobserved_promises_nothing() {
+        let t = topology([true, true]);
+        let none = summarize(&t, route(&t, "Coder"), &health(down(), down()), &observed());
+        assert!(!none.available);
+        assert_eq!(none.context_length, None);
+        assert!(!none.capabilities.0.streaming);
+
+        let unobserved = summarize(
+            &t,
+            route(&t, "Coder"),
+            &health(serving("QwenCoder"), serving("CoderBackup")),
+            &BTreeMap::new(),
+        );
+        assert!(unobserved.available);
+        assert_eq!(
+            unobserved.context_length, None,
+            "no number it cannot vouch for"
         );
     }
 }

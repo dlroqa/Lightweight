@@ -28,6 +28,7 @@ use crate::domain::{CapabilitySet, DeploymentHealth, NodeId, Route};
 use crate::error::{json_error, unauthorized};
 use crate::health::NodeStatus;
 use crate::proxy::{self, Endpoint};
+use crate::select::RouteSummary as RouteView;
 
 /// The `owned_by` every route row carries.
 pub const OWNED_BY: &str = "lightweight-router";
@@ -79,62 +80,15 @@ async fn completions(
     proxy::forward(state, Endpoint::Completions, &headers, &body).await
 }
 
-/// What the router can say about one route right now.
-struct RouteView {
-    available: bool,
-    /// The smallest context any of the route's deployments was last seen
-    /// serving. Smallest, because the router may send a request to any of
-    /// them, and a prompt sized for the largest would overflow the others.
-    context_length: Option<u32>,
-    /// What every *available* deployment supports.
-    features: CapabilitySet,
-    max_concurrent_requests: Option<u32>,
-}
-
+/// The route as a client may be told about it: computed over the same
+/// eligible set routing uses. See [`crate::select::summarize`].
 fn view(state: &RouterState, route: &Route, health: &BTreeMap<NodeId, NodeStatus>) -> RouteView {
-    let unknown = NodeStatus::default();
-    let mut available = false;
-    let mut context_length: Option<u32> = None;
-    let mut features: Option<CapabilitySet> = None;
-    let mut max_concurrent: Option<u32> = None;
-
-    for id in &route.deployments {
-        let Some(deployment) = state.topology.deployment(id) else {
-            continue;
-        };
-        let Some(node) = state.topology.node(&deployment.node) else {
-            continue;
-        };
-        let status = health.get(&node.id).unwrap_or(&unknown);
-        if let Some(served) = status.served().filter(|served| {
-            lightweight_catalog::alias::same_name(&served.id, &deployment.remote_model)
-        }) {
-            context_length = Some(
-                context_length.map_or(served.context_length, |c| c.min(served.context_length)),
-            );
-        }
-        if crate::health::availability(node, deployment, status) == DeploymentHealth::Available {
-            available = true;
-            if let Some(observed) = &status.observed {
-                features = Some(match features {
-                    Some(so_far) => so_far.intersect(&observed.features),
-                    None => observed.features.clone(),
-                });
-                max_concurrent = Some(
-                    max_concurrent.map_or(observed.max_concurrent_requests, |m| {
-                        m.min(observed.max_concurrent_requests)
-                    }),
-                );
-            }
-        }
-    }
-
-    RouteView {
-        available,
-        context_length,
-        features: features.unwrap_or_else(CapabilitySet::none),
-        max_concurrent_requests: max_concurrent,
-    }
+    crate::select::summarize(
+        &state.topology,
+        route,
+        health,
+        &state.health.deployment_snapshot(),
+    )
 }
 
 /// `GET /v1/models`: every configured route, whether or not it is available
@@ -203,8 +157,8 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
     let mut max_concurrent: Option<u32> = None;
     for (_, view) in views.iter().filter(|(_, view)| view.available) {
         features = Some(match features {
-            Some(so_far) => so_far.intersect(&view.features),
-            None => view.features.clone(),
+            Some(so_far) => so_far.intersect(&view.capabilities),
+            None => view.capabilities.clone(),
         });
         if let Some(limit) = view.max_concurrent_requests {
             max_concurrent = Some(max_concurrent.map_or(limit, |m| m.min(limit)));
@@ -226,7 +180,7 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
                 "id": route.name.as_str(),
                 "available": view.available,
                 "context_length": view.context_length,
-                "features": view.features,
+                "features": view.capabilities,
             })
         })
         .collect();
@@ -415,6 +369,9 @@ async fn deployments(State(state): State<Arc<RouterState>>, headers: HeaderMap) 
         .iter()
         .map(|deployment| {
             let (available, reason) = deployment_availability(&state, deployment, &health);
+            // This deployment's own last-observed figures, never a route's
+            // combined ones.
+            let observed = state.health.deployment(&deployment.id);
             json!({
                 "id": deployment.id,
                 "node": deployment.node,
@@ -422,6 +379,8 @@ async fn deployments(State(state): State<Arc<RouterState>>, headers: HeaderMap) 
                 "routes": state.topology.routes_using(&deployment.id),
                 "available": available,
                 "unavailable_reason": reason,
+                "observed": observed,
+                "observed_at": observed.as_ref().map(|seen| unix(seen.observed_at)),
             })
         })
         .collect();
