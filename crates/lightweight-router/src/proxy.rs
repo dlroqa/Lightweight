@@ -62,13 +62,15 @@ use serde_json::Value;
 
 use crate::RouterState;
 use crate::affinity::{AffinityKey, Established, Reassignment};
-use crate::auto_route::AUTO_ROUTE;
-use crate::domain::{CapabilityGap, DeploymentId, Node, RouteName, RoutingFailure, RoutingReason};
+use crate::auto_route::{AUTO_ROUTE, AutoRoute};
+use crate::domain::{
+    CapabilityGap, DeploymentId, Node, Route, RouteName, RoutingFailure, RoutingReason,
+};
 use crate::error::{json_error, routing_failure, server_error};
 use crate::health::{Outcome as Probe, describe_transport};
 use crate::load::Lease;
 use crate::metrics::{ActiveGuard, Outcome, UNKNOWN_ROUTE};
-use crate::requirements;
+use crate::requirements::{self, RequestRequirements};
 use crate::select::{Candidate, Selection, Sticky};
 use crate::sse::{FrameRewriter, rewrite_body_measuring};
 use crate::trace::{
@@ -194,6 +196,8 @@ impl Tracker {
             target: targets::ROUTER,
             request_id = trace.request_id.as_str(),
             route = trace.route.as_str(),
+            requested_route = trace.requested_route.as_str(),
+            auto_rule = trace.auto_rule.as_deref(),
             policy = trace.policy,
             stream = trace.stream,
             session = trace.session.as_ref().map(|s| s.fingerprint.as_str()),
@@ -396,57 +400,22 @@ async fn route_request(
     // they are read here, once, and reused below. Everything else resolves by
     // name, as it always has.
     let mut early_needs = None;
-    let resolution =
-        match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
-            Some(auto) => {
-                let needs = match requirements::extract(endpoint, body) {
-                    Ok(needs) => needs,
-                    Err(refusal) => {
-                        // Refused before any route was chosen, so it is counted
-                        // under `Auto` — a fixed name, never one a client typed.
-                        let routing = planning_started.elapsed();
-                        state
-                            .metrics
-                            .observe_planning(AUTO_ROUTE, NO_POLICY, routing);
-                        tracing::info!(
-                            target: targets::ROUTER,
-                            request_id,
-                            requested_route = AUTO_ROUTE,
-                            endpoint = endpoint.as_str(),
-                            upstream_status = refusal.status().as_u16(),
-                            routing_ms = millis(routing),
-                            "request refused before routing"
-                        );
-                        state
-                            .metrics
-                            .record_request(AUTO_ROUTE, Outcome::ClientError);
-                        return *refusal;
-                    }
-                };
-                let decision = auto.decide(&needs);
-                tracing::info!(
-                    target: targets::ROUTER,
-                    request_id,
-                    requested_route = AUTO_ROUTE,
-                    auto_rule = decision.rule_label(),
-                    resolved_route = %decision.route,
-                    endpoint = endpoint.as_str(),
-                    requires_tools = needs.tools,
-                    tool_choice = needs.tool_choice.as_str(),
-                    requires_reasoning = needs.reasoning,
-                    estimated_prompt_tokens = needs.prompt_tokens,
-                    "auto route resolved"
-                );
-                let resolved = state.topology.route(decision.route).ok_or_else(|| {
-                    RoutingFailure::UnknownRoute {
-                        requested: decision.route.to_string(),
-                    }
-                });
-                early_needs = Some(needs);
-                resolved
+    // The rule that chose the route — `Some(None)` for the fallback — when
+    // the client asked for `Auto`.
+    let mut auto_rule: Option<Option<String>> = None;
+    let resolution = match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
+        Some(auto) => {
+            match resolve_auto(state, auto, endpoint, body, request_id, planning_started) {
+                Ok(resolved) => {
+                    early_needs = Some(resolved.needs);
+                    auto_rule = Some(resolved.rule);
+                    resolved.route
+                }
+                Err(refusal) => return *refusal,
             }
-            None => state.topology.resolve(requested),
-        };
+        }
+        None => state.topology.resolve(requested),
+    };
     let route = match resolution {
         Ok(route) => route,
         Err(failure) => {
@@ -470,6 +439,11 @@ async fn route_request(
     };
     let policy = route.policy.as_str();
     let mut tracker = Tracker::new(state, request_id, &route.name, policy, endpoint, received);
+    if let Some(rule) = auto_rule {
+        tracker.trace.requested_route = AUTO_ROUTE.to_owned();
+        tracker.trace.auto_fallback = rule.is_none();
+        tracker.trace.auto_rule = rule;
+    }
     tracker.trace.stream = request.get("stream") == Some(&Value::Bool(true));
     tracker.trace.deployments = route.deployments.len();
 
@@ -829,6 +803,8 @@ async fn route_request(
                     target: targets::ROUTER,
                     request_id,
                     route = %decision.route,
+                    requested_route = tracker.trace.requested_route.as_str(),
+                    auto_rule = tracker.trace.auto_rule.as_deref(),
                     policy = plan.policy.as_str(),
                     node = %decision.node,
                     deployment = %decision.deployment,
@@ -917,6 +893,86 @@ async fn route_request(
             response
         }
     }
+}
+
+/// What `Auto` resolved one request to.
+struct AutoResolution<'a> {
+    /// The route the rules named. Always configured — validation saw to it —
+    /// but carried as a resolution so the ordinary refusal stands if not.
+    route: Result<&'a Route, RoutingFailure>,
+    /// Read to decide, and reused for capability filtering.
+    needs: RequestRequirements,
+    /// The rule that matched; `None` for the fallback.
+    rule: Option<String>,
+}
+
+/// Resolve an `Auto` request: read what it requires, and let the first
+/// matching rule, or the fallback, name the route.
+///
+/// Only a route is chosen here. Which of its deployments answers is decided
+/// afterwards exactly as for a request that named the route. A request the
+/// gateway would refuse is refused before any route is chosen, and counted
+/// under `Auto` — a fixed name, never one a client typed.
+fn resolve_auto<'a>(
+    state: &'a RouterState,
+    auto: &'a AutoRoute,
+    endpoint: Endpoint,
+    body: &[u8],
+    request_id: &str,
+    planning_started: Instant,
+) -> Result<AutoResolution<'a>, Box<Response>> {
+    let needs = match requirements::extract(endpoint, body) {
+        Ok(needs) => needs,
+        Err(refusal) => {
+            let routing = planning_started.elapsed();
+            state
+                .metrics
+                .observe_planning(AUTO_ROUTE, NO_POLICY, routing);
+            tracing::info!(
+                target: targets::ROUTER,
+                request_id,
+                requested_route = AUTO_ROUTE,
+                endpoint = endpoint.as_str(),
+                upstream_status = refusal.status().as_u16(),
+                routing_ms = millis(routing),
+                "request refused before routing"
+            );
+            state
+                .metrics
+                .record_request(AUTO_ROUTE, Outcome::ClientError);
+            return Err(refusal);
+        }
+    };
+    let decision = auto.decide(&needs);
+    tracing::info!(
+        target: targets::ROUTER,
+        request_id,
+        requested_route = AUTO_ROUTE,
+        auto_rule = decision.rule_label(),
+        resolved_route = %decision.route,
+        endpoint = endpoint.as_str(),
+        requires_tools = needs.tools,
+        tool_choice = needs.tool_choice.as_str(),
+        requires_reasoning = needs.reasoning,
+        estimated_prompt_tokens = needs.prompt_tokens,
+        "auto route resolved"
+    );
+    state.metrics.record_auto_decision(
+        decision.rule_label(),
+        decision.route.as_str(),
+        decision.is_fallback(),
+    );
+    let route = state
+        .topology
+        .route(decision.route)
+        .ok_or_else(|| RoutingFailure::UnknownRoute {
+            requested: decision.route.to_string(),
+        });
+    Ok(AutoResolution {
+        route,
+        needs,
+        rule: decision.rule.map(str::to_owned),
+    })
 }
 
 /// Record where a session's request succeeded.

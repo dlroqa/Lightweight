@@ -79,7 +79,20 @@ pub struct RoutingTrace {
     pub request_id: String,
     /// Unix seconds when the router had the request.
     pub received_at: u64,
+    /// The logical route that handled the request: the one the client named,
+    /// or the one `Auto` resolved to. Every deployment field below is a
+    /// deployment of this route.
     pub route: String,
+    /// What the client asked for: `Auto`, or the route itself. Two decisions
+    /// are on record when they differ — `Auto` chose `route` (by `auto_rule`,
+    /// or its fallback), then the route's policy chose the deployment.
+    pub requested_route: String,
+    /// The rule that chose `route`, when the client asked for `Auto`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_rule: Option<String>,
+    /// `Auto` matched no rule, and `route` is its fallback.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub auto_fallback: bool,
     pub endpoint: &'static str,
     pub stream: bool,
     pub policy: &'static str,
@@ -135,6 +148,9 @@ impl RoutingTrace {
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or_default(),
             route: route.to_owned(),
+            requested_route: route.to_owned(),
+            auto_rule: None,
+            auto_fallback: false,
             endpoint,
             stream: false,
             policy,

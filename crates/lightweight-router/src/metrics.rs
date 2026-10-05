@@ -87,6 +87,11 @@ pub struct RouterMetrics {
     placement_actions: Mutex<BTreeMap<(String, &'static str, &'static str), u64>>,
     /// Placement actions that failed, by route and reason.
     placement_failures: Mutex<BTreeMap<(String, &'static str), u64>>,
+    /// Routes `Auto` chose, by rule (a configured name, or `_fallback`) and
+    /// route. Counted when the route is chosen, whatever the route answers.
+    auto_decisions: Mutex<BTreeMap<(String, String), u64>>,
+    /// `Auto` requests no rule matched, by the fallback route they went to.
+    auto_fallbacks: Mutex<BTreeMap<String, u64>>,
     histograms: Histograms,
 }
 
@@ -495,6 +500,32 @@ impl RouterMetrics {
         bump(&self.placement_actions, (route.to_owned(), action, result));
     }
 
+    pub fn record_auto_decision(&self, rule: &str, route: &str, fallback: bool) {
+        bump(&self.auto_decisions, (rule.to_owned(), route.to_owned()));
+        if fallback {
+            bump(&self.auto_fallbacks, route.to_owned());
+        }
+    }
+
+    /// How many times `rule` chose a route, whichever.
+    pub fn auto_decisions(&self, rule: &str) -> u64 {
+        self.auto_decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|((r, _), _)| r == rule)
+            .map(|(_, count)| count)
+            .sum()
+    }
+
+    pub fn auto_fallbacks(&self) -> u64 {
+        self.auto_fallbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .sum()
+    }
+
     pub fn record_placement_failure(&self, route: &str, reason: &'static str) {
         bump(&self.placement_failures, (route.to_owned(), reason));
     }
@@ -882,6 +913,40 @@ impl RouterMetrics {
             let _ = writeln!(
                 out,
                 "router_placement_failures_total{{route=\"{}\",reason=\"{reason}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        out.push_str(
+            "# HELP router_auto_route_decisions_total Routes Auto chose, by rule and route. `_fallback` is no rule matching.\n",
+        );
+        out.push_str("# TYPE router_auto_route_decisions_total counter\n");
+        for ((rule, route), count) in self
+            .auto_decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_auto_route_decisions_total{{rule=\"{}\",route=\"{}\"}} {count}",
+                escape(rule),
+                escape(route)
+            );
+        }
+        out.push_str(
+            "# HELP router_auto_route_fallback_total Auto requests no rule matched, by the fallback route they went to.\n",
+        );
+        out.push_str("# TYPE router_auto_route_fallback_total counter\n");
+        for (route, count) in self
+            .auto_fallbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_auto_route_fallback_total{{route=\"{}\"}} {count}",
                 escape(route)
             );
         }

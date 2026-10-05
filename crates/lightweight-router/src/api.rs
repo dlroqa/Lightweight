@@ -6,8 +6,8 @@
 //!   to. It names routes and nothing else: no node, no address, no node-local
 //!   model name, no file.
 //! * **`/api/router/v1`** is the operator's read-only view of what is behind
-//!   the routes — nodes, deployments, health, session affinity and recent
-//!   routing traces. It shares `/v1`'s credential and never shows a node's
+//!   the routes — nodes, deployments, health, session affinity, `Auto`'s
+//!   rules and recent routing traces. It shares `/v1`'s credential and never shows a node's
 //!   key, a session id (only a keyed fingerprint) or any request content.
 
 use std::collections::BTreeMap;
@@ -49,6 +49,7 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/health", get(health_detail))
         .route("/api/router/v1/sessions", get(sessions))
         .route("/api/router/v1/traces", get(traces))
+        .route("/api/router/v1/auto", get(auto_rules))
         .route("/api/router/v1/placement", get(placement))
         .route("/api/router/v1/placement/reconcile", post(reconcile))
         .fallback(not_found)
@@ -414,6 +415,42 @@ async fn reconcile(State(state): State<Arc<RouterState>>, headers: HeaderMap) ->
         axum::Json(json!({"reconcile": "scheduled"})),
     )
         .into_response()
+}
+
+/// `GET /api/router/v1/auto`: `Auto`'s rules in the order they are tried,
+/// each with the route it chooses and how often it has. Read-only: rules
+/// change only with the configuration file.
+async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(auto) = &state.auto else {
+        return axum::Json(json!({"configured": false, "enabled": false})).into_response();
+    };
+    let rules: Vec<Value> = auto
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            json!({
+                "position": index + 1,
+                "name": rule.name,
+                "when": rule.when,
+                "condition": rule.when.summary(),
+                "route": rule.route.as_str(),
+                "decisions": state.metrics.auto_decisions(&rule.name),
+            })
+        })
+        .collect();
+    axum::Json(json!({
+        "configured": true,
+        "enabled": auto.enabled,
+        "name": crate::auto_route::AUTO_ROUTE,
+        "fallback_route": auto.fallback.as_str(),
+        "fallback_decisions": state.metrics.auto_fallbacks(),
+        "rules": rules,
+    }))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
