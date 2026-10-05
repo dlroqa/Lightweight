@@ -27,6 +27,28 @@ All notable changes to this project are documented in this file.
   against a real engine.
 - `hermes models alias` changes an alias through a running gateway that serves
   the same profile, rather than editing the catalog file under it.
+- **Federated model router (`hermes router`).** A new, separately run
+  `lightweight-router` crate puts one OpenAI-compatible endpoint in front of
+  several Lightweight gateways.
+  - Clients discover and send logical route names (`Coder`, `Fast`).
+  - Each route lists node deployments in priority order. The router picks the
+    first healthy one, rewrites `model` to that node's own alias, and rewrites
+    the response back to the route name, in streamed chunks too. Streams are
+    relayed frame by frame, and a client disconnect cancels the node's
+    generation.
+  - Failover happens only before any response has started: on a refused
+    connection, a 502/503/504, or a node that stopped serving the model. A
+    stream that fails mid-way ends with an error frame and no `[DONE]`.
+  - Unknown routes are `model_not_found`. A known route with nothing healthy is
+    `route_unavailable`. `default` resolves only to an explicitly configured
+    `default_route`.
+  - Node health comes from probing each node's `/v1/capabilities`, with a
+    failure threshold.
+  - Client and node credentials are separate, and every key is read from an
+    environment variable.
+  - Read-only `/api/router/v1/{nodes,routes,deployments,health}`, Prometheus
+    `/metrics`, and `hermes router validate-config`.
+  - `hermes serve` is unchanged. See `docs/ROUTER.md`.
 
 ### Fixed
 

@@ -602,6 +602,27 @@ missing model file, or names a profile with no key. It is the interactive/
 foreground way to run several at once; for an always-on server, run each model as
 its own service unit instead.
 
+### One endpoint over several machines (`hermes router`)
+
+`hermes router` is a separate process that puts one OpenAI-compatible endpoint
+in front of several gateways. Clients list and send logical names such as
+`Coder`. The router sends each request to the first healthy deployment in the
+order you configured, rewrites `model` to that node's own alias, and relays the
+answer, streamed or not, under the logical name. If a node fails before it has
+answered, the next deployment is tried. Once the answer has started, the
+deployment is never switched.
+
+```sh
+export LIGHTWEIGHT_DELL_KEY=...  LIGHTWEIGHT_T420_KEY=...   # one key per node, never in the file
+hermes router validate-config --config router.json          # checks everything; listens on nothing
+hermes router --config router.json                          # http://127.0.0.1:11500/v1
+```
+
+`hermes serve` is unchanged. The router only uses each node's public `/v1`
+surface and never loads, places or inspects a model. See
+[docs/ROUTER.md](docs/ROUTER.md) for the configuration, the failover rules and
+the read-only `/api/router/v1` control API.
+
 ### Keys, and where the configuration lives
 
 Two files under the config directory (`~/.config/CpuInferenceGateway` on Linux,
@@ -767,6 +788,7 @@ the verdict without parsing the report. Add `--json` to any command for machine
 | `lightweight-gateway` | The HTTP surface: routes, auth, streaming, cancellation, the scheduler, metrics, the control API and the panel it serves |
 | `lightweight-observability` | Structured logging, rotation, privacy-mode wiring |
 | `lightweight-bench` | Measures what this machine does with a model, and records it so it can be believed rather than assumed |
+| `lightweight-router` | Stable logical model names over several gateways: routes, node health, priority selection, pre-response failover, stream relaying. A client of the gateways, never an engine |
 | `lightweight-cli` | Command-line access to the above |
 
 Two parts of the product are not crates:
