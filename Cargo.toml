@@ -14,6 +14,7 @@ members = [
     "crates/lightweight-api",
     "crates/lightweight-gateway",
     "crates/lightweight-cli",
+    "crates/lightweight-router",
     "crates/lightweight-system-info",
     "crates/lightweight-observability",
     "crates/lightweight-sys",
@@ -131,6 +132,7 @@ lightweight-backend-llamacpp = { path = "crates/lightweight-backend-llamacpp" }
 lightweight-backend-mock = { path = "crates/lightweight-backend-mock" }
 lightweight-api = { path = "crates/lightweight-api" }
 lightweight-gateway = { path = "crates/lightweight-gateway" }
+lightweight-router = { path = "crates/lightweight-router" }
 lightweight-system-info = { path = "crates/lightweight-system-info" }
 lightweight-observability = { path = "crates/lightweight-observability" }
 lightweight-sys = { path = "crates/lightweight-sys" }

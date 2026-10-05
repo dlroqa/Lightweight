@@ -1,0 +1,35 @@
+[package]
+name = "lightweight-router"
+description = "A federated model router: stable logical model names over remote Lightweight gateways."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The router is a client of Lightweight gateways, never an inference engine: it
+# depends on the gateway only for its authentication policy and on the API
+# crate only for the wire types both sides already agree on. Nothing here
+# parses GGUF, estimates memory, loads a model or supervises an engine.
+[dependencies]
+lightweight-core.workspace = true
+lightweight-api.workspace = true
+lightweight-catalog.workspace = true
+lightweight-gateway.workspace = true
+lightweight-download.workspace = true
+lightweight-observability.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+lightweight-backend-mock.workspace = true
+lightweight-inference.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
