@@ -232,12 +232,21 @@ pub enum RoutePolicy {
     /// same health always produces the same choice.
     #[default]
     Priority,
+    /// Equal steps around the eligible deployments, in configured order. One
+    /// step per client request, however many failover attempts it takes.
+    RoundRobin,
+    /// The eligible deployment with the lowest `active / concurrency limit`,
+    /// ties to configured order. Load is the router's own in-flight count;
+    /// latency plays no part.
+    LeastBusy,
 }
 
 impl RoutePolicy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Priority => "priority",
+            Self::RoundRobin => "round_robin",
+            Self::LeastBusy => "least_busy",
         }
     }
 }
@@ -247,8 +256,9 @@ impl RoutePolicy {
 pub struct Route {
     pub name: RouteName,
     pub policy: RoutePolicy,
-    /// In configured order, which under [`RoutePolicy::Priority`] is the order
-    /// they are tried in. Never empty.
+    /// In configured order: the order tried under [`RoutePolicy::Priority`],
+    /// the ring under [`RoutePolicy::RoundRobin`], and the tie-break under
+    /// [`RoutePolicy::LeastBusy`]. Never empty.
     pub deployments: Vec<DeploymentId>,
 }
 
@@ -369,6 +379,19 @@ pub enum RoutingReason {
     /// A higher-priority deployment was tried and failed before it had sent
     /// anything, so the request moved on.
     PrimaryFailedFallback,
+    /// The round-robin rotation's turn.
+    RoundRobin,
+    /// The rotation's choice failed before answering; this is the next
+    /// deployment after it in the rotation.
+    RoundRobinFailover,
+    /// The lowest normalized load, strictly.
+    LeastBusy,
+    /// The lowest normalized load, shared with another deployment; configured
+    /// order broke the tie.
+    LeastBusyTiebreak,
+    /// The least-busy choice failed before answering; this is the next in the
+    /// load order observed when the request was planned.
+    LeastBusyFailover,
 }
 
 impl RoutingReason {
@@ -378,6 +401,11 @@ impl RoutingReason {
             Self::PrimaryHealthy => "primary_healthy",
             Self::PrimaryUnavailableFallback => "primary_unavailable_fallback",
             Self::PrimaryFailedFallback => "primary_failed_fallback",
+            Self::RoundRobin => "round_robin",
+            Self::RoundRobinFailover => "round_robin_failover",
+            Self::LeastBusy => "least_busy",
+            Self::LeastBusyTiebreak => "least_busy_tiebreak",
+            Self::LeastBusyFailover => "least_busy_failover",
         }
     }
 }
