@@ -79,6 +79,9 @@ pub struct RouterState {
     pub metrics: RouterMetrics,
     /// Per-route policy state and the per-deployment in-flight counts.
     pub selector: Selector,
+    /// The `auto_route` section, if the file has one. Only ever chooses a
+    /// route; everything after that is the route's own.
+    pub auto: Option<crate::auto_route::AutoRoute>,
     /// Which deployment each live session prefers. Empty, and never written,
     /// while affinity is off.
     pub affinity: AffinityBook,
@@ -148,6 +151,7 @@ impl RouterState {
             client,
             metrics: RouterMetrics::default(),
             selector,
+            auto: config.auto.clone(),
             affinity: AffinityBook::new(config.affinity.clone()),
             traces: TraceBook::new(config.trace_capacity),
             phase_delays: crate::proxy::PhaseDelays::default(),

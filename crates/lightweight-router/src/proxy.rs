@@ -6,7 +6,11 @@
 //!    forwarded as the client sent it — the node, not the router, decides what
 //!    `tools`, `max_tokens` or `reasoning_effort` mean.
 //! 2. **Resolve** `model` to a route, through the same `default` rules the
-//!    gateway applies.
+//!    gateway applies. `Auto`, when it is configured, is resolved by its rules
+//!    instead ([`crate::auto_route`]): the request's requirements are read
+//!    first and the first matching rule names the route. From here on an
+//!    `Auto` request is exactly a request for that route — its affinity, its
+//!    policy, its failover and its name on the response.
 //! 3. **Require**: what the request needs of a deployment — its endpoint,
 //!    tools, `tool_choice`, reasoning, and room for its prompt — read once by
 //!    [`crate::requirements`]. A request the gateway would refuse is refused
@@ -58,6 +62,7 @@ use serde_json::Value;
 
 use crate::RouterState;
 use crate::affinity::{AffinityKey, Established, Reassignment};
+use crate::auto_route::AUTO_ROUTE;
 use crate::domain::{CapabilityGap, DeploymentId, Node, RouteName, RoutingFailure, RoutingReason};
 use crate::error::{json_error, routing_failure, server_error};
 use crate::health::{Outcome as Probe, describe_transport};
@@ -387,7 +392,62 @@ async fn route_request(
     pause(&state.phase_delays.during_planning_ms).await;
 
     let requested = request.get("model").and_then(Value::as_str);
-    let route = match state.topology.resolve(requested) {
+    // `Auto` needs the request's requirements to choose a route, so for it
+    // they are read here, once, and reused below. Everything else resolves by
+    // name, as it always has.
+    let mut early_needs = None;
+    let resolution =
+        match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
+            Some(auto) => {
+                let needs = match requirements::extract(endpoint, body) {
+                    Ok(needs) => needs,
+                    Err(refusal) => {
+                        // Refused before any route was chosen, so it is counted
+                        // under `Auto` — a fixed name, never one a client typed.
+                        let routing = planning_started.elapsed();
+                        state
+                            .metrics
+                            .observe_planning(AUTO_ROUTE, NO_POLICY, routing);
+                        tracing::info!(
+                            target: targets::ROUTER,
+                            request_id,
+                            requested_route = AUTO_ROUTE,
+                            endpoint = endpoint.as_str(),
+                            upstream_status = refusal.status().as_u16(),
+                            routing_ms = millis(routing),
+                            "request refused before routing"
+                        );
+                        state
+                            .metrics
+                            .record_request(AUTO_ROUTE, Outcome::ClientError);
+                        return *refusal;
+                    }
+                };
+                let decision = auto.decide(&needs);
+                tracing::info!(
+                    target: targets::ROUTER,
+                    request_id,
+                    requested_route = AUTO_ROUTE,
+                    auto_rule = decision.rule_label(),
+                    resolved_route = %decision.route,
+                    endpoint = endpoint.as_str(),
+                    requires_tools = needs.tools,
+                    tool_choice = needs.tool_choice.as_str(),
+                    requires_reasoning = needs.reasoning,
+                    estimated_prompt_tokens = needs.prompt_tokens,
+                    "auto route resolved"
+                );
+                let resolved = state.topology.route(decision.route).ok_or_else(|| {
+                    RoutingFailure::UnknownRoute {
+                        requested: decision.route.to_string(),
+                    }
+                });
+                early_needs = Some(needs);
+                resolved
+            }
+            None => state.topology.resolve(requested),
+        };
+    let route = match resolution {
         Ok(route) => route,
         Err(failure) => {
             let routing = planning_started.elapsed();
@@ -414,7 +474,11 @@ async fn route_request(
     tracker.trace.deployments = route.deployments.len();
 
     // What the request needs, read once, before any deployment is looked at.
-    let needs = match requirements::extract(endpoint, body) {
+    let extracted = match early_needs {
+        Some(needs) => Ok(needs),
+        None => requirements::extract(endpoint, body),
+    };
+    let needs = match extracted {
         Ok(needs) => needs,
         Err(refusal) => {
             let routing = planning_started.elapsed();

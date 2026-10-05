@@ -131,8 +131,23 @@ async fn models(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Re
             }
             row
         })
+        .chain(enabled_auto(&state).map(|_| {
+            // The router's own choice, not a model: no context, because that
+            // belongs to whichever route a request resolves to.
+            json!({
+                "id": crate::auto_route::AUTO_ROUTE,
+                "object": "model",
+                "created": created,
+                "owned_by": OWNED_BY,
+            })
+        }))
         .collect();
     axum::Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+/// `Auto`, when it is configured and on.
+fn enabled_auto(state: &RouterState) -> Option<&crate::auto_route::AutoRoute> {
+    state.auto.as_ref().filter(|auto| auto.enabled)
 }
 
 /// `GET /v1/capabilities`: the gateway's contract, answered for routes.
@@ -146,6 +161,10 @@ async fn models(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Re
 /// **every deployment it could send a request to right now** supports it, and
 /// the router as a whole only what every available route supports. A route
 /// with nothing available claims nothing.
+///
+/// `Auto` is not a route and is not listed under `routes`: what it can serve
+/// is whatever the route a request resolves to can. It is described under
+/// `auto` by the routes it can resolve to, and claims nothing of its own.
 async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
         return refusal;
@@ -197,7 +216,7 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
         object.insert("model".into(), model);
     }
 
-    axum::Json(json!({
+    let mut body = json!({
         "object": "capability.list",
         "protocol": {
             "name": PROTOCOL_NAME,
@@ -219,8 +238,18 @@ async fn capabilities(State(state): State<Arc<RouterState>>, headers: HeaderMap)
             "max_concurrent_requests": max_concurrent.unwrap_or(0),
         },
         "routes": routes,
-    }))
-    .into_response()
+    });
+    if let (Some(auto), Some(object)) = (enabled_auto(&state), body.as_object_mut()) {
+        object.insert(
+            "auto".into(),
+            json!({
+                "id": crate::auto_route::AUTO_ROUTE,
+                "router_resolved": true,
+                "routes": auto.targets().iter().map(|route| route.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    axum::Json(body).into_response()
 }
 
 /// `GET /health`: never refused, and says only whether routes are available.
