@@ -1999,6 +1999,34 @@ response bodies.
 
 **Next:** review of this branch (not merged). R9.2 needs explicit approval.
 
+**Merged and frozen.** PR #39 → `c493ce7` (head `b8a29c3`, unchanged since
+review). Master validated: check.sh 1228 tests, frontend 26, desktop 29,
+contract 47/2; CI run 37413886272 (all seven check jobs) and render panel
+37413886286 green. Post-merge smoke against a real `lightweight router
+--web-root`: gateway-only paths redirect to Auto Routing; Auto Routing and
+Classifier load; provider switching; Jev settings, candidates, fallback and
+descriptions render; Test Connection reached the router and returned a real
+`model_not_listed` for the pinned `jev-1.13.0`, shown with the pinned-version
+caveat; snippet, `validate-config` and restart guidance visible; the per-run
+key in neither the DOM nor any of 16 responses. R9.1 + R9.1a + the classifier
+UI are frozen.
+
+## R9.2 adaptive route scoring — design only
+
+Design in [R9_2_ADAPTIVE_ROUTE_SCORING.md](R9_2_ADAPTIVE_ROUTE_SCORING.md); no
+code. Findings that shaped it: classifiers return one verdict (route +
+confidence), never a distribution; Jev's documented `probabilities` are
+parsed and discarded today; every metric is cumulative since start and
+`router_requests_total` records at response head (a broken stream stays `ok`),
+so history needs its own bounded, decayed per-route record taken at
+`Tracker::finish`. Proposed slice 1: classifier verdict + threshold anchor
+(R9.1 restated, so neutral weights reproduce R9.1 exactly) + operator priors
++ gated, shrunk, time-decayed success history; off by default; deterministic
+tie-break; no latency, context-fit, persistence or UI yet.
+
+**Next:** review of the design. Implementation (`feature/router-route-scoring`)
+needs explicit approval.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:
