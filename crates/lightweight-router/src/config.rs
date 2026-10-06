@@ -603,7 +603,7 @@ pub fn validate(
     let auto = file
         .auto_route
         .as_ref()
-        .and_then(|raw| crate::auto_route::validate(raw, &routes, &mut errors));
+        .and_then(|raw| crate::auto_route::validate(raw, &routes, env, &mut errors));
 
     if !errors.is_empty() {
         return Err(ConfigErrors(errors));
@@ -808,7 +808,7 @@ fn validate_health(raw: &HealthFile, errors: &mut Vec<ConfigError>) -> HealthPol
 }
 
 /// Read one secret from the environment, recording why it could not be.
-fn read_secret(
+pub(crate) fn read_secret(
     owner: &str,
     var: &str,
     env: &dyn Fn(&str) -> Option<String>,
@@ -904,7 +904,7 @@ fn validate_nodes(
 }
 
 /// Check a node URL, returning the reason it is unusable.
-fn validate_url(raw: &str) -> Result<reqwest::Url, &'static str> {
+pub(crate) fn validate_url(raw: &str) -> Result<reqwest::Url, &'static str> {
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| "is not a valid URL")?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("must use http or https");

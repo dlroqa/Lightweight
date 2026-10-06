@@ -40,9 +40,16 @@ pub struct SessionTrace {
 /// answer it gave.
 #[derive(Clone, Debug, Serialize)]
 pub struct ClassifierTrace {
-    /// The classifier route.
-    pub route: String,
-    /// `chosen`, `low_confidence`, `invalid`, `unavailable`, `timeout` or
+    /// `lightweight` or `jev`.
+    pub provider: &'static str,
+    /// The classifier route, for the Lightweight provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// The model asked (Jev: the versioned id that answered, when it said).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `chosen`, `low_confidence`, `invalid`, `unavailable`, `timeout`,
+    /// `auth_error`, `rate_limited`, `connection_error`, `provider_error` or
     /// `nested`. Only `chosen` makes `chosen_route` the request's route.
     pub outcome: &'static str,
     /// The candidate the classifier named, taken or not.

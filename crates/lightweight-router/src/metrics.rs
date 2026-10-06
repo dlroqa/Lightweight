@@ -92,10 +92,10 @@ pub struct RouterMetrics {
     auto_decisions: Mutex<BTreeMap<(String, String), u64>>,
     /// `Auto` requests no rule matched, by the fallback route they went to.
     auto_fallbacks: Mutex<BTreeMap<String, u64>>,
-    /// Classifications, by outcome.
-    classifier_outcomes: Mutex<BTreeMap<&'static str, u64>>,
-    /// Routes classifications chose (outcome `chosen`), by route.
-    classifier_routes: Mutex<BTreeMap<String, u64>>,
+    /// Classifications, by provider and outcome.
+    classifier_outcomes: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
+    /// Routes classifications chose (outcome `chosen`), by provider and route.
+    classifier_routes: Mutex<BTreeMap<(&'static str, String), u64>>,
     histograms: Histograms,
 }
 
@@ -349,7 +349,7 @@ impl Default for Histograms {
             ),
             classifier: Family::new(
                 "router_classifier_duration_seconds",
-                "One Auto classification, from asking the classifier route to its verdict, timeout or failure, by outcome. Not part of router_routing_duration_seconds.",
+                "One Auto classification, from asking the classifier to its verdict, timeout or failure, by provider and outcome. Not part of router_routing_duration_seconds.",
                 SECONDS,
             ),
         }
@@ -530,25 +530,33 @@ impl RouterMetrics {
 
     pub fn record_classification(
         &self,
+        provider: &'static str,
         outcome: &'static str,
         chosen: Option<&str>,
         elapsed: Duration,
     ) {
-        bump(&self.classifier_outcomes, outcome);
+        bump(&self.classifier_outcomes, (provider, outcome));
         if let Some(route) = chosen {
-            bump(&self.classifier_routes, route.to_owned());
+            bump(&self.classifier_routes, (provider, route.to_owned()));
         }
-        self.histograms
-            .classifier
-            .observe(vec![("outcome", outcome.to_owned())], millis(elapsed));
+        self.histograms.classifier.observe(
+            vec![
+                ("provider", provider.to_owned()),
+                ("outcome", outcome.to_owned()),
+            ],
+            millis(elapsed),
+        );
     }
 
-    /// Classifications so far, by outcome.
-    pub fn classifier_outcomes(&self) -> BTreeMap<&'static str, u64> {
+    /// Classifications so far by `provider`, by outcome.
+    pub fn classifier_outcomes(&self, provider: &str) -> BTreeMap<&'static str, u64> {
         self.classifier_outcomes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .filter(|((p, _), _)| *p == provider)
+            .map(|((_, outcome), count)| (*outcome, *count))
+            .collect()
     }
 
     pub fn auto_fallbacks(&self) -> u64 {
@@ -985,10 +993,10 @@ impl RouterMetrics {
         }
 
         out.push_str(
-            "# HELP router_classifier_requests_total Auto classifications, by outcome: chosen, low_confidence, invalid, unavailable, timeout, nested.\n",
+            "# HELP router_classifier_requests_total Auto classifications, by provider and outcome: chosen, low_confidence, invalid, unavailable, timeout, auth_error, rate_limited, connection_error, provider_error, nested.\n",
         );
         out.push_str("# TYPE router_classifier_requests_total counter\n");
-        for (outcome, count) in self
+        for ((provider, outcome), count) in self
             .classifier_outcomes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -996,14 +1004,14 @@ impl RouterMetrics {
         {
             let _ = writeln!(
                 out,
-                "router_classifier_requests_total{{outcome=\"{outcome}\"}} {count}"
+                "router_classifier_requests_total{{provider=\"{provider}\",outcome=\"{outcome}\"}} {count}"
             );
         }
         out.push_str(
-            "# HELP router_classifier_route_total Routes Auto classifications chose and took, by route.\n",
+            "# HELP router_classifier_route_total Routes Auto classifications chose and took, by provider and route.\n",
         );
         out.push_str("# TYPE router_classifier_route_total counter\n");
-        for (route, count) in self
+        for ((provider, route), count) in self
             .classifier_routes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1011,7 +1019,7 @@ impl RouterMetrics {
         {
             let _ = writeln!(
                 out,
-                "router_classifier_route_total{{route=\"{}\"}} {count}",
+                "router_classifier_route_total{{provider=\"{provider}\",route=\"{}\"}} {count}",
                 escape(route)
             );
         }

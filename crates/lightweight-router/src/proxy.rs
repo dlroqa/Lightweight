@@ -501,7 +501,13 @@ async fn route_request(
             .and_then(|auto| auto.classifier.as_ref()),
     ) {
         tracker.trace.classifier = Some(ClassifierTrace {
-            route: classifier.route.to_string(),
+            provider: classification.provider.as_str(),
+            route: classifier.provider.route().map(ToString::to_string),
+            model: classification
+                .verdict
+                .as_ref()
+                .and_then(|verdict| verdict.model.clone())
+                .or_else(|| classifier.provider.model().map(str::to_owned)),
             outcome: classification.outcome.as_str(),
             chosen_route: classification
                 .verdict
@@ -1022,10 +1028,14 @@ async fn resolve_auto<'a>(
     };
     let decision = auto.decide(&needs);
     let classification = match auto.classifier.as_ref().filter(|_| decision.classify) {
-        Some(_) if nested => Some(Classification::nested()),
+        Some(classifier) if nested => Some(Classification::nested(classifier.provider.kind())),
         Some(classifier) => {
-            let input =
-                ClassificationInput::read(endpoint, body, &needs, classifier.max_input_chars);
+            let input = ClassificationInput::read(
+                endpoint,
+                body,
+                &needs,
+                classifier.limits().max_input_chars,
+            );
             Some(crate::classifier::classify(state, classifier, &input, request_id).await)
         }
         None => None,
@@ -1036,7 +1046,9 @@ async fn resolve_auto<'a>(
             target: targets::ROUTER,
             request_id,
             auto_rule = decision.rule_label(),
-            classifier_route = %classifier.route,
+            classifier_provider = classification.provider.as_str(),
+            classifier_route = classifier.provider.route().map(RouteName::as_str),
+            classifier_model = classifier.provider.model(),
             classifier_outcome = classification.outcome.as_str(),
             classifier_chosen = chosen.map(|verdict| verdict.route.as_str()),
             classifier_confidence = chosen.map(|verdict| verdict.confidence),
@@ -1045,7 +1057,9 @@ async fn resolve_auto<'a>(
             resolved_route = %classification.route(classifier),
             "auto route classified"
         );
+        state.classifier_status.record(classification.outcome);
         state.metrics.record_classification(
+            classification.provider.as_str(),
             classification.outcome.as_str(),
             (classification.outcome == crate::classifier::ClassifierOutcome::Chosen)
                 .then(|| classification.route(classifier).as_str()),
