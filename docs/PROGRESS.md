@@ -2319,3 +2319,38 @@ routes at all.
   Linux ran 1298 workspace tests (from 1293) with 0 failed; Windows ran
   1268, and macOS x64 and arm64 1273 each (platform-gated tests). The
   contract suite was 47 passed, 2 skipped.
+
+### R9.2 slice 1 MERGED and FROZEN
+
+PR #41 was merged as `ef4f868` (reviewed head `f3d16aa`, merge commit, head
+pinned; the tree is identical to the reviewed head). PR #40, design only, was
+closed as superseded: its design commit is in #41.
+
+Master was validated:
+- local `check.sh` green, with 1298 workspace tests and contract 47/2;
+- Actions check run 37470607756 (Linux x64, Windows x64, macOS x64, macOS
+  arm64, Flatpak, Linux artifacts, render icons) and render panel run
+  37470607758, all green;
+- no release workflow ran.
+
+Master smoke on the real `hermes router` binary passed all seven checks:
+1. `weights.history: 0.01` was refused with the observational-history error.
+2. `0` was accepted.
+3. A borderline sweep gave General below 0.75 and Coder from 0.76.
+4. The same winners held with General at 120 successes and Coder at 5, and
+   with that popularity reversed.
+5. Coder at 0.40, 0.60 and 0.649 stayed rejected (`below_threshold`, no
+   candidates), despite a maximum Coder prior and 150 Coder successes.
+6. The admin view showed `history_mode: observational`,
+   `history_affects_scoring: false` and `weights.history: 0`, with the
+   observations visible.
+7. Reset of one route and of all routes worked and needed the key (401
+   without it). Routes, sessions, placement and the `Auto` configuration
+   were byte-identical before and after (hashes compared), and the Coder
+   session's affinity survived.
+
+**Frozen definition:** the R9.1 classifier result feeds the classifier
+signal plus a bounded operator prior, which choose the logical-route winner.
+Route history is observational telemetry only: `weights.history` must be 0,
+and a below-threshold verdict is never resurrected. Any change to R9.2 now
+needs explicit approval. R9.3 is at the design stage only.
