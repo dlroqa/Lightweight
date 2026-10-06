@@ -2383,5 +2383,21 @@ metric, trace field or UI. The facts were read from `master` (`ef4f868`):
 - the response names the serving route, and the trace keeps the initial and
   final routes.
 
-Nine open questions are listed in section 29. Implementation needs explicit
-approval.
+**Final design (approved decisions, section 0 of the doc):**
+1. keep `route_exhausted` as a distinct reason;
+2. R8 rule routes under `Auto` are eligible, with R5 requirements never
+   weakened;
+3. an exhausted chain returns the final attempted route's existing error;
+4. context overflow is deferred, with no fallback;
+5. one shared list per route;
+6. no shared deadline: deferred, and the latency risk is documented;
+7. `router_requests_total` counts once per request;
+8. explicit routes never fall back;
+9. side-effect safety is a hard future constraint;
+10. the list is selected once and non-transitive (validate the graph, never
+    traverse it);
+11. `MAX_FALLBACK_ROUTES = 3`, fixed;
+12. `model` names the final serving route.
+
+The remaining questions are marked DEFERRED. R9.3.1 is the implementation
+slice.

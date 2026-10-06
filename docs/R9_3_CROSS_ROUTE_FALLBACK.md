@@ -1,9 +1,11 @@
 # R9.3 — Explicit cross-route fallback (design)
 
-Status: **design only**. Nothing here is implemented. No fallback execution,
-configuration field, trace field, metric or UI described here exists on
-`master` (`ef4f868`). R9.1, R9.1a, the classifier UI and R9.2 slice 1 are
-merged and frozen; this design builds on them without changing them.
+Status: **design final (approved decisions incorporated); R9.3.1 is the
+first implementation slice.** At the time of writing nothing here is
+implemented on `master` (`ef4f868`). R9.1, R9.1a, the classifier UI and R9.2
+slice 1 are merged and frozen; this design builds on them without changing
+them. **Section 0 holds the approved decisions; where any later text
+differs, section 0 wins.**
 
 The rules everything below obeys:
 
@@ -12,6 +14,37 @@ The rules everything below obeys:
 > deployment failover, not quality retry, and not mixture-of-agents.
 >
 > **Never switch logical routes after response or side-effect commit.**
+
+---
+
+## 0. Approved decisions (final)
+
+| # | Decision | Consequence for R9.3.1 |
+|---|---|---|
+| 1 | **Keep `route_exhausted`.** | All of a route's planned deployments were attempted, and every one refused before commit with 502, 503 or 504 (a deployment that could not be reached at all, or that answered `404 model_not_found`, may be among them). That qualifies as a trigger. It stays a **distinct** reason in traces, metrics and the admin view, and is never collapsed into `route_unavailable`. |
+| 2 | **Deterministic R8 rules under `Auto` are eligible.** | Any route an `Auto` request resolved to is eligible: an R8 rule, R9.1, R9.2 or `Auto`'s `fallback_route`. Every fallback route still passes normal R5 filtering with the **original** request requirements, which are never weakened or stripped. |
+| 3 | **Exhausted chain: the final attempted route's existing error.** | No new public error code. The client gets exactly what the last attempted route returns. The trace, metrics and admin view mark the chain `exhausted` and keep every attempt. |
+| 4 | **Context overflow is deferred.** | `400 context_length_exceeded` keeps today's behaviour and never triggers cross-route fallback. |
+| 5 | **One shared ordered list per route.** | No reason-specific lists. The same list serves all three triggers. |
+| 6 | **A shared request budget is deferred.** | **R9.3.1 does not introduce a shared end-to-end deadline.** Work is bounded by same-route attempt limits, `MAX_FALLBACK_ROUTES = 3` (at most 4 logical-route attempts) and the existing connect and network timeouts. The latency risk is documented in section 17. |
+| 7 | **`router_requests_total` counts once per client request.** | Intermediate route attempts appear only in the dedicated R9.3 metrics. |
+| 8 | **Explicit routes never fall back.** | Only a request whose original `model` was `Auto` is eligible. `model: "Coder"`, any spelling or case of a route name, `default` and an omitted `model` mean that route or its error. There is no opt-in flag in this slice. |
+| 9 | **Side-effect safety is a hard future constraint.** | `safe_to_cross_route_fallback = !response_committed && !external_side_effect_committed`. Today nodes execute no tools, so the response-head commit is sufficient, and no runtime flag is added. If Lightweight ever executes server-side side effects before commit, fallback must stop at that boundary. |
+| 10 | **The list is selected once and is non-transitive.** | The initial route's list is read **once**, frozen for the request, and attempted in order. A fallback route's own list is **never** consulted. There is no graph traversal at runtime. This is a hard invariant, mutation-tested. |
+| 11 | **`MAX_FALLBACK_ROUTES = 3`, fixed.** | A server-defined constant, not configurable: at most 1 + 3 = 4 logical-route attempts. |
+| 12 | **Response identity is the final serving route.** | `model` names the route that served the response, for streaming, bodies and tool calls. The trace keeps `requested_route`, `initial_route` and `final_route`. |
+
+**Approved trigger set (R9.3.1):** `route_unavailable`, `route_exhausted`,
+`route_capability_mismatch`, all strictly pre-commit and after same-route
+failover. **Nothing else triggers.** In particular, none of these do: a 500,
+a single deployment's 502/503/504 while candidates remain,
+`context_length_exceeded`, 429 or other 4xx, latency or TTFT, answer or
+classifier quality, a post-commit stream failure, cancellation, a classifier
+failure, or anything from R9.2.
+
+**Validate the graph; never traverse it.** At load, the union of all
+configured lists must be acyclic. At run time only the initial route's flat
+list is used.
 
 ---
 
@@ -103,19 +136,19 @@ Read from `proxy::route_request` and `attempt_one` on `master`:
 Unknown route, no default route and `Auto`'s own requirement refusals happen
 before a route exists and are never R9.3's concern.
 
-## 6. Triggering failure conditions (slice 1)
+## 6. Triggering failure conditions (R9.3.1, final)
 
-| Trigger (`reason`) | From | Why it qualifies |
+| Trigger (`reason`) | Exact source on `master` | Why it qualifies |
 |---|---|---|
-| `route_unavailable` | both `route_unavailable` paths above | the route as a whole had nothing that could take the request; nothing was generated or committed |
-| `route_exhausted` | every attempted deployment refused with 502/503/504 | the same fact in another form: every deployment turned the request away before answering, failover is exhausted, nothing committed. R9.2 history already counts it as `unavailable` |
-| `route_capability_mismatch` | the plan refused for fit | no available deployment of the route can serve this request; another route might. R5 still filters the next route normally |
+| `route_unavailable` | the plan returned `RoutingFailure::RouteUnavailable`, so nothing was attempted; **or** every attempted deployment failed with **no** answer worth returning: a connect or transport error before the head, or `404 model_not_found` (`Attempt::Next(None)`), and the loop ended with no refusal, giving today's `503 route_unavailable` | the route had nothing that could take the request; nothing was generated or committed |
+| `route_exhausted` | every planned deployment was attempted, and the loop ended holding a refusal: at least one deployment, and the last one to refuse, answered 502/503/504 before commit (`Attempt::Next(Some(refusal))`); today the client gets that node's refusal | the same fact in another form, kept **distinct** (decision 1). R9.2 history already counts it as `unavailable` |
+| `route_capability_mismatch` | the plan returned `RoutingFailure::CapabilityMismatch` | no available deployment of the route can serve this request; R5 filters the next route with the **same, unweakened** requirements (decision 2) |
 
-`route_exhausted` is the one addition to the two candidates in the brief.
-Without it, the most common unavailability on a busy CPU node (`503
-overloaded` from every deployment) would never fall back, although it is as
-safe as `route_unavailable`. If it is not wanted, it is one line to drop
-(open question 1).
+`404 model_not_found` is not a trigger of its own. It is already one of the
+"no answer" failures, and a route whose every attempt failed that way is
+today's `route_unavailable`, which is approved. A route ending with
+`route_exhausted` must have tried **every** deployment its plan listed: a
+single 503 with candidates left is ordinary same-route failover.
 
 ## 7. Excluded failure conditions
 
@@ -123,10 +156,9 @@ safe as `route_unavailable`. If it is not wanted, it is one line to drop
   one deployment's answer, not the route's, and R9.3 does not change that.
 - **One deployment's 502/503/504 while the route still has candidates.**
   Same-route failover handles that; R9.3 sees only the exhausted route.
-- **`400 context_length_exceeded` after in-route overflow failover is
-  exhausted.** It is pre-commit and route-level, but it depends on request
-  size and is close to a capability mismatch the router could not foresee.
-  Deferred (open question 2).
+- **`400 context_length_exceeded`** (decision 4). Today's behaviour,
+  including in-route overflow failover, is kept, with no cross-route
+  fallback. Context-driven cross-route fallback needs its own design.
 - **429, any other 4xx, and every committed answer.**
 - **Slow TTFT, latency, answer quality, low confidence, tool-result quality
   and user dissatisfaction**: none of these is an execution failure.
@@ -135,6 +167,7 @@ safe as `route_unavailable`. If it is not wanted, it is one line to drop
 - **Client cancellation**: nobody is left to answer.
 - **A classifier failure**: R9.1 already resolves it to its fallback; that
   is not a route failure.
+- **Anything from R9.2**, whether score or history.
 
 ## 8. Response-commit boundary
 
@@ -189,7 +222,12 @@ no fallback.
 **Rule:** cross-route fallback only before the response head, and so before
 any tool call or other externally visible output reaches the client.
 
-**Forward constraint (not slice 1):** if a node ever executes server-side
+**The rule, as approved (decision 9):** `safe_to_cross_route_fallback =
+!response_committed && !external_side_effect_committed`. Today the second
+term is always false before the head, so R9.3.1 enforces the first,
+structurally, and adds no runtime flag.
+
+**Forward constraint (hard, future):** if a node ever executes server-side
 tools or actions, its side effects could precede the head. Such a node would
 have to declare a capability (for example `server_side_effects: true` in
 `/v1/capabilities`), and R9.3 would then never fall back from a route that
@@ -237,9 +275,12 @@ to `Auto`-resolved requests:
 - Absent section, or a route with no entry, means no cross-route fallback.
   There is no separate `enabled` flag: the section's presence is the
   switch, as with `session_affinity` and `placement`.
-- There is one list for all triggers. Reason-specific lists
-  (`on_unavailable`, `on_capability_mismatch`) are deferred; nothing so far
-  shows they would differ (open question 4).
+- There is one list for all three triggers (decision 5). Reason-specific
+  lists are not part of R9.3.1.
+- **The list is selected once and frozen** (decision 10). After the initial
+  route is resolved, its list is copied into the request. Attempts follow
+  that copy in order, and no other entry of the section is ever read for the
+  request.
 
 **Alternative considered:** a per-route field (`routes[].fallback`, like
 `placement`). It reads naturally, but a route-level field that silently does
@@ -251,7 +292,8 @@ better.
 
 For every key and every listed target:
 
-- **unknown route**: not a configured route;
+- **unknown source or target**: not a configured route (a source key that is
+  `Auto` is unknown, since `Auto` is not a route);
 - **`Auto`, or `default`, or another reserved name**: a target must be a
   concrete route, never a request to re-run selection;
 - **the Lightweight classifier's route** (the active or standby provider's
@@ -283,43 +325,39 @@ deployment at most once. So the worst case is
 `Σ deployments(route attempted) + 1` deployment attempts, with the extra one
 for context-overflow failover, which stays inside a route.
 
-## 14. Explicit-route policy
+## 14. Explicit-route policy (decision 8)
 
-**Slice 1: no cross-route fallback for an explicitly named route.**
-`model: "Coder"` means "Coder or fail". A client that pinned a route must
-never silently get another model's answer. An explicit route that fails
-returns its own error, exactly as today. Opting explicit requests in would be
-a separate, explicit configuration in a later slice, with its own scope
-field and its own review.
+**No cross-route fallback for an explicitly named route.** `model: "Coder"`
+in any spelling or case means "Coder or its error". So does `default`, or an
+omitted `model`, which resolves to the configured default route. A client
+that pinned a route must never silently get another model's answer.
+Eligibility is decided by the **original requested model being `Auto`**,
+carried with the request; it is never inferred from the current route name.
+Nested classification requests never fall back either: their failure is
+R9.1's to handle. There is no opt-in in R9.3.1; a future explicit-route
+policy would be its own design.
 
-The same holds for `default` (and an omitted `model`), which is a named
-route too, and for the router's own **nested classification requests**:
-their failure is R9.1's to handle, and it already resolves to the classifier
-fallback.
+## 15. Auto policy (decision 2)
 
-## 15. Auto policy
-
-R9.3 applies to every `Auto` request **after** `Auto` resolved it to a
-concrete route, whichever way it did: a deterministic R8 rule, a
-classification (R9.1), scoring (R9.2), or `Auto`'s plain `fallback_route`.
-All of them are the router's own choice, made for a client that asked the
-router to choose. That is what R9.3 is for.
-
-(Open question 3: should a *deterministic* rule's route be eligible? A
-`tool_choice=required → ToolAgent` rule may express a hard requirement,
-where falling back to `General` would be wrong. R5 still refuses a
-`General` that cannot do tools, so the risk is semantic, not a broken
-request. Recommendation: eligible. The operator controls it by not listing
-`ToolAgent`.)
+Every `Auto` request is eligible **after** `Auto` resolved it to a concrete
+route, however that happened: an R8 deterministic rule (for example
+`tool_choice=required → ToolAgent`), R9.1 classification, R9.2 scoring, or
+`Auto`'s plain `fallback_route`. The fallback routes run R5 with the
+request's original requirements. If `General` cannot do the tools the
+request requires, `General` is a `route_capability_mismatch` like any other,
+and the next frozen entry is tried or the chain ends. Requirements are never
+stripped or weakened to make a fallback fit.
 
 ## 16. Fallback attempt order
 
 ```text
+plan := chain(R0)                        read ONCE, frozen for this request (decision 10)
 attempt 1: initial route R0              (existing pipeline, all of R0's deployments)
-attempt 2: chain(R0)[0]                  only if attempt 1 ended in a qualifying failure
-attempt 3: chain(R0)[1]                  only if attempt 2 ended in a qualifying failure
-attempt 4: chain(R0)[2]                  likewise
-then: the last route's own error
+attempt 2: plan[0]                        only if attempt 1 ended in a qualifying failure
+attempt 3: plan[1]                        only if attempt 2 ended in a qualifying failure
+attempt 4: plan[2]                        likewise
+then: the last attempted route's own error (decision 3)
+never:  chain(plan[i])                    a fallback route's own list is not consulted
 ```
 
 - Each attempt runs the **unchanged** pipeline for its route: plan from the
@@ -340,6 +378,9 @@ then: the last route's own error
 `request.connect_timeout_secs` (default 5 s), because a CPU prefill can take
 minutes and no generation limit chosen on one machine is right for another.
 
+> **R9.3.1 does not introduce a shared end-to-end deadline. A shared request
+> budget remains future work** (decision 6).
+
 **Decision for slice 1:** no new deadline system. R9.3 adds only route
 attempts that end **before** a response head. The added latency per failed
 route is at most the sum of its deployments' connect timeouts, or the time
@@ -350,10 +391,12 @@ deployments tried once, the worst case is bounded by configuration:
 gives up cancels the whole request, as today: dropping the future drops
 every in-flight attempt.
 
-A shared request budget (for example `cross_route_fallback_budget_ms`, which
-is checked before each further route attempt and never interrupts one) is
-the natural extension if real traffic shows long chains of slow connect
-failures. It is deferred (open question 5).
+**Latency risk, stated plainly:** a chain of routes whose nodes time out at
+connect can add `connect_timeout` per deployment per route attempt before the
+client gets an answer or the final error. Operators keep chains short, and
+health probing keeps known-down nodes out of plans, so they cost nothing. A
+shared budget (for example `…_budget_ms`, checked before each further route
+attempt and never interrupting one) is the deferred extension.
 
 ## 18. Affinity interaction
 
@@ -437,11 +480,11 @@ fallback was considered:
 | `router_cross_route_fallback_total` | `from_route`, `to_route`, `reason` | configured pairs only (≤ keys × 3) × 3 reasons |
 | `router_cross_route_fallback_exhausted_total` | `route` (initial), `reason` (last) | keys × 3 |
 
-- `router_requests_total` keeps its meaning of one count per request, under
-  the **final** route. The initial route's failure is visible in
-  `router_cross_route_fallback_total{from_route}`, and also in R9.2's
-  observation counters. (Open question 6: count each route attempt in
-  `router_requests_total` instead.)
+- `router_requests_total` counts **once per client request** (decision 7),
+  under the **final** route with its final outcome. Intermediate route
+  attempts are never counted there. They are visible in
+  `router_cross_route_fallback_total{from_route,…}`, and in R9.2's
+  observational per-route history.
 - `router_auto_route_decisions_total` still counts the initial decision.
 - Never a request id, session, prompt, user or address as a label.
 
@@ -454,6 +497,7 @@ fallback was considered:
   "configured": true,
   "chains": { "Coder": ["General"], "Research": ["General"] },
   "max_routes": 3,
+  "triggers": ["route_unavailable", "route_exhausted", "route_capability_mismatch"],
   "counts": { "Coder": { "General": { "route_unavailable": 4 } } },
   "exhausted": { "Research": { "route_unavailable": 1 } }
 }
@@ -465,12 +509,14 @@ screen, is a later slice.
 
 ## 25. Errors
 
-- **Chain exhausted:** the client gets the **last attempted route's own
-  error**, as that route would have returned it: `503 route_unavailable`
-  naming that route, or the last node's 502/503/504 refusal, or `400
-  route_capability_mismatch`. A specific existing error is never replaced by
-  a generic 500. (Open question 7: return the initial route's error
-  instead.)
+- **Chain exhausted (decision 3):** the client gets the **final attempted
+  route's existing error**, exactly as that route returns it: `503
+  route_unavailable` naming it, the last node's 502/503/504 refusal, or `400
+  route_capability_mismatch`. There is no new public error code, and a
+  specific error is never replaced by a generic 500. Example: Research
+  `route_unavailable`, then General `route_capability_mismatch`: the client
+  gets General's 400, and the trace shows `exhausted: true` with both
+  attempts.
 - **No chain:** exactly today's error.
 - **Configuration:** a new `ConfigError::BadCrossRouteFallback { problem }`,
   rendered `auto_route.cross_route_fallback: …` like its siblings.
@@ -555,40 +601,51 @@ Each deliberate break must fail at least one test:
 
 ## 29. Open questions
 
-1. Include `route_exhausted` (every deployment refused 502/503/504) as a
-   trigger? Recommended: **yes**, as reasoned in section 6.
-2. Treat an exhausted `400 context_length_exceeded` as a trigger? Deferred.
-   It is size-dependent and needs its own measurements.
-3. Are deterministic R8 rule routes eligible? Recommended: yes, controlled by
-   which keys are listed.
-4. Reason-specific lists? Deferred until two triggers need different targets.
-5. A shared fallback budget (`…_budget_ms`)? Deferred until measured.
-6. Count each route attempt in `router_requests_total`? Recommended: no;
-   keep one count per request under the final route.
-7. On exhaustion, return the last route's error or the initial route's?
-   Recommended: the last route's.
-8. Explicit-route opt-in: whether, and with what scope field. Not slice 1.
-9. A server-side-effect capability, for gateways that might one day execute
-   tools (section 9). Not needed today.
+Resolved by section 0: `route_exhausted` (kept), deterministic-rule
+eligibility (eligible), reason-specific lists (no), `router_requests_total`
+(once per request), and the exhausted-chain error (the final route's).
 
-## 30. Recommended first implementation slice
+**DEFERRED (future work, not R9.3.1 blockers):**
 
-**`feature/router-cross-route-fallback`:**
+1. **DEFERRED:** context-overflow cross-route fallback (decision 4); needs
+   its own design and measurements.
+2. **DEFERRED:** a shared end-to-end request budget (decision 6).
+3. **DEFERRED:** an explicit-route opt-in policy (decision 8).
+4. **DEFERRED:** a server-side-effect capability and boundary, needed only
+   if nodes ever execute side effects (decision 9).
+5. **DEFERRED:** reason-specific fallback lists, if two triggers ever need
+   different targets.
+6. **DEFERRED:** UI for chains and counters.
 
-1. `auto_route.cross_route_fallback` as flat, ordered, non-transitive lists,
-   with every validation in section 12 and `MAX_FALLBACK_ROUTES = 3`;
-2. applies to `Auto`-resolved requests only; never to explicit, `default` or
-   nested requests;
-3. triggers: `route_unavailable`, `route_exhausted` (subject to open question
-   1) and `route_capability_mismatch`, each only from the uncommitted
-   terminal paths of `route_request`, after same-route failover;
-4. one loop around the existing per-route attempt. That attempt is
-   refactored so a qualifying failure is returned to the loop instead of
-   finishing the trace, with its behaviour otherwise unchanged;
-5. response identity from the committing route; one trace with the
-   `cross_route_fallback` block and `route` on deployment attempts; the two
-   metrics; the admin field; the log line;
-6. no 500 fallback, no latency or quality trigger, no reclassification, no
-   R9.2 re-scoring, no history influence, no placement action, no mid-stream
-   switch, no MoA, no UI;
-7. the tests of section 27 and the mutations of section 28; docs.
+## 30. R9.3.1, the first implementation slice (frozen)
+
+**`feature/router-cross-route-fallback`**, from master after this design
+merges:
+
+- **Scope:** `Auto`-selected routes only (an R8 rule, R9.1, R9.2 or the
+  `fallback_route`); never explicit, `default` or nested requests.
+- **Configuration:** `auto_route.cross_route_fallback`, one flat ordered
+  list per initial route. Every validation in section 12 applies: an
+  acyclic union graph and at most `MAX_FALLBACK_ROUTES = 3` entries
+  (constant).
+- **Runtime:** the initial route's list is read once and frozen, and is
+  **never** transitive. At most 4 logical-route attempts.
+- **Triggers:** `route_unavailable`, `route_exhausted` (distinct) and
+  `route_capability_mismatch`, each only from the uncommitted terminal paths
+  of the existing route attempt, after same-route deployment failover is
+  exhausted.
+- **Implementation shape:** the existing per-route attempt is refactored into
+  a reusable step that returns a qualifying failure instead of finishing the
+  request. Health, R5, affinity, policy, failover, commit, rewriting and the
+  request id are all unchanged.
+- **Identity and errors:** the response names the final serving route. An
+  exhausted chain returns the final attempted route's existing error.
+- **Observability:** `router_requests_total` counts once per request. The
+  trace gets a `cross_route_fallback` block, and deployment attempts gain a
+  `route` field. Two R9.3 metrics, an admin field and a bounded log line.
+- **Never:** a 500 trigger, a context-overflow trigger, latency or quality
+  triggers, reclassification, R9.2 re-scoring, history influence, placement
+  action, post-commit switching, MoA, or UI.
+- **Tests and mutations:** section 27 and section 28, extended by the
+  implementation brief (non-transitive, per-path eligibility, request id,
+  counters, identity).
