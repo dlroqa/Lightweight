@@ -14,9 +14,11 @@
 //! from the request — its endpoint, tools, `tool_choice`, reasoning and the
 //! router's prompt estimate — and the route to use when all of them hold.
 //! Rules are tried in configured order and the first that matches wins; when
-//! none does, the configured fallback route is used. There is no score, no
-//! weight, no history and no look at the prompt's meaning: the same request
-//! against the same configuration always goes to the same route.
+//! none does, the configured fallback route is used. The rules have no score,
+//! no weight, no history and no look at the prompt's meaning: the same request
+//! against the same configuration always goes to the same route. Only a rule
+//! that asks the classifier looks at meaning ([`crate::classifier`]), and only
+//! its classification can be scored ([`crate::scoring`]).
 //!
 //! Choosing a route is all `Auto` does. If the chosen route has nothing that
 //! can serve the request, the client gets that route's own answer —
@@ -34,6 +36,7 @@ use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
 use crate::proxy::Endpoint;
 use crate::requirements::{RequestRequirements, ToolChoiceRequirement};
+use crate::scoring::{AdaptiveScoring, AdaptiveScoringFile};
 
 /// The name a client sends to ask the router to choose. Matched the way route
 /// names are: trimmed and ignoring case.
@@ -70,6 +73,10 @@ pub struct AutoRouteFile {
     /// says `"classify": true`.
     #[serde(default)]
     pub classifier: Option<ClassifierFile>,
+    /// Adaptive logical-route scoring of a classification (R9.2). Absent or
+    /// off: a classification resolves exactly as R9.1 resolves it.
+    #[serde(default)]
+    pub adaptive_scoring: Option<AdaptiveScoringFile>,
 }
 
 /// One rule, as written.
@@ -246,6 +253,8 @@ pub struct AutoRoute {
     /// The classifier a classifying rule calls. Present whenever such a rule
     /// is.
     pub classifier: Option<RouteClassifier>,
+    /// How a classification is scored, when the file says (R9.2).
+    pub scoring: Option<AdaptiveScoring>,
 }
 
 /// The route `Auto` chose for one request, and why.
@@ -370,6 +379,14 @@ pub(crate) fn validate(
     let classifier = raw.classifier.as_ref().and_then(|classifier| {
         crate::classifier::validate(classifier, routes, &raw.fallback_route, env, errors)
     });
+    let scoring = raw.adaptive_scoring.as_ref().and_then(|scoring| {
+        crate::scoring::validate(
+            scoring,
+            classifier.as_ref(),
+            raw.classifier.is_some(),
+            errors,
+        )
+    });
 
     if raw.rules.len() > MAX_RULES {
         errors.push(ConfigError::BadAutoRoute {
@@ -472,6 +489,7 @@ pub(crate) fn validate(
         fallback: fallback.ok()?,
         rules,
         classifier,
+        scoring,
     })
 }
 

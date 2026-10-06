@@ -74,6 +74,7 @@ use crate::health::{Outcome as Probe, describe_transport};
 use crate::load::Lease;
 use crate::metrics::{ActiveGuard, Outcome, UNKNOWN_ROUTE};
 use crate::requirements::{self, RequestRequirements};
+use crate::scoring::{Observation, ScoringTrace};
 use crate::select::{Candidate, Selection, Sticky};
 use crate::sse::{FrameRewriter, rewrite_body_measuring};
 use crate::trace::{
@@ -157,6 +158,13 @@ struct Tracker {
     route: RouteName,
     policy: &'static str,
     finished: bool,
+    /// The router's own classification request: never counted toward route
+    /// history.
+    nested: bool,
+    /// What the request counts as toward route history when its trace
+    /// outcome does not say: a capability mismatch, or every deployment
+    /// refusing before answering.
+    observation: Option<Observation>,
 }
 
 impl Tracker {
@@ -167,6 +175,7 @@ impl Tracker {
         policy: &'static str,
         endpoint: Endpoint,
         received: Instant,
+        nested: bool,
     ) -> Self {
         Self {
             state: Arc::clone(state),
@@ -175,6 +184,8 @@ impl Tracker {
             route: route.clone(),
             policy,
             finished: false,
+            nested,
+            observation: None,
         }
     }
 
@@ -191,6 +202,20 @@ impl Tracker {
             self.trace.actual_prompt_tokens,
         ) {
             metrics.observe_estimate(self.route.as_str(), estimated, actual);
+        }
+        // Route history (R9.2) learns from the final outcome, here and only
+        // here: a stream counts once it has ended, not when its head arrived.
+        if !self.nested {
+            let observation = self
+                .observation
+                .unwrap_or_else(|| Observation::of_outcome(outcome));
+            if self
+                .state
+                .route_history
+                .observe(&self.route, observation, Instant::now())
+            {
+                metrics.record_route_history(self.route.as_str(), observation.as_str());
+            }
         }
         let trace = &mut self.trace;
         trace.duration_ms = millis(elapsed);
@@ -436,6 +461,7 @@ async fn route_request(
     // the client asked for `Auto`.
     let mut auto_rule: Option<Option<String>> = None;
     let mut classification = None;
+    let mut scoring = None;
     let resolution = match state.auto.as_ref().filter(|auto| auto.claims(requested)) {
         Some(auto) => {
             match resolve_auto(
@@ -458,6 +484,7 @@ async fn route_request(
                     early_needs = Some(resolved.needs);
                     auto_rule = Some(resolved.rule);
                     classification = resolved.classification;
+                    scoring = resolved.scoring;
                     resolved.route
                 }
                 Err(refusal) => return *refusal,
@@ -487,7 +514,15 @@ async fn route_request(
         }
     };
     let policy = route.policy.as_str();
-    let mut tracker = Tracker::new(state, request_id, &route.name, policy, endpoint, received);
+    let mut tracker = Tracker::new(
+        state,
+        request_id,
+        &route.name,
+        policy,
+        endpoint,
+        received,
+        nested,
+    );
     if let Some(rule) = auto_rule {
         tracker.trace.requested_route = AUTO_ROUTE.to_owned();
         tracker.trace.auto_fallback = rule.is_none();
@@ -519,6 +554,7 @@ async fn route_request(
             input_truncated: classification.input_truncated,
         });
     }
+    tracker.trace.scoring = scoring;
     tracker.trace.stream = request.get("stream") == Some(&Value::Bool(true));
     tracker.trace.deployments = route.deployments.len();
 
@@ -618,6 +654,8 @@ async fn route_request(
                 state
                     .metrics
                     .record_capability_mismatch(route.name.as_str());
+                // Fit, not route quality: observed, never scored.
+                tracker.observation = Some(Observation::CapabilityMismatch);
                 state
                     .metrics
                     .record_request(route.name.as_str(), Outcome::ClientError);
@@ -941,6 +979,17 @@ async fn route_request(
             );
             let outcome = Outcome::of_status(refusal.status.as_u16());
             state.metrics.record_request(route.name.as_str(), outcome);
+            // Every deployment turned the request away before answering with a
+            // 502, 503 or 504 (none ran it): to route history that is the route
+            // having nothing ready, like `route_unavailable`, not a wrong route.
+            if matches!(
+                refusal.status,
+                StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) {
+                tracker.observation = Some(Observation::Unavailable);
+            }
             tracker.finish(Some(refusal.status.as_u16()), outcome.as_str());
             refusal_response(refusal)
         }
@@ -981,6 +1030,8 @@ struct AutoResolution<'a> {
     rule: Option<String>,
     /// The classification, when the rule asked for one.
     classification: Option<Classification>,
+    /// How adaptive scoring resolved the classification, when it is on.
+    scoring: Option<ScoringTrace>,
 }
 
 /// Resolve an `Auto` request: read what it requires, and let the first
@@ -995,6 +1046,12 @@ struct AutoResolution<'a> {
 /// which candidate should answer — unless this request is itself a
 /// classification, which takes the rule's fallback instead. A classification
 /// that fails or is unsure resolves to the classifier's fallback.
+///
+/// With adaptive scoring on (R9.2), an accepted classification is then scored:
+/// its verdict route against the fallback, by classifier signal, prior and
+/// route history. That is the only thing scoring can change, and it changes
+/// only which logical route; a rejected or failed classification resolves
+/// exactly as above.
 async fn resolve_auto<'a>(
     state: &'a Arc<RouterState>,
     auto: &'a AutoRoute,
@@ -1040,6 +1097,29 @@ async fn resolve_auto<'a>(
         }
         None => None,
     };
+    // R9.2: only a classification, only while scoring is on, only a route.
+    let scored = match (
+        &classification,
+        &auto.classifier,
+        auto.scoring.as_ref().filter(|scoring| scoring.enabled),
+    ) {
+        (Some(classification), Some(classifier), Some(scoring)) => {
+            let decision = crate::scoring::decide(
+                scoring,
+                &state.route_history,
+                classification,
+                classifier,
+                Instant::now(),
+            );
+            state.metrics.record_scoring(
+                decision.trace.reason,
+                decision.route.as_str(),
+                decision.trace.overrode,
+            );
+            Some(decision)
+        }
+        _ => None,
+    };
     if let (Some(classification), Some(classifier)) = (&classification, &auto.classifier) {
         let chosen = classification.verdict.as_ref();
         tracing::info!(
@@ -1054,7 +1134,13 @@ async fn resolve_auto<'a>(
             classifier_confidence = chosen.map(|verdict| verdict.confidence),
             classifier_duration_ms = millis(classification.duration),
             input_truncated = classification.input_truncated,
-            resolved_route = %classification.route(classifier),
+            classified_route = %classification.route(classifier),
+            scoring_reason = scored.as_ref().map(|scored| scored.trace.reason.as_str()),
+            scoring_overrode = scored.as_ref().map(|scored| scored.trace.overrode),
+            resolved_route = %scored.as_ref().map_or_else(
+                || classification.route(classifier),
+                |scored| &scored.route,
+            ),
             "auto route classified"
         );
         state.classifier_status.record(classification.outcome);
@@ -1066,8 +1152,9 @@ async fn resolve_auto<'a>(
             classification.duration,
         );
     }
-    let resolved = match (&classification, &auto.classifier) {
-        (Some(classification), Some(classifier)) => classification.route(classifier),
+    let resolved = match (&scored, &classification, &auto.classifier) {
+        (Some(scored), _, _) => &scored.route,
+        (None, Some(classification), Some(classifier)) => classification.route(classifier),
         _ => decision.route,
     };
     tracing::info!(
@@ -1099,6 +1186,7 @@ async fn resolve_auto<'a>(
         needs,
         rule: decision.rule.map(str::to_owned),
         classification,
+        scoring: scored.map(|scored| scored.trace),
     })
 }
 

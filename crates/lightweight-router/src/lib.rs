@@ -43,6 +43,7 @@ pub mod metrics;
 pub mod placement;
 pub mod proxy;
 pub mod requirements;
+pub mod scoring;
 pub mod select;
 pub mod sse;
 pub mod trace;
@@ -83,6 +84,9 @@ pub struct RouterState {
     /// The `auto_route` section, if the file has one. Only ever chooses a
     /// route; everything after that is the route's own.
     pub auto: Option<crate::auto_route::AutoRoute>,
+    /// Each route's success history, for adaptive route scoring (R9.2).
+    /// Records nothing unless scoring is configured and on.
+    pub route_history: crate::scoring::HistoryBook,
     /// When the classifier last answered, last failed, and was last checked.
     /// Read by the admin view only.
     pub classifier_status: crate::classifier::ClassifierStatus,
@@ -156,6 +160,20 @@ impl RouterState {
             metrics: RouterMetrics::default(),
             selector,
             auto: config.auto.clone(),
+            route_history: crate::scoring::HistoryBook::new(
+                config
+                    .topology
+                    .routes()
+                    .iter()
+                    .map(|route| route.name.clone())
+                    .collect(),
+                config
+                    .auto
+                    .as_ref()
+                    .and_then(|auto| auto.scoring.as_ref())
+                    .filter(|scoring| scoring.enabled)
+                    .map(|scoring| scoring.history),
+            ),
             classifier_status: crate::classifier::ClassifierStatus::default(),
             affinity: AffinityBook::new(config.affinity.clone()),
             traces: TraceBook::new(config.trace_capacity),

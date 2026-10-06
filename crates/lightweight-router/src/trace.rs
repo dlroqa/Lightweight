@@ -127,6 +127,10 @@ pub struct RoutingTrace {
     /// Present when `auto_rule` asked the classifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classifier: Option<ClassifierTrace>,
+    /// Present when adaptive scoring is on and `classifier` ran (R9.2): which
+    /// logical route won and why, by named components. Never a deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoring: Option<crate::scoring::ScoringTrace>,
     pub endpoint: &'static str,
     pub stream: bool,
     pub policy: &'static str,
@@ -186,6 +190,7 @@ impl RoutingTrace {
             auto_rule: None,
             auto_fallback: false,
             classifier: None,
+            scoring: None,
             endpoint,
             stream: false,
             policy,

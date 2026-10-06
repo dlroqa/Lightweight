@@ -75,6 +75,21 @@ fn summarize(config: &RouterConfig, out: &mut String) {
             if auto.enabled { "on" } else { "off" },
             auto.summary()
         ));
+        if let Some(scoring) = &auto.scoring {
+            let weights = scoring.weights;
+            out.push_str(&format!(
+                "  scoring {:<14} {} -> classifier {} + prior {} \
+                 (moves decisions within {:.3} of the threshold); route history observational \
+                 only (half-life {}s, min samples {})\n",
+                "",
+                if scoring.enabled { "on" } else { "off" },
+                weights.classifier,
+                weights.prior,
+                weights.influence_radius(),
+                scoring.history.half_life.as_secs(),
+                scoring.history.min_samples,
+            ));
+        }
     }
 }
 
