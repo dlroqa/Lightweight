@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router classifier providers and TypeSafe Jev (R9.1a).** The classifier an
+  `Auto` rule invokes is now chosen by `classifier.provider`: `lightweight`
+  (the default — a configured route, as in R9.1) or `jev`, TypeSafe AI's
+  System One API.
+  - Jev is asked `POST /v1/systemone` with one typed Choice question whose
+    options are exactly the candidate routes and their descriptions; its own
+    `confidence` is thresholded; a choice that is not a candidate is invalid.
+    It is not a node or deployment and is never reachable through the router.
+  - `classifier.jev {base_url, api_key_env, model, timeout_ms, min_confidence,
+    max_input_chars, include_user_text}`: https (loopback excepted), the key
+    from the environment (`TYPESAFE_API_KEY` by default) and demanded only when
+    Jev is active, `model` and `timeout_ms` required.
+  - Auth (`401`/`403`), rate limit (`429`/`529`), other errors, connection
+    failures, timeouts and invalid answers all fall back to the classifier's
+    fallback route, without retries; error bodies are never kept.
+  - Each provider has its own settings block; R9.1's flat keys still read as
+    the `lightweight` block. Switching provider changes no rule.
+  - Classifier metrics gain a `provider` label; traces gain `provider` and
+    `model`; `/api/router/v1/auto` shows both providers' settings (never a key,
+    only `api_key_configured`) and a status; a start-up check and
+    `POST /api/router/v1/classifier/check` call `GET /v1/models`.
+
 - **Router content-aware `Auto` classification (R9.1).** Opt-in twice over:
   an `auto_route.classifier` section, and a rule that says `"classify": true`
   instead of naming a `route`. Without both, `Auto` is exactly R8.
@@ -13,6 +35,8 @@ All notable changes to this project are documented in this file.
     own pipeline as a nested request (`<request id>-classify`). It may
     recommend only the configured candidate `routes`; an answer naming
     anything else — a node, `Auto`, a non-candidate route — is invalid.
+  - The classifier's `timeout_ms` is required whenever a classifier section
+    exists: a real CPU classifier took 13–44 s, so no default fits.
   - It is sent the candidates, optional `routes[].description`s, the request's
     structural traits and the last user message cut to `max_input_chars`
     (default 2000) — no history, system prompt or tool schemas.

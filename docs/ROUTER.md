@@ -31,8 +31,9 @@ This document covers milestones R0 to R8, and R9.1:
   request's structure; the route then chooses the deployment exactly as
   before. See [Auto routing](#auto-routing). **R8 is not learned routing:**
   no classifier, embedding, score, history, latency or cost is involved.
-- **R9.1:** optional content-aware classification. An `Auto` rule may say
-  `"classify": true`, and a classifier — itself a configured route — then
+- **R9.1 / R9.1a:** optional content-aware classification. An `Auto` rule may
+  say `"classify": true`, and a classifier — a configured route on the
+  operator's own gateways, or TypeSafe AI's Jev System One API — then
   recommends one of the operator's candidate routes by what the request asks
   for. It chooses a route only, never a deployment, and every failure falls
   back deterministically. See
@@ -46,7 +47,7 @@ The [roadmap](#roadmap) lists what comes after.
 |---|---|---|
 | Client (Lightagent) | which capability it wants | a route name such as `Coder`, or `Auto` |
 | Auto rules (in the router, R8) | which logical route, when the client sent `Auto` | ordered rules over the request's structure — never a deployment or a node |
-| Classifier (a configured route, R9.1) | which candidate route, when a rule asks | a recommendation of one configured route name — never a deployment or a node |
+| Classifier provider (R9.1 / R9.1a) | which candidate route, when a rule asks | a recommendation of one configured route name — never a deployment or a node. A configured route (`lightweight`) or Jev (`jev`). |
 | **Router** | where the request goes | routes, the deployment registry, node health, routing policy, forwarding, stream relaying, failover, router logs and metrics |
 | Node (`hermes serve`) | how the model runs | its aliases, canonical ids, GGUF files, RAM admission, the scheduler and the engine |
 | Placement controller (in the router process, R7) | where a route is prepared | load requests to empty nodes, readiness confirmation, backoff — never a request's path |
@@ -532,12 +533,15 @@ Auto ─▶ R8 rules, in order ─┬─ a rule names a route ──────
   "enabled": true,
   "fallback_route": "General",
   "classifier": {
-    "route": "RouterClassifier",
+    "provider": "lightweight",
     "routes": ["General", "Coder", "Research"],
     "fallback_route": "General",
-    "min_confidence": 0.65,
-    "timeout_ms": 30000,
-    "max_input_chars": 2000
+    "lightweight": {
+      "route": "RouterClassifier",
+      "timeout_ms": 30000,
+      "min_confidence": 0.65,
+      "max_input_chars": 2000
+    }
   },
   "rules": [
     { "name": "forced-tools",  "when": { "tool_choice": "required" },   "route": "ToolAgent" },
@@ -549,14 +553,24 @@ Auto ─▶ R8 rules, in order ─┬─ a rule names a route ──────
 
 | Key | Default | Meaning |
 |---|---|---|
-| `classifier.route` | required | The configured route that classifies. Any route — typically a small instruct model on one node. Never `Auto`. |
-| `classifier.routes` | required | The candidates it may recommend, 1 to 16 configured routes, never `Auto`. Nothing else can be its answer. |
-| `classifier.fallback_route` | `auto_route.fallback_route` | Where a classification that fails or is unsure goes. |
-| `classifier.min_confidence` | 0.65 | A recommendation below this is not taken. 0 to 1. |
-| `classifier.timeout_ms` | **required** | How long a classification may take, 1 to 120 000. No default: see [Classification latency](#classification-latency). Never unlimited. |
-| `classifier.max_input_chars` | 2000 | How much of the request's text is sent, 1 to 32 000. |
+| `classifier.provider` | `lightweight` | Who classifies: `lightweight` (a configured route) or `jev` (TypeSafe's System One API, see [Jev](#the-jev-provider)). Switching changes this one word and no rule. |
+| `classifier.routes` | required | The candidates it may recommend, 1 to 16 configured routes, never `Auto`. Nothing else can be its answer. Shared by both providers. |
+| `classifier.fallback_route` | `auto_route.fallback_route` | Where a classification that fails or is unsure goes. Shared. |
+| `classifier.lightweight.route` | required for `lightweight` | The configured route that classifies. Any route — typically a small instruct model on one node. Never `Auto`. |
+| `classifier.lightweight.timeout_ms` | **required** | How long a classification may take, 1 to 120 000. No default: see [Classification latency](#classification-latency). Never unlimited. |
+| `classifier.lightweight.min_confidence` | 0.65 | A recommendation below this is not taken. 0 to 1. |
+| `classifier.lightweight.max_input_chars` | 2000 | How much of the request's text is sent, 1 to 32 000. |
+| `classifier.jev` | none | The Jev provider's own settings; see [Jev](#the-jev-provider). |
 | `rules[].classify` | `false` | The rule asks the classifier instead of naming a `route` (exactly one of the two). A classifying rule may have an empty `when`. |
 | `routes[].description` | none | What the classifier is told the route is for. No deterministic decision reads it. |
+
+Each provider keeps its own timeout, threshold and input limit, because their
+operational facts differ (a CPU model in tens of seconds, a remote API in
+hundreds of milliseconds). Both blocks may be present; only the one `provider`
+names is used, and the other is shown in the admin view as standby. The R9.1
+shape — `route`, `timeout_ms`, `min_confidence` and `max_input_chars` written
+directly in the classifier section — is still read, as the `lightweight` block;
+writing both forms is refused.
 
 **Classification is opt-in twice over.** It needs the classifier section *and*
 a rule that says `"classify": true`. A classifier section with no such rule is
@@ -565,7 +579,7 @@ route, an `Auto` request a deterministic rule resolves, and an `Auto` request no
 rule matches are never classified. Rules are still tried in order, so
 deterministic rules placed before the classifying rule always win.
 
-### What the classifier is, and what it sees
+### What the Lightweight classifier is, and what it sees
 
 The classifier is **a configured logical route**, called through the router's
 own pipeline as a nested request: its health, capability filtering, policy and
@@ -587,6 +601,135 @@ It is sent one chat request — `temperature: 0`, `reasoning_effort: "none"`,
   `(truncated)`). No earlier turn, system prompt, tool schema, alias or node
   name is sent.
 
+### The Jev provider
+
+[Jev](https://docs.typesafe.ai) is TypeSafe AI's System One model: it answers
+typed questions about a state with calibrated probabilities. With
+`"provider": "jev"` the router asks it one **Choice** question — which
+candidate route should answer — instead of asking a configured route.
+
+**Jev is not a deployment.** It is never in a route, never health-probed, never
+behind priority, round-robin or least-busy, and never reachable by a client
+through the router. It recommends a logical route; the route's own pipeline
+then chooses the deployment, exactly as for the Lightweight provider.
+
+```json
+"classifier": {
+  "provider": "jev",
+  "routes": ["General", "Coder", "Research", "Reasoning"],
+  "fallback_route": "General",
+  "jev": {
+    "base_url": "https://api.typesafe.ai",
+    "api_key_env": "TYPESAFE_API_KEY",
+    "model": "jev-latest",
+    "timeout_ms": 5000,
+    "min_confidence": 0.65,
+    "max_input_chars": 2000,
+    "include_user_text": true
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `jev.base_url` | `https://api.typesafe.ai` | Trailing slashes are removed, so `…/v1/systemone` is never `…//v1/systemone`; a path prefix (a proxy) is kept. Must be `https`, except a loopback address. No credentials, query or fragment. |
+| `jev.api_key_env` | `TYPESAFE_API_KEY` | The environment variable holding the API key — TypeSafe's own convention. The key is never written in the file; a literal `api_key` is refused as unknown. Read at start, like a node's key. |
+| `jev.model` | **required** | An alias such as `jev-latest` (moves with TypeSafe's releases) or a pinned versioned id such as `jev-1.13.0` (TypeSafe recommends pinning once thresholds are tuned). |
+| `jev.timeout_ms` | **required** | 1 to 120 000. It is a network call; the right bound depends on the network. 5000 is a reasonable start, not a guarantee. |
+| `jev.min_confidence` | 0.65 | Applied to TypeSafe's own `confidence` for the answer. |
+| `jev.max_input_chars` | 2000 | 1 to 32 000. |
+| `jev.include_user_text` | `true` | `false` sends only the request's structural traits and the route descriptions — more private, and less able to tell a greeting from a coding question. |
+
+**What is sent, and where.** When `provider` is `jev`, each classified request
+sends to the configured TypeSafe endpoint: the candidate route names and their
+descriptions, the request's structural traits (endpoint, whether tools are
+declared, `tool_choice`, whether reasoning was asked for, the router's prompt
+estimate) and — unless `include_user_text` is `false` — **the last user message,
+cut to `max_input_chars`**. Never earlier turns, a system prompt, tool schemas,
+an alias, a node address, a request id or a node credential. That text leaves
+the operator's machines; TypeSafe documents its data handling at
+[docs.typesafe.ai/legal](https://docs.typesafe.ai/legal). If it must not, use
+the Lightweight provider.
+
+**The request**, per TypeSafe's API reference:
+
+```json
+POST {base_url}/v1/systemone
+Authorization: Bearer <key>
+
+{"model": "jev-latest",
+ "state": {"request": "write a Rust async TCP server", "request_truncated": false,
+           "endpoint": "chat", "tools_declared": true, "tool_choice": "unspecified",
+           "reasoning_requested": false, "estimated_prompt_tokens": 8},
+ "questions": {"route": {"type": "choice",
+   "instructions": "Which route should answer this request? …",
+   "criteria": {"General": "General conversation …", "Coder": "Programming, …",
+                "Research": "…", "Reasoning": null}}}}
+```
+
+The `criteria` are exactly the candidates, each with its `description` (or
+`null`). The answer is read from `answers.route`: it must be a `choice` naming
+**one of the candidates exactly**, with a `confidence` in `[0, 1]` — TypeSafe's
+own certainty derived from the probability distribution, the one figure the
+router thresholds. A choice that is not a candidate (another route, `Auto`, a
+node name, a different casing) is `invalid`. The response's `model` — the
+versioned id behind an alias — is recorded in the trace.
+
+**Failures**, all answered by the classifier's fallback route, never by an
+error to the client and never by a retry (the timeout bounds the wait):
+
+| Jev | Outcome |
+|---|---|
+| `401`, `403` | `auth_error` (the live API answers a keyless request `403`) |
+| `429`, `529` | `rate_limited` |
+| any other error status (`422`, `5xx`) | `provider_error` |
+| refused or failed connection | `connection_error` |
+| no answer within `timeout_ms` | `timeout` (the HTTPS request is dropped) |
+| not the documented shape, not a candidate, confidence out of range | `invalid` |
+| below `min_confidence` | `low_confidence` |
+
+A provider's error body is never read into a log, a trace, a metric or the
+admin view.
+
+**Checking the setup.** At start the router checks Jev once, in the background
+(a provider that is down never stops the router): `GET /v1/models` with the
+key — is it accepted, is the model listed. `POST /api/router/v1/classifier/check`
+runs the same check on demand and returns, sanitized:
+
+```json
+{"provider": "jev", "status": "ok", "model": "jev-latest", "model_listed": true,
+ "http_status": 200, "checked_at": 1791300000, "duration_ms": 180.2}
+```
+
+`status` is `ok`, `model_not_listed`, `api_key_missing`, `auth_error`,
+`rate_limited`, `provider_error`, `invalid_response`, `connection_error` or
+`timeout`. `GET /v1/models` lists TypeSafe's **aliases**; a pinned versioned
+id is accepted by `/v1/systemone` without being listed, so `model_not_listed`
+is expected for one and a misconfiguration for an alias. The check never
+classifies and never sends request content.
+
+**Setting it up:**
+
+1. Obtain a TypeSafe API key.
+2. Set it in the router's environment: `export TYPESAFE_API_KEY=…` (or the
+   variable `jev.api_key_env` names). Never in `router.json`.
+3. In the classifier section, set `"provider": "jev"` and a `jev` block with
+   at least `model` and `timeout_ms`; adjust `base_url`, `min_confidence`,
+   `max_input_chars` and `include_user_text` if needed. Give the candidate
+   routes `description`s — they are what Jev chooses between.
+4. `hermes router validate-config` — a missing key is refused here, by name.
+5. Restart the router (configuration is read at start).
+6. `GET /api/router/v1/auto`: `classifier.provider` is `jev`,
+   `classifier.jev.api_key_configured` is `true`, and `status.last_check`
+   shows the start-up check.
+7. `POST /api/router/v1/classifier/check` to re-check at any time.
+8. Send an `Auto` request that a classifying rule matches, and read its
+   trace: `classifier.provider`, `model`, `outcome`, `chosen_route`,
+   `confidence`, `duration_ms`.
+
+There is no settings screen for the router; it is configured by file, and
+this is its read-only operator view.
+
 ### Answers, confidence and fallback
 
 The answer must be one JSON object (text around it, such as a code fence, is
@@ -600,6 +743,7 @@ tolerated) naming one of the candidates, matched ignoring case, with a
 | `invalid` | not JSON, no `route`, a route that is not a candidate (a node name, `Auto`, a configured route outside `routes`), or a missing or out-of-range confidence | the classifier's fallback |
 | `unavailable` | the classifier route refused (`route_unavailable`, a node's `503`, …) | the classifier's fallback |
 | `timeout` | no answer within `timeout_ms`. The nested request is dropped, which closes its upstream connection. | the classifier's fallback |
+| `auth_error`, `rate_limited`, `connection_error`, `provider_error` | Jev only; see [The Jev provider](#the-jev-provider) | the classifier's fallback |
 | `nested` | a classification request reached a classifying rule — impossible by configuration, and refused at run time too | the rule's fallback |
 
 **`Auto` never fails because the classifier did.** A route can never be
@@ -657,13 +801,18 @@ trace shows what it would have chosen). The classification request has its own
 trace under the classifier route. One `auto route classified` log line records
 the same fields. No prompt, answer text or tool schema is ever in a trace, a
 log line, a metric or the admin view. Metrics:
-`router_classifier_requests_total{outcome}`,
-`router_classifier_route_total{route}` (chosen and taken), and
-`router_classifier_duration_seconds{outcome}`; `router_auto_route_decisions_total`
+`router_classifier_requests_total{provider,outcome}`,
+`router_classifier_route_total{provider,route}` (chosen and taken), and
+`router_classifier_duration_seconds{provider,outcome}`; `router_auto_route_decisions_total`
 counts the classifying rule under the route it finally resolved to.
 `GET /api/router/v1/auto` adds each rule's `classify` and a `classifier`
-block: its route, candidates with descriptions, fallback, threshold, timeout,
-input limit, the rules that invoke it, and outcome counts.
+block: the provider, candidates with descriptions, fallback, the active
+provider's threshold, timeout and input limit, the rules that invoke it,
+outcome counts, a `status` (`last_success_at`, `last_failure_at`,
+`last_failure_kind`, `last_check`), and each configured provider's settings
+under `lightweight` / `jev` with `active` — for Jev, `api_key_configured`,
+never the key. The trace's classifier object carries `provider` and, for Jev,
+`model` (the versioned id that answered).
 
 ## Health
 
@@ -1319,6 +1468,7 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
 | `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
 | `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). Read-only; rules change only with the file. |
+| `POST /api/router/v1/classifier/check` | Checks the active classifier provider now and records the result: for Jev, `GET /v1/models` (key accepted, model listed); for the Lightweight provider, whether its classifier route is available. Sanitized report; never classifies. `409 classifier_not_configured` without a classifier. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
 ## Observability
@@ -1499,9 +1649,10 @@ or an address.
   `router_placement_failures_total{route,reason}`, and the histogram
   `router_placement_reconcile_duration_seconds` (one pass, without the loads
   it starts).
-- Classification (R9.1): `router_classifier_requests_total{outcome}`,
-  `router_classifier_route_total{route}`, and the histogram
-  `router_classifier_duration_seconds{outcome}`.
+- Classification (R9.1 / R9.1a): `router_classifier_requests_total{provider,outcome}`,
+  `router_classifier_route_total{provider,route}`, and the histogram
+  `router_classifier_duration_seconds{provider,outcome}`. `provider` is
+  `lightweight` or `jev`; outcomes are a fixed list.
 - `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
   `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
   — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
@@ -1580,6 +1731,13 @@ clients cannot add labels by inventing model names.
 - **Classification adds a generation to every classified request.** See
   [Classification latency](#classification-latency). `timeout_ms` is required
   precisely because no one value suits a GPU, a CPU and a remote classifier.
+- **Jev sends request text to an external service** (unless
+  `include_user_text` is off), and its quality, latency and limits are
+  TypeSafe's — rate limits are documented as dynamic. Every failure falls back,
+  so Auto keeps answering, but a classification that is always falling back is
+  only visible in the trace, the metrics and the admin status.
+- **No provider chain.** If the active provider fails, the request takes the
+  fallback route; the other provider is not tried.
 - **The classifier route is a visible model.** It is a configured route, so it
   is listed in `/v1/models` and a client may call it directly.
 - **`Auto`'s prompt threshold is the router's lower bound.** A prompt the model
@@ -1668,7 +1826,8 @@ identity.
 | **R7** | Done: per-route `min_ready` / `warm_standby` targets on allowed nodes, a reconciliation loop that loads installed models onto empty nodes through each node's control API, readiness by the router's own probe, the node's admission as the authority, bounded backoff, `/api/router/v1/placement`. Deliberately left out: unloading, swapping, rebalancing, downloading, and any use of latency or traffic. |
 | **R8** | Done: an opt-in `Auto` model that chooses the logical route by ordered, first-match rules over the R5 request requirements (endpoint, tools, `tool_choice`, reasoning, prompt estimate), with an explicit fallback; the route's own pipeline chooses the deployment; route-scoped affinity; the resolved route on every response; `requested_route`/`auto_rule` in traces, decision metrics and `/api/router/v1/auto`. Deliberately left out: prompt-content classification, scores, history, latency or cost, cross-route fallback, and live rule editing. |
 | **R9.1** | Done: an opt-in classifier an `Auto` rule invokes with `"classify": true` — itself a configured route, called through the router's pipeline — choosing only among configured candidate routes (with optional route descriptions), with a confidence threshold, a timeout, bounded input, and a deterministic fallback for every failure; recursion refused; classifier time measured apart from `routing_ms`; traces, metrics and admin state. Deliberately left out: scores, history, latency, cross-route fallback, and orchestration. |
-| **R9.2** | Planned, after R9.1 is reviewed: bounded, explainable scoring of candidate **routes** (never deployments) from configured weights and route-level evidence, with a deterministic fallback and an off switch. |
+| **R9.1a** | Done: a provider-neutral classifier boundary (`classifier/`: `lightweight`, `jev`) with one `Classification` result; TypeSafe Jev System One as an optional provider (typed Choice over the candidates, its own confidence, bearer key from the environment, https, bounded failures, no retries); per-provider settings; sanitized admin state, a start-up check and `POST /api/router/v1/classifier/check`. Deliberately left out: provider chains, scoring, and anything after the route is chosen. |
+| **R9.2** | Planned, after R9.1a is reviewed: bounded, explainable scoring of candidate **routes** (never deployments) from configured weights and route-level evidence, with a deterministic fallback and an off switch. |
 | **R9.3** | Planned: explicit, acyclic cross-route fallback chains for pre-response `route_unavailable` / `route_capability_mismatch` only; never mid-stream; kept apart from deployment failover. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
