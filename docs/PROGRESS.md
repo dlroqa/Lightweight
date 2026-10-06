@@ -2401,3 +2401,29 @@ metric, trace field or UI. The facts were read from `master` (`ef4f868`):
 
 The remaining questions are marked DEFERRED. R9.3.1 is the implementation
 slice.
+
+### R9.3 design MERGED and FROZEN
+
+PR #42 was merged as `41d0750` (head `4f26ee7`, docs only: `PROGRESS.md`,
+`R9_3_CROSS_ROUTE_FALLBACK.md`, `ROUTER.md`). Master was validated:
+- local `check.sh` green, with 1298 tests and contract 47/2;
+- Actions check run 37508409588 (all 7 jobs) and render panel run
+  37508409592, green;
+- no release workflow ran.
+
+**Frozen R9.3.1 definition:**
+- `Auto`-selected routes only; never explicit routes;
+- one flat ordered list, selected once from the initial route, never
+  transitive at runtime (the union graph is still validated acyclic);
+- triggers `route_unavailable`, `route_exhausted` and
+  `route_capability_mismatch`, only after same-route failover is exhausted,
+  and only before response commit (no server-side side-effect commit exists
+  today);
+- no 500, context-overflow or latency fallback; no classifier re-entry, R9.2
+  re-scoring, history influence or placement action;
+- `MAX_FALLBACK_ROUTES = 3`;
+- `model` names the final serving route;
+- an exhausted chain returns the final attempted route's existing error;
+- `router_requests_total` counts once per request.
+
+Implementation proceeds on `feature/router-cross-route-fallback`.
