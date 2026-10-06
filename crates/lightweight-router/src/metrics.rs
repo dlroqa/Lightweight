@@ -96,6 +96,16 @@ pub struct RouterMetrics {
     classifier_outcomes: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
     /// Routes classifications chose (outcome `chosen`), by provider and route.
     classifier_routes: Mutex<BTreeMap<(&'static str, String), u64>>,
+    /// Scored classifications (R9.2), by the route that won and whether it
+    /// overrode the route R9.1 alone would have taken.
+    scoring_decisions: Mutex<BTreeMap<(String, bool), u64>>,
+    /// Classifications scoring left as R9.1 resolved them, by reason
+    /// (`below_threshold`, `no_verdict`, `internal_error`).
+    scoring_fallbacks: Mutex<BTreeMap<&'static str, u64>>,
+    /// Finished requests counted toward route history, by route and
+    /// observation (`success`, `failure`, `unavailable`, `mismatch`,
+    /// `neutral`). Only while scoring is on.
+    route_history_observations: Mutex<BTreeMap<(String, &'static str), u64>>,
     histograms: Histograms,
 }
 
@@ -559,6 +569,81 @@ impl RouterMetrics {
             .collect()
     }
 
+    /// One scoring resolution: a contest's winner, or the reason R9.1's route
+    /// stood without one.
+    pub fn record_scoring(
+        &self,
+        reason: crate::scoring::ScoringReason,
+        winner: &str,
+        overrode: bool,
+    ) {
+        if reason.contested() {
+            bump(&self.scoring_decisions, (winner.to_owned(), overrode));
+        } else {
+            bump(&self.scoring_fallbacks, reason.as_str());
+        }
+    }
+
+    pub fn scoring_decisions(&self, route: &str, overrode: bool) -> u64 {
+        read(&self.scoring_decisions, &(route.to_owned(), overrode))
+    }
+
+    pub fn scoring_fallbacks(&self, reason: &'static str) -> u64 {
+        read(&self.scoring_fallbacks, &reason)
+    }
+
+    pub fn record_route_history(&self, route: &str, observation: &'static str) {
+        bump(
+            &self.route_history_observations,
+            (route.to_owned(), observation),
+        );
+    }
+
+    pub fn route_history_observations(&self, route: &str, observation: &'static str) -> u64 {
+        read(
+            &self.route_history_observations,
+            &(route.to_owned(), observation),
+        )
+    }
+
+    /// Each route's decayed history, read at scrape time. Nothing while
+    /// scoring is off.
+    pub fn route_history_to_prometheus(
+        book: &crate::scoring::HistoryBook,
+        now: std::time::Instant,
+    ) -> String {
+        let mut out = String::new();
+        if !book.is_recording() {
+            return out;
+        }
+        let view = book.view(now);
+        out.push_str(
+            "# HELP router_route_history_effective_samples Decayed scored observations (successes plus failures) per logical route.\n",
+        );
+        out.push_str("# TYPE router_route_history_effective_samples gauge\n");
+        for route in &view {
+            let _ = writeln!(
+                out,
+                "router_route_history_effective_samples{{route=\"{}\"}} {}",
+                escape(&route.route),
+                route.signal.effective_samples
+            );
+        }
+        out.push_str(
+            "# HELP router_route_history_signal The history term adaptive scoring reads per logical route, in (-1, 1); 0 below min_samples.\n",
+        );
+        out.push_str("# TYPE router_route_history_signal gauge\n");
+        for route in &view {
+            let _ = writeln!(
+                out,
+                "router_route_history_signal{{route=\"{}\"}} {}",
+                escape(&route.route),
+                route.signal.value
+            );
+        }
+        out
+    }
+
     pub fn auto_fallbacks(&self) -> u64 {
         self.auto_fallbacks
             .lock()
@@ -1020,6 +1105,54 @@ impl RouterMetrics {
             let _ = writeln!(
                 out,
                 "router_classifier_route_total{{provider=\"{provider}\",route=\"{}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        out.push_str(
+            "# HELP router_route_scoring_decisions_total Classifications adaptive scoring contested, by the winning logical route and whether it overrode R9.1's route.\n",
+        );
+        out.push_str("# TYPE router_route_scoring_decisions_total counter\n");
+        for ((route, overrode), count) in self
+            .scoring_decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_route_scoring_decisions_total{{route=\"{}\",overrode=\"{overrode}\"}} {count}",
+                escape(route)
+            );
+        }
+        out.push_str(
+            "# HELP router_route_scoring_fallback_total Classifications adaptive scoring left as R9.1 resolved them, by reason: below_threshold, no_verdict, internal_error.\n",
+        );
+        out.push_str("# TYPE router_route_scoring_fallback_total counter\n");
+        for (reason, count) in self
+            .scoring_fallbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_route_scoring_fallback_total{{reason=\"{reason}\"}} {count}"
+            );
+        }
+        out.push_str(
+            "# HELP router_route_history_observations_total Finished requests counted toward route history, by route and outcome. Only success and failure are scored.\n",
+        );
+        out.push_str("# TYPE router_route_history_observations_total counter\n");
+        for ((route, outcome), count) in self
+            .route_history_observations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_route_history_observations_total{{route=\"{}\",outcome=\"{outcome}\"}} {count}",
                 escape(route)
             );
         }
