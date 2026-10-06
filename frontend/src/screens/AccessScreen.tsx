@@ -149,7 +149,7 @@ function ConnectCard({ baseUrl, exposed }: { baseUrl: string; exposed: boolean }
   );
 }
 
-function CodeBlock({ text }: { text: string }) {
+export function CodeBlock({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   async function copy() {
     try {

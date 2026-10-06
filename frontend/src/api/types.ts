@@ -597,3 +597,113 @@ export interface BenchmarkSample {
   machine_ticks: number | null;
   peak_rss: number | null;
 }
+
+// --- the router (`hermes router --web-root`), `/api/router/v1` ---------------------
+
+/** `GET /version`: on a router, `build` starts with `lightweight-router-`. */
+export interface VersionBody {
+  version: string;
+  build: string;
+}
+
+export interface RouterDeploymentView {
+  id: string;
+  node: string;
+  model: string;
+  priority: number;
+  available: boolean;
+  unavailable_reason: string | null;
+}
+
+/** `GET /api/router/v1/routes`, one row. */
+export interface RouterRouteView {
+  name: string;
+  /** What a classifier is told the route is for. */
+  description: string | null;
+  strategy: string;
+  available: boolean;
+  deployments: RouterDeploymentView[];
+}
+
+export interface RouterRoutesBody {
+  object: string;
+  default_route: string | null;
+  data: RouterRouteView[];
+}
+
+/** One `Auto` rule, in the order rules are tried. */
+export interface AutoRuleView {
+  position: number;
+  name: string;
+  when: Record<string, unknown>;
+  /** The router's own one-line wording of `when`. */
+  condition: string;
+  route: string;
+  /** `true`: the rule asks the classifier rather than naming a route. */
+  classify: boolean;
+  decisions: number;
+}
+
+/** `POST /api/router/v1/classifier/check`. Sanitized: a status, never a body. */
+export interface ClassifierCheckReport {
+  provider: "lightweight" | "jev";
+  status: string;
+  model?: string;
+  model_listed?: boolean;
+  http_status?: number;
+  checked_at: number;
+  duration_ms: number;
+}
+
+export interface LightweightProviderView {
+  route: string;
+  timeout_ms: number;
+  min_confidence: number;
+  max_input_chars: number;
+  active: boolean;
+}
+
+/** The Jev block. The key itself is never in it; only whether it was found. */
+export interface JevProviderView {
+  base_url: string;
+  model: string;
+  api_key_env: string;
+  api_key_configured: boolean;
+  timeout_ms: number;
+  min_confidence: number;
+  max_input_chars: number;
+  include_user_text: boolean;
+  active: boolean;
+}
+
+export interface ClassifierView {
+  provider: "lightweight" | "jev";
+  route: string | null;
+  model: string | null;
+  candidates: { route: string; description?: string }[];
+  fallback_route: string;
+  min_confidence: number;
+  timeout_ms: number;
+  max_input_chars: number;
+  invoked_by: string[];
+  outcomes: Record<string, number>;
+  status: {
+    last_success_at: number | null;
+    last_failure_at: number | null;
+    last_failure_kind: string | null;
+    last_check: ClassifierCheckReport | null;
+  };
+  lightweight?: LightweightProviderView;
+  jev?: JevProviderView;
+}
+
+/** `GET /api/router/v1/auto`. */
+export interface AutoView {
+  configured: boolean;
+  enabled: boolean;
+  name?: string;
+  fallback_route?: string;
+  fallback_decisions?: number;
+  rules?: AutoRuleView[];
+  classifier?: ClassifierView | null;
+}
