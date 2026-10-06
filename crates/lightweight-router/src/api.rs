@@ -50,6 +50,7 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/sessions", get(sessions))
         .route("/api/router/v1/traces", get(traces))
         .route("/api/router/v1/auto", get(auto_rules))
+        .route("/api/router/v1/classifier/check", post(classifier_check))
         .route("/api/router/v1/placement", get(placement))
         .route("/api/router/v1/placement/reconcile", post(reconcile))
         .fallback(not_found)
@@ -450,21 +451,92 @@ async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -
         "fallback_route": auto.fallback.as_str(),
         "fallback_decisions": state.metrics.auto_fallbacks(),
         "rules": rules,
-        // The classifier's settings: routes and limits only — it has no
-        // credential of its own, and its nodes' keys are never shown.
-        "classifier": auto.classifier.as_ref().map(|classifier| json!({
-            "route": classifier.route.as_str(),
-            "candidates": classifier.candidates,
-            "fallback_route": classifier.fallback.as_str(),
-            "min_confidence": classifier.min_confidence,
-            "timeout_ms": u64::try_from(classifier.timeout.as_millis()).unwrap_or(u64::MAX),
-            "max_input_chars": classifier.max_input_chars,
-            "invoked_by": auto.rules.iter().filter(|rule| rule.classify)
-                .map(|rule| rule.name.as_str()).collect::<Vec<_>>(),
-            "outcomes": state.metrics.classifier_outcomes(),
-        })),
+        // The classifier's settings and state. Never a key: a provider that
+        // has one says only whether it is configured.
+        "classifier": auto.classifier.as_ref().map(|classifier| {
+            let provider = classifier.provider.kind().as_str();
+            let limits = classifier.limits();
+            let mut view = json!({
+                "provider": provider,
+                "route": classifier.provider.route().map(|route| route.as_str()),
+                "model": classifier.provider.model(),
+                "candidates": classifier.candidates,
+                "fallback_route": classifier.fallback.as_str(),
+                "min_confidence": limits.min_confidence,
+                "timeout_ms": u64::try_from(limits.timeout.as_millis()).unwrap_or(u64::MAX),
+                "max_input_chars": limits.max_input_chars,
+                "invoked_by": auto.rules.iter().filter(|rule| rule.classify)
+                    .map(|rule| rule.name.as_str()).collect::<Vec<_>>(),
+                "outcomes": state.metrics.classifier_outcomes(provider),
+                "status": state.classifier_status.view(),
+            });
+            if let Some(object) = view.as_object_mut() {
+                for configured in std::iter::once(&classifier.provider)
+                    .chain(classifier.standby.as_ref())
+                {
+                    let mut block = configured.view();
+                    if let Some(block) = block.as_object_mut() {
+                        block.insert(
+                            "active".into(),
+                            json!(configured.kind() == classifier.provider.kind()),
+                        );
+                    }
+                    object.insert(configured.kind().as_str().into(), block);
+                }
+            }
+            view
+        }),
     }))
     .into_response()
+}
+
+/// `POST /api/router/v1/classifier/check`: check the active classifier
+/// provider now, record the result for `GET /api/router/v1/auto`, and return
+/// it. For Jev: `GET /v1/models` — is the key accepted, is the model listed —
+/// bounded by its timeout, never a classification and never a key or a
+/// provider's error body in the answer. For the Lightweight provider: whether
+/// its classifier route has a deployment available. It changes nothing.
+async fn classifier_check(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let Some(classifier) = state
+        .auto
+        .as_ref()
+        .and_then(|auto| auto.classifier.as_ref())
+    else {
+        return json_error(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::invalid_request(
+                "no classifier is configured, so there is nothing to check",
+                "classifier_not_configured",
+            ),
+        );
+    };
+    let report = match &classifier.provider {
+        crate::classifier::ClassifierProvider::Jev(jev) => {
+            crate::classifier::jev::check(&state.client, jev).await
+        }
+        crate::classifier::ClassifierProvider::Lightweight(lightweight) => {
+            let started = std::time::Instant::now();
+            let health = state.health.snapshot();
+            let available = state
+                .topology
+                .route(&lightweight.route)
+                .is_some_and(|route| view(&state, route, &health).available);
+            crate::classifier::CheckReport {
+                provider: "lightweight",
+                status: if available { "ok" } else { "route_unavailable" },
+                model: None,
+                model_listed: None,
+                http_status: None,
+                checked_at: crate::classifier::unix_now(),
+                duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            }
+        }
+    };
+    state.classifier_status.record_check(report.clone());
+    axum::Json(report).into_response()
 }
 
 #[derive(serde::Deserialize)]

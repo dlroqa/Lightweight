@@ -1876,6 +1876,69 @@ classification each. Its tree is unchanged; the gateway on 11434 untouched.
 **Next:** review of this branch. R9.2 (adaptive route scoring) is not started
 and needs explicit approval.
 
+## Router classifier providers and Jev, R9.1a (feature/router-classifier-providers)
+
+The R9 plan gained a phase before scoring: R9.1 → **R9.1a** (classifier
+provider abstraction + TypeSafe Jev) → R9.2 → R9.3 → R9.4. Stacked on R9.1
+(PR #37, not yet merged), so it is reviewable on its own.
+
+**Stage 0 audit — there was no partial R9.2 work.** No branch, commit, stash,
+worktree or uncommitted change anywhere (local or `origin`) contained scoring
+code; the umbrella `feature/router-adaptive-orchestration` had 0 commits beyond
+master `036bad0`. The only uncommitted work was the interrupted R9.1 timeout
+hardening, which was finished and committed to PR #37 first (`e654fd0`:
+`timeout_ms` required). Nothing was kept, moved, deferred or removed, because
+nothing existed.
+
+What TypeSafe documents (read from docs.typesafe.ai before any code):
+`POST /v1/systemone` takes `state`, `model` and a map of typed `questions`; a
+Choice has `instructions` and `criteria` (option → description, ≤ 255); its
+answer has `choice`, `probabilities` and `confidence` (TypeSafe's own
+certainty, `(n·p_max − 1)/(n − 1)` for a Choice); `GET /v1/models` returns
+`{models: [{name, description, release_date}]}` listing aliases only — a pinned
+versioned id is accepted unlisted; errors are `401`, `422`, `429`, `529`.
+
+- **Structure:** `classifier/{mod.rs, lightweight.rs, jev.rs}`. A closed
+  `ClassifierProvider` enum (the crate's own idiom, as `RoutePolicy`), one
+  provider-neutral `Classification`, timeout and threshold applied once in
+  `classify()` for every provider.
+- **Jev:** one Choice whose criteria are exactly the candidates; exact-name
+  match; its `confidence` thresholded; `401`/`403` → `auth_error`,
+  `429`/`529` → `rate_limited`, other statuses → `provider_error`, transport →
+  `connection_error` / `timeout`; bounded body reads; no retries; error bodies
+  never kept; no request id sent out.
+- **Settings:** `provider` (default `lightweight`), per-provider blocks, R9.1
+  flat keys = the `lightweight` block; Jev key via the existing secret reader,
+  demanded only when active; https off loopback; `model` and `timeout_ms`
+  required.
+- **Operator view:** `/api/router/v1/auto` shows both blocks (active/standby),
+  `api_key_configured`, last success/failure/check; a background start-up check
+  and `POST /api/router/v1/classifier/check` (`GET /v1/models`). The router has
+  no settings UI (the frontend and desktop shell never call `/api/router`), so
+  this is the operator surface.
+- **Mutation check:** 429/529 → provider_error fails 3 tests; not trimming
+  `base_url` fails 9; case-insensitive choice matching fails 1.
+
+Verified by execution: **real Jev smoke test skipped — `TYPESAFE_API_KEY` not
+configured** on this machine. A keyless `GET https://api.typesafe.ai/v1/models`
+(no content sent) answered `403` over verified TLS — the documented table says
+`401`; both map to `auth_error`. The Lightweight provider was re-run through
+the new configuration shape with Qwen3-1.7B on node C: with `timeout_ms
+120000`, "Write a Rust async TCP server using tokio." → `Coder` (0.9, 46.6 s
+cold) and "Hello, how are you?" → `General` (0.9, 12.7 s), `routing_ms` 0.31;
+with `timeout_ms 2000`, the classification timed out at 2001 ms, its nested
+trace reads `cancelled`, node C's own log records `cancelled` for
+`r91a-short-classify`, and the request was answered by `General` with
+`routing_ms` 0.3.
+
+- **Validation.** `./scripts/check.sh` passed in full: 1223 workspace tests, 0
+  failed (1203 at R9.1). The router has 297 (181 unit, 72 surface, 14 Auto,
+  9 classification, 8 Jev, 12 placement, 1 log-correlation). Contract suite 47
+  passed, 2 skipped. Cross-platform proof is the PR's CI.
+
+**Next:** review of R9.1 (PR #37) and this branch. R9.2 is parked — nothing of
+it exists — and needs explicit approval.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

@@ -83,6 +83,9 @@ pub struct RouterState {
     /// The `auto_route` section, if the file has one. Only ever chooses a
     /// route; everything after that is the route's own.
     pub auto: Option<crate::auto_route::AutoRoute>,
+    /// When the classifier last answered, last failed, and was last checked.
+    /// Read by the admin view only.
+    pub classifier_status: crate::classifier::ClassifierStatus,
     /// Which deployment each live session prefers. Empty, and never written,
     /// while affinity is off.
     pub affinity: AffinityBook,
@@ -153,6 +156,7 @@ impl RouterState {
             metrics: RouterMetrics::default(),
             selector,
             auto: config.auto.clone(),
+            classifier_status: crate::classifier::ClassifierStatus::default(),
             affinity: AffinityBook::new(config.affinity.clone()),
             traces: TraceBook::new(config.trace_capacity),
             phase_delays: crate::proxy::PhaseDelays::default(),
@@ -251,6 +255,34 @@ impl BoundRouter {
                 max_entries = policy.max_entries,
                 "session affinity is on"
             );
+        }
+
+        // An external classifier is checked once at start — key accepted, model
+        // listed — in the background: a provider that is down must not stop
+        // the router starting, and Auto falls back without it anyway.
+        if let Some(jev) = state
+            .auto
+            .as_ref()
+            .and_then(|auto| auto.classifier.as_ref())
+            .and_then(|classifier| match &classifier.provider {
+                crate::classifier::ClassifierProvider::Jev(jev) => Some(jev.clone()),
+                crate::classifier::ClassifierProvider::Lightweight(_) => None,
+            })
+        {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let report = crate::classifier::jev::check(&state.client, &jev).await;
+                tracing::info!(
+                    target: targets::ROUTER,
+                    provider = "jev",
+                    model = report.model.as_deref(),
+                    status = report.status,
+                    model_listed = report.model_listed,
+                    http_status = report.http_status,
+                    "classifier provider checked"
+                );
+                state.classifier_status.record_check(report);
+            });
         }
 
         // Off unless a route has a placement target. It shares the health book

@@ -1,40 +1,43 @@
-//! Content-aware route classification (R9.1): when an `Auto` rule asks for
-//! it, a classifier reads what the request says and recommends one of the
+//! Content-aware route classification: when an `Auto` rule asks for it, a
+//! classifier reads what the request says and recommends one of the
 //! operator's logical routes.
 //!
-//! This is the only part of the router that reads a prompt for meaning, and it
-//! is bounded on every side:
+//! Two providers can classify, and nothing outside this module knows which
+//! one did (R9.1a):
+//!
+//! * [`lightweight`] (R9.1): a configured logical route, asked through the
+//!   router's own pipeline — everything stays on the operator's gateways.
+//! * [`jev`]: TypeSafe AI's System One API, asked one typed Choice question
+//!   over HTTPS — an external service, not a node, not a deployment.
+//!
+//! Both produce the same [`Classification`]: an outcome, the candidate named
+//! (if any) with its confidence, the provider, the duration. Whichever
+//! provider is configured, the classification is bounded on every side:
 //!
 //! * **Invoked, never ambient.** It runs only when an `Auto` rule written
-//!   `"classify": true` matches. A request that names a route, an `Auto`
-//!   request an ordinary rule resolves, and every configuration without such a
-//!   rule never reach it.
-//! * **A route, not a node.** The classifier is itself a configured logical
-//!   route, called through the router's own pipeline — health, capability
-//!   filtering, the route's policy, failover — like any request. It can only
-//!   answer with one of the candidate routes it was given; anything else is a
-//!   failure, never a new route.
-//! * **Always answered.** A timeout, an unavailable classifier route, an
-//!   answer that is not one of the candidates, or one below the confidence
-//!   threshold falls back to the configured fallback route. `Auto` never fails
-//!   because the classifier did.
-//! * **Never recursive.** The classifier route cannot be `Auto`, and a
-//!   classification request is marked nested: should it ever reach a
-//!   classifying rule, it takes the fallback instead of classifying again.
+//!   `"classify": true` matches. Switching provider never changes a rule.
+//! * **Candidates only.** A provider can only recommend one of the configured
+//!   candidate routes; anything else is a failure, never a new route, and
+//!   never a node or deployment.
+//! * **Always answered.** A timeout, an unreachable or refusing provider, an
+//!   answer that is not a candidate, or one below the confidence threshold
+//!   falls back to the configured fallback route. `Auto` never fails because
+//!   the classifier did.
+//! * **Never recursive.** No route a classifier involves can be `Auto`, and a
+//!   nested classification request never classifies again.
 //! * **Bounded input.** Only the last user message (a completion's first
 //!   prompt), cut to `max_input_chars`, and the request's structural traits.
-//!   No history, system prompt or tool schema is sent, and none of it is
-//!   logged, traced or counted.
+//!   None of it is logged, traced or counted.
 //!
 //! Which deployment answers the chosen route is not decided here: the
 //! recommendation is a route name, and the request then goes through that
 //! route's pipeline exactly as if the client had named it.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+pub mod jev;
+pub mod lightweight;
 
-use axum::body::Bytes;
-use axum::http::{HeaderMap, HeaderValue};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lightweight_api::chat::ChatCompletionRequest;
 use lightweight_api::completions::CompletionRequest;
@@ -47,62 +50,96 @@ use crate::RouterState;
 use crate::auto_route::is_auto;
 use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
-use crate::proxy::{Endpoint, REQUEST_ID_HEADER};
-use crate::requirements::RequestRequirements;
+use crate::proxy::Endpoint;
+use crate::requirements::{RequestRequirements, ToolChoiceRequirement};
+
+pub use jev::{CheckReport, JevClassifier, JevFile};
+pub use lightweight::{LightweightClassifier, LightweightFile};
 
 /// The longest a configuration may let a classification take. There is no
-/// default timeout: see [`ClassifierFile::timeout_ms`].
+/// default timeout: how long one takes depends on the provider, the model,
+/// the hardware or network, and the prompt — well under a second for a GPU
+/// or a fast remote service, tens of seconds for a 1–2B model on a small CPU —
+/// so no single default is right, and a wrong one silently sends every
+/// classification to the fallback. Never unlimited: classification must not
+/// hold a request indefinitely.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 /// The confidence below which a recommendation is not taken, by default.
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.65;
-/// How much of the request's text the classifier is sent, by default.
+/// How much of the request's text a classifier is sent, by default.
 pub const DEFAULT_MAX_INPUT_CHARS: usize = 2_000;
-/// The most text a configuration may let the classifier be sent.
+/// The most text a configuration may let a classifier be sent.
 pub const MAX_INPUT_CHARS: usize = 32_000;
 /// The most candidate routes one classifier may choose among.
 pub const MAX_CANDIDATES: usize = 16;
 /// The longest route description accepted.
 pub const MAX_DESCRIPTION_CHARS: usize = 200;
-/// The output budget of a classification: one short JSON object.
-const ANSWER_TOKENS: u32 = 48;
-/// How much of the classifier's answer is read.
-const ANSWER_LIMIT: usize = 64 * 1024;
+
+pub(crate) const fn default_min_confidence() -> f64 {
+    DEFAULT_MIN_CONFIDENCE
+}
+pub(crate) const fn default_max_input_chars() -> usize {
+    DEFAULT_MAX_INPUT_CHARS
+}
+
+/// Which provider classifies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// A configured route on the operator's own gateways (R9.1). The default,
+    /// so an R9.1 configuration means what it meant.
+    #[default]
+    Lightweight,
+    /// TypeSafe AI's System One API.
+    Jev,
+}
+
+impl ProviderKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lightweight => "lightweight",
+            Self::Jev => "jev",
+        }
+    }
+}
 
 /// The `auto_route.classifier` section, as written.
+///
+/// `provider` chooses; each provider's settings live in its own block, so
+/// switching provider changes one word and no rule. The R9.1 shape — `route`,
+/// `timeout_ms`, `min_confidence` and `max_input_chars` directly here — is
+/// still read, as the `lightweight` block.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClassifierFile {
-    /// The configured route that classifies. Never `Auto`.
-    pub route: String,
-    /// The routes it may recommend, in the order they are described to it.
+    #[serde(default)]
+    pub provider: ProviderKind,
+    /// The routes a classifier may recommend, in the order they are described
+    /// to it. Shared by every provider.
     pub routes: Vec<String>,
     /// Where a classification that fails or is unsure goes. Absent: the
     /// `auto_route.fallback_route`.
     #[serde(default)]
     pub fallback_route: Option<String>,
-    #[serde(default = "default_min_confidence")]
-    pub min_confidence: f64,
-    /// How long a classification may take. **Required**, 1 to
-    /// [`MAX_TIMEOUT_MS`]: how long one takes depends on the classifier model,
-    /// the hardware, the backend and the prompt — well under a second on a GPU,
-    /// tens of seconds for a 1–2B model on a small CPU — so no single default
-    /// is right, and a wrong one silently sends every classification to the
-    /// fallback. Never unlimited: classification must not hold a request
-    /// indefinitely.
+    #[serde(default)]
+    pub lightweight: Option<LightweightFile>,
+    #[serde(default)]
+    pub jev: Option<JevFile>,
+    /// R9.1 shorthand for `lightweight.route`.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// R9.1 shorthand for `lightweight.timeout_ms`.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    #[serde(default = "default_max_input_chars")]
-    pub max_input_chars: usize,
+    /// R9.1 shorthand for `lightweight.min_confidence`.
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
+    /// R9.1 shorthand for `lightweight.max_input_chars`.
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
 }
 
-const fn default_min_confidence() -> f64 {
-    DEFAULT_MIN_CONFIDENCE
-}
-const fn default_max_input_chars() -> usize {
-    DEFAULT_MAX_INPUT_CHARS
-}
-
-/// A route the classifier may recommend, and what the operator said it is for.
+/// A route a classifier may recommend, and what the operator said it is for.
 #[derive(Clone, Debug, Serialize)]
 pub struct Candidate {
     pub route: RouteName,
@@ -110,30 +147,110 @@ pub struct Candidate {
     pub description: Option<String>,
 }
 
-/// The validated classifier.
-#[derive(Clone, Debug)]
-pub struct RouteClassifier {
-    pub route: RouteName,
-    pub candidates: Vec<Candidate>,
-    pub fallback: RouteName,
-    pub min_confidence: f64,
+/// One provider's bounds: how long it may take, how sure it must be, and how
+/// much text it is sent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Limits {
     pub timeout: Duration,
+    pub min_confidence: f64,
     pub max_input_chars: usize,
 }
 
+/// A configured provider.
+#[derive(Clone, Debug)]
+pub enum ClassifierProvider {
+    Lightweight(LightweightClassifier),
+    Jev(JevClassifier),
+}
+
+impl ClassifierProvider {
+    pub const fn kind(&self) -> ProviderKind {
+        match self {
+            Self::Lightweight(_) => ProviderKind::Lightweight,
+            Self::Jev(_) => ProviderKind::Jev,
+        }
+    }
+
+    pub const fn limits(&self) -> &Limits {
+        match self {
+            Self::Lightweight(lightweight) => &lightweight.limits,
+            Self::Jev(jev) => &jev.limits,
+        }
+    }
+
+    /// The classifier route, for the Lightweight provider.
+    pub const fn route(&self) -> Option<&RouteName> {
+        match self {
+            Self::Lightweight(lightweight) => Some(&lightweight.route),
+            Self::Jev(_) => None,
+        }
+    }
+
+    /// The model asked, for an external provider.
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            Self::Lightweight(_) => None,
+            Self::Jev(jev) => Some(jev.model.as_str()),
+        }
+    }
+
+    /// Settings as the admin view may show them. No credential.
+    pub fn view(&self) -> Value {
+        match self {
+            Self::Lightweight(lightweight) => json!({
+                "route": lightweight.route.as_str(),
+                "timeout_ms": millis(lightweight.limits.timeout),
+                "min_confidence": lightweight.limits.min_confidence,
+                "max_input_chars": lightweight.limits.max_input_chars,
+            }),
+            Self::Jev(jev) => jev.view(),
+        }
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The validated classifier.
+#[derive(Clone, Debug)]
+pub struct RouteClassifier {
+    pub candidates: Vec<Candidate>,
+    pub fallback: RouteName,
+    /// The provider that classifies.
+    pub provider: ClassifierProvider,
+    /// The other provider, when its block is configured too: never asked,
+    /// kept so the admin view can show whether switching would work.
+    pub standby: Option<ClassifierProvider>,
+}
+
+impl RouteClassifier {
+    pub const fn limits(&self) -> &Limits {
+        self.provider.limits()
+    }
+}
+
 /// How one classification ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClassifierOutcome {
     /// A candidate, at or above the threshold: it is the route.
     Chosen,
     /// A candidate below the threshold: the fallback is the route.
     LowConfidence,
-    /// An answer that named no candidate, or was not the JSON asked for.
+    /// An answer that named no candidate, or was not the shape asked for.
     Invalid,
-    /// The classifier route refused or could not answer.
+    /// The Lightweight classifier route refused or could not answer.
     Unavailable,
     /// No answer within the timeout.
     Timeout,
+    /// The external provider refused the key (`401`, `403`).
+    AuthError,
+    /// The external provider is rate-limiting or overloaded (`429`, `529`).
+    RateLimited,
+    /// The external provider could not be reached.
+    ConnectionError,
+    /// The external provider answered with any other error status.
+    ProviderError,
     /// A classification request reached a classifying rule itself. Prevented
     /// by validation; kept so recursion is impossible rather than unlikely.
     Nested,
@@ -147,16 +264,26 @@ impl ClassifierOutcome {
             Self::Invalid => "invalid",
             Self::Unavailable => "unavailable",
             Self::Timeout => "timeout",
+            Self::AuthError => "auth_error",
+            Self::RateLimited => "rate_limited",
+            Self::ConnectionError => "connection_error",
+            Self::ProviderError => "provider_error",
             Self::Nested => "nested",
         }
     }
+
+    /// The provider answered with a usable verdict, taken or not.
+    pub const fn provider_answered(self) -> bool {
+        matches!(self, Self::Chosen | Self::LowConfidence)
+    }
 }
 
-/// What the classifier is told about one request.
+/// What a classifier is told about one request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassificationInput {
     pub endpoint: Endpoint,
     pub tools: bool,
+    pub tool_choice: ToolChoiceRequirement,
     pub reasoning: bool,
     pub prompt_tokens: Option<u32>,
     /// The last user message (a completion's first prompt), at most
@@ -199,6 +326,7 @@ impl ClassificationInput {
         Self {
             endpoint,
             tools: needs.tools,
+            tool_choice: needs.tool_choice,
             reasoning: needs.reasoning,
             prompt_tokens: needs.prompt_tokens,
             text,
@@ -215,102 +343,28 @@ fn truncate(text: &str, max_chars: usize) -> (String, bool) {
     }
 }
 
-/// The chat request sent to the classifier route.
-///
-/// Deterministic (`temperature: 0`), short, never streamed, and with thinking
-/// off: a classification is one JSON object, not an essay.
-pub fn request_body(classifier: &RouteClassifier, input: &ClassificationInput) -> Value {
-    let mut routes = String::new();
-    for candidate in &classifier.candidates {
-        routes.push_str("- ");
-        routes.push_str(candidate.route.as_str());
-        if let Some(description) = &candidate.description {
-            routes.push_str(": ");
-            routes.push_str(description);
-        }
-        routes.push('\n');
-    }
-    let system = format!(
-        "You choose which route should answer a request. Choose exactly one of these routes:\n\
-         {routes}\n\
-         Judge by what the request asks for. A client may declare tools on every request, so \
-         declared tools alone do not mean the request needs them.\n\
-         Answer with one JSON object and nothing else: \
-         {{\"route\": \"<one route name from the list>\", \"confidence\": <a number from 0 to 1>}}"
-    );
-    let user = format!(
-        "Endpoint: {}. Tools declared: {}. Reasoning requested: {}. Estimated prompt tokens: {}.\n\
-         Request{}:\n{}",
-        input.endpoint.as_str(),
-        if input.tools { "yes" } else { "no" },
-        if input.reasoning { "yes" } else { "no" },
-        input
-            .prompt_tokens
-            .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
-        if input.truncated { " (truncated)" } else { "" },
-        input.text,
-    );
-    json!({
-        "model": classifier.route.as_str(),
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "max_tokens": ANSWER_TOKENS,
-        "temperature": 0,
-        "reasoning_effort": "none",
-        "stream": false,
-    })
-}
-
-/// A candidate the classifier named, and how sure it said it was.
+/// A candidate a provider named, and how sure it said it was.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Verdict {
     pub route: RouteName,
     pub confidence: f64,
+    /// The model that answered, when the provider says (Jev reports the
+    /// versioned id behind an alias).
+    pub model: Option<String>,
 }
 
-/// Read the classifier's answer: a chat completion whose message is one JSON
-/// object naming a candidate and a confidence in `[0, 1]`.
-///
-/// The object may be wrapped in other text (a model's preamble, a code fence):
-/// the first `{` to the last `}` is read. Anything else — no object, a route
-/// that is not a candidate, a confidence that is missing or out of range — is
-/// refused. The answer is never echoed into a log: it may quote the prompt.
-pub fn parse_answer(body: &[u8], candidates: &[Candidate]) -> Result<Verdict, &'static str> {
-    let response: Value = serde_json::from_slice(body).map_err(|_| "not_json")?;
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or("no_content")?;
-    let start = content.find('{').ok_or("no_object")?;
-    let end = content.rfind('}').ok_or("no_object")?;
-    if end < start {
-        return Err("no_object");
-    }
-    let object: Value = serde_json::from_str(&content[start..=end]).map_err(|_| "no_object")?;
-    let named = object["route"].as_str().ok_or("no_route")?;
-    let route = candidates
-        .iter()
-        .find(|candidate| candidate.route.matches(named))
-        .map(|candidate| candidate.route.clone())
-        .ok_or("unknown_route")?;
-    let confidence = object["confidence"]
-        .as_f64()
-        .filter(|value| (0.0..=1.0).contains(value))
-        .ok_or("bad_confidence")?;
-    Ok(Verdict { route, confidence })
-}
-
-/// One classification, start to finish.
+/// One classification, start to finish — the same shape whichever provider
+/// produced it.
 #[derive(Clone, Debug)]
 pub struct Classification {
+    pub provider: ProviderKind,
     pub outcome: ClassifierOutcome,
-    /// What the classifier named, when it named a candidate — taken only when
+    /// What the provider named, when it named a candidate — taken only when
     /// `outcome` is [`ClassifierOutcome::Chosen`].
     pub verdict: Option<Verdict>,
     pub duration: Duration,
-    /// The classification request's own id, in the router's and the node's
-    /// logs.
+    /// The Lightweight classification request's own id, in the router's and
+    /// the node's logs. Empty for an external provider, which is not sent one.
     pub request_id: String,
     /// The text sent was cut to `max_input_chars`.
     pub input_truncated: bool,
@@ -325,8 +379,9 @@ impl Classification {
         }
     }
 
-    pub fn nested() -> Self {
+    pub const fn nested(provider: ProviderKind) -> Self {
         Self {
+            provider,
             outcome: ClassifierOutcome::Nested,
             verdict: None,
             duration: Duration::ZERO,
@@ -336,12 +391,12 @@ impl Classification {
     }
 }
 
-/// Ask the classifier route which candidate should answer `input`.
+/// Ask the configured provider which candidate should answer `input`.
 ///
-/// The request goes through the router's own pipeline as a nested request:
-/// the classifier route's health, capabilities and policy choose where it
-/// runs. On timeout the nested request is dropped, which closes its upstream
-/// connection and stops the node generating.
+/// The timeout and the confidence threshold are applied here, the same way
+/// for every provider. On timeout the provider's call is dropped — for the
+/// Lightweight provider that closes the nested request's upstream connection,
+/// for Jev the HTTPS request.
 pub async fn classify(
     state: &Arc<RouterState>,
     classifier: &RouteClassifier,
@@ -349,37 +404,41 @@ pub async fn classify(
     request_id: &str,
 ) -> Classification {
     let started = Instant::now();
-    let nested_id = format!("{request_id}-classify");
-    let mut headers = HeaderMap::new();
-    if let Ok(value) = HeaderValue::from_str(&nested_id) {
-        headers.insert(REQUEST_ID_HEADER, value);
-    }
-    let body = Bytes::from(request_body(classifier, input).to_string());
-    let call = async {
-        let response = crate::proxy::forward_nested(
-            Arc::clone(state),
-            Endpoint::ChatCompletions,
-            headers,
-            body,
-        )
-        .await;
-        if !response.status().is_success() {
-            return Err(ClassifierOutcome::Unavailable);
-        }
-        let bytes = axum::body::to_bytes(response.into_body(), ANSWER_LIMIT)
+    let limits = classifier.limits();
+    let mut nested_id = String::new();
+    let result = match &classifier.provider {
+        ClassifierProvider::Lightweight(lightweight) => {
+            nested_id = format!("{request_id}-classify");
+            tokio::time::timeout(
+                limits.timeout,
+                lightweight::call(
+                    state,
+                    lightweight,
+                    &classifier.candidates,
+                    input,
+                    &nested_id,
+                ),
+            )
             .await
-            .map_err(|_| ClassifierOutcome::Unavailable)?;
-        parse_answer(&bytes, &classifier.candidates).map_err(|_| ClassifierOutcome::Invalid)
+        }
+        ClassifierProvider::Jev(jev) => {
+            tokio::time::timeout(
+                limits.timeout,
+                jev::call(&state.client, jev, &classifier.candidates, input),
+            )
+            .await
+        }
     };
-    let (outcome, verdict) = match tokio::time::timeout(classifier.timeout, call).await {
+    let (outcome, verdict) = match result {
         Err(_) => (ClassifierOutcome::Timeout, None),
         Ok(Err(outcome)) => (outcome, None),
-        Ok(Ok(verdict)) if verdict.confidence < classifier.min_confidence => {
+        Ok(Ok(verdict)) if verdict.confidence < limits.min_confidence => {
             (ClassifierOutcome::LowConfidence, Some(verdict))
         }
         Ok(Ok(verdict)) => (ClassifierOutcome::Chosen, Some(verdict)),
     };
     Classification {
+        provider: classifier.provider.kind(),
         outcome,
         verdict,
         duration: started.elapsed(),
@@ -388,20 +447,68 @@ pub async fn classify(
     }
 }
 
-/// Check the classifier section against the configured routes.
+/// When the classifier last answered and last failed, and the last check.
+/// For the admin view; no routing decision reads it.
+#[derive(Debug, Default)]
+pub struct ClassifierStatus {
+    inner: Mutex<StatusInner>,
+}
+
+#[derive(Debug, Default)]
+struct StatusInner {
+    last_success: Option<u64>,
+    last_failure: Option<(u64, &'static str)>,
+    last_check: Option<CheckReport>,
+}
+
+impl ClassifierStatus {
+    pub fn record(&self, outcome: ClassifierOutcome) {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if outcome.provider_answered() {
+            inner.last_success = Some(unix_now());
+        } else if outcome != ClassifierOutcome::Nested {
+            inner.last_failure = Some((unix_now(), outcome.as_str()));
+        }
+    }
+
+    pub fn record_check(&self, report: CheckReport) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_check = Some(report);
+    }
+
+    pub fn view(&self) -> Value {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        json!({
+            "last_success_at": inner.last_success,
+            "last_failure_at": inner.last_failure.map(|(at, _)| at),
+            "last_failure_kind": inner.last_failure.map(|(_, kind)| kind),
+            "last_check": inner.last_check,
+        })
+    }
+}
+
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Check the classifier section against the configured routes and the
+/// environment the router started in.
 pub(crate) fn validate(
     raw: &ClassifierFile,
     routes: &[Route],
     auto_fallback: &str,
+    env: &dyn Fn(&str) -> Option<String>,
     errors: &mut Vec<ConfigError>,
 ) -> Option<RouteClassifier> {
     let before = errors.len();
-    let mut fail = |problem: String| {
-        errors.push(ConfigError::BadAutoClassifier { problem });
-    };
-    let route = configured(&raw.route, routes)
-        .map_err(|problem| fail(format!("route {:?} {problem}", raw.route)))
-        .ok();
+    let mut problems: Vec<String> = Vec::new();
+    let mut fail = |problem: String| problems.push(problem);
+
     let fallback_name = raw.fallback_route.as_deref().unwrap_or(auto_fallback);
     let fallback = configured(fallback_name, routes)
         .map_err(|problem| fail(format!("fallback_route {fallback_name:?} {problem}")))
@@ -434,35 +541,127 @@ pub(crate) fn validate(
             Err(problem) => fail(format!("routes entry {name:?} {problem}")),
         }
     }
-    if !(raw.min_confidence.is_finite() && (0.0..=1.0).contains(&raw.min_confidence)) {
-        fail("min_confidence must be between 0 and 1".into());
-    }
-    match raw.timeout_ms {
-        None => fail(format!(
-            "timeout_ms is required: how long a classification takes depends on the \
-             classifier model and the hardware it runs on (tens of seconds for a small \
-             model on a CPU), so choose a bound between 1 and {MAX_TIMEOUT_MS}"
-        )),
-        Some(timeout) if timeout == 0 || timeout > MAX_TIMEOUT_MS => {
-            fail(format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"));
+
+    // The Lightweight provider's settings: its block, or the R9.1 shorthand.
+    let shorthand = raw.route.is_some()
+        || raw.timeout_ms.is_some()
+        || raw.min_confidence.is_some()
+        || raw.max_input_chars.is_some();
+    let lightweight_file = match (&raw.lightweight, shorthand) {
+        (Some(_), true) => {
+            fail(
+                "write the Lightweight classifier's settings either in a \"lightweight\" block \
+                 or directly in the classifier section (the R9.1 shorthand), not both"
+                    .into(),
+            );
+            None
         }
-        Some(_) => {}
+        (Some(block), false) => Some((
+            LightweightFile {
+                route: block.route.clone(),
+                timeout_ms: block.timeout_ms,
+                min_confidence: block.min_confidence,
+                max_input_chars: block.max_input_chars,
+            },
+            "lightweight.",
+        )),
+        (None, true) => match &raw.route {
+            Some(route) => Some((
+                LightweightFile {
+                    route: route.clone(),
+                    timeout_ms: raw.timeout_ms,
+                    min_confidence: raw.min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE),
+                    max_input_chars: raw.max_input_chars.unwrap_or(DEFAULT_MAX_INPUT_CHARS),
+                },
+                "",
+            )),
+            None => {
+                fail("route is required for the Lightweight classifier".into());
+                None
+            }
+        },
+        (None, false) => None,
+    };
+    let lightweight = lightweight_file.as_ref().and_then(|(file, prefix)| {
+        lightweight::validate(file, routes, prefix, &mut fail).map(ClassifierProvider::Lightweight)
+    });
+    let jev_active = raw.provider == ProviderKind::Jev;
+    let jev = raw.jev.as_ref().and_then(|file| {
+        jev::validate(file, jev_active, env, &mut fail, errors).map(ClassifierProvider::Jev)
+    });
+
+    match raw.provider {
+        ProviderKind::Lightweight if lightweight_file.is_none() => fail(
+            "provider \"lightweight\" needs its settings: a \"lightweight\" block with a \
+             \"route\" and \"timeout_ms\" (or, as in R9.1, \"route\" and \"timeout_ms\" \
+             directly here)"
+                .into(),
+        ),
+        ProviderKind::Jev if raw.jev.is_none() => fail(
+            "provider \"jev\" needs a \"jev\" block with at least \"model\" and \"timeout_ms\""
+                .into(),
+        ),
+        _ => {}
     }
-    if raw.max_input_chars == 0 || raw.max_input_chars > MAX_INPUT_CHARS {
-        fail(format!(
-            "max_input_chars must be between 1 and {MAX_INPUT_CHARS}"
-        ));
+
+    for problem in problems {
+        errors.push(ConfigError::BadAutoClassifier { problem });
     }
     if errors.len() > before {
         return None;
     }
+    let (provider, standby) = match raw.provider {
+        ProviderKind::Lightweight => (lightweight?, jev),
+        ProviderKind::Jev => (jev?, lightweight),
+    };
     Some(RouteClassifier {
-        route: route?,
         candidates,
         fallback: fallback?,
-        min_confidence: raw.min_confidence,
-        timeout: Duration::from_millis(raw.timeout_ms?),
-        max_input_chars: raw.max_input_chars,
+        provider,
+        standby,
+    })
+}
+
+/// Check one provider's bounds. `prefix` names where they were written.
+pub(crate) fn validate_limits(
+    prefix: &str,
+    timeout_ms: Option<u64>,
+    min_confidence: f64,
+    max_input_chars: usize,
+    fail: &mut dyn FnMut(String),
+) -> Option<Limits> {
+    let mut ok = true;
+    if !(min_confidence.is_finite() && (0.0..=1.0).contains(&min_confidence)) {
+        fail(format!("{prefix}min_confidence must be between 0 and 1"));
+        ok = false;
+    }
+    match timeout_ms {
+        None => {
+            fail(format!(
+                "{prefix}timeout_ms is required: how long a classification takes depends on the \
+                 classifier model and the hardware or network it runs on (tens of seconds for a \
+                 small model on a CPU), so choose a bound between 1 and {MAX_TIMEOUT_MS}"
+            ));
+            ok = false;
+        }
+        Some(timeout) if timeout == 0 || timeout > MAX_TIMEOUT_MS => {
+            fail(format!(
+                "{prefix}timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
+            ));
+            ok = false;
+        }
+        Some(_) => {}
+    }
+    if max_input_chars == 0 || max_input_chars > MAX_INPUT_CHARS {
+        fail(format!(
+            "{prefix}max_input_chars must be between 1 and {MAX_INPUT_CHARS}"
+        ));
+        ok = false;
+    }
+    ok.then(|| Limits {
+        timeout: Duration::from_millis(timeout_ms.unwrap_or(1)),
+        min_confidence,
+        max_input_chars,
     })
 }
 
@@ -482,7 +681,7 @@ fn configured(name: &str, routes: &[Route]) -> Result<RouteName, &'static str> {
         .ok_or("is not one of the configured routes")
 }
 
-/// Check a route's description: what the classifier is told the route is for.
+/// Check a route's description: what a classifier is told the route is for.
 pub(crate) fn validate_description(raw: &str) -> Result<String, String> {
     let description = raw.trim();
     if description.is_empty() {
@@ -576,19 +775,27 @@ mod tests {
     fn the_classifier_is_read_with_its_defaults_and_route_descriptions() {
         let auto = semantic(json!([{"name": "semantic", "when": {}, "classify": true}]));
         let classifier = auto.classifier.as_ref().unwrap();
-        assert_eq!(classifier.route.as_str(), "RouterClassifier");
+        assert_eq!(
+            classifier.provider.route().unwrap().as_str(),
+            "RouterClassifier"
+        );
+        assert_eq!(
+            classifier.provider.kind(),
+            ProviderKind::Lightweight,
+            "the R9.1 default"
+        );
         assert_eq!(
             classifier.fallback.as_str(),
             "General",
             "the Auto fallback, by default"
         );
-        assert_eq!(classifier.min_confidence, DEFAULT_MIN_CONFIDENCE);
+        assert_eq!(classifier.limits().min_confidence, DEFAULT_MIN_CONFIDENCE);
         assert_eq!(
-            classifier.timeout,
+            classifier.limits().timeout,
             Duration::from_secs(30),
             "the configured timeout, exactly"
         );
-        assert_eq!(classifier.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
+        assert_eq!(classifier.limits().max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         let described: Vec<(&str, Option<&str>)> = classifier
             .candidates
             .iter()
@@ -791,7 +998,7 @@ mod tests {
             .auto
             .unwrap();
             assert_eq!(
-                auto.classifier.unwrap().timeout,
+                auto.classifier.unwrap().limits().timeout,
                 Duration::from_millis(timeout)
             );
         }
@@ -873,7 +1080,11 @@ mod tests {
             {"role": "system", "content": "You are a secret system prompt."},
             {"role": "user", "content": "compare today's GPU announcements"}
         ]});
-        let request = request_body(classifier, &input(&body, 2_000));
+        let request = lightweight::request_body(
+            classifier.provider.route().unwrap(),
+            &classifier.candidates,
+            &input(&body, 2_000),
+        );
         assert_eq!(request["model"], "RouterClassifier");
         assert_eq!(request["stream"], false);
         assert_eq!(request["temperature"], 0);
@@ -912,7 +1123,7 @@ mod tests {
     fn only_a_candidate_with_a_confidence_in_range_is_a_verdict() {
         let auto = semantic(json!([{"name": "semantic", "when": {}, "classify": true}]));
         let candidates = &auto.classifier.as_ref().unwrap().candidates;
-        let parse = |content: &str| parse_answer(&answer(content), candidates);
+        let parse = |content: &str| lightweight::parse_answer(&answer(content), candidates);
 
         let verdict = parse(r#"{"route": "Coder", "confidence": 0.91}"#).unwrap();
         assert_eq!(verdict.route.as_str(), "Coder");
@@ -946,9 +1157,12 @@ mod tests {
         );
         assert_eq!(parse("Coder"), Err("no_object"));
         assert_eq!(parse(r#"{"confidence": 0.9}"#), Err("no_route"));
-        assert_eq!(parse_answer(b"not json", candidates), Err("not_json"));
         assert_eq!(
-            parse_answer(br#"{"choices": []}"#, candidates),
+            lightweight::parse_answer(b"not json", candidates),
+            Err("not_json")
+        );
+        assert_eq!(
+            lightweight::parse_answer(br#"{"choices": []}"#, candidates),
             Err("no_content")
         );
     }

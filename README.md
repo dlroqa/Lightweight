@@ -650,6 +650,12 @@ every turn, such as Lightagent, can still have a greeting answered by
 unavailable, is unsure, or names anything but a candidate falls back to a
 configured route; it never chooses a node.
 
+The classifier can instead be TypeSafe AI's Jev System One API
+(`"provider": "jev"`, R9.1a), asked one typed choice over the candidate
+routes, with its key read from `TYPESAFE_API_KEY` in the environment. Jev is an
+external service: the last user message (bounded, or omitted with
+`include_user_text: false`) is sent to it. Switching provider changes no rule.
+
 ```sh
 export LIGHTWEIGHT_DELL_KEY=...  LIGHTWEIGHT_T420_KEY=...   # one key per node, never in the file
 hermes router validate-config --config router.json          # checks everything; listens on nothing
