@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router content-aware `Auto` classification (R9.1).** Opt-in twice over:
+  an `auto_route.classifier` section, and a rule that says `"classify": true`
+  instead of naming a `route`. Without both, `Auto` is exactly R8.
+  - The classifier is a configured logical route, called through the router's
+    own pipeline as a nested request (`<request id>-classify`). It may
+    recommend only the configured candidate `routes`; an answer naming
+    anything else — a node, `Auto`, a non-candidate route — is invalid.
+  - It is sent the candidates, optional `routes[].description`s, the request's
+    structural traits and the last user message cut to `max_input_chars`
+    (default 2000) — no history, system prompt or tool schemas.
+  - Below `min_confidence` (default 0.65), past `timeout_ms` (default 1500),
+    unavailable, or invalid, the request goes to the classifier's
+    `fallback_route` (default: Auto's). `Auto` never fails because the
+    classifier did, and classification can never recurse.
+  - Only the logical route is chosen: capability filtering, route-scoped
+    affinity, policies, failover, placement and the response's `model` are the
+    chosen route's, unchanged. No cross-route fallback.
+  - Classifier time is measured on its own and excluded from `routing_ms`.
+    Traces gain a `classifier` object (outcome, chosen route, confidence,
+    duration — never text); `router_classifier_requests_total{outcome}`,
+    `router_classifier_route_total{route}`,
+    `router_classifier_duration_seconds{outcome}`; `/api/router/v1/auto` shows
+    the classifier and its candidates.
+  - Not scoring, learning, latency routing or orchestration (R9.2–R9.4).
+
 - **Router rule-based `Auto` model (R8).** Off unless the configuration has an
   `auto_route` section with `"enabled": true`; without one, `Auto` is an
   unknown model exactly as before.

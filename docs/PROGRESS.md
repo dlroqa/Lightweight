@@ -1797,6 +1797,79 @@ SmolLM2-135M, scratch `XDG_DATA_HOME`s): `General → node-a/QwenCoder`,
 **Next:** review of this branch. R9 (learned/adaptive routing, mixture of
 agents) is not started.
 
+## Router content-aware classification, R9.1 (feature/router-content-classification)
+
+R8 was merged first (PR #36, head `e27c201` re-verified unchanged; merge
+commit `036bad0`) and master validated: `./scripts/check.sh` 1184 tests, 0
+failed, contract suite 47 passed, 2 skipped; CI run 37390160690 (seven `check`
+jobs, Flatpak, Linux artifacts, render icons) and 37390160581 (render panel)
+green. Post-merge Auto smoke on real gateways: placement loaded an empty B
+(1532 ms, probe-confirmed); ordinary Auto → `General`, tool Auto → `Coder`
+round-robin B/A/B, a session settling on one Coder deployment (miss, hit,
+hit) with its affinity under `Coder`; `response.model` the resolved route
+every time. `v0.5.0` unchanged. R8 is frozen. R9 is split into R9.1–R9.4, each
+gated by review; the umbrella branch `feature/router-adaptive-orchestration`
+and this branch both start at `036bad0`.
+
+What master offered, read before any code: `proxy::resolve_auto` reads the R5
+requirements and runs `AutoRoute::decide`; requirements carry no message text
+(by design); the gateway has no `response_format` or grammar option, so a
+classifier's output cannot be constrained at decode time — it must be parsed
+strictly and checked against the candidates. So the classifier is a
+configured route, called through the router's own pipeline, and its answer is
+a recommendation the router validates.
+
+- **Domain/config** (`classifier.rs`, `auto_route.rs`):
+  `auto_route.classifier {route, routes, fallback_route, min_confidence,
+  timeout_ms, max_input_chars}`; rules gain `"classify": true` (exactly one of
+  it and `route`; may have an empty `when`); `routes[].description`. A
+  classifying rule's `route` is the classifier's fallback, so `decide` stays
+  pure and every R8 type and test is unchanged.
+- **Request path:** `resolve_auto` (now async) classifies only when the
+  matching rule asks; `proxy::forward_nested` (boxed, `nested = true`) sends the
+  classification through the pipeline; a nested request never classifies.
+  Classifier time is added to `planning_started`, so `routing_ms` is unchanged
+  in meaning.
+- **Observability:** trace `classifier {route, outcome, chosen_route,
+  confidence, duration_ms, request_id, input_truncated}`, one `auto route
+  classified` line, three metrics, `/api/router/v1/auto` classifier block.
+- **Mutation check:** never classifying fails 6 of the 8 integration tests,
+  ignoring the threshold fails 1, counting classifier time in `routing_ms`
+  fails 1.
+
+Verified by execution against three real gateways (scratch `XDG_DATA_HOME`s):
+A and B SmolLM2-135M (`General`/`Research` → A, `Coder` → B), C **Qwen3-1.7B**
+Q4_K_M at `--ctx 2048` behind `RouterClassifier`; candidates General, Coder,
+Research with descriptions; `min_confidence 0.5`, `timeout_ms 120000`; rules
+`forced-tools → Coder`, then `semantic` (classify). Every request declared tools:
+
+| Prompt | Resolved | Confidence | Classification |
+|---|---|---|---|
+| "Hello, how are you?" | General | 0.9 | 43.9 s (first, cold) |
+| "Write a Rust async TCP server using tokio." | Coder | 0.9 | 13.8 s |
+| "Compare today's current GPU announcements from NVIDIA and AMD." | **General** (intended Research) | 0.8 | 17.0 s |
+| "Search the web for current CUDA benchmarks." | Research | 0.8 | 14.7 s |
+| "What are the latest news headlines about AI chips this week?" | Research | 0.9 | 13.4 s |
+| "Hello, how are you?" + `tool_choice: required` | Coder (rule, no classification) | — | — |
+
+`routing_ms` stayed 0.26–0.37 ms throughout. Node C's log has only the five
+`-classify` ids; A has the General/Research requests, B the Coder ones. On
+this box classification costs 13–44 s, so the 1.5 s default would make every
+classification time out and fall back — documented. **Unmodified Lightagent
+`7d95232`** (scratch profile model `Auto`) listed `General, Coder, Research,
+RouterClassifier, Auto`; both of its turns declared its tool set, and "Hi
+there! How is your day going?" resolved to `General` (0.9) while "Write a Rust
+function that reverses a string." resolved to `Coder` (1.0), about 13 s of
+classification each. Its tree is unchanged; the gateway on 11434 untouched.
+
+- **Validation.** `./scripts/check.sh` passed in full: 1203 workspace tests, 0
+  failed (1184 on master). The router has 277 (170 unit, 72 surface, 14 Auto,
+  8 classification, 12 placement, 1 log-correlation). Contract suite 47
+  passed, 2 skipped. Cross-platform proof is the PR's CI.
+
+**Next:** review of this branch. R9.2 (adaptive route scoring) is not started
+and needs explicit approval.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:

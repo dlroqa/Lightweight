@@ -638,8 +638,17 @@ whether it declares tools, its `tool_choice`, whether it asks for reasoning,
 and the router's prompt-size estimate — pick the route, first match wins, with
 an explicit `fallback_route`. The chosen route then picks the deployment
 exactly as if the client had named it, and the response names that route.
-`Auto` never reads a prompt for meaning, never tries a second route, and is
-not learned or adaptive.
+`Auto`'s rules never read a prompt for meaning, never try a second route, and
+are not learned or adaptive.
+
+Optionally (R9.1), a rule can say `"classify": true` instead of naming a
+route: a classifier — itself one of the configured routes, typically a small
+instruct model — is asked which of a list of candidate routes the request is
+for, and the request goes there. That is how a client that declares tools on
+every turn, such as Lightagent, can still have a greeting answered by
+`General` and a coding question by `Coder`. A classifier that times out, is
+unavailable, is unsure, or names anything but a candidate falls back to a
+configured route; it never chooses a node.
 
 ```sh
 export LIGHTWEIGHT_DELL_KEY=...  LIGHTWEIGHT_T420_KEY=...   # one key per node, never in the file
