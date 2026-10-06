@@ -749,13 +749,17 @@ async fn a_bad_key_and_an_unreachable_service_fall_back() {
     assert_eq!(traces["data"][0]["classifier"]["outcome"], "auth_error");
     stop.cancel();
 
-    // Nothing listening where Jev should be.
+    // Nothing listening where Jev should be. Windows reports a refused
+    // loopback connection only after retrying for about two seconds, so the
+    // bound is long enough for the refusal, not the timeout, to be what is
+    // seen on every platform.
     let unused = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let closed = format!("http://{}", unused.local_addr().unwrap());
     drop(unused);
-    let router = Router::start(fleet.config("jev", json!({"base_url": closed}))).await;
+    let router =
+        Router::start(fleet.config("jev", json!({"base_url": closed, "timeout_ms": 5_000}))).await;
     let (status, body) = router
         .send(lightagent("write a Rust async TCP server"))
         .await;
