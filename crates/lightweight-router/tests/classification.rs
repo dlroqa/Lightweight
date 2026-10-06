@@ -550,13 +550,13 @@ async fn every_classifier_failure_falls_back_and_auto_still_answers() {
     for (outcome, count) in [("low_confidence", 1), ("invalid", 3), ("timeout", 1)] {
         assert!(
             metrics.contains(&format!(
-                "router_classifier_requests_total{{outcome=\"{outcome}\"}} {count}"
+                "router_classifier_requests_total{{provider=\"lightweight\",outcome=\"{outcome}\"}} {count}"
             )),
             "{outcome}: {metrics}"
         );
     }
     assert!(
-        !metrics.contains("router_classifier_route_total{route="),
+        !metrics.contains("router_classifier_route_total{"),
         "nothing was taken"
     );
 }
@@ -802,9 +802,16 @@ async fn classification_time_is_its_own_and_the_admin_view_shows_the_classifier(
         .text()
         .await
         .unwrap();
-    assert!(metrics.contains("router_classifier_requests_total{outcome=\"chosen\"} 1"));
-    assert!(metrics.contains("router_classifier_route_total{route=\"Coder\"} 1"));
-    assert!(metrics.contains("router_classifier_duration_seconds_count{outcome=\"timeout\"} 1"));
+    assert!(metrics.contains(
+        "router_classifier_requests_total{provider=\"lightweight\",outcome=\"chosen\"} 1"
+    ));
+    assert!(
+        metrics
+            .contains("router_classifier_route_total{provider=\"lightweight\",route=\"Coder\"} 1")
+    );
+    assert!(metrics.contains(
+        "router_classifier_duration_seconds_count{provider=\"lightweight\",outcome=\"timeout\"} 1"
+    ));
     assert!(
         metrics.contains("router_auto_route_decisions_total{rule=\"semantic\",route=\"Coder\"} 1")
     );
@@ -812,7 +819,11 @@ async fn classification_time_is_its_own_and_the_admin_view_shows_the_classifier(
 
     let admin = router.get("/api/router/v1/auto").await;
     let classifier = &admin["classifier"];
+    assert_eq!(classifier["provider"], "lightweight");
     assert_eq!(classifier["route"], "RouterClassifier");
+    assert_eq!(classifier["lightweight"]["route"], "RouterClassifier");
+    assert_eq!(classifier["lightweight"]["active"], true);
+    assert!(classifier.get("jev").is_none());
     assert_eq!(classifier["fallback_route"], "General");
     assert_eq!(classifier["min_confidence"], 0.65);
     assert_eq!(classifier["timeout_ms"], 400);
