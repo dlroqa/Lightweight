@@ -225,7 +225,7 @@ impl Router {
             json!({"interval_secs": 3600, "timeout_secs": 2, "failure_threshold": 1});
         let file: RouterFile = serde_json::from_value(config).expect("config shape");
         let config = lightweight_router::validate(file, &|name| {
-            (name == "CLASSIFIER_NODE_KEY").then(|| "classifier-node-secret".to_owned())
+            (name == "CLASSIFIER_NODE_KEY").then(|| "classifier-key".to_owned())
         })
         .expect("valid config");
         let bound = lightweight_router::bind(&config).await.expect("bind");
@@ -593,7 +593,7 @@ async fn the_classifier_sees_candidates_and_the_last_message_only() {
     );
     assert_eq!(
         headers.get("authorization").unwrap(),
-        "Bearer classifier-node-secret",
+        "Bearer classifier-key",
         "the classifier node's own key, as for any request"
     );
     assert!(headers.get("x-lightweight-session").is_none());
@@ -775,7 +775,7 @@ async fn classification_time_is_its_own_and_the_admin_view_shows_the_classifier(
     assert_eq!(classifier["outcomes"]["chosen"], 1);
     assert_eq!(admin["rules"][1]["classify"], true);
     let shown = admin.to_string();
-    assert!(!shown.contains("classifier-node-secret") && !shown.contains("CLASSIFIER_NODE_KEY"));
+    assert!(!shown.contains("classifier-key") && !shown.contains("CLASSIFIER_NODE_KEY"));
     no_alias_in(&shown);
 
     // Discovery: the candidates are Auto's routes; the classifier is not.
