@@ -37,6 +37,7 @@ pub mod config;
 pub mod controller;
 pub mod domain;
 pub mod error;
+pub mod fallback;
 pub mod health;
 pub mod load;
 pub mod metrics;
