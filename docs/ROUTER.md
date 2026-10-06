@@ -536,7 +536,7 @@ Auto ─▶ R8 rules, in order ─┬─ a rule names a route ──────
     "routes": ["General", "Coder", "Research"],
     "fallback_route": "General",
     "min_confidence": 0.65,
-    "timeout_ms": 1500,
+    "timeout_ms": 30000,
     "max_input_chars": 2000
   },
   "rules": [
@@ -553,7 +553,7 @@ Auto ─▶ R8 rules, in order ─┬─ a rule names a route ──────
 | `classifier.routes` | required | The candidates it may recommend, 1 to 16 configured routes, never `Auto`. Nothing else can be its answer. |
 | `classifier.fallback_route` | `auto_route.fallback_route` | Where a classification that fails or is unsure goes. |
 | `classifier.min_confidence` | 0.65 | A recommendation below this is not taken. 0 to 1. |
-| `classifier.timeout_ms` | 1500 | How long a classification may take, 1 to 120 000. |
+| `classifier.timeout_ms` | **required** | How long a classification may take, 1 to 120 000. No default: see [Classification latency](#classification-latency). Never unlimited. |
 | `classifier.max_input_chars` | 2000 | How much of the request's text is sent, 1 to 32 000. |
 | `rules[].classify` | `false` | The rule asks the classifier instead of naming a `route` (exactly one of the two). A classifying rule may have an empty `when`. |
 | `routes[].description` | none | What the classifier is told the route is for. No deterministic decision reads it. |
@@ -629,11 +629,20 @@ generation on the classifier route costs. It is measured on its own —
 `classifier.duration_ms` in the trace and the
 `router_classifier_duration_seconds` histogram — and is **not** part of
 `routing_ms` or `router_routing_duration_seconds`, which keep their R6
-meaning: the router's own planning time. On a CPU-only machine a 1–2B
-classifier can take far longer than the 1.5 s default (13–44 s per
-classification on the development box with Qwen3-1.7B), in which case every
-classification times out and falls back: raise `timeout_ms`, use a smaller
-classifier model, or put the classifier route on a faster node.
+meaning: the router's own planning time.
+
+How long a classification takes depends on the classifier model, the hardware
+and backend it runs on, and the prompt length — so `timeout_ms` **has no
+default** and must be written in the classifier section. One observation, not a
+benchmark: Qwen3-1.7B (Q4_K_M) on the 4-core development CPU took roughly
+**13–44 s** per classification. A GPU, a smaller model, or a faster remote node
+can classify in well under a second and support a much shorter timeout. A
+timeout shorter than the classifier's real latency makes **every**
+classification time out and fall back — correct, but no longer classifying —
+so set it from the `router_classifier_duration_seconds` you observe. It is
+bounded at 120 000 ms: classification must never hold a request indefinitely.
+On timeout the classification request is cancelled (its upstream connection is
+closed) and the request continues at the classifier's fallback route.
 
 ### Observability
 
@@ -1569,8 +1578,8 @@ clients cannot add labels by inventing model names.
   answer is taken. Descriptions and the candidate list are the operator's
   levers; nothing is learned from outcomes (that would be R9.2).
 - **Classification adds a generation to every classified request.** See
-  [Classification latency](#classification-latency). The default 1.5 s timeout suits a GPU or a very small
-  classifier; a CPU-only 1–2B model needs far more.
+  [Classification latency](#classification-latency). `timeout_ms` is required
+  precisely because no one value suits a GPU, a CPU and a remote classifier.
 - **The classifier route is a visible model.** It is a configured route, so it
   is listed in `/v1/models` and a client may call it directly.
 - **`Auto`'s prompt threshold is the router's lower bound.** A prompt the model

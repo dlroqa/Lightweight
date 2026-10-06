@@ -48,6 +48,9 @@ struct Script {
     role: Role,
     tools: bool,
     hits: Arc<AtomicU32>,
+    /// Classifications answered to the end: a handler the router abandoned
+    /// never gets here.
+    answered: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
 }
 
@@ -74,6 +77,7 @@ impl Node {
             role,
             tools,
             hits: Arc::default(),
+            answered: Arc::default(),
             seen: Arc::default(),
         };
         let app = axum::Router::new()
@@ -174,6 +178,7 @@ async fn generate(
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
+            script.answered.fetch_add(1, Ordering::SeqCst);
             return axum::Json(json!({
                 "id": "k1", "object": "chat.completion", "model": model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
@@ -336,7 +341,8 @@ impl Fleet {
 
     fn config_with(&self, classifier: Value) -> Value {
         let mut section = json!({"route": "RouterClassifier",
-                                 "routes": ["General", "Coder", "Research"]});
+                                 "routes": ["General", "Coder", "Research"],
+                                 "timeout_ms": 5_000});
         if let (Some(section), Value::Object(extra)) = (section.as_object_mut(), classifier) {
             section.extend(extra);
         }
@@ -556,6 +562,49 @@ async fn every_classifier_failure_falls_back_and_auto_still_answers() {
 }
 
 #[tokio::test]
+async fn a_timeout_cancels_the_classification_and_the_fallback_answers() {
+    ensure_provider();
+    let fleet = Fleet::start().await;
+    let router = Router::start(fleet.config_with(json!({"timeout_ms": 300}))).await;
+
+    // The classifier would take 2 s; the bound is 300 ms.
+    let started = Instant::now();
+    let (status, body) = router.send(lightagent("SLOW write a Rust server")).await;
+    let waited = started.elapsed();
+    assert_eq!(status, 200, "a timeout is never the client's error: {body}");
+    assert_eq!(body["model"], "General", "the deterministic fallback");
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_millis(1_500),
+        "bounded by the timeout: {waited:?}"
+    );
+    assert_eq!(fleet.coder.hits(), 0, "the slow verdict was never taken");
+    let trace = router.last_trace().await;
+    assert_eq!(trace["classifier"]["outcome"], "timeout");
+    let classified = trace["classifier"]["duration_ms"].as_f64().unwrap();
+    assert!((300.0..1_500.0).contains(&classified), "{trace}");
+    assert!(trace["routing_ms"].as_f64().unwrap() < 200.0, "{trace}");
+
+    // Cancelled, not merely ignored: the classifier node was reached, its
+    // handler was dropped when the router let go, and it never answered.
+    assert_eq!(fleet.classifier.hits(), 1);
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    assert_eq!(
+        fleet.classifier.script.answered.load(Ordering::SeqCst),
+        0,
+        "the abandoned classification was not left running to completion"
+    );
+    let traces = router.get("/api/router/v1/traces?limit=10").await;
+    let nested = traces["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["route"] == "RouterClassifier")
+        .cloned()
+        .unwrap();
+    assert_eq!(nested["outcome"], "cancelled", "{nested}");
+}
+
+#[tokio::test]
 async fn an_unavailable_classifier_falls_back_to_its_own_fallback_route() {
     ensure_provider();
     let fleet = Fleet::with_classifier(Role::Down).await;
@@ -657,7 +706,8 @@ async fn the_chosen_route_streams_under_its_own_name_with_its_own_filtering_and_
             {"name": "RouterClassifier", "deployments": [{"node": "classifier", "model": "ClassifierAlias"}]}
         ],
         "auto_route": {"enabled": true, "fallback_route": "General",
-            "classifier": {"route": "RouterClassifier", "routes": ["General", "Coder", "Research"]},
+            "classifier": {"route": "RouterClassifier", "routes": ["General", "Coder", "Research"],
+                           "timeout_ms": 5_000},
             "rules": [{"name": "semantic", "when": {}, "classify": true}]}
     });
     let router = Router::start(config).await;

@@ -50,11 +50,8 @@ use crate::domain::{Route, RouteName};
 use crate::proxy::{Endpoint, REQUEST_ID_HEADER};
 use crate::requirements::RequestRequirements;
 
-/// How long a classification may take, by default. Classification sits in
-/// front of the request's own answer, so it is short; a slow machine, or a
-/// larger classifier model, raises it.
-pub const DEFAULT_TIMEOUT_MS: u64 = 1_500;
-/// The longest a configuration may let a classification take.
+/// The longest a configuration may let a classification take. There is no
+/// default timeout: see [`ClassifierFile::timeout_ms`].
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 /// The confidence below which a recommendation is not taken, by default.
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.65;
@@ -85,17 +82,21 @@ pub struct ClassifierFile {
     pub fallback_route: Option<String>,
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
+    /// How long a classification may take. **Required**, 1 to
+    /// [`MAX_TIMEOUT_MS`]: how long one takes depends on the classifier model,
+    /// the hardware, the backend and the prompt — well under a second on a GPU,
+    /// tens of seconds for a 1–2B model on a small CPU — so no single default
+    /// is right, and a wrong one silently sends every classification to the
+    /// fallback. Never unlimited: classification must not hold a request
+    /// indefinitely.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
     #[serde(default = "default_max_input_chars")]
     pub max_input_chars: usize,
 }
 
 const fn default_min_confidence() -> f64 {
     DEFAULT_MIN_CONFIDENCE
-}
-const fn default_timeout_ms() -> u64 {
-    DEFAULT_TIMEOUT_MS
 }
 const fn default_max_input_chars() -> usize {
     DEFAULT_MAX_INPUT_CHARS
@@ -436,8 +437,16 @@ pub(crate) fn validate(
     if !(raw.min_confidence.is_finite() && (0.0..=1.0).contains(&raw.min_confidence)) {
         fail("min_confidence must be between 0 and 1".into());
     }
-    if raw.timeout_ms == 0 || raw.timeout_ms > MAX_TIMEOUT_MS {
-        fail(format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"));
+    match raw.timeout_ms {
+        None => fail(format!(
+            "timeout_ms is required: how long a classification takes depends on the \
+             classifier model and the hardware it runs on (tens of seconds for a small \
+             model on a CPU), so choose a bound between 1 and {MAX_TIMEOUT_MS}"
+        )),
+        Some(timeout) if timeout == 0 || timeout > MAX_TIMEOUT_MS => {
+            fail(format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"));
+        }
+        Some(_) => {}
     }
     if raw.max_input_chars == 0 || raw.max_input_chars > MAX_INPUT_CHARS {
         fail(format!(
@@ -452,7 +461,7 @@ pub(crate) fn validate(
         candidates,
         fallback: fallback?,
         min_confidence: raw.min_confidence,
-        timeout: Duration::from_millis(raw.timeout_ms),
+        timeout: Duration::from_millis(raw.timeout_ms?),
         max_input_chars: raw.max_input_chars,
     })
 }
@@ -528,7 +537,8 @@ mod tests {
     }
 
     fn classifier_section() -> Value {
-        json!({"route": "RouterClassifier", "routes": ["General", "Coder", "Research"]})
+        json!({"route": "RouterClassifier", "routes": ["General", "Coder", "Research"],
+               "timeout_ms": 30_000})
     }
 
     fn semantic(rules: Value) -> AutoRoute {
@@ -575,7 +585,8 @@ mod tests {
         assert_eq!(classifier.min_confidence, DEFAULT_MIN_CONFIDENCE);
         assert_eq!(
             classifier.timeout,
-            Duration::from_millis(DEFAULT_TIMEOUT_MS)
+            Duration::from_secs(30),
+            "the configured timeout, exactly"
         );
         assert_eq!(classifier.max_input_chars, DEFAULT_MAX_INPUT_CHARS);
         let described: Vec<(&str, Option<&str>)> = classifier
@@ -736,6 +747,58 @@ mod tests {
             "nodes": [], "routes": [], "auto_route": {"fallback_route": "G",
                 "classifier": {"route": "C", "routes": ["G"], "provider_url": "http://x"}}}));
         assert!(unknown.is_err(), "unknown classifier keys are refused");
+    }
+
+    #[test]
+    fn a_classifier_must_name_its_timeout_and_a_configuration_without_one_needs_none() {
+        // Without a classifier section, nothing about a timeout is asked for.
+        let plain = config(json!({"enabled": true, "fallback_route": "General",
+            "rules": [{"name": "tools", "when": {"requires_tools": true}, "route": "Coder"}]}));
+        assert!(plain.auto.unwrap().classifier.is_none());
+
+        // With one — invoked or not — the timeout must be written down.
+        let without = |rules: Value| {
+            errors(json!({"enabled": true, "fallback_route": "General",
+                "classifier": {"route": "RouterClassifier", "routes": ["General", "Coder"]},
+                "rules": rules}))
+        };
+        for rules in [
+            json!([{"name": "semantic", "when": {}, "classify": true}]),
+            json!([{"name": "tools", "when": {"requires_tools": true}, "route": "Coder"}]),
+        ] {
+            let found = without(rules);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains("timeout_ms is required"), "{found:?}");
+            assert!(found[0].contains("between 1 and 120000"), "{found:?}");
+        }
+
+        // Bounded at both ends; never unlimited.
+        for timeout in [0, MAX_TIMEOUT_MS + 1] {
+            let found = errors(json!({"enabled": true, "fallback_route": "General",
+                "classifier": {"route": "RouterClassifier", "routes": ["General"],
+                               "timeout_ms": timeout},
+                "rules": [{"name": "semantic", "when": {}, "classify": true}]}));
+            assert!(
+                found[0].contains("timeout_ms must be between 1 and 120000"),
+                "{found:?}"
+            );
+        }
+        for timeout in [1, 1_500, MAX_TIMEOUT_MS] {
+            let auto = config(json!({"enabled": true, "fallback_route": "General",
+                "classifier": {"route": "RouterClassifier", "routes": ["General"],
+                               "timeout_ms": timeout},
+                "rules": [{"name": "semantic", "when": {}, "classify": true}]}))
+            .auto
+            .unwrap();
+            assert_eq!(
+                auto.classifier.unwrap().timeout,
+                Duration::from_millis(timeout)
+            );
+        }
+        let negative: Result<RouterFile, _> = serde_json::from_value(json!({
+            "nodes": [], "routes": [], "auto_route": {"fallback_route": "G",
+                "classifier": {"route": "C", "routes": ["G"], "timeout_ms": -1}}}));
+        assert!(negative.is_err());
     }
 
     #[test]

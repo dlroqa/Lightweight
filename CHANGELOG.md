@@ -16,7 +16,7 @@ All notable changes to this project are documented in this file.
   - It is sent the candidates, optional `routes[].description`s, the request's
     structural traits and the last user message cut to `max_input_chars`
     (default 2000) — no history, system prompt or tool schemas.
-  - Below `min_confidence` (default 0.65), past `timeout_ms` (default 1500),
+  - Below `min_confidence` (default 0.65), past `timeout_ms` (required, 1–120 000 ms: no single default suits CPU, GPU and remote classifiers),
     unavailable, or invalid, the request goes to the classifier's
     `fallback_route` (default: Auto's). `Auto` never fails because the
     classifier did, and classification can never recurse.

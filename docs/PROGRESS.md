@@ -1854,8 +1854,14 @@ Research with descriptions; `min_confidence 0.5`, `timeout_ms 120000`; rules
 
 `routing_ms` stayed 0.26–0.37 ms throughout. Node C's log has only the five
 `-classify` ids; A has the General/Research requests, B the Coder ones. On
-this box classification costs 13–44 s, so the 1.5 s default would make every
-classification time out and fall back — documented. **Unmodified Lightagent
+this box classification costs 13–44 s, so the original 1.5 s default would
+have made every classification time out and fall back. **Hardening:**
+`timeout_ms` is now required whenever a classifier section exists (still
+bounded 1–120 000 ms, never unlimited); configurations without a classifier
+need nothing. A test proves a timeout cancels the classification upstream
+(the scripted classifier never finishes its answer, the nested trace reads
+`cancelled`) and the request continues at the fallback with `routing_ms`
+unaffected. **Unmodified Lightagent
 `7d95232`** (scratch profile model `Auto`) listed `General, Coder, Research,
 RouterClassifier, Auto`; both of its turns declared its tool set, and "Hi
 there! How is your day going?" resolved to `General` (0.9) while "Write a Rust
