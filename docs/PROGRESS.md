@@ -2427,3 +2427,82 @@ PR #42 was merged as `41d0750` (head `4f26ee7`, docs only: `PROGRESS.md`,
 - `router_requests_total` counts once per request.
 
 Implementation proceeds on `feature/router-cross-route-fallback`.
+
+## Router cross-route fallback, R9.3.1 (feature/router-cross-route-fallback)
+
+Branched from validated, design-frozen master `41d0750`. It implements the
+frozen R9.3.1 definition with no deviation. R9.4 is not started.
+
+- **Configuration** (`fallback.rs`): `auto_route.cross_route_fallback`, a
+  map from route to a flat ordered list. Refused at load:
+  - unknown, `Auto`, `default`, reserved, empty or classifier-route sources
+    and targets;
+  - a source `Auto` can never resolve to;
+  - an empty list, or more than `MAX_FALLBACK_ROUTES` = 3 entries (a
+    constant);
+  - a self-reference, or a duplicate (compared ignoring case);
+  - a cycle anywhere in the union of lists (DFS). The graph is validated,
+    never traversed.
+- **Refactor** (`proxy.rs`): the per-route part of `route_request` moved
+  verbatim into `attempt_route`. Its uncommitted exits return a
+  `RouteFailure` (the route's own error, outcome, observation and fallback
+  reason) that the caller concludes exactly as before. All 380 router tests
+  passed on the refactor alone, before any fallback logic existed.
+- **Fallback loop:**
+  - Only for an original `model: "Auto"` (never explicit, `default` or
+    nested requests). The initial route's list is copied once and frozen,
+    and a fallback route's own list is never read.
+  - `FallbackReason` has exactly three variants: `RouteUnavailable` (plan
+    refusal, or every attempt failed with no answer), `RouteExhausted`
+    (every planned deployment tried, ending on a 502/503/504 refusal, with
+    no context overflow on the way) and `RouteCapabilityMismatch`.
+  - A committed answer ends the request. A committed attempt consumes the
+    request's tracker, so a switch after commit cannot even be written.
+  - `Tracker::retarget` resets the per-route trace fields for the next
+    route and keeps the per-request ones.
+  - Each route left is observed in R9.2 history; `router_requests_total`
+    counts once, under the final route.
+- **Observability:** a `cross_route_fallback` trace block, `route` on each
+  deployment attempt, two metric families, `GET /auto` state, and two log
+  lines.
+- **Tests:** 8 configuration unit tests and 22 end-to-end
+  (`tests/cross_route_fallback.rs`), covering every case in the brief.
+- **Mutations:** 12 of 12 caught:
+
+  | # | Mutation | Tests failed |
+  |---|---|---|
+  | 1 | cycle detection removed | 1 |
+  | 2 | committed answers treated as route failures | 1 |
+  | 3 | fallback on the first deployment's 503 | 3 |
+  | 4 | explicit-route fallback | 1 |
+  | 5 | transitive lists | 4 |
+  | 6 | classifier re-run | 3 |
+  | 7 | a second scoring decision | 1 |
+  | 8 | list bound removed | 1 |
+  | 9 | 500 as a trigger | 1 |
+  | 10 | initial route's affinity reused | 1 |
+  | 11 | each route counted in `router_requests_total` | 2 |
+  | 12 | initial route reported as `model` | 10 |
+
+- **Real smoke** on the real `hermes router` binary (5 topologies, scripted
+  stdlib-Python nodes and classifier), all six passing:
+  - A: Auto → Coder (down) → General, `model: General`.
+  - B: Coder/A down, Coder/B healthy → `answer from CoderB`, no fallback.
+  - C: both Coder deployments refused 503 (each hit once) →
+    `route_exhausted` → General.
+  - D: an explicit Coder request got its own 503; General was not hit.
+  - E: a committed stream broke in-band (`upstream_stream_interrupted`) and
+    no second route was tried.
+  - F: with `Coder: [General, Reasoning]` and `General: [Research]`, Coder
+    then General (down) then Reasoning; Research was hit 0 times.
+
+  Each client request was counted once. A first smoke attempt raced: the
+  routers took their one-time probe before the Python nodes were listening,
+  and everything showed unavailable. The routers were restarted after the
+  nodes were up and the run repeated. Processes were stopped by PID.
+
+**Known limits** (documented): there is no shared end-to-end deadline
+(deferred), no explicit-route opt-in, no context-overflow trigger, and no UI.
+
+**Next:** review of this branch (not merged). A UI follow-up and any R9.3.x
+or R9.4 work need explicit approval.

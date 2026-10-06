@@ -6,6 +6,38 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router explicit cross-route fallback (R9.3.1).** An optional
+  `auto_route.cross_route_fallback` maps a route to an ordered list of at
+  most 3 other routes. If the route an `Auto` request resolved to cannot
+  execute, the next listed route is tried, before anything is committed and
+  only after the route's own deployment failover is exhausted.
+  - **Triggers:** `route_unavailable`, `route_exhausted` (every planned
+    deployment refused 502/503/504 before answering) and
+    `route_capability_mismatch`. Never a 500, `context_length_exceeded`,
+    429/4xx, latency, quality, a post-commit stream failure, cancellation, a
+    classifier failure or anything from R9.2.
+  - **Scope:** `Auto` requests only, whether the route came from an R8 rule,
+    R9.1, R9.2 or `fallback_route`. Explicit and `default` requests never
+    fall back.
+  - **Behaviour:** the initial route's list is read once and never
+    transitive, with at most four route attempts. Each fallback route runs
+    the normal pipeline with the original requirements (R5 never weakened)
+    and its own affinity. There is no reclassification, re-scoring, history,
+    latency or placement action.
+  - **Responses:** `model` names the serving route; an exhausted list returns
+    the final attempted route's own error; one request id throughout;
+    `router_requests_total` counts once.
+  - **Validation at load:** unknown, reserved, `Auto`, classifier, empty,
+    duplicate and self-referencing entries, lists over 3, unreachable
+    sources, and cycles anywhere in the lists.
+  - **Observability:** a `cross_route_fallback` trace block, a `route` on
+    each deployment attempt,
+    `router_cross_route_fallback_total{from_route,to_route,reason}`,
+    `router_cross_route_fallback_exhausted_total{route,reason}`, and
+    `cross_route_fallback` in `GET /api/router/v1/auto`.
+  - **Not in this slice:** no shared end-to-end deadline, no explicit-route
+    opt-in, no UI.
+
 - **Router adaptive logical-route scoring (R9.2, slice 1).** An optional
   `auto_route.adaptive_scoring` section, off by default. It ranks **logical
   routes only, never deployments**.

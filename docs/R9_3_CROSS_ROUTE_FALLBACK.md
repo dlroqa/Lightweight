@@ -1,11 +1,14 @@
 # R9.3 — Explicit cross-route fallback (design)
 
-Status: **design final (approved decisions incorporated); R9.3.1 is the
-first implementation slice.** At the time of writing nothing here is
-implemented on `master` (`ef4f868`). R9.1, R9.1a, the classifier UI and R9.2
-slice 1 are merged and frozen; this design builds on them without changing
-them. **Section 0 holds the approved decisions; where any later text
-differs, section 0 wins.**
+Status: **design final and frozen; R9.3.1 implemented** on
+`feature/router-cross-route-fallback` (`crates/lightweight-router/src/fallback.rs`,
+and the route-attempt loop in `proxy.rs`). The operator documentation is
+[ROUTER.md, Cross-route fallback](ROUTER.md#cross-route-fallback-r931).
+**Section 0 holds the approved decisions; where any later text differs,
+section 0 wins.** The implementation follows section 30 without deviation.
+Its trace attempt outcomes are `committed` and `failed`. A failed attempt
+carries one of the three reasons, or `context_length_exceeded` when a
+fallback route stops the chain that way.
 
 The rules everything below obeys:
 
