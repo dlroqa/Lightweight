@@ -491,6 +491,8 @@ pub enum ConfigError {
     BadAutoRule { rule: String, problem: String },
     #[error("auto_route.classifier: {problem}")]
     BadAutoClassifier { problem: String },
+    #[error("auto_route.adaptive_scoring: {problem}")]
+    BadAdaptiveScoring { problem: String },
     #[error("route {route:?}: {problem}")]
     BadRouteDescription { route: String, problem: String },
 }
