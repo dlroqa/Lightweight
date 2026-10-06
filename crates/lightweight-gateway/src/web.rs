@@ -38,7 +38,15 @@ pub async fn serve(State(state): State<Arc<GatewayState>>, uri: Uri) -> Response
         // client sees when it gets a path wrong.
         return StatusCode::NOT_FOUND.into_response();
     };
+    serve_root(root, &uri).await
+}
 
+/// Serve a file from `root`, by the same rules the gateway's panel follows.
+///
+/// Public so the router (`hermes router --web-root`) can serve the same panel
+/// bundle from its own origin with exactly this path whitelist, cache policy
+/// and deep-link behaviour, rather than a second copy of them.
+pub async fn serve_root(root: &Path, uri: &Uri) -> Response {
     let requested = uri.path();
     match resolve(root, requested) {
         // A real file: send it.

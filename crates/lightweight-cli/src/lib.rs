@@ -320,6 +320,14 @@ enum Command {
         /// Repeatable.
         #[arg(long, value_name = "HOST:PORT")]
         listen: Vec<String>,
+        /// Serve the control panel's built files at `/`.
+        ///
+        /// The same bundle `hermes serve --web-root` serves. From the router's
+        /// own origin it shows the router's screens (Auto routing and the
+        /// classifier) against `/api/router/v1`, with no cross-origin policy.
+        /// Without this, `/` is a 404 and the API is unchanged.
+        #[arg(long, value_name = "DIR")]
+        web_root: Option<PathBuf>,
     },
     /// Update lightweight to the latest release.
     Update {
@@ -834,7 +842,8 @@ fn run(
             action: None,
             config,
             listen,
-        } => router::run(config.clone(), listen),
+            web_root,
+        } => router::run(config.clone(), listen, web_root.clone()),
         Command::Update { check, force } => {
             let invoker = personality.update_cli();
             runtime()?.block_on(release_update::run(

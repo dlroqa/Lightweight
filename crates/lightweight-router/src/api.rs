@@ -11,13 +11,14 @@
 //!   key, a session id (only a keyed fingerprint) or any request content.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use lightweight_api::capabilities::{PROTOCOL_NAME, PROTOCOL_VERSION};
@@ -35,6 +36,31 @@ use crate::select::RouteSummary as RouteView;
 pub const OWNED_BY: &str = "lightweight-router";
 
 pub fn app(state: Arc<RouterState>) -> Router {
+    app_with_panel(state, None)
+}
+
+/// The router's HTTP surface, optionally also serving the control panel's
+/// built files from `web_root` (`hermes router --web-root`).
+///
+/// The panel is served for the same reason the gateway serves it: the page
+/// and the API it calls then share an origin, so no cross-origin policy is
+/// ever written. Every endpoint is matched first, the panel's files need no
+/// credential (they carry none), and the API keeps its own: an unknown path
+/// under `/api` or `/v1` still gets this router's JSON `not_found`, never the
+/// panel's document. Without a web root nothing here changes.
+pub fn app_with_panel(state: Arc<RouterState>, web_root: Option<PathBuf>) -> Router {
+    let web_root = web_root.map(Arc::new);
+    let fallback = move |uri: Uri| {
+        let web_root = web_root.clone();
+        async move {
+            match web_root {
+                Some(root) if !is_api_path(uri.path()) => {
+                    lightweight_gateway::web::serve_root(&root, &uri).await
+                }
+                _ => not_found().await,
+            }
+        }
+    };
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -53,8 +79,16 @@ pub fn app(state: Arc<RouterState>) -> Router {
         .route("/api/router/v1/classifier/check", post(classifier_check))
         .route("/api/router/v1/placement", get(placement))
         .route("/api/router/v1/placement/reconcile", post(reconcile))
-        .fallback(not_found)
+        .fallback(fallback)
         .with_state(state)
+}
+
+/// A path that belongs to an API surface, where a missing endpoint must be a
+/// JSON error and never the panel's document.
+fn is_api_path(path: &str) -> bool {
+    ["/api", "/v1"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 /// Check the client's credential against the router's own policy.
@@ -643,6 +677,9 @@ async fn routes(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Re
                 .collect();
             json!({
                 "name": route.name.as_str(),
+                // What a classifier is told the route is for; `null` when the
+                // file gives none.
+                "description": route.description,
                 "strategy": route.policy.as_str(),
                 "available": view(&state, route, &health).available,
                 "deployments": deployments,
