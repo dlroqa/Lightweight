@@ -70,6 +70,7 @@ use crate::domain::{
     CapabilityGap, DeploymentId, Node, Route, RouteName, RoutingFailure, RoutingReason,
 };
 use crate::error::{json_error, routing_failure, server_error};
+use crate::fallback::{FallbackAttemptTrace, FallbackReason, FallbackTrace};
 use crate::health::{Outcome as Probe, describe_transport};
 use crate::load::Lease;
 use crate::metrics::{ActiveGuard, Outcome, UNKNOWN_ROUTE};
@@ -203,20 +204,16 @@ impl Tracker {
         ) {
             metrics.observe_estimate(self.route.as_str(), estimated, actual);
         }
-        // Route history (R9.2) learns from the final outcome, here and only
-        // here: a stream counts once it has ended, not when its head arrived.
-        if !self.nested {
-            let observation = self
-                .observation
-                .unwrap_or_else(|| Observation::of_outcome(outcome));
-            if self
-                .state
-                .route_history
-                .observe(&self.route, observation, Instant::now())
-            {
-                metrics.record_route_history(self.route.as_str(), observation.as_str());
-            }
-        }
+        // Route history (R9.2) learns from the final outcome, here: a stream
+        // counts once it has ended, not when its head arrived. (A route an
+        // `Auto` request fell back from is observed when it is left.)
+        observe_route(
+            &self.state,
+            &self.route,
+            self.observation
+                .unwrap_or_else(|| Observation::of_outcome(outcome)),
+            self.nested,
+        );
         let trace = &mut self.trace;
         trace.duration_ms = millis(elapsed);
         trace.status = status;
@@ -243,6 +240,46 @@ impl Tracker {
             "request finished"
         );
         self.state.traces.push(trace.clone());
+    }
+}
+
+impl Tracker {
+    /// Point the request at the next route of its fallback plan: what the
+    /// trace says about one route — its deployments, plan, session, selection
+    /// — starts over; what it says about the request — its id, timings so
+    /// far, classification, scoring, every deployment attempt — is kept.
+    fn retarget(&mut self, route: &Route) {
+        self.route = route.name.clone();
+        self.policy = route.policy.as_str();
+        self.observation = None;
+        let trace = &mut self.trace;
+        trace.route = route.name.to_string();
+        trace.policy = self.policy;
+        trace.session = None;
+        trace.deployments = route.deployments.len();
+        trace.available = 0;
+        trace.capable = 0;
+        trace.unavailable.clear();
+        trace.unfit.clear();
+        trace.selected = None;
+        trace.selection_reason = None;
+        trace.final_deployment = None;
+        trace.context_overflow = None;
+        trace.routing_ms = 0.0;
+    }
+}
+
+/// Record one route's observation in route history (R9.2: observational only)
+/// — never for the router's own classification requests.
+fn observe_route(state: &RouterState, route: &RouteName, observation: Observation, nested: bool) {
+    if !nested
+        && state
+            .route_history
+            .observe(route, observation, Instant::now())
+    {
+        state
+            .metrics
+            .record_route_history(route.as_str(), observation.as_str());
     }
 }
 
@@ -523,6 +560,15 @@ async fn route_request(
         received,
         nested,
     );
+    // R9.3.1: the routes an `Auto` request may move to if its initial route
+    // cannot execute — read once, here, from the initial route's own list,
+    // and frozen for the request. A fallback route's own list is never read.
+    // Only for a client that asked for `Auto`: a named route is that route or
+    // its error. Never for the router's own classification requests.
+    let fallback_plan: Vec<RouteName> = match (&auto_rule, state.auto.as_ref()) {
+        (Some(_), Some(auto)) if !nested => auto.cross_route_fallback.chain(&route.name).to_vec(),
+        _ => Vec::new(),
+    };
     if let Some(rule) = auto_rule {
         tracker.trace.requested_route = AUTO_ROUTE.to_owned();
         tracker.trace.auto_fallback = rule.is_none();
@@ -592,6 +638,207 @@ async fn route_request(
     };
     tracker.trace.estimated_prompt_tokens = needs.prompt_tokens;
 
+    // One route attempt at a time: the route's own pipeline, start to finish,
+    // same-route failover included. Only an uncommitted failure for one of
+    // the three fallback reasons may move the request to the next route of
+    // the frozen plan; anything committed, and anything else, ends it here.
+    let initial = route;
+    let mut route = route;
+    let mut active = Some(active);
+    let mut remaining = fallback_plan.iter();
+    let mut hops: Vec<FallbackAttemptTrace> = Vec::new();
+    loop {
+        let failure = match attempt_route(
+            state,
+            endpoint,
+            headers,
+            &mut request,
+            request_id,
+            route,
+            &needs,
+            tracker,
+            active,
+            planning_started,
+        )
+        .await
+        {
+            RouteEnd::Committed(response) => return response,
+            RouteEnd::Failed(failure) => *failure,
+        };
+        let next = failure
+            .reason
+            .and_then(|_| remaining.next())
+            .and_then(|name| state.topology.route(name));
+        let (Some(reason), Some(next)) = (failure.reason, next) else {
+            return conclude_chain(state, request_id, initial, hops, failure);
+        };
+
+        // The failed route's own observation, as a final request's would be
+        // recorded; the request itself is counted once, at the end.
+        observe_route(
+            state,
+            &failure.route,
+            failure
+                .observation
+                .unwrap_or_else(|| Observation::of_outcome(failure.outcome.as_str())),
+            nested,
+        );
+        state.metrics.record_cross_route_fallback(
+            failure.route.as_str(),
+            next.name.as_str(),
+            reason.as_str(),
+        );
+        tracing::info!(
+            target: targets::ROUTER,
+            request_id,
+            initial_route = %initial.name,
+            from_route = %failure.route,
+            to_route = %next.name,
+            reason = reason.as_str(),
+            attempt = hops.len() + 2,
+            "cross-route fallback"
+        );
+        hops.push(FallbackAttemptTrace {
+            route: failure.route.to_string(),
+            outcome: "failed",
+            reason: Some(reason.as_str()),
+        });
+        tracker = failure.tracker;
+        active = failure.active;
+        tracker.retarget(next);
+        // Provisional: correct if this route commits, replaced if it fails.
+        let mut attempts = hops.clone();
+        attempts.push(FallbackAttemptTrace {
+            route: next.name.to_string(),
+            outcome: "committed",
+            reason: None,
+        });
+        tracker.trace.cross_route_fallback = Some(FallbackTrace {
+            initial_route: initial.name.to_string(),
+            final_route: next.name.to_string(),
+            exhausted: false,
+            attempts,
+        });
+        route = next;
+        planning_started = Instant::now();
+    }
+}
+
+/// Answer an `Auto` request whose last route attempt committed nothing, with
+/// that route's own error. If the request had moved to fallback routes, the
+/// trace and metrics say how the chain ended.
+fn conclude_chain(
+    state: &Arc<RouterState>,
+    request_id: &str,
+    initial: &Route,
+    mut hops: Vec<FallbackAttemptTrace>,
+    mut failure: RouteFailure,
+) -> Response {
+    if !hops.is_empty() {
+        // Ended for a fallback reason with the plan used up: exhausted. Ended
+        // any other way (a context overflow): the chain stopped there.
+        let exhausted = failure.reason.is_some();
+        let reason = failure.reason.map(FallbackReason::as_str).or_else(|| {
+            failure
+                .tracker
+                .trace
+                .context_overflow
+                .is_some()
+                .then_some("context_length_exceeded")
+        });
+        hops.push(FallbackAttemptTrace {
+            route: failure.route.to_string(),
+            outcome: "failed",
+            reason,
+        });
+        if let (true, Some(last)) = (exhausted, failure.reason) {
+            state
+                .metrics
+                .record_cross_route_exhausted(initial.name.as_str(), last.as_str());
+        }
+        tracing::info!(
+            target: targets::ROUTER,
+            request_id,
+            initial_route = %initial.name,
+            final_route = %failure.route,
+            exhausted,
+            route_attempts = hops.len(),
+            "cross-route fallback ended without an answer"
+        );
+        failure.tracker.trace.cross_route_fallback = Some(FallbackTrace {
+            initial_route: initial.name.to_string(),
+            final_route: failure.route.to_string(),
+            exhausted,
+            attempts: hops,
+        });
+    }
+    failure.conclude(state)
+}
+
+/// How one logical-route attempt ended.
+enum RouteEnd {
+    /// A deployment answered and the response was committed — whatever its
+    /// status. Nothing after this can change the route.
+    Committed(Response),
+    /// Nothing was committed: the route's own error, not yet sent. Boxed, as
+    /// refusals are: it is the rare path.
+    Failed(Box<RouteFailure>),
+}
+
+/// A route attempt that committed nothing, with everything needed either to
+/// answer the client with the route's own error or to try another route.
+struct RouteFailure {
+    /// The route's own error, exactly as the client would get it.
+    response: Response,
+    /// How `router_requests_total` and the trace count it, if it is final.
+    outcome: Outcome,
+    /// What route history observes for it, when the outcome does not say.
+    observation: Option<Observation>,
+    /// The cross-route fallback reason this is, if it is one of the three.
+    reason: Option<FallbackReason>,
+    /// The route that failed.
+    route: RouteName,
+    tracker: Tracker,
+    active: Option<ActiveGuard>,
+}
+
+impl RouteFailure {
+    /// Answer the client with the route's own error, counting the request
+    /// once, under this route.
+    fn conclude(self, state: &RouterState) -> Response {
+        let Self {
+            response,
+            outcome,
+            observation,
+            route,
+            mut tracker,
+            ..
+        } = self;
+        state.metrics.record_request(route.as_str(), outcome);
+        tracker.observation = observation;
+        tracker.finish(Some(response.status().as_u16()), outcome.as_str());
+        response
+    }
+}
+
+/// One attempt at one logical route: the session's affinity for this route,
+/// the plan (health, R5 capability filtering, policy), and every deployment
+/// in it with the existing pre-response failover. A committed answer is
+/// relayed from here; anything else is handed back uncommitted.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn attempt_route(
+    state: &Arc<RouterState>,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    request: &mut serde_json::Map<String, Value>,
+    request_id: &str,
+    route: &Route,
+    needs: &RequestRequirements,
+    mut tracker: Tracker,
+    mut active: Option<ActiveGuard>,
+    planning_started: Instant,
+) -> RouteEnd {
+    let policy = route.policy.as_str();
     // The session, if the client named one and affinity is on, and the
     // deployment it last succeeded on, if that has not expired. Only ever a
     // preference: the selector checks it against health and this request's
@@ -621,7 +868,7 @@ async fn route_request(
         route,
         &state.health.snapshot(),
         &observed,
-        &needs,
+        needs,
         sticky.as_ref(),
     ) {
         Ok(plan) => plan,
@@ -654,17 +901,16 @@ async fn route_request(
                 state
                     .metrics
                     .record_capability_mismatch(route.name.as_str());
-                // Fit, not route quality: observed, never scored.
-                tracker.observation = Some(Observation::CapabilityMismatch);
-                state
-                    .metrics
-                    .record_request(route.name.as_str(), Outcome::ClientError);
-                let response = routing_failure(&failure, state.policy.interval);
-                tracker.finish(
-                    Some(response.status().as_u16()),
-                    Outcome::ClientError.as_str(),
-                );
-                return response;
+                return RouteEnd::Failed(Box::new(RouteFailure {
+                    response: routing_failure(&failure, state.policy.interval),
+                    outcome: Outcome::ClientError,
+                    // Fit, not route quality: observed, never scored.
+                    observation: Some(Observation::CapabilityMismatch),
+                    reason: Some(FallbackReason::RouteCapabilityMismatch),
+                    route: route.name.clone(),
+                    tracker,
+                    active,
+                }));
             }
             tracing::warn!(
                 target: targets::ROUTER,
@@ -673,15 +919,16 @@ async fn route_request(
                 error = failure_code(&failure),
                 "no deployment is available"
             );
-            state
-                .metrics
-                .record_request(route.name.as_str(), Outcome::Unavailable);
-            let response = routing_failure(&failure, state.policy.interval);
-            tracker.finish(
-                Some(response.status().as_u16()),
-                Outcome::Unavailable.as_str(),
-            );
-            return response;
+            return RouteEnd::Failed(Box::new(RouteFailure {
+                response: routing_failure(&failure, state.policy.interval),
+                outcome: Outcome::Unavailable,
+                observation: None,
+                reason: matches!(failure, RoutingFailure::RouteUnavailable { .. })
+                    .then_some(FallbackReason::RouteUnavailable),
+                route: route.name.clone(),
+                tracker,
+                active,
+            }));
         }
     };
     record_unfit(state, request_id, &route.name, &plan.unfit);
@@ -750,7 +997,6 @@ async fn route_request(
         } => (None, None, Some(active_before), concurrency_limit),
     };
 
-    let mut active = Some(active);
     let mut reservation = plan.reservation.take();
     let mut last_refusal = None;
     // After a `context_length_exceeded`, the largest context known to be too
@@ -815,9 +1061,10 @@ async fn route_request(
         attempts_made += 1;
         let rest = &plan.candidates[attempt + 1..];
         let is_sticky = attempt == 0 && plan.sticky == Some(Sticky::Hit);
-        let (outcome, sent) = attempt_one(&context, &request).await;
+        let (outcome, sent) = attempt_one(&context, request).await;
         let mut record = |outcome: &'static str| {
             tracker.trace.attempts.push(AttemptTrace {
+                route: route.name.to_string(),
                 deployment: candidate.deployment.to_string(),
                 reason: decision.reason.as_str(),
                 outcome,
@@ -961,7 +1208,7 @@ async fn route_request(
                     status: status.as_u16(),
                     upstream_done: false,
                 };
-                return commit(response, &route.name, held).await;
+                return RouteEnd::Committed(commit(response, &route.name, held).await);
             }
         }
     }
@@ -977,21 +1224,28 @@ async fn route_request(
                 failover_count = tried,
                 "every deployment refused; returning the last refusal"
             );
-            let outcome = Outcome::of_status(refusal.status.as_u16());
-            state.metrics.record_request(route.name.as_str(), outcome);
             // Every deployment turned the request away before answering with a
             // 502, 503 or 504 (none ran it): to route history that is the route
             // having nothing ready, like `route_unavailable`, not a wrong route.
-            if matches!(
+            let unready = matches!(
                 refusal.status,
                 StatusCode::BAD_GATEWAY
                     | StatusCode::SERVICE_UNAVAILABLE
                     | StatusCode::GATEWAY_TIMEOUT
-            ) {
-                tracker.observation = Some(Observation::Unavailable);
-            }
-            tracker.finish(Some(refusal.status.as_u16()), outcome.as_str());
-            refusal_response(refusal)
+            );
+            // `route_exhausted`: the plan was walked to its end and the route
+            // ended on such a refusal. A context overflow on the way makes it
+            // context-dependent, which R9.3.1 leaves alone.
+            let exhausted = unready && tracker.trace.context_overflow.is_none();
+            RouteEnd::Failed(Box::new(RouteFailure {
+                outcome: Outcome::of_status(refusal.status.as_u16()),
+                observation: unready.then_some(Observation::Unavailable),
+                reason: exhausted.then_some(FallbackReason::RouteExhausted),
+                response: refusal_response(refusal),
+                route: route.name.clone(),
+                tracker,
+                active,
+            }))
         }
         None => {
             tracing::warn!(
@@ -1001,20 +1255,20 @@ async fn route_request(
                 failover_count = tried,
                 "every deployment failed before answering"
             );
-            state
-                .metrics
-                .record_request(route.name.as_str(), Outcome::Unavailable);
-            let response = routing_failure(
-                &RoutingFailure::RouteUnavailable {
-                    route: route.name.clone(),
-                },
-                state.policy.interval,
-            );
-            tracker.finish(
-                Some(response.status().as_u16()),
-                Outcome::Unavailable.as_str(),
-            );
-            response
+            RouteEnd::Failed(Box::new(RouteFailure {
+                response: routing_failure(
+                    &RoutingFailure::RouteUnavailable {
+                        route: route.name.clone(),
+                    },
+                    state.policy.interval,
+                ),
+                outcome: Outcome::Unavailable,
+                observation: None,
+                reason: Some(FallbackReason::RouteUnavailable),
+                route: route.name.clone(),
+                tracker,
+                active,
+            }))
         }
     }
 }

@@ -534,6 +534,20 @@ async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -
         // Adaptive route scoring (R9.2): its settings, and each route's
         // history as numbers. Never a request, session, deployment or node.
         "adaptive_scoring": adaptive_scoring_view(&state, auto),
+        // Explicit cross-route fallback (R9.3.1): the lists, the bound, the
+        // reasons that can trigger it, and what it has done.
+        "cross_route_fallback": {
+            "configured": !auto.cross_route_fallback.chains().is_empty(),
+            "chains": auto.cross_route_fallback.view(),
+            "max_routes": crate::fallback::MAX_FALLBACK_ROUTES,
+            "triggers": crate::fallback::FallbackReason::ALL
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>(),
+            "applies_to": "auto",
+            "counts": state.metrics.cross_route_fallback_counts(),
+            "exhausted": state.metrics.cross_route_exhausted_counts(),
+        },
     }))
     .into_response()
 }
