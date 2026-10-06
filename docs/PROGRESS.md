@@ -2319,3 +2319,85 @@ routes at all.
   Linux ran 1298 workspace tests (from 1293) with 0 failed; Windows ran
   1268, and macOS x64 and arm64 1273 each (platform-gated tests). The
   contract suite was 47 passed, 2 skipped.
+
+### R9.2 slice 1 MERGED and FROZEN
+
+PR #41 was merged as `ef4f868` (reviewed head `f3d16aa`, merge commit, head
+pinned; the tree is identical to the reviewed head). PR #40, design only, was
+closed as superseded: its design commit is in #41.
+
+Master was validated:
+- local `check.sh` green, with 1298 workspace tests and contract 47/2;
+- Actions check run 37470607756 (Linux x64, Windows x64, macOS x64, macOS
+  arm64, Flatpak, Linux artifacts, render icons) and render panel run
+  37470607758, all green;
+- no release workflow ran.
+
+Master smoke on the real `hermes router` binary passed all seven checks:
+1. `weights.history: 0.01` was refused with the observational-history error.
+2. `0` was accepted.
+3. A borderline sweep gave General below 0.75 and Coder from 0.76.
+4. The same winners held with General at 120 successes and Coder at 5, and
+   with that popularity reversed.
+5. Coder at 0.40, 0.60 and 0.649 stayed rejected (`below_threshold`, no
+   candidates), despite a maximum Coder prior and 150 Coder successes.
+6. The admin view showed `history_mode: observational`,
+   `history_affects_scoring: false` and `weights.history: 0`, with the
+   observations visible.
+7. Reset of one route and of all routes worked and needed the key (401
+   without it). Routes, sessions, placement and the `Auto` configuration
+   were byte-identical before and after (hashes compared), and the Coder
+   session's affinity survived.
+
+**Frozen definition:** the R9.1 classifier result feeds the classifier
+signal plus a bounded operator prior, which choose the logical-route winner.
+Route history is observational telemetry only: `weights.history` must be 0,
+and a below-threshold verdict is never resurrected. Any change to R9.2 now
+needs explicit approval. R9.3 is at the design stage only.
+
+## Router cross-route fallback, R9.3 (DESIGN ONLY: docs/r9.3-cross-route-fallback-design)
+
+`docs/R9_3_CROSS_ROUTE_FALLBACK.md`. There is no code, configuration,
+metric, trace field or UI. The facts were read from `master` (`ef4f868`):
+
+- **Qualifying outcomes are all uncommitted terminal paths of
+  `route_request`:** plan-time `RouteUnavailable`, plan-time
+  `CapabilityMismatch`, every attempt failing without an answer
+  (`route_unavailable`), and every deployment refusing with 502/503/504 (the
+  last node's refusal is returned).
+- **Commit is the response head** (`Attempt::Committed`), for streams and
+  bodies alike.
+- **No request deadline exists**: there is only `connect_timeout` (5 s).
+- **Nodes never execute tools**: the only `Command::new` is the engine
+  supervisor. So side-effect commit cannot precede response commit.
+- **Affinity is keyed by route and session.**
+
+**Recommended first slice** (`feature/router-cross-route-fallback`):
+- `auto_route.cross_route_fallback`: flat, ordered, non-transitive lists,
+  at most 3 entries;
+- `Auto`-resolved requests only; never explicit, `default` or nested;
+- triggers `route_unavailable`, `route_exhausted` and
+  `route_capability_mismatch`, only after same-route failover;
+- configuration order only, with no reclassification, re-scoring, history,
+  latency, 500 or mid-stream trigger;
+- the response names the serving route, and the trace keeps the initial and
+  final routes.
+
+**Final design (approved decisions, section 0 of the doc):**
+1. keep `route_exhausted` as a distinct reason;
+2. R8 rule routes under `Auto` are eligible, with R5 requirements never
+   weakened;
+3. an exhausted chain returns the final attempted route's existing error;
+4. context overflow is deferred, with no fallback;
+5. one shared list per route;
+6. no shared deadline: deferred, and the latency risk is documented;
+7. `router_requests_total` counts once per request;
+8. explicit routes never fall back;
+9. side-effect safety is a hard future constraint;
+10. the list is selected once and non-transitive (validate the graph, never
+    traverse it);
+11. `MAX_FALLBACK_ROUTES = 3`, fixed;
+12. `model` names the final serving route.
+
+The remaining questions are marked DEFERRED. R9.3.1 is the implementation
+slice.
