@@ -2309,6 +2309,13 @@ routes at all.
   - The traces showed `history_signal 0` and totals 0.95 against 0.75; the
     admin view showed the counts with `history_affects_scoring: false`.
   - The processes were stopped by PID.
-- **Validation:** local fmt, clippy and the router and CLI tests; build,
-  render and the full `check.sh` on GitHub Actions (the user's instruction),
-  runs recorded below.
+- **Validation:** locally, fmt, workspace clippy and the router and CLI
+  tests. Build, render and the full `check.sh` ran on GitHub Actions, per the
+  user's instruction, against `f670109`, and were green:
+  - check run 37460150610: Linux x64, Windows x64, macOS x64, macOS arm64,
+    Flatpak, Linux artifacts and render icons;
+  - render panel run 37460150606.
+
+  Linux ran 1298 workspace tests (from 1293) with 0 failed; Windows ran
+  1268, and macOS x64 and arm64 1273 each (platform-gated tests). The
+  contract suite was 47 passed, 2 skipped.
