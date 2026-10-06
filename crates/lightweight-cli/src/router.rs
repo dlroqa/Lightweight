@@ -79,7 +79,11 @@ fn summarize(config: &RouterConfig, out: &mut String) {
 }
 
 /// `hermes router`: validate, bind, and serve until interrupted.
-pub fn run(config: Option<PathBuf>, listen: &[String]) -> Result<ExitCode, String> {
+pub fn run(
+    config: Option<PathBuf>,
+    listen: &[String],
+    web_root: Option<PathBuf>,
+) -> Result<ExitCode, String> {
     let (path, mut config) = load(config)?;
     if !listen.is_empty() {
         config.listen = listen
@@ -108,7 +112,8 @@ pub fn run(config: Option<PathBuf>, listen: &[String]) -> Result<ExitCode, Strin
     runtime.block_on(async move {
         let bound = lightweight_router::bind(&config)
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| err.to_string())?
+            .with_web_root(web_root.clone());
         let state = bound.state();
 
         let mut summary = String::new();
@@ -119,6 +124,12 @@ pub fn run(config: Option<PathBuf>, listen: &[String]) -> Result<ExitCode, Strin
         ));
         for address in bound.addresses() {
             summary.push_str(&format!("  listen   http://{address}/v1\n"));
+        }
+        if let Some(root) = &web_root {
+            for address in bound.addresses() {
+                summary.push_str(&format!("  panel    http://{address}/\n"));
+            }
+            summary.push_str(&format!("  web root {}\n", root.display()));
         }
         summary.push_str(&format!(
             "  auth     {}\n",

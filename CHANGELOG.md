@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router panel: Auto Routing and Classifier screens.** `hermes router
+  --web-root <dir>` serves the control panel from the router's own origin
+  (no CORS); the panel detects a router via `GET /version` and shows its own
+  sections, leaving a gateway's panel unchanged.
+  - Auto Routing: rules in order, each reading *Route directly to …* or
+    *Semantic classification*, with decision counts; logical routes with
+    descriptions and availability.
+  - Classifier: provider status (active provider, API key *Configured* /
+    *Missing* by variable name only, last check / success / failure and kind,
+    outcomes) and **Test Connection** (`POST /api/router/v1/classifier/check`)
+    with every status in plain words; `model_not_listed` is a warning that a
+    pinned version may still be accepted, not "invalid model".
+  - A settings draft with a Lightweight / Jev provider selector and only the
+    chosen provider's fields, the Jev privacy notice, include-user-text with
+    what each setting sends, candidates, route descriptions and the fallback
+    route — checked by the router's own rules and turned into the canonical
+    `auto_route.classifier` section to paste (the router has no config write
+    API, so nothing is saved from the panel). The TypeSafe key never reaches
+    the browser.
+  - `GET /api/router/v1/routes` now includes each route's `description`.
+
 - **Router classifier providers and TypeSafe Jev (R9.1a).** The classifier an
   `Auto` rule invokes is now chosen by `classifier.provider`: `lightweight`
   (the default — a configured route, as in R9.1) or `jev`, TypeSafe AI's

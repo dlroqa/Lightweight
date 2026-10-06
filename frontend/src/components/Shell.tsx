@@ -12,6 +12,8 @@ import {
   Package,
   RotateCw,
   Settings as SettingsIcon,
+  Sparkles,
+  Split,
   Sliders,
   Sun,
 } from "lucide-react";
@@ -20,6 +22,7 @@ import { api } from "../api/client";
 import { bytes, percent } from "../api/format";
 import { usePoll } from "../hooks/usePoll";
 import { useUtilization } from "../hooks/useSeries";
+import { useBackend } from "../state/backend";
 import { usePreferences } from "../state/preferences";
 import { wasRead } from "../api/types";
 
@@ -36,6 +39,15 @@ const NAV = [
 ];
 
 /**
+ * A router's sections. It serves the same panel, but answers only the
+ * router's API, so only the screens that read it are offered.
+ */
+const ROUTER_NAV = [
+  { to: "/auto", label: "Auto Routing", icon: Split, end: false },
+  { to: "/classifier", label: "Classifier", icon: Sparkles, end: false },
+];
+
+/**
  * The frame every screen sits in: the rail on the left, the page on the right.
  *
  * The rail carries the machine's own state at the bottom, as the reference
@@ -45,10 +57,13 @@ const NAV = [
 export function Shell() {
   const { preferences, update } = usePreferences();
   const collapsed = preferences.railCollapsed;
+  const onRouter = useBackend() === "router";
+  const nav = onRouter ? ROUTER_NAV : NAV;
 
   // One poll for the whole rail. Two seconds rather than one: this is ambient
-  // context, and the screens that need a faster reading take their own.
-  const system = usePoll(api.system, 2000);
+  // context, and the screens that need a faster reading take their own. A
+  // router has no machine report to poll.
+  const system = usePoll(api.system, 2000, !onRouter);
   const times = wasRead(system.data?.cpu_times) ? system.data.cpu_times : null;
   const utilization = useUtilization(times);
   const memory = wasRead(system.data?.memory) ? system.data.memory : null;
@@ -73,13 +88,13 @@ export function Shell() {
           {!collapsed && (
             <span className="rail__name">
               <strong>Lightweight</strong>
-              <span>CPU Inference Gateway</span>
+              <span>{onRouter ? "Model Router" : "CPU Inference Gateway"}</span>
             </span>
           )}
         </div>
 
         <div className="rail__nav">
-          {NAV.map(({ to, label, icon: Icon, end }) => (
+          {nav.map(({ to, label, icon: Icon, end }) => (
             <NavLink
               key={to}
               to={to}
@@ -95,7 +110,19 @@ export function Shell() {
 
         <div className="rail__spacer" />
 
-        {!collapsed && (
+        {!collapsed && onRouter && (
+          <div className="railcard">
+            <span className="railcard__label">Router</span>
+            <span className="railcard__line">
+              Routes requests across your Lightweight gateways.
+            </span>
+            <span className="railcard__line">
+              Each gateway&apos;s own panel is at its own address.
+            </span>
+          </div>
+        )}
+
+        {!collapsed && !onRouter && (
           <div className="railcard">
             <span className="railcard__label">CPU Mode</span>
             <span

@@ -181,9 +181,18 @@ impl RouterState {
 pub struct BoundRouter {
     state: Arc<RouterState>,
     listeners: Vec<tokio::net::TcpListener>,
+    web_root: Option<std::path::PathBuf>,
 }
 
 impl BoundRouter {
+    /// Also serve the control panel's built files at `/` (see
+    /// [`api::app_with_panel`]). `None` serves no panel, as before.
+    #[must_use]
+    pub fn with_web_root(mut self, web_root: Option<std::path::PathBuf>) -> Self {
+        self.web_root = web_root;
+        self
+    }
+
     /// The addresses actually bound — with port 0, the ones the kernel chose.
     pub fn addresses(&self) -> Vec<SocketAddr> {
         self.listeners
@@ -291,7 +300,7 @@ impl BoundRouter {
 
         let mut servers = Vec::with_capacity(self.listeners.len());
         for listener in self.listeners {
-            let app = api::app(Arc::clone(&state));
+            let app = api::app_with_panel(Arc::clone(&state), self.web_root.clone());
             let stopping = stop.clone();
             servers.push(tokio::spawn(async move {
                 axum::serve(listener, app)
@@ -335,5 +344,9 @@ pub async fn bind(config: &RouterConfig) -> Result<BoundRouter, StartError> {
             })?;
         listeners.push(listener);
     }
-    Ok(BoundRouter { state, listeners })
+    Ok(BoundRouter {
+        state,
+        listeners,
+        web_root: None,
+    })
 }

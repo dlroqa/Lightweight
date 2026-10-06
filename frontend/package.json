@@ -6,7 +6,8 @@
   "description": "The Lightweight control panel: a browser SPA served by the gateway itself.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && npm run test && vite build",
+    "test": "node --experimental-strip-types --test src/screens/router/*.test.ts",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

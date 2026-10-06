@@ -1453,6 +1453,81 @@ should not be controlled should simply not be listed in any `allowed_nodes`.
 - **Shutdown:** stopping the router stops the controller and aborts its load
   tasks. The router starts no process of its own, so nothing is left behind.
 
+## The panel (`--web-root`)
+
+`hermes router --web-root <dir>` serves the control panel — the same bundle
+`hermes serve --web-root` serves, built by `npm run build` in `frontend/` — at
+the router's own address, for the same reason the gateway serves it: the page
+and the API it calls share an origin, so no cross-origin policy is ever
+written. Without the flag, `/` is a `404` and nothing changes.
+
+```sh
+export TYPESAFE_API_KEY="..."     # only when Jev is configured; never in a file or the panel
+hermes router --config router.json --web-root frontend/dist
+# open http://127.0.0.1:11500/
+```
+
+- The panel asks `GET /version` once; a `build` beginning `lightweight-router-`
+  means a router, and it shows the router's sections — **Auto Routing** and
+  **Classifier** — instead of the gateway's. A gateway's panel is unchanged.
+- The panel's files need no credential; every API path keeps the router's own.
+  An unknown path under `/api` or `/v1` is still the router's JSON
+  `not_found`, never the panel's document. A router with a client key
+  (`api_key_env`) refuses the panel's API reads with `401`, and the panel says
+  so rather than storing the key: serve it from a loopback-only router, or read
+  the API with `curl`.
+
+**Auto Routing** lists the rules in the order they are tried. Each rule's action
+reads either *Route directly to &lt;route&gt;* or *Semantic classification* (a rule
+written `"classify": true`), with its decision count, and the logical routes
+with their descriptions and availability.
+
+**Classifier** has three parts:
+
+- **Provider status** — the running provider, whether it is active, the API key
+  status (*Configured* or *Missing*, with the variable's name — never the
+  value), model and endpoint, which rules use it, last check, last success,
+  last failure and its kind, and outcome counts. **Test Connection** calls
+  `POST /api/router/v1/classifier/check` on the running router: for Jev, the
+  router lists TypeSafe's models with its key (no request text is sent); for the
+  Lightweight provider, it checks the classifier route is available. Every
+  status is shown in words — *Connected*, *API key missing*, *Authentication
+  failed*, *Provider rate limited the request*, *Provider error*, *Could not
+  reach the provider*, *Connection timed out*, *Unexpected response*.
+  `model_not_listed` reads *The configured model was not listed by the
+  provider's model discovery endpoint. Pinned versions may still be accepted.*
+  — TypeSafe lists aliases only, so it is a warning for a pinned version and
+  likely a typo for an alias, never "invalid model".
+- **Classifier settings**, a draft seeded from the running router: a
+  **Classifier Provider** choice (Lightweight / Jev / TypeSafe) and only the
+  chosen provider's fields. Lightweight: classifier route, timeout, minimum
+  confidence, maximum input characters. Jev: base URL, API key environment
+  variable and its status, model (free text — an alias or a pinned version;
+  `jev-latest` is only a suggestion), model discovery status from the last
+  check, timeout (required; 5000 ms is offered by a button as a starting point,
+  never filled in silently), minimum confidence, maximum input characters, and
+  **Include user message text in classifier request** with what each setting
+  sends. When Jev is chosen, a notice says that it is an external provider and
+  that, with user text included, bounded user-message content goes to the
+  configured TypeSafe endpoint. Then the shared **candidates** (logical routes
+  only — never `Auto`, a node, a deployment or a model file), each route's
+  **description** (one line, at most 200 characters), and the **fallback
+  route**, which every non-chosen outcome uses: `low_confidence`, `timeout`,
+  `auth_error`, `rate_limited`, `connection_error`, `provider_error`,
+  `unavailable`, `invalid`.
+- **Configuration to apply.** The router reads `router.json` once at start and
+  has no API that writes it, so the panel does not pretend to save. Every field
+  is checked as the router would check it (the router stays the authority); a
+  valid draft becomes the canonical `auto_route.classifier` section — `provider`
+  and one block per provider, never the R9.1 flat keys, never a key — plus any
+  changed route descriptions, to paste in, check with
+  `hermes router validate-config`, and load by restarting the router.
+
+Switching provider changes only that section: rules keep `"classify": true`.
+The TypeSafe key is set where the router runs (`export TYPESAFE_API_KEY=...`,
+or the variable `api_key_env` names) and never passes through the panel: it is
+not a field, not in any response the panel reads, and not in browser storage.
+
 ## The control API
 
 All of these use the client key. None of them shows a key: `auth` is reported
@@ -1461,7 +1536,7 @@ only as `"bearer"` or `"none"`.
 | Endpoint | Shows |
 |---|---|
 | `GET /api/router/v1/nodes` | Each node's URL, `enabled`, health, consecutive failures, last check, last seen, last error, the model it is serving, and its version. |
-| `GET /api/router/v1/routes` | Each route's `strategy`, `available`, and its deployments with their configured position (`priority`), availability and reason. Also the `default_route`. |
+| `GET /api/router/v1/routes` | Each route's `description` (or `null`), `strategy`, `available`, and its deployments with their configured position (`priority`), availability and reason. Also the `default_route`. |
 | `GET /api/router/v1/deployments` | Each deployment's node, model, the routes that use it, and its availability. Also its own last-observed `capabilities`, `context_length` and `max_concurrent_requests`, and what least-busy reads: `active_requests` (the router's in-flight count) and `concurrency_limit`. |
 | `GET /api/router/v1/health` | Node and route health in one read, the probe settings, and active requests. |
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
@@ -1827,6 +1902,7 @@ identity.
 | **R8** | Done: an opt-in `Auto` model that chooses the logical route by ordered, first-match rules over the R5 request requirements (endpoint, tools, `tool_choice`, reasoning, prompt estimate), with an explicit fallback; the route's own pipeline chooses the deployment; route-scoped affinity; the resolved route on every response; `requested_route`/`auto_rule` in traces, decision metrics and `/api/router/v1/auto`. Deliberately left out: prompt-content classification, scores, history, latency or cost, cross-route fallback, and live rule editing. |
 | **R9.1** | Done: an opt-in classifier an `Auto` rule invokes with `"classify": true` — itself a configured route, called through the router's pipeline — choosing only among configured candidate routes (with optional route descriptions), with a confidence threshold, a timeout, bounded input, and a deterministic fallback for every failure; recursion refused; classifier time measured apart from `routing_ms`; traces, metrics and admin state. Deliberately left out: scores, history, latency, cross-route fallback, and orchestration. |
 | **R9.1a** | Done: a provider-neutral classifier boundary (`classifier/`: `lightweight`, `jev`) with one `Classification` result; TypeSafe Jev System One as an optional provider (typed Choice over the candidates, its own confidence, bearer key from the environment, https, bounded failures, no retries); per-provider settings; sanitized admin state, a start-up check and `POST /api/router/v1/classifier/check`. Deliberately left out: provider chains, scoring, and anything after the route is chosen. |
+| **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
 | **R9.2** | Planned, after R9.1a is reviewed: bounded, explainable scoring of candidate **routes** (never deployments) from configured weights and route-level evidence, with a deterministic fallback and an off switch. |
 | **R9.3** | Planned: explicit, acyclic cross-route fallback chains for pre-response `route_unavailable` / `route_capability_mismatch` only; never mid-stream; kept apart from deployment failover. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |

@@ -8,6 +8,10 @@
 
 import type {
   ApiErrorBody,
+  AutoView,
+  ClassifierCheckReport,
+  RouterRoutesBody,
+  VersionBody,
   BenchmarkRun,
   Conversation,
   ConversationSummary,
@@ -73,7 +77,25 @@ export async function followJob(id: number): Promise<void> {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** Which server answers: the gateway that served the panel, or a router. */
+type Server = "gateway" | "router";
+
+const UNREACHABLE: Record<Server, { message: string; remedy: string }> = {
+  gateway: {
+    message: "The gateway is not responding. Is it still running?",
+    remedy: "Check that `hermes serve` is running, then try again.",
+  },
+  router: {
+    message: "The router is not responding. Is it still running?",
+    remedy: "Check that `hermes router` is running, then try again.",
+  },
+};
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  server: Server = "gateway",
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -84,14 +106,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       },
     });
   } catch (cause) {
-    // The gateway is not answering at all. Said as such, rather than as a
+    // The server is not answering at all. Said as such, rather than as a
     // status code that never arrived.
-    throw new ApiError(
-      0,
-      "gateway_unreachable",
-      "The gateway is not responding. Is it still running?",
-      [{ label: "Check that `hermes serve` is running, then try again." }],
-    );
+    throw new ApiError(0, `${server}_unreachable`, UNREACHABLE[server].message, [
+      { label: UNREACHABLE[server].remedy },
+    ]);
   }
 
   if (response.status === 204) {
@@ -116,8 +135,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(
       response.status,
       "invalid_json_response",
-      `The gateway returned invalid JSON for ${path}.`,
-      [{ label: "Restart `hermes serve`, then try again." }],
+      `The ${server} returned invalid JSON for ${path}.`,
+      [{ label: `Restart \`hermes ${server === "gateway" ? "serve" : "router"}\`, then try again.` }],
     );
   }
 
@@ -307,4 +326,22 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+};
+
+/**
+ * The router's operator surface, `/api/router/v1`, for a panel served by
+ * `hermes router --web-root`. Same origin as the router, like the gateway's
+ * own panel: no base URL, no CORS. Read-only, apart from asking the router to
+ * check its classifier provider now — which changes nothing.
+ */
+export const routerApi = {
+  version: () => request<VersionBody>("/version", undefined, "router"),
+  routes: () => request<RouterRoutesBody>("/api/router/v1/routes", undefined, "router"),
+  auto: () => request<AutoView>("/api/router/v1/auto", undefined, "router"),
+  checkClassifier: () =>
+    request<ClassifierCheckReport>(
+      "/api/router/v1/classifier/check",
+      { method: "POST" },
+      "router",
+    ),
 };

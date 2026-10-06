@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 
 import { App } from "./App";
+import { BackendProvider } from "./state/backend";
 import { PreferencesProvider } from "./state/preferences";
 import "./styles/app.css";
 
@@ -22,9 +23,11 @@ if (!container) {
 createRoot(container).render(
   <StrictMode>
     <PreferencesProvider>
-      <HashRouter>
-        <App />
-      </HashRouter>
+      <BackendProvider>
+        <HashRouter>
+          <App />
+        </HashRouter>
+      </BackendProvider>
     </PreferencesProvider>
   </StrictMode>,
 );

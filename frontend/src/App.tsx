@@ -10,8 +10,25 @@ import { Logs } from "./screens/Logs";
 import { Models } from "./screens/Models";
 import { Performance } from "./screens/Performance";
 import { SettingsScreen } from "./screens/SettingsScreen";
+import { AutoRoutingScreen } from "./screens/router/AutoRoutingScreen";
+import { ClassifierScreen } from "./screens/router/ClassifierScreen";
+import { useBackend } from "./state/backend";
 
 export function App() {
+  // A router serves the same bundle; it answers only the router's API, so it
+  // gets the router's screens. A gateway's screens are exactly as before.
+  if (useBackend() === "router") {
+    return (
+      <Routes>
+        <Route element={<Shell />}>
+          <Route index element={<Navigate to="/auto" replace />} />
+          <Route path="auto" element={<AutoRoutingScreen />} />
+          <Route path="classifier" element={<ClassifierScreen />} />
+          <Route path="*" element={<Navigate to="/auto" replace />} />
+        </Route>
+      </Routes>
+    );
+  }
   return (
     <Routes>
       <Route element={<Shell />}>
