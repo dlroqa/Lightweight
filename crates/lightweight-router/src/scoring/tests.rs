@@ -146,17 +146,44 @@ fn feed(setup: &Setup, route: &str, observation: Observation, n: u32, now: Insta
     }
 }
 
-/// The largest weights validation accepts for `min_confidence` 0.65, a hair
-/// under the bound: `(prior + 2·history) / classifier < 0.175`.
+/// The largest prior weight validation accepts for `min_confidence` 0.65, a
+/// hair under the bound: `prior / classifier < 0.175`.
 fn strongest() -> Value {
-    json!({"enabled": true, "weights": {"classifier": 1.0, "prior": 0.07, "history": 0.0524}})
+    json!({"enabled": true, "weights": {"classifier": 1.0, "prior": 0.17}})
 }
 
-/// The worst case for the verdict: the fallback has the top prior and a long
-/// success record, the verdict route none (its server errors are unscored).
-fn stack_against_coder(setup: &Setup, now: Instant) {
-    feed(setup, "General", Observation::Success, 5_000, now);
-    feed(setup, "Coder", Observation::ServerError, 5_000, now);
+/// `strongest()` with every prior on the fallback: the most the active inputs
+/// can do against a Coder verdict.
+fn strongest_against_coder() -> Value {
+    json!({"enabled": true, "weights": {"classifier": 1.0, "prior": 0.17},
+           "priors": {"General": 1.0}})
+}
+
+/// A borderline setup: General's prior is worth 0.10, so Coder verdicts in
+/// [0.65, 0.75) lose to it and those at 0.75 and above win.
+fn borderline() -> Value {
+    json!({"enabled": true, "weights": {"prior": 0.1}, "priors": {"General": 1.0}})
+}
+
+/// Massive popularity for one route, nothing for the other.
+fn popular(setup: &Setup, route: &str, now: Instant) {
+    feed(setup, route, Observation::Success, 10_000, now);
+}
+
+/// Confidences around and across the borderline, for comparing decisions.
+fn sweep() -> impl Iterator<Item = f64> {
+    (0..=350).map(|step| 0.65 + f64::from(step) / 1_000.0)
+}
+
+/// `(winner, verdict total, fallback total)` for a Coder verdict at
+/// `confidence`.
+fn outcome(setup: &Setup, confidence: f64, now: Instant) -> (String, f64, f64) {
+    let decision = decide_at(setup, &classified(setup, "Coder", confidence), now);
+    (
+        decision.route.to_string(),
+        decision.trace.candidates[0].total_score,
+        decision.trace.candidates[1].total_score,
+    )
 }
 
 // --- disabled / compatibility --------------------------------------------------
@@ -192,8 +219,8 @@ fn every_classification(setup: &Setup) -> Vec<Classification> {
 fn neutral_weights_reproduce_r91_exactly_whatever_the_history() {
     let setup = setup(json!({"enabled": true}));
     let now = Instant::now();
-    // History is recorded, and must not matter while its weight is zero.
-    stack_against_coder(&setup, now);
+    popular(&setup, "General", now);
+    feed(&setup, "Coder", Observation::ServerError, 5_000, now);
     for classification in every_classification(&setup) {
         let decision = decide_at(&setup, &classification, now);
         assert_eq!(
@@ -238,16 +265,105 @@ fn an_absent_section_configures_nothing() {
     assert!(config.auto.unwrap().scoring.is_none());
 }
 
+// --- history_weight is 0 in slice 1 -------------------------------------------
+
+#[test]
+fn a_zero_history_weight_is_valid() {
+    let setup = setup(json!({"enabled": true,
+        "weights": {"classifier": 1.0, "prior": 0.1, "history": 0.0}}));
+    assert_eq!(setup.scoring.weights.history, 0.0);
+    // Omitted means 0, too.
+    assert_eq!(
+        setup_of(json!({"weights": {"prior": 0.1}}))
+            .scoring
+            .weights
+            .history,
+        0.0
+    );
+}
+
+/// [`setup`], callable where a local `setup` shadows it.
+fn setup_of(scoring: Value) -> Setup {
+    setup(scoring)
+}
+
+#[test]
+fn a_nonzero_history_weight_is_refused_with_its_reason() {
+    for weight in [0.0001, 0.01, 0.06, 1.0] {
+        let found = errors(json!({"enabled": true,
+            "weights": {"classifier": 1.0, "prior": 0.1, "history": weight}}));
+        assert_eq!(found.len(), 1, "{weight}: {found:?}");
+        let message = &found[0];
+        for expected in [
+            "auto_route.adaptive_scoring: weights.history must be 0",
+            "observational only",
+            "R9.2 slice 1",
+            "successful traffic volume, not route-attributable quality",
+        ] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+    // Refused while off too, and negative or non-finite values as well.
+    assert_eq!(
+        errors(json!({"enabled": false, "weights": {"history": 0.5}})).len(),
+        1
+    );
+    assert!(
+        errors(json!({"weights": {"history": -0.01}}))[0].contains("weights.history must be 0")
+    );
+}
+
+// --- the active influence radius -----------------------------------------------
+
+#[test]
+fn the_influence_radius_counts_only_the_active_prior() {
+    for (classifier, prior) in [(1.0, 0.1), (0.5, 0.08), (0.8, 0.0), (1.0, 0.17)] {
+        let setup = setup(json!({"weights": {"classifier": classifier, "prior": prior,
+                                             "history": 0.0}}));
+        let radius = setup.scoring.weights.influence_radius();
+        assert!(
+            (radius - prior / classifier).abs() < 1e-12,
+            "{classifier}/{prior}: {radius}"
+        );
+    }
+    // No phantom history allowance: a prior of 0.17 is within 0.175, which
+    // `(prior + 2·history)` with any history term would not have needed to be.
+    let setup = setup(strongest_against_coder());
+    assert!((setup.scoring.weights.influence_radius() - 0.17).abs() < 1e-12);
+    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.7), Instant::now());
+    assert!((decision.trace.influence_radius - 0.17).abs() < 1e-12);
+}
+
+#[test]
+fn scoring_moves_a_decision_by_exactly_the_active_radius() {
+    let setup = setup(strongest_against_coder());
+    let now = Instant::now();
+    popular(&setup, "General", now);
+    let radius = setup.scoring.weights.influence_radius();
+    for confidence in sweep() {
+        let decision = decide_at(&setup, &classified(&setup, "Coder", confidence), now);
+        // The fallback wins exactly below baseline + radius, whatever its
+        // popularity.
+        let expected = if confidence < 0.65 + radius - 1e-9 {
+            "General"
+        } else {
+            "Coder"
+        };
+        if (confidence - (0.65 + radius)).abs() > 1e-9 {
+            assert_eq!(decision.route.as_str(), expected, "{confidence}");
+        }
+    }
+}
+
 // --- the confidence threshold boundary -----------------------------------------
 
 #[test]
 fn a_confidence_well_above_the_threshold_is_never_overturned() {
-    let setup = setup(strongest());
+    let setup = setup(strongest_against_coder());
     let now = Instant::now();
-    stack_against_coder(&setup, now);
+    popular(&setup, "General", now);
     let radius = setup.scoring.weights.influence_radius();
-    assert!(radius < 0.175 && radius > 0.17, "{radius}");
-    // At and above baseline + radius, nothing moves the verdict.
+    assert!(radius < 0.175 && radius > 0.17 - 1e-9, "{radius}");
     let mut confidence = 0.65 + radius + 1e-9;
     while confidence <= 1.0 {
         assert_eq!(
@@ -262,28 +378,48 @@ fn a_confidence_well_above_the_threshold_is_never_overturned() {
 }
 
 #[test]
-fn a_prior_and_history_may_decide_a_verdict_exactly_at_the_threshold() {
-    let setup = setup(json!({"enabled": true,
-        "weights": {"prior": 0.1, "history": 0.03},
+fn a_bounded_prior_decides_a_verdict_exactly_at_the_threshold() {
+    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.1},
         "priors": {"General": 0.5}}));
-    // Nothing else known: a tie on classifier signal, broken by General's
-    // prior.
     let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), Instant::now());
     assert_eq!(decision.route.as_str(), "General");
     assert!(decision.trace.overrode);
     assert_eq!(decision.trace.reason, ScoringReason::Scored);
     assert_eq!(decision.trace.classified_route, "Coder");
+}
 
-    // History alone can decide it too: General's record of successes.
-    let setup = setup_history_only();
+#[test]
+fn history_cannot_change_an_exact_threshold_decision() {
+    // No priors: an exact tie on the baseline, which the verdict wins, however
+    // popular the fallback is.
+    let setup = setup(strongest());
     let now = Instant::now();
-    feed(&setup, "General", Observation::Success, 40, now);
-    assert_eq!(
-        decide_at(&setup, &classified(&setup, "Coder", 0.65), now)
-            .route
-            .as_str(),
-        "General"
-    );
+    popular(&setup, "General", now);
+    assert_eq!(outcome(&setup, 0.65, now).0, "Coder");
+    // With a prior for General: General, however popular Coder is.
+    let setup = setup_of(json!({"enabled": true, "weights": {"prior": 0.1},
+        "priors": {"General": 0.5}}));
+    popular(&setup, "Coder", now);
+    assert_eq!(outcome(&setup, 0.65, now).0, "General");
+}
+
+#[test]
+fn history_cannot_break_a_tie() {
+    // Same classifier contribution (verdict at the baseline), same prior, and
+    // wildly different observed history: the existing tie rule decides.
+    let tie = json!({"enabled": true, "weights": {"prior": 0.1},
+        "priors": {"General": 0.5, "Coder": 0.5}});
+    for popular_route in ["General", "Coder"] {
+        let setup = setup(tie.clone());
+        let now = Instant::now();
+        popular(&setup, popular_route, now);
+        let (winner, verdict, fallback) = outcome(&setup, 0.65, now);
+        assert_eq!(verdict, fallback, "an exact tie");
+        assert_eq!(
+            winner, "Coder",
+            "ties go to the verdict ({popular_route} popular)"
+        );
+    }
 }
 
 #[test]
@@ -297,19 +433,15 @@ fn at_the_threshold_with_nothing_against_it_the_verdict_wins_the_tie() {
     );
 }
 
-fn setup_history_only() -> Setup {
-    setup(json!({"enabled": true, "weights": {"history": 0.08}}))
-}
-
 #[test]
 fn a_verdict_below_the_threshold_is_rejected_and_never_resurrected() {
-    // Everything favours Coder: the top prior and a long success record, and
-    // General has none. R9.1 rejected Coder at 0.40, and that stands.
-    let setup = setup(json!({"enabled": true,
-        "weights": {"prior": 0.07, "history": 0.0524},
+    // Everything favours Coder: the maximum allowed prior and 10 000
+    // successes, against a General with neither. R9.1 rejected Coder, and
+    // that stands.
+    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.17},
         "priors": {"Coder": 1.0}}));
     let now = Instant::now();
-    feed(&setup, "Coder", Observation::Success, 5_000, now);
+    popular(&setup, "Coder", now);
     feed(&setup, "General", Observation::ServerError, 5_000, now);
     for confidence in [0.0, 0.10, 0.40, 0.60, 0.649_999_999] {
         let classification = classified(&setup, "Coder", confidence);
@@ -354,13 +486,12 @@ fn a_verdict_for_the_fallback_itself_is_uncontested() {
 
 #[test]
 fn only_the_verdict_and_the_fallback_contend() {
-    // Research has the top prior and a perfect record, but the classifier
+    // Research has the top prior and 10 000 successes, but the classifier
     // named Coder: there is no signal for Research, and it cannot win.
-    let setup = setup(json!({"enabled": true,
-        "weights": {"prior": 0.07, "history": 0.0524},
+    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.17},
         "priors": {"Research": 1.0}}));
     let now = Instant::now();
-    feed(&setup, "Research", Observation::Success, 5_000, now);
+    popular(&setup, "Research", now);
     for confidence in [0.65, 0.7, 0.99] {
         let decision = decide_at(&setup, &classified(&setup, "Coder", confidence), now);
         let routes: Vec<&str> = decision
@@ -399,17 +530,16 @@ impl Lcg {
 }
 
 #[test]
-fn property_no_valid_configuration_lets_priors_or_history_overturn_a_strong_classification() {
+fn property_no_valid_configuration_lets_a_prior_overturn_a_strong_classification() {
     let mut random = Lcg(0x5eed);
     let mut checked = 0;
     for _ in 0..400 {
         let min_confidence = 0.05 + 0.9 * random.next();
         let classifier_weight = 0.05 + 0.95 * random.next();
         // Spread over and past the bound, so both sides of it are sampled.
-        let prior = 0.3 * random.next();
-        let history = 0.15 * random.next();
+        let prior = 0.4 * random.next();
         let scoring = json!({"enabled": true,
-            "weights": {"classifier": classifier_weight, "prior": prior, "history": history},
+            "weights": {"classifier": classifier_weight, "prior": prior},
             "priors": {"General": random.next(), "Coder": random.next()}});
         let mut auto = auto_section(scoring);
         auto["classifier"]["lightweight"]["min_confidence"] = json!(min_confidence);
@@ -427,9 +557,7 @@ fn property_no_valid_configuration_lets_priors_or_history_overturn_a_strong_clas
             scoring: auto.scoring.unwrap(),
         };
         let now = Instant::now();
-        // The worst history for Coder and the best for General.
         feed(&setup, "General", Observation::Success, 2_000, now);
-        feed(&setup, "Coder", Observation::ServerError, 2_000, now);
         let radius = setup.scoring.weights.influence_radius();
         assert!(radius < 0.5 * (1.0 - min_confidence) || radius == 0.0);
         // Anywhere in the upper half of the accepted range.
@@ -450,34 +578,6 @@ fn property_no_valid_configuration_lets_priors_or_history_overturn_a_strong_clas
     assert!(checked > 50, "too few valid configurations: {checked}");
 }
 
-#[test]
-fn property_scoring_moves_a_decision_only_within_the_influence_radius() {
-    let setup = setup(strongest());
-    let now = Instant::now();
-    stack_against_coder(&setup, now);
-    let radius = setup.scoring.weights.influence_radius();
-    let mut overrides = 0;
-    for step in 0..=350 {
-        let confidence = 0.65 + f64::from(step) / 1_000.0;
-        let decision = decide_at(&setup, &classified(&setup, "Coder", confidence), now);
-        if decision.trace.overrode {
-            overrides += 1;
-            assert!(
-                confidence - 0.65 < radius,
-                "overrode at {confidence}, outside the radius {radius}"
-            );
-        }
-    }
-    // With only successes scored, history spans [0, 1), so the swing it can
-    // actually produce is W_history (here ~0.052), within the validated
-    // radius of (prior + 2·history) / classifier, which stays conservative.
-    let realised = f64::from(overrides) / 1_000.0;
-    assert!(
-        realised > 0.04 && realised <= setup.scoring.weights.history + 0.001,
-        "the worst case flips the band near the threshold, and no more: {realised}"
-    );
-}
-
 // --- priors --------------------------------------------------------------------
 
 #[test]
@@ -491,158 +591,201 @@ fn a_route_without_a_prior_is_neutral() {
 
 #[test]
 fn a_bounded_prior_changes_a_borderline_result() {
-    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.1},
-        "priors": {"General": 1.0}}));
+    let setup = setup(borderline());
     assert_eq!(winner(&setup, "Coder", 0.70), "General", "within 0.1");
     assert_eq!(
         winner(&setup, "Coder", 0.76),
         "Coder",
         "beyond the prior's reach"
     );
-    // A prior for the verdict route helps it hold against the fallback's
-    // history, too.
-    let setup = setup_with_coder_prior();
-    let now = Instant::now();
-    feed(&setup, "General", Observation::Success, 40, now);
-    assert_eq!(
-        decide_at(&setup, &classified(&setup, "Coder", 0.66), now)
-            .route
-            .as_str(),
-        "Coder"
-    );
-}
-
-fn setup_with_coder_prior() -> Setup {
-    setup(
-        json!({"enabled": true, "weights": {"prior": 0.1, "history": 0.03},
-        "priors": {"Coder": 1.0}}),
-    )
+    // A prior for the verdict route helps it hold.
+    let setup = setup_of(json!({"enabled": true, "weights": {"prior": 0.1},
+        "priors": {"Coder": 1.0, "General": 0.5}}));
+    assert_eq!(winner(&setup, "Coder", 0.66), "Coder");
 }
 
 #[test]
 fn a_prior_cannot_overpower_a_strong_classification() {
-    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.17},
-        "priors": {"General": 1.0}}));
+    let setup = setup(strongest_against_coder());
     assert_eq!(winner(&setup, "Coder", 0.83), "Coder");
     assert_eq!(winner(&setup, "Coder", 0.99), "Coder");
 }
 
-// --- history -------------------------------------------------------------------
+// --- history is observational only ---------------------------------------------
 
 #[test]
-fn success_history_raises_a_route_within_its_cap() {
-    let setup = setup_history_only();
+fn equal_successful_volume_cannot_affect_the_winner() {
+    let quiet = setup(borderline());
+    let busy = setup(borderline());
     let now = Instant::now();
-    // General's perfect record beats a borderline Coder, but no further than
-    // 2 · 0.08 = 0.16 above the threshold — here only 0.08, as Coder has none.
-    feed(&setup, "General", Observation::Success, 10_000, now);
-    let decide = |confidence| {
-        decide_at(&setup, &classified(&setup, "Coder", confidence), now)
-            .route
-            .to_string()
-    };
-    assert_eq!(decide(0.70), "General");
-    assert_eq!(decide(0.73), "Coder", "beyond history's cap");
-}
-
-#[test]
-fn server_errors_never_lower_a_route() {
-    // One upstream 500, then ten thousand: none is evidence about the route.
-    let setup = setup_history_only();
-    let now = Instant::now();
-    for count in [1, 9_999] {
-        feed(&setup, "Coder", Observation::ServerError, count, now);
-        let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), now);
-        assert_eq!(decision.route.as_str(), "Coder", "{count}");
-        let coder = &decision.trace.candidates[0];
-        assert_eq!(coder.history, HistorySignal::NEUTRAL);
-        assert_eq!(coder.history_signal, 0.0);
+    feed(&busy, "General", Observation::Success, 10, now);
+    feed(&busy, "Coder", Observation::Success, 10, now);
+    for confidence in sweep() {
+        assert_eq!(
+            outcome(&busy, confidence, now),
+            outcome(&quiet, confidence, now),
+            "{confidence}"
+        );
     }
-    assert_eq!(setup.history.view(now)[1].server_error, 10_000);
-}
-
-#[test]
-fn interrupted_streams_never_lower_a_route() {
-    let setup = setup_history_only();
-    let now = Instant::now();
-    feed(&setup, "Coder", Observation::Interrupted, 5_000, now);
-    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), now);
-    assert_eq!(decision.route.as_str(), "Coder");
-    assert_eq!(decision.trace.candidates[0].history, HistorySignal::NEUTRAL);
-    assert_eq!(setup.history.view(now)[1].interrupted, 5_000);
-}
-
-#[test]
-fn history_below_min_samples_does_not_count() {
-    let setup = setup_history_only();
-    let now = Instant::now();
-    // 19 successes for General are not yet evidence; the 20th is.
-    feed(&setup, "General", Observation::Success, 19, now);
-    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.66), now);
-    assert_eq!(decision.route.as_str(), "Coder");
-    assert!(decision.trace.candidates[1].history.gated);
-    assert_eq!(decision.trace.candidates[1].history_signal, 0.0);
-    feed(&setup, "General", Observation::Success, 1, now);
+    assert_eq!(outcome(&busy, 0.70, now).0, "General", "the prior decides");
     assert_eq!(
-        decide_at(&setup, &classified(&setup, "Coder", 0.66), now)
-            .route
-            .as_str(),
-        "General"
-    );
-}
-
-#[test]
-fn no_unscored_outcome_moves_the_score() {
-    let setup = setup_history_only();
-    let now = Instant::now();
-    feed(&setup, "Coder", Observation::ServerError, 1_000, now);
-    feed(&setup, "Coder", Observation::Interrupted, 1_000, now);
-    feed(&setup, "Coder", Observation::Unavailable, 1_000, now);
-    feed(&setup, "Coder", Observation::CapabilityMismatch, 1_000, now);
-    feed(&setup, "Coder", Observation::Neutral, 1_000, now);
-    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), now);
-    assert_eq!(
-        decision.route.as_str(),
+        outcome(&busy, 0.80, now).0,
         "Coder",
-        "an unready route is not a bad route"
+        "the classifier decides"
     );
-    assert_eq!(decision.trace.candidates[0].history, HistorySignal::NEUTRAL);
 }
 
 #[test]
-fn history_fades_and_a_decision_recovers_without_exploration() {
-    let setup = setup_history_only();
+fn ten_against_ten_thousand_successes_cannot_affect_the_winner() {
+    let now = Instant::now();
+    // Coder: 10 successes. General: 10 000.
+    let lopsided = setup(borderline());
+    feed(&lopsided, "Coder", Observation::Success, 10, now);
+    popular(&lopsided, "General", now);
+    // And the other way round.
+    let reversed = setup(borderline());
+    popular(&reversed, "Coder", now);
+    feed(&reversed, "General", Observation::Success, 10, now);
+    let quiet = setup(borderline());
+
+    // Active scoring says Coder (0.80 against 0.65 + 0.10): Coder wins,
+    // despite General's 10 000.
+    assert_eq!(outcome(&lopsided, 0.80, now).0, "Coder");
+    // Reverse the active evidence (0.70 against 0.75): General wins — because
+    // classifier + prior say so, whichever route is popular.
+    assert_eq!(outcome(&lopsided, 0.70, now).0, "General");
+    assert_eq!(outcome(&reversed, 0.70, now).0, "General");
+    assert_eq!(outcome(&reversed, 0.80, now).0, "Coder");
+
+    // Identical decisions and identical scores, request for request.
+    for confidence in sweep() {
+        let expected = outcome(&quiet, confidence, now);
+        assert_eq!(
+            outcome(&lopsided, confidence, now),
+            expected,
+            "{confidence}"
+        );
+        assert_eq!(
+            outcome(&reversed, confidence, now),
+            expected,
+            "{confidence}"
+        );
+    }
+
+    // History is still collected, and still visible.
+    let view = lopsided.history.view(now);
+    assert!((view[0].observations.successes - 10_000.0).abs() < 1e-9);
+    assert!((view[1].observations.successes - 10.0).abs() < 1e-9);
+    assert!(view[0].observations.min_samples_reached);
+    assert!(!view[1].observations.min_samples_reached);
+}
+
+#[test]
+fn history_decays_and_decay_never_changes_the_winner() {
+    let setup = setup(borderline());
     let start = Instant::now();
-    feed(&setup, "General", Observation::Success, 80, start);
-    let decide = |at| {
-        decide_at(&setup, &classified(&setup, "Coder", 0.66), at)
-            .route
-            .to_string()
-    };
-    assert_eq!(decide(start), "General");
+    popular(&setup, "General", start);
+    let later = start + Duration::from_secs(3_600);
+    let observed = setup.history.observations(&name("General"), later);
+    assert!(
+        (observed.effective_samples - 5_000.0).abs() < 1e-6,
+        "halved after the one-hour default half-life: {observed:?}"
+    );
+    for confidence in sweep() {
+        assert_eq!(
+            outcome(&setup, confidence, start),
+            outcome(&setup, confidence, later),
+            "{confidence}"
+        );
+    }
+}
+
+#[test]
+fn no_observed_outcome_moves_the_score() {
+    let quiet = setup(borderline());
+    let noisy = setup(borderline());
+    let now = Instant::now();
+    for observation in [
+        Observation::Success,
+        Observation::ServerError,
+        Observation::Interrupted,
+        Observation::Unavailable,
+        Observation::CapabilityMismatch,
+        Observation::Neutral,
+    ] {
+        feed(&noisy, "Coder", observation, 1_000, now);
+        feed(&noisy, "General", observation, 3_000, now);
+    }
+    for confidence in sweep() {
+        assert_eq!(
+            outcome(&noisy, confidence, now),
+            outcome(&quiet, confidence, now),
+            "{confidence}"
+        );
+    }
+    let coder = &noisy.history.view(now)[1];
     assert_eq!(
-        decide(start + Duration::from_secs(3 * 3_600)),
-        "Coder",
-        "below min_samples after three half-lives: neutral again"
+        (
+            coder.server_error,
+            coder.interrupted,
+            coder.unavailable,
+            coder.mismatch,
+            coder.neutral
+        ),
+        (1_000, 1_000, 1_000, 1_000, 1_000),
+        "every outcome is still observed"
     );
 }
 
 // --- the trace ----------------------------------------------------------------
 
 #[test]
+fn the_trace_shows_history_as_inactive_and_still_observed() {
+    let setup = setup(borderline());
+    let now = Instant::now();
+    popular(&setup, "General", now);
+    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.70), now);
+    let trace = &decision.trace;
+    assert!(!trace.history_active);
+    assert_eq!(trace.weights.history, 0.0);
+    for candidate in &trace.candidates {
+        assert_eq!(candidate.history_signal, 0.0, "{candidate:?}");
+        let sum = candidate.classifier_signal + candidate.prior_signal;
+        assert!(
+            (sum - candidate.total_score).abs() < 1e-12,
+            "only classifier and prior: {candidate:?}"
+        );
+    }
+    // The fallback's popularity is reported, not used.
+    let general = &trace.candidates[1];
+    assert!((general.history_observations.successes - 10_000.0).abs() < 1e-9);
+    assert!((general.total_score - 0.75).abs() < 1e-12);
+
+    let text = serde_json::to_string(trace).unwrap();
+    for field in [
+        "\"history_active\":false",
+        "\"history_signal\":0.0",
+        "\"history_observations\"",
+    ] {
+        assert!(text.contains(field), "{field}: {text}");
+    }
+    for absent in ["\"value\"", "success_rate", "\"gated\""] {
+        assert!(
+            !text.contains(absent),
+            "no quality-looking field: {absent}: {text}"
+        );
+    }
+}
+
+#[test]
 fn the_trace_explains_the_decision_and_names_no_deployment() {
-    let setup = setup(json!({"enabled": true,
-        "weights": {"prior": 0.1, "history": 0.03},
+    let setup = setup(json!({"enabled": true, "weights": {"prior": 0.1},
         "priors": {"General": 0.5}}));
     let now = Instant::now();
     feed(&setup, "General", Observation::Success, 30, now);
     let decision = decide_at(&setup, &classified(&setup, "Coder", 0.70), now);
     let trace = &decision.trace;
     assert_eq!(trace.classifier_baseline, 0.65);
-    for candidate in &trace.candidates {
-        let sum = candidate.classifier_signal + candidate.prior_signal + candidate.history_signal;
-        assert!((sum - candidate.total_score).abs() < 1e-12, "{candidate:?}");
-    }
     assert_eq!(trace.candidates[0].basis, ClassifierBasis::Verdict);
     assert_eq!(trace.candidates[1].basis, ClassifierBasis::Baseline);
     assert_eq!(trace.candidates[1].confidence, 0.65, "the baseline");
@@ -662,9 +805,9 @@ fn the_trace_explains_the_decision_and_names_no_deployment() {
 
 #[test]
 fn deciding_is_cheap() {
-    let setup = setup(strongest());
+    let setup = setup(strongest_against_coder());
     let now = Instant::now();
-    stack_against_coder(&setup, now);
+    popular(&setup, "General", now);
     let classification = classified(&setup, "Coder", 0.7);
     let started = Instant::now();
     for _ in 0..10_000 {
@@ -689,7 +832,7 @@ fn weights_and_history_settings_are_bounded() {
     for expected in [
         "weights.classifier must be greater than 0 and at most 1",
         "weights.prior must be between 0 and 1",
-        "weights.history must be between 0 and 1",
+        "weights.history must be 0",
         "history.half_life_secs must be between 60 and 604800",
         "history.min_samples must be between 1 and 10000",
         "history.shrinkage_samples must be between 1 and 10000",
@@ -725,14 +868,15 @@ fn non_finite_numbers_never_parse() {
 
 #[test]
 fn the_dominance_bound_is_enforced_against_every_configured_provider() {
-    let found = errors(json!({"enabled": true, "weights": {"prior": 0.1, "history": 0.05}}));
+    let found = errors(json!({"enabled": true, "weights": {"prior": 0.2}}));
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(
-        found[0].contains("move a decision by up to 0.200") && found[0].contains("less than 0.175"),
+        found[0].contains("move a decision by up to 0.200 in confidence (prior / classifier)")
+            && found[0].contains("less than 0.175"),
         "{found:?}"
     );
-    // A smaller classifier weight magnifies what priors and history can do.
-    let found = errors(json!({"weights": {"classifier": 0.5, "prior": 0.09, "history": 0.0}}));
+    // A smaller classifier weight magnifies what priors can do.
+    let found = errors(json!({"weights": {"classifier": 0.5, "prior": 0.09}}));
     assert!(found[0].contains("0.180"), "{found:?}");
     let _ = config(json!({"weights": {"classifier": 0.5, "prior": 0.08}}));
 
@@ -750,8 +894,8 @@ fn the_dominance_bound_is_enforced_against_every_configured_provider() {
 }
 
 #[test]
-fn a_threshold_of_one_leaves_no_room_for_priors_or_history() {
-    let mut auto = auto_section(json!({"weights": {"history": 0.001}}));
+fn a_threshold_of_one_leaves_no_room_for_priors() {
+    let mut auto = auto_section(json!({"weights": {"prior": 0.001}}));
     auto["classifier"]["lightweight"]["min_confidence"] = json!(1.0);
     assert_eq!(errors_of(auto).len(), 1);
     let mut auto = auto_section(json!({"enabled": true}));

@@ -12,40 +12,38 @@ All notable changes to this project are documented in this file.
   - An accepted classification's verdict route is scored against the
     classifier's fallback route, whose classifier signal is the explicit
     `classifier_baseline` (the provider's `min_confidence`):
-    `W_classifier·signal + W_prior·prior + W_history·history`, ties to the
-    verdict. Other candidates have no signal and are not scored.
+    `W_classifier·signal + W_prior·prior`, ties to the verdict. **Only
+    classifier confidence and the configured route prior affect route
+    selection.** Other candidates have no signal and are not scored.
   - A verdict below `min_confidence` stays rejected: R9.1's fallback is the
     decision and the rejected route can never be revived. Explicit routes,
     deterministic rules and `Auto`'s plain fallback are never scored.
-  - Validation keeps the influence radius `(prior + 2·history) / classifier`
-    under half the accepted range for every configured provider, so a
-    confident classification is never overturned. There is one set of weights
-    and no provider-specific weights. The neutral defaults (`1 / 0 / 0`)
-    reproduce R9.1 exactly.
-  - Route-success history is per route and in memory only. It is recorded at
-    each request's final outcome (direct and `Auto` traffic; never the
-    router's own classification requests). Observation is not scoring:
-    only `ok` is scored (as success). `server_error` (one deployment's 500),
-    `interrupted`, `route_unavailable`, an all-502/503/504 refusal and
-    `route_capability_mismatch` are observed and shown but never scored,
-    because none can yet be attributed to the route rather than a deployment.
-    Client errors and cancellations are neutral. `effective_samples` counts
-    scored observations only. History is
-    neutral below `min_samples` (20), shrunk toward 0.5, and decays with a
-    configurable half-life (default 1 h, a provisional starting point). There
-    is no random exploration.
-  - A `scoring` trace block (route names and numbers only),
-    `adaptive_scoring` in `GET /api/router/v1/auto`, an admin-only
+  - Validation keeps the influence radius `prior / classifier` under half
+    the accepted range for every configured provider, so a confident
+    classification is never overturned. There is one set of weights and no
+    provider-specific weights. The neutral defaults reproduce R9.1 exactly.
+  - **Route history is collected but observational only.** Its
+    observations measure successful traffic volume, not validated route
+    quality, so `weights.history` must be 0; any other value is refused. Per
+    route, in memory only, recorded at each request's final outcome (direct
+    and `Auto` traffic; never the router's own classification requests):
+    decayed successes (`effective_samples`; half-life default 1 h,
+    provisional), plus counters for `server_error`, `interrupted`,
+    `unavailable`, `mismatch` and `neutral`. History becomes eligible for
+    scoring only with a genuinely route-attributable quality signal.
+  - A `scoring` trace block (route names and numbers;
+    `history_active: false`), `adaptive_scoring` in
+    `GET /api/router/v1/auto` (`history_mode: "observational"`,
+    `history_affects_scoring: false`), an admin-only
     `POST /api/router/v1/adaptive-scoring/reset` (all routes or one; touches
-    nothing else), and the metrics
+    history only), and the metrics
     `router_route_scoring_decisions_total{route,overrode}`,
     `router_route_scoring_fallback_total{reason}`,
-    `router_route_history_observations_total{route,outcome}`,
-    `router_route_history_effective_samples{route}` and
-    `router_route_history_signal{route}`.
-  - Not in this slice: latency or context-fit scoring, Jev per-option
-    probabilities, availability penalties, cross-route fallback (R9.3),
-    persistence, and UI.
+    `router_route_history_observations_total{route,outcome}` and
+    `router_route_history_effective_samples{route}`.
+  - Not in this slice: history scoring, latency or context-fit scoring, Jev
+    per-option probabilities, availability penalties, cross-route fallback
+    (R9.3), persistence, and UI.
 
 - **Router panel: Auto Routing and Classifier screens.** `hermes router
   --web-root <dir>` serves the control panel from the router's own origin

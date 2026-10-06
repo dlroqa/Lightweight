@@ -489,11 +489,12 @@ impl Fleet {
     }
 }
 
-/// `(prior + 2·history) / classifier` = 0.05 + 0.12 = 0.17 < 0.175: the most
-/// influence the bound allows at `min_confidence` 0.65, near enough.
+/// General's prior is worth 0.10 (radius `prior / classifier` = 0.10 < 0.175):
+/// a Coder verdict in [0.65, 0.75) loses to General, one at 0.75 or above wins.
+/// History is observational only, so its weight is 0.
 fn borderline_scoring() -> Value {
-    json!({"enabled": true, "weights": {"prior": 0.05, "history": 0.06},
-           "priors": {"General": 0.2}})
+    json!({"enabled": true, "weights": {"prior": 0.1},
+           "priors": {"General": 1.0}})
 }
 
 /// Direct traffic: a success record for General, and 500s for Coder, which
@@ -512,7 +513,7 @@ async fn absent_or_off_classification_resolves_as_r91_and_nothing_is_recorded() 
     let fleet = Fleet::start().await;
     // An off section is still configured (and checked), and otherwise inert:
     // weights that would decide every borderline case change nothing.
-    let off = json!({"enabled": false, "weights": {"prior": 0.05, "history": 0.06},
+    let off = json!({"enabled": false, "weights": {"prior": 0.1},
                      "priors": {"General": 1.0}});
     for (scoring, configured) in [(None, false), (Some(off), true)] {
         let router = Router::start(fleet.config("lightweight", scoring)).await;
@@ -585,8 +586,8 @@ async fn high_borderline_and_low_confidence_coder() {
     assert_eq!(trace["scoring"]["overrode"], false);
 
     // Borderline: within the bound, history and prior choose General.
-    // (Coder's 500s are unscored: only General's successes and prior count.)
-    let (status, body) = router.chat("Auto", "PICK Coder 0.68").await;
+    // (Only the classifier and General's prior count: 0.70 against 0.75.)
+    let (status, body) = router.chat("Auto", "PICK Coder 0.70").await;
     assert_eq!((status, body["model"].as_str()), (200, Some("General")));
     let trace = router.last_trace().await;
     let scoring = &trace["scoring"];
@@ -642,13 +643,12 @@ async fn a_rejected_route_is_never_resurrected_however_favoured() {
     let fleet = Fleet::start().await;
     let router = Router::start(fleet.config(
         "lightweight",
-        Some(
-            json!({"enabled": true, "weights": {"prior": 0.05, "history": 0.06},
-                    "priors": {"Coder": 1.0}}),
-        ),
+        Some(json!({"enabled": true, "weights": {"prior": 0.17},
+                    "priors": {"Coder": 1.0}})),
     ))
     .await;
-    // Coder: the top prior and a perfect record. General: a failing one.
+    // Coder: the maximum allowed prior and a record of successes. General:
+    // only failures.
     for _ in 0..30 {
         assert_eq!(router.chat("Coder", "hello").await.0, 200);
         assert_eq!(router.chat("General", "FAIL500").await.0, 500);
@@ -663,7 +663,7 @@ async fn a_rejected_route_is_never_resurrected_however_favoured() {
         assert_eq!(trace["scoring"]["reason"], "below_threshold");
     }
     assert_eq!(fleet.coder.hits(), coder_before, "Coder was never asked");
-    // And just at the threshold, accepted, Coder's evidence holds it there.
+    // And just at the threshold, accepted, Coder's prior holds it there.
     let (_, body) = router.chat("Auto", "PICK Coder 0.65").await;
     assert_eq!(body["model"], "Coder");
 }
@@ -773,8 +773,10 @@ async fn history_counts_each_final_outcome_as_specified() {
     );
     assert_eq!(coder["unavailable"], 1, "{coder}");
     close(&coder["effective_samples"], 2.0);
-    assert_eq!(coder["gated"], true, "2 scored samples < min_samples 20");
-    assert_eq!(coder["value"], 0.0);
+    assert_eq!(
+        coder["min_samples_reached"], false,
+        "2 samples < min_samples 20"
+    );
 
     let research = router.history("Research").await;
     assert_eq!(
@@ -798,10 +800,13 @@ async fn history_counts_each_final_outcome_as_specified() {
         "router_route_history_observations_total{route=\"Coder\",outcome=\"unavailable\"} 1",
         "router_route_history_observations_total{route=\"Research\",outcome=\"mismatch\"} 1",
         "router_route_history_observations_total{route=\"Offline\",outcome=\"unavailable\"} 1",
-        "router_route_history_signal{route=\"Coder\"} 0",
     ] {
         assert!(metrics.contains(line), "{line}\n{metrics}");
     }
+    assert!(
+        !metrics.contains("router_route_history_signal"),
+        "no quality-looking gauge: history is observational"
+    );
     let samples = metrics
         .lines()
         .find_map(|line| {
@@ -995,9 +1000,12 @@ async fn the_admin_view_shows_settings_and_aggregates_only() {
     assert_eq!(view["enabled"], true);
     assert_eq!(
         view["weights"],
-        json!({"classifier": 1.0, "prior": 0.05, "history": 0.06})
+        json!({"classifier": 1.0, "prior": 0.1, "history": 0.0})
     );
-    assert_eq!(view["priors"], json!({"General": 0.2}));
+    assert_eq!(view["history_mode"], "observational");
+    assert_eq!(view["history_affects_scoring"], false);
+    close(&view["influence_radius"], 0.1);
+    assert_eq!(view["priors"], json!({"General": 1.0}));
     assert_eq!(view["classifier_baseline"], 0.65);
     assert_eq!(view["history"]["half_life_secs"], 3_600);
     assert_eq!(view["history"]["half_life_provisional"], true);
@@ -1013,15 +1021,19 @@ async fn the_admin_view_shows_settings_and_aggregates_only() {
         "successes",
         "server_error",
         "interrupted",
-        "success_rate",
-        "value",
-        "gated",
+        "min_samples_reached",
         "unavailable",
         "mismatch",
         "neutral",
         "last_observed_at",
     ] {
         assert!(coder.get(field).is_some(), "{field}: {coder}");
+    }
+    for quality_looking in ["value", "gated", "success_rate"] {
+        assert!(
+            coder.get(quality_looking).is_none(),
+            "observations, not a quality score: {coder}"
+        );
     }
     let text = view.to_string();
     for absent in [
@@ -1063,10 +1075,9 @@ async fn one_broken_deployment_never_lowers_its_route() {
     let pair = router.history("Pair").await;
     assert_eq!(pair["server_error"], 21, "observed: {pair}");
     close(&pair["effective_samples"], 21.0);
-    // Exactly what 21 successes alone give, n / (n + k) = 21/41: the broken
-    // deployment's 500s lowered nothing.
-    close(&pair["value"], 21.0 / 41.0);
-    assert_eq!(pair["gated"], false);
+    // The broken deployment's 500s are observed and are not samples.
+    close(&pair["successes"], 21.0);
+    assert_eq!(pair["min_samples_reached"], true);
 }
 
 #[tokio::test]
@@ -1080,8 +1091,7 @@ async fn server_errors_neither_lower_a_route_nor_open_its_history_gate() {
     }
     let coder = router.history("Coder").await;
     close(&coder["effective_samples"], 1.0);
-    assert_eq!(coder["gated"], true, "{coder}");
-    assert_eq!(coder["value"], 0.0);
+    assert_eq!(coder["min_samples_reached"], false, "{coder}");
     assert_eq!(coder["server_error"], 19);
     // Many more change nothing.
     for _ in 0..60 {
@@ -1089,7 +1099,6 @@ async fn server_errors_neither_lower_a_route_nor_open_its_history_gate() {
     }
     let coder = router.history("Coder").await;
     close(&coder["effective_samples"], 1.0);
-    assert_eq!(coder["value"], 0.0);
     assert_eq!(coder["server_error"], 79);
     // And an at-threshold verdict for Coder carries no history penalty: only
     // General's configured prior separates them.
@@ -1116,7 +1125,57 @@ async fn interrupted_streams_never_lower_a_route() {
     let coder = router.history("Coder").await;
     assert_eq!(coder["interrupted"], 25, "{coder}");
     close(&coder["effective_samples"], 0.0);
-    assert_eq!(coder["value"], 0.0);
+}
+
+// --- popularity is not quality ----------------------------------------------------------
+
+/// The winners for a borderline sweep, and the history the router reports.
+async fn decisions(router: &Router) -> Vec<String> {
+    let mut winners = Vec::new();
+    for confidence in ["0.65", "0.70", "0.74", "0.76", "0.80", "0.95"] {
+        let (_, body) = router
+            .chat("Auto", &format!("PICK Coder {confidence}"))
+            .await;
+        winners.push(body["model"].as_str().unwrap_or("").to_owned());
+        let scoring = &router.last_trace().await["scoring"];
+        assert_eq!(scoring["history_active"], false);
+        for candidate in scoring["candidates"].as_array().unwrap() {
+            assert_eq!(candidate["history_signal"], 0.0);
+        }
+    }
+    winners
+}
+
+#[tokio::test]
+async fn successful_traffic_volume_never_changes_the_winner() {
+    let fleet = Fleet::start().await;
+    let expected = ["General", "General", "General", "Coder", "Coder", "Coder"];
+    // General popular (100) and Coder quiet (5), then the other way round.
+    for (busy, quiet) in [("General", "Coder"), ("Coder", "General")] {
+        let router = Router::start(fleet.config("lightweight", Some(borderline_scoring()))).await;
+        for _ in 0..100 {
+            assert_eq!(router.chat(busy, "hello").await.0, 200);
+        }
+        for _ in 0..5 {
+            assert_eq!(router.chat(quiet, "hello").await.0, 200);
+        }
+        assert_eq!(
+            decisions(&router).await,
+            expected,
+            "classifier + prior decide, not {busy}'s volume"
+        );
+        // Still collected and visible.
+        let busy_history = router.history(busy).await;
+        let quiet_history = router.history(quiet).await;
+        assert!(
+            busy_history["successes"].as_f64().unwrap() > 99.0,
+            "{busy_history}"
+        );
+        assert!(
+            quiet_history["successes"].as_f64().unwrap() >= 4.9,
+            "{quiet_history}"
+        );
+    }
 }
 
 // --- provider parity ---------------------------------------------------------------------------
@@ -1131,7 +1190,7 @@ async fn jev_and_lightweight_verdicts_are_scored_alike() {
         let mut seen = Vec::new();
         for text in [
             "PICK Coder 0.95",
-            "PICK Coder 0.68",
+            "PICK Coder 0.70",
             "PICK Coder 0.40",
             "PICK General 0.9",
         ] {
@@ -1143,8 +1202,8 @@ async fn jev_and_lightweight_verdicts_are_scored_alike() {
             // Scores, components and the decision: everything but timing.
             if let Some(candidates) = scoring["candidates"].as_array_mut() {
                 for candidate in candidates {
-                    candidate["history"]["effective_samples"] = json!(
-                        candidate["history"]["effective_samples"]
+                    candidate["history_observations"]["effective_samples"] = json!(
+                        candidate["history_observations"]["effective_samples"]
                             .as_f64()
                             .map(f64::round)
                     );

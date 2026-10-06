@@ -12,7 +12,7 @@ R9.1, R9.1a and the classifier UI are unchanged.
 
 | # | Decision | Implemented as |
 |---|---|---|
-| 1 | Borderline accepted decisions may be influenced, within a strict bound; strong ones never. | Influence radius `(W_prior + 2·W_history) / W_classifier` must be **less than half the accepted range**, `(1 − min_confidence) / 2`, for every configured provider block (`MAX_INFLUENCE_SHARE = 0.5`). This replaces section 8's `Wp + 2·Ws < Wc·min_confidence`, which bounded only unnamed candidates and allowed a radius as large as the threshold itself. Property tests sweep random valid configurations against worst-case priors and history. |
+| 1 | Borderline accepted decisions may be influenced, within a strict bound; strong ones never. | Influence radius `W_prior / W_classifier` (active inputs only; history is not one) must be **less than half the accepted range**, `(1 − min_confidence) / 2`, for every configured provider block (`MAX_INFLUENCE_SHARE = 0.5`). This replaces section 8's `Wp + 2·Ws < Wc·min_confidence`, which bounded only unnamed candidates and allowed a radius as large as the threshold itself. Property tests sweep random valid configurations against worst-case priors. |
 | 2 | No provider-specific weights. | One `weights` block. The provider is trace metadata only. `jev`/`lightweight` weight keys are refused as unknown. |
 | 3 | One-hour half-life, configurable, provisional. | `history.half_life_secs`, default 3600, bounds 60..=604800. Documented as an operational starting point, not tuned; the admin view says `half_life_provisional: true`. |
 | 4 | Admin-only history reset. | `POST /api/router/v1/adaptive-scoring/reset`, empty body / `{}` for all, `{"route": "Coder"}` for one. Router key, like every control endpoint. Resets history aggregates only. |
@@ -20,7 +20,33 @@ R9.1, R9.1a and the classifier UI are unchanged.
 | 6 | No route capability schema. | None added. R5 stays the capability authority. |
 | 7 | `route_unavailable` is not scored. | Observed (`unavailable` counter, metric) and never scored. A request every deployment turned away with 502/503/504 before answering counts the same way. |
 
-**Observation is not scoring (pre-merge hardening, supersedes section 17).**
+**History is observational only in slice 1 (final pre-merge hardening;
+supersedes everything below about a history term, including the next
+paragraph's estimator).** R9.2 slice 1 collects route-history observations
+but does not use them to choose a route. Current history observations
+measure successful traffic volume, not validated route quality: a route
+picked more often succeeds more often, so scoring them would feed popularity
+back into selection. Therefore:
+
+- `weights.history` must be 0. Any other value is refused at load, not
+  clamped and not ignored. The key stays in the schema for a later phase.
+- **Only classifier confidence and the configured route prior affect route
+  selection:** `score = W_classifier·signal + W_prior·prior`. The trace
+  carries `history_active: false` and `history_signal: 0`.
+- The influence radius is `W_prior / W_classifier`, with no history term.
+- History stays collected, decayed, resettable and visible. The trace,
+  `GET /auto` (`history_mode: "observational"`,
+  `history_affects_scoring: false`) and the metrics show *observations*
+  (`effective_samples`, `successes`, `min_samples_reached`, outcome
+  counters), never a quality-looking value. The `router_route_history_signal`
+  gauge was removed before release.
+- **Future activation condition.** History may get a non-zero weight only
+  once Lightweight has a genuinely route-attributable quality signal: for
+  example validated task success or failure, operator or user evaluation, a
+  verifier result, tool-completion quality, or a route-level evaluator. None
+  is implemented.
+
+**Observation is not scoring (earlier pre-merge hardening, supersedes section 17).**
 Adaptive route history records many outcome categories, but only outcomes
 that can safely be attributed to route-level quality participate in the
 scored history signal. Deployment and infrastructure failures remain
@@ -31,14 +57,12 @@ observable but do not train logical-route preference.
 - An `interrupted` stream is one node's or one connection's failure. It is
   observed as `interrupted` and not scored.
 - Nothing the router sees today can be attributed to the route as a whole, so
-  slice 1 scores **successes only**: `history = n/(n + k)`, in `[0, 1)`.
-- `effective_samples` counts scored successes only. No unscored outcome can
-  open the `min_samples` gate (1 success + 19 server errors = 1 sample).
-- The influence-radius bound keeps its `2·W_history` term. It is now
-  conservative, since the realised history swing is at most `W_history`.
-- Consequence: history measures recent successful volume, so a busier route
-  accrues more positive history, within the radius, gate, shrinkage and
-  decay. Keep the `history` weight small until real traffic justifies it.
+  only successes are samples (`effective_samples`). No other outcome counts
+  toward `min_samples`: 1 success + 19 server errors is 1 sample. The future
+  estimator `n/(n + k)` is kept in code and tests, and is not read by
+  routing.
+- That made the remaining evidence successful volume, which is why the final
+  hardening above made history observational only.
 
 **The threshold is a hard boundary (supersedes open question 1 and section
 8's "chosen or low_confidence").** Scoring starts from R9.1's accepted
@@ -47,7 +71,7 @@ decision:
 ```text
 confidence < min_confidence  →  R9.1 rejects the verdict; its fallback IS the decision
                                  (reason below_threshold; the rejected route never contends)
-confidence = min_confidence  →  verdict and fallback tie on classifier signal; prior/history decide
+confidence = min_confidence  →  verdict and fallback tie on classifier signal; priors decide (ties to the verdict)
 confidence > min_confidence  →  scored; overturned only within the influence radius
 ```
 

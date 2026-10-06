@@ -606,8 +606,8 @@ impl RouterMetrics {
         )
     }
 
-    /// Each route's decayed history, read at scrape time. Nothing while
-    /// scoring is off.
+    /// Each route's decayed observational history, read at scrape time.
+    /// Nothing while scoring is off. It never affects routing.
     pub fn route_history_to_prometheus(
         book: &crate::scoring::HistoryBook,
         now: std::time::Instant,
@@ -618,7 +618,7 @@ impl RouterMetrics {
         }
         let view = book.view(now);
         out.push_str(
-            "# HELP router_route_history_effective_samples Decayed scored observations (successes plus failures) per logical route.\n",
+            "# HELP router_route_history_effective_samples Observational route history: decayed successful completions per logical route. Not a quality score; route history does not affect routing in R9.2 slice 1.\n",
         );
         out.push_str("# TYPE router_route_history_effective_samples gauge\n");
         for route in &view {
@@ -626,19 +626,7 @@ impl RouterMetrics {
                 out,
                 "router_route_history_effective_samples{{route=\"{}\"}} {}",
                 escape(&route.route),
-                route.signal.effective_samples
-            );
-        }
-        out.push_str(
-            "# HELP router_route_history_signal The history term adaptive scoring reads per logical route, in (-1, 1); 0 below min_samples.\n",
-        );
-        out.push_str("# TYPE router_route_history_signal gauge\n");
-        for route in &view {
-            let _ = writeln!(
-                out,
-                "router_route_history_signal{{route=\"{}\"}} {}",
-                escape(&route.route),
-                route.signal.value
+                route.observations.effective_samples
             );
         }
         out
@@ -1141,7 +1129,7 @@ impl RouterMetrics {
             );
         }
         out.push_str(
-            "# HELP router_route_history_observations_total Finished requests counted toward route history, by route and outcome. Only success and failure are scored.\n",
+            "# HELP router_route_history_observations_total Finished requests observed in route history, by route and outcome. Observational only: no outcome affects routing in R9.2 slice 1.\n",
         );
         out.push_str("# TYPE router_route_history_observations_total counter\n");
         for ((route, outcome), count) in self

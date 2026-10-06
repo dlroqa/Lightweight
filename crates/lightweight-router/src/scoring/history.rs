@@ -1,4 +1,12 @@
-//! Route-success history: one small, decaying aggregate per logical route.
+//! Route history: one small, decaying aggregate per logical route.
+//!
+//! **Observational only in R9.2 slice 1.** Everything here is recorded,
+//! decayed, shown (admin view, traces, metrics) and resettable, and nothing
+//! here enters a score: [`super::decide`] reads only [`HistoryObservations`]
+//! for its trace. The estimator below ([`signal_of`], [`HistorySignal`]) is
+//! kept as the foundation for a future route-quality signal and is not read by
+//! routing: with only successes attributable, it measures successful traffic
+//! volume, and popularity must never masquerade as quality.
 //!
 //! Recorded once per finished request, for the route that handled it — direct
 //! and `Auto` traffic alike — and read by [`super::decide`]. Never per request,
@@ -9,11 +17,12 @@
 //! **Observation is not scoring.** Every final outcome is recorded and shown;
 //! only an outcome that can be attributed to the *logical route* — rather than
 //! to the one deployment, node or connection that happened to serve the
-//! request — enters the scored signal. History answers "was this route a good
+//! request — could ever enter a quality estimate, and in slice 1 none enters
+//! any score at all (see above). History is meant to answer "was this route a good
 //! choice?", never "did the node picked this time behave?": that question is
 //! health's and the route policy's.
 //!
-//! | final outcome | observation | scored? |
+//! | final outcome | observation | an estimator sample? |
 //! |---|---|---|
 //! | `ok` (a completed response or stream) | `success` | **yes** |
 //! | `server_error` (a 5xx answer: one deployment's, as 500 is never retried) | `server_error` | no |
@@ -23,13 +32,13 @@
 //! | `client_error`, `cancelled` | `neutral` | no |
 //!
 //! Every failure the router can see today is one deployment's or one
-//! connection's, so slice 1 scores **successes only** and manufactures no
-//! negative evidence. A failure category is added to the score only once it
-//! can be told apart as the route's own.
+//! connection's, so only successes are samples, and no negative evidence is
+//! manufactured. Successes alone measure volume, which is exactly why the
+//! estimator is not used for routing yet.
 //!
-//! The signal ([`signal_of`]). `n` is the decayed count of **scored**
-//! observations — successes — and nothing else: unscored outcomes never bring a
-//! route closer to `min_samples`.
+//! The future estimator ([`signal_of`], not read by routing). `n` is the
+//! decayed count of samples — successes — and nothing else: other outcomes
+//! never bring a route closer to `min_samples`.
 //!
 //! ```text
 //! n < min_samples   →  h = 0                        (neutral; "gated")
@@ -104,7 +113,29 @@ impl Observation {
     }
 }
 
-/// One route's history signal, as scoring reads it.
+/// What has been observed of a route: decayed scored-category samples. Shown in
+/// traces and the admin view; never a score input.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HistoryObservations {
+    /// Decayed successful completions — the only category a future quality
+    /// estimator could count today.
+    pub effective_samples: f64,
+    pub successes: f64,
+    /// At least `min_samples` effective samples.
+    pub min_samples_reached: bool,
+}
+
+impl HistoryObservations {
+    pub const NONE: Self = Self {
+        effective_samples: 0.0,
+        successes: 0.0,
+        min_samples_reached: false,
+    };
+}
+
+/// A future quality estimator over a route's history. **Not read by routing in
+/// slice 1**: kept, and tested, as the foundation for a signal that becomes
+/// eligible only with genuinely route-attributable quality evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct HistorySignal {
     /// Decayed **scored** observations only: what `min_samples` gates on.
@@ -145,6 +176,14 @@ pub fn signal_of(successes: f64, policy: &HistoryPolicy) -> HistorySignal {
     }
 }
 
+fn observations_of(successes: f64, policy: &HistoryPolicy) -> HistoryObservations {
+    HistoryObservations {
+        effective_samples: successes,
+        successes,
+        min_samples_reached: successes >= f64::from(policy.min_samples),
+    }
+}
+
 /// What a count is worth `elapsed` later: `2^(−elapsed / half_life)`.
 pub fn decay_factor(elapsed: Duration, half_life: Duration) -> f64 {
     (-elapsed.as_secs_f64() / half_life.as_secs_f64()).exp2()
@@ -176,13 +215,13 @@ impl Record {
     }
 }
 
-/// One route's history, for the admin view. Numbers and a route name only.
-/// The counters after `signal` are observed and never scored.
+/// One route's history, for the admin view. Numbers and a route name only;
+/// observations, never a score.
 #[derive(Clone, Debug, Serialize)]
 pub struct RouteHistoryView {
     pub route: String,
     #[serde(flatten)]
-    pub signal: HistorySignal,
+    pub observations: HistoryObservations,
     pub server_error: u64,
     pub interrupted: u64,
     pub unavailable: u64,
@@ -252,7 +291,8 @@ impl HistoryBook {
         true
     }
 
-    /// `route`'s signal at `now`. Neutral for a route with no history, an
+    /// `route`'s future-estimator signal at `now` (not read by routing in
+    /// slice 1). Neutral for a route with no history, an
     /// unknown route, or while scoring is off.
     pub fn signal(&self, route: &RouteName, now: Instant) -> HistorySignal {
         let (Some(policy), Some(index)) = (self.policy, self.index(route)) else {
@@ -262,6 +302,20 @@ impl HistoryBook {
         records.get(index).map_or(HistorySignal::NEUTRAL, |record| {
             signal_of(record.decayed(now, policy.half_life), &policy)
         })
+    }
+
+    /// What has been observed of `route` at `now`. Empty for a route with no
+    /// history, an unknown route, or while scoring is off.
+    pub fn observations(&self, route: &RouteName, now: Instant) -> HistoryObservations {
+        let (Some(policy), Some(index)) = (self.policy, self.index(route)) else {
+            return HistoryObservations::NONE;
+        };
+        let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        records
+            .get(index)
+            .map_or(HistoryObservations::NONE, |record| {
+                observations_of(record.decayed(now, policy.half_life), &policy)
+            })
     }
 
     /// Forget `route`'s history, or every route's. Returns the routes reset.
@@ -294,8 +348,8 @@ impl HistoryBook {
             .zip(records.iter())
             .map(|(route, record)| RouteHistoryView {
                 route: route.to_string(),
-                signal: self.policy.map_or(HistorySignal::NEUTRAL, |policy| {
-                    signal_of(record.decayed(now, policy.half_life), &policy)
+                observations: self.policy.map_or(HistoryObservations::NONE, |policy| {
+                    observations_of(record.decayed(now, policy.half_life), &policy)
                 }),
                 server_error: record.server_error,
                 interrupted: record.interrupted,
@@ -568,7 +622,7 @@ mod tests {
         assert!(book.reset(Some(&name("Nowhere"))).is_empty());
         assert_eq!(book.reset(None).len(), 3);
         for view in book.view(now) {
-            assert_eq!(view.signal, HistorySignal::NEUTRAL);
+            assert_eq!(view.observations, HistoryObservations::NONE);
             assert_eq!(view.last_observed_at, None);
         }
     }

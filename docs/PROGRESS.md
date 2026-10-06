@@ -2250,3 +2250,65 @@ stream ending without finishing.
   21 × 500 (each 1 attempt on `broken`) and 21 × 200. History showed
   `server_error` 21, `effective_samples` 21.00 and `value` 0.5122 (= 21/41).
 - **Validation:** `./scripts/check.sh` green on the first run: 1293 workspace tests (from 1286; router 367), contract 47/2.
+
+### Final pre-merge hardening: history is observational only
+
+Review found what scoring only successes leaves: a measure of **successful
+traffic volume**, not route quality. A route picked more often succeeds more
+often, wins more borderline decisions, and draws more traffic. Popularity
+must never masquerade as quality, so in slice 1 history does not choose
+routes at all.
+
+- **Score:** `W_classifier·signal + W_prior·prior` only. The trace says
+  `history_active: false` and `history_signal: 0`; `total_score =
+  classifier_signal + prior_signal`.
+- **Validation:** `weights.history` must be 0. The key is kept for a later
+  phase; any other value is refused with "weights.history must be 0:
+  adaptive route history is observational only in this release (R9.2
+  slice 1). Its observations measure successful traffic volume, not
+  route-attributable quality, so they must not choose a route".
+- **Radius:** `W_prior / W_classifier`, with no phantom `2·W_history` term;
+  still `< (1 − min_confidence)/2` per provider.
+- **History kept as telemetry.** Recorded, decayed, resettable, and shown as
+  observations (`effective_samples`, `successes`, `min_samples_reached`,
+  outcome counters) in traces, `GET /auto` (`history_mode:
+  "observational"`, `history_affects_scoring: false`) and
+  `router_route_history_observations_total` /
+  `router_route_history_effective_samples`. The quality-looking
+  `router_route_history_signal` gauge and the `value`/`gated`/`success_rate`
+  fields were removed before release. The `n/(n+k)` estimator stays in code
+  and tests as the foundation for a future route-attributable quality signal.
+- **Tests:** router 372 (from 367). Added or rewritten:
+  - zero history weight valid; 0.0001, 0.01, 0.06 and 1.0 refused, and also
+    while off and when negative;
+  - the radius counts only the prior; a decision moves by exactly the radius;
+  - 10 vs 10 and 10 vs 10 000 successes (both directions) give identical
+    winners and scores over a 351-step sweep, and the telemetry still shows
+    10 and 10 000;
+  - decay halves the observations and never changes a winner;
+  - an exact-threshold decision and a tie are unaffected by history;
+  - no observed outcome moves the score;
+  - the trace shows history inactive;
+  - end to end: 100 vs 5 successes and the reverse give the same winners;
+    the admin view shows the observational mode and no quality fields; no
+    signal gauge.
+- **Mutations:** 5 of 5 caught:
+  - non-zero history weight accepted (2 tests failed);
+  - history reconnected to the score (12, including both 10-vs-10 000 tests);
+  - low-confidence verdict contends (5);
+  - the radius regaining a history term (17);
+  - the trace claiming history active (2).
+- **Real smoke** on the real `hermes router` binary (scripted General, Coder
+  and classifier nodes; prior 0.1, priors General 1.0):
+  - `validate-config` refused `history: 0.01` with the message above and
+    accepted `0`.
+  - With General at 100 successes and Coder at 5, Coder verdicts 0.65, 0.70
+    and 0.74 went to General, and 0.76, 0.80 and 0.95 went to Coder.
+  - After a reset with popularity reversed (Coder 100, General 5), the
+    winners were identical.
+  - The traces showed `history_signal 0` and totals 0.95 against 0.75; the
+    admin view showed the counts with `history_affects_scoring: false`.
+  - The processes were stopped by PID.
+- **Validation:** local fmt, clippy and the router and CLI tests; build,
+  render and the full `check.sh` on GitHub Actions (the user's instruction),
+  runs recorded below.

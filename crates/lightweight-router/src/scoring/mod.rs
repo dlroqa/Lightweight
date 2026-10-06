@@ -34,19 +34,27 @@
 //! ```text
 //! score(route) = W_classifier · classifier_signal(route)
 //!              + W_prior      · prior(route)                 ∈ [0, 1]
-//!              + W_history    · history(route)               ∈ (−1, 1)
 //! ```
 //!
+//! These are the only active inputs. **Route history is observational only in
+//! slice 1**: it is recorded, decayed, shown and resettable ([`history`]), and
+//! never read into a score. With failures unattributable to a route, its only
+//! scorable evidence is successful completions, and that measures successful
+//! traffic *volume*, not route quality — scoring it would let a route that is
+//! picked more often win more often. Popularity must never masquerade as
+//! quality, so `weights.history` must be 0 (validated) and the history
+//! contribution is 0 by construction. It can become eligible only once a
+//! genuinely route-attributable quality signal exists.
+//!
 //! The verdict wins ties, which is R9.1's own `confidence ≥ min_confidence`
-//! rule at equality. With `W_prior = W_history = 0` the verdict's
-//! `W·confidence ≥ W·baseline` always holds, so the result is R9.1's, request
-//! for request.
+//! rule at equality. With `W_prior = 0` the verdict's `W·confidence ≥
+//! W·baseline` always holds, so the result is R9.1's, request for request.
 //!
 //! # What is never scored
 //!
 //! * A verdict **below** the threshold. R9.1 rejected it and its fallback is
 //!   the accepted decision; scoring starts from that decision and the rejected
-//!   route cannot come back, whatever its prior or history.
+//!   route cannot come back, whatever its prior.
 //! * A classification with **no** verdict (a timeout, a refused key, …).
 //! * A candidate the classifier did not name: there is no signal for it, and
 //!   none is invented.
@@ -55,13 +63,13 @@
 //!
 //! # How far scoring can move a decision
 //!
-//! The verdict wins whenever `confidence − baseline ≥ (W_prior·Δprior +
-//! W_history·Δhistory) / W_classifier`, and the right side is at most the
-//! [`Weights::influence_radius`] `(W_prior + 2·W_history) / W_classifier`.
-//! Validation keeps that radius under half of the accepted range
+//! The verdict wins whenever `confidence − baseline ≥ W_prior·Δprior /
+//! W_classifier`, and the right side is at most the
+//! [`Weights::influence_radius`] `W_prior / W_classifier` (a prior spans
+//! `[0, 1]`). Validation keeps that radius under half of the accepted range
 //! `[baseline, 1]`, for every configured provider's threshold
 //! ([`MAX_INFLUENCE_SHARE`]): a classification in the upper half of the
-//! accepted range is never overturned, by any prior or any history.
+//! accepted range is never overturned, by any prior.
 
 pub mod history;
 
@@ -76,7 +84,7 @@ use crate::classifier::{Classification, ClassifierOutcome, RouteClassifier};
 use crate::config::ConfigError;
 use crate::domain::RouteName;
 
-pub use history::{HistoryBook, HistorySignal, Observation, RouteHistoryView};
+pub use history::{HistoryBook, HistoryObservations, HistorySignal, Observation, RouteHistoryView};
 
 /// One hour: an operational starting point for how fast history fades, not
 /// an empirically tuned value.
@@ -87,8 +95,8 @@ pub const MAX_HALF_LIFE_SECS: u64 = 604_800;
 pub const DEFAULT_MIN_SAMPLES: u32 = 20;
 /// The bound on `min_samples` and `shrinkage_samples`.
 pub const MAX_SAMPLES: u32 = 10_000;
-/// The share of the accepted confidence range `[baseline, 1]` priors and
-/// history together may reach into. Above it, the classifier alone decides.
+/// The share of the accepted confidence range `[baseline, 1]` priors may reach
+/// into. Above it, the classifier alone decides.
 pub const MAX_INFLUENCE_SHARE: f64 = 0.5;
 
 const fn default_classifier_weight() -> f64 {
@@ -172,12 +180,12 @@ pub struct Weights {
 }
 
 impl Weights {
-    /// How far, in classifier confidence, priors and history together can
-    /// move a decision: `(prior + 2·history) / classifier`. A prior spans
-    /// `[0, 1]` and a history term `(−1, 1)`, so the largest swing between two
-    /// routes is `prior + 2·history`.
+    /// How far, in classifier confidence, the active inputs can move a
+    /// decision: `prior / classifier`. A prior spans `[0, 1]`, so the largest
+    /// swing between two routes is `W_prior`. History is not an active input
+    /// (its weight is validated to be 0), so it has no term here.
     pub fn influence_radius(&self) -> f64 {
-        (self.prior + 2.0 * self.history) / self.classifier
+        self.prior / self.classifier
     }
 }
 
@@ -214,6 +222,9 @@ impl AdaptiveScoring {
             "enabled": self.enabled,
             "weights": self.weights,
             "influence_radius": self.weights.influence_radius(),
+            // Route history is recorded and shown, never scored, in slice 1.
+            "history_mode": "observational",
+            "history_affects_scoring": false,
             "priors": self.priors.iter()
                 .map(|(route, prior)| (route.to_string(), *prior))
                 .collect::<BTreeMap<_, _>>(),
@@ -284,7 +295,7 @@ pub enum ClassifierBasis {
     Baseline,
 }
 
-/// One contender's score, decomposed. The three signals sum to the total.
+/// One contender's score, decomposed. The signals sum to the total.
 #[derive(Clone, Debug, Serialize)]
 pub struct CandidateScore {
     pub route: String,
@@ -293,14 +304,17 @@ pub struct CandidateScore {
     pub classifier_signal: f64,
     /// `W_prior · prior`.
     pub prior_signal: f64,
-    /// `W_history · history.value`.
+    /// Always 0: route history is observational in slice 1 and never enters
+    /// a score.
     pub history_signal: f64,
+    /// `classifier_signal + prior_signal`.
     pub total_score: f64,
     /// The unweighted classifier input: the verdict's confidence, or the
     /// baseline.
     pub confidence: f64,
     pub prior: f64,
-    pub history: HistorySignal,
+    /// What has been observed of the route — shown, not scored.
+    pub history_observations: HistoryObservations,
 }
 
 /// The `scoring` block of a routing trace. Route names and numbers only:
@@ -312,6 +326,8 @@ pub struct ScoringTrace {
     pub classifier_baseline: f64,
     pub influence_radius: f64,
     pub weights: Weights,
+    /// Always false in slice 1: route history did not affect this decision.
+    pub history_active: bool,
     /// The route R9.1 alone resolves the classification to.
     pub classified_route: String,
     pub winner: String,
@@ -354,6 +370,7 @@ pub fn decide(
         classifier_baseline: baseline,
         influence_radius: scoring.weights.influence_radius(),
         weights: scoring.weights,
+        history_active: false,
         classified_route: classified.to_string(),
         winner: classified.to_string(),
         overrode: false,
@@ -384,21 +401,20 @@ pub fn decide(
 
     let score = |route: &RouteName, basis: ClassifierBasis, confidence: f64| {
         let prior = scoring.prior(route);
-        let signal = history.signal(route, now);
         let weights = &scoring.weights;
         let classifier_signal = weights.classifier * confidence;
         let prior_signal = weights.prior * prior;
-        let history_signal = weights.history * signal.value;
         CandidateScore {
             route: route.to_string(),
             basis,
             classifier_signal,
             prior_signal,
-            history_signal,
-            total_score: classifier_signal + prior_signal + history_signal,
+            // Observational only: recorded for the trace, never added.
+            history_signal: 0.0,
+            total_score: classifier_signal + prior_signal,
             confidence,
             prior,
-            history: signal,
+            history_observations: history.observations(route, now),
         }
     };
     trace.candidates.push(score(
@@ -468,11 +484,20 @@ pub(crate) fn validate(
         problems.push("weights.classifier must be greater than 0 and at most 1".into());
         weights_ok = false;
     }
-    for (name, value) in [("prior", weights.prior), ("history", weights.history)] {
-        if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
-            problems.push(format!("weights.{name} must be between 0 and 1"));
-            weights_ok = false;
-        }
+    if !(weights.prior.is_finite() && (0.0..=1.0).contains(&weights.prior)) {
+        problems.push("weights.prior must be between 0 and 1".into());
+        weights_ok = false;
+    }
+    // Kept in the schema for a later phase, and refused unless 0: in slice 1
+    // history is observational, and never silently clamped or ignored.
+    if weights.history != 0.0 {
+        problems.push(
+            "weights.history must be 0: adaptive route history is observational only in this \
+             release (R9.2 slice 1). Its observations measure successful traffic volume, not \
+             route-attributable quality, so they must not choose a route"
+                .into(),
+        );
+        weights_ok = false;
     }
 
     let history = &raw.history;
@@ -553,8 +578,8 @@ pub(crate) fn validate(
                     let limit = MAX_INFLUENCE_SHARE * (1.0 - baseline);
                     if radius > 0.0 && radius >= limit {
                         problems.push(format!(
-                            "weights let priors and history move a decision by up to {radius:.3} \
-                             in confidence ((prior + 2 x history) / classifier); with the {} \
+                            "weights let priors move a decision by up to {radius:.3} in \
+                             confidence (prior / classifier); with the {} \
                              classifier's min_confidence of {baseline}, that must be less than \
                              {limit:.3}, half of the accepted range, so a confident \
                              classification is never overturned",
