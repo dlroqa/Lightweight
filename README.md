@@ -662,6 +662,15 @@ hermes router validate-config --config router.json          # checks everything;
 hermes router --config router.json                          # http://127.0.0.1:11500/v1
 ```
 
+Start it with `--web-root frontend/dist` and the control panel opens at the
+router's own address with two router sections: **Auto Routing** (each rule as
+*Route directly to …* or *Semantic classification*) and **Classifier** (which
+provider is active, whether its API key was found — never the key itself —
+**Test Connection**, and a validated settings draft for either provider that
+produces the `auto_route.classifier` section to paste into `router.json`; the
+router has no API that writes its file). Jev's key stays in the router's
+environment: `export TYPESAFE_API_KEY="..."` before starting it.
+
 `hermes serve` is unchanged. The router only uses each node's public `/v1`
 surface and never loads, places or inspects a model. See
 [docs/ROUTER.md](docs/ROUTER.md) for the configuration, the failover rules,

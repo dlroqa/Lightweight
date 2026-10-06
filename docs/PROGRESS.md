@@ -1939,6 +1939,66 @@ trace reads `cancelled`, node C's own log records `cancelled` for
 **Next:** review of R9.1 (PR #37) and this branch. R9.2 is parked — nothing of
 it exists — and needs explicit approval.
 
+## Router classifier UI (feature/router-classifier-ui)
+
+R9.1 (PR #37 → `5627ffa`) and R9.1a (PR #38, retargeted to master and updated
+by a merge from master that changed no file → `58688cd`) are merged; master
+was validated after each (check.sh 1205 then 1223 tests, contract 47/2, all
+eight CI jobs green: runs 37401555264/37401555100 and 37406630315/37406630244).
+That backend is frozen; this branch builds on it. R9.2 does not exist.
+
+**What the existing UI was, read before building:** the panel (`frontend/`,
+React + Vite, `HashRouter`) is served by `hermes serve --web-root` and calls only
+its own gateway's `/api/v1/*`, same-origin by design (no CORS, no base URL).
+Nine screens; forms are `.field`/`.input` with inline notices, errors are
+`ApiError` + `ErrorState`, polling is `usePoll`. The router is a separate
+process whose `/api/router/v1/*` the panel could not reach, and it has no
+config write path — `router.json` is read once at start.
+
+**Decisions (the user's):** the router serves the panel itself, and saving is
+a validated snippet plus a proposal, not a new write API.
+
+- **Backend (additive, opt-in):** `hermes router --web-root <dir>`;
+  `lightweight_gateway::web::serve_root` shared so the router uses the same
+  path whitelist and cache rules; unknown `/api` or `/v1` paths stay JSON
+  `not_found`; panel files need no key, the API keeps its own;
+  `GET /api/router/v1/routes` gains `description`. Nothing in the classifier
+  contract changed.
+- **Panel:** `GET /version` (`build` prefix `lightweight-router-`) chooses the
+  router's sections, Auto Routing and Classifier; a gateway's panel is unchanged.
+  Classifier = provider status + Test Connection (real
+  `POST /classifier/check`), a draft seeded from `/auto` with a provider
+  selector and only that provider's fields, the Jev privacy notice,
+  include-user-text explained both ways, candidates, descriptions, fallback,
+  and the canonical `auto_route.classifier` snippet (never the R9.1 shorthand,
+  never a key). Field rules in `classifierModel.ts` mirror the router's.
+- **Not built:** Test Classification (no backend endpoint exists; adding one is
+  a backend change), a model *list* from discovery (the check endpoint returns
+  only `model_listed`), and any write of `router.json`.
+
+**Proposed separately — the smallest safe config write:** `PUT
+/api/router/v1/classifier` on a loopback-only router (refused when any listener
+is exposed), body = exactly the `auto_route.classifier` section, validated by
+the same `classifier::validate` against the running routes, written atomically
+(temp file + rename, keeping a `.bak`) to the file the router loaded, answering
+`restart_required: true`; never accepting a key, only `api_key_env`. Route
+descriptions would be a second, equally narrow endpoint.
+
+Verified by execution: `scripts/render-panel.sh` locally (scratch ports — the
+user's own gateway is on 11434): the gateway panel's 10 checks unchanged, and
+47 router-panel checks against a real `lightweight router --web-root` with Jev
+pointed at a scripted TypeSafe (`e2e/mock-jev.mjs`): Test Connection → real
+router → `Connected`; every other status rendered in words; validation;
+provider switching; the per-run key absent from DOM, storage and all 29
+response bodies.
+
+- **Validation.** `./scripts/check.sh`: 1228 workspace tests (+5 router
+  `tests/panel.rs`), 26 frontend unit tests (`npm run test`, run by the build),
+  contract 47/2. `.gitignore` gains `/e2e/node_modules` and `/e2e/screens`: a
+  local `npm ci --prefix e2e` otherwise tripped the secrets gate.
+
+**Next:** review of this branch (not merged). R9.2 needs explicit approval.
+
 ## Next step
 
 M10 is complete, and with it the approved plan M0-M10. Stated exactly:
