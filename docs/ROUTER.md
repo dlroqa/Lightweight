@@ -11,7 +11,7 @@ Lightagent ─ model="Coder" ─▶ router ─ model="QwenCoder" ─▶ node A  
                                      └ model="CoderBackup" ─▶ node B   (fallback)
 ```
 
-This document covers milestones R0 to R8:
+This document covers milestones R0 to R8, and R9.1:
 
 - **R0–R3:** the domain model, a transparent proxy, a multi-node registry with
   health checks, and priority routing with failover before the response starts.
@@ -31,6 +31,12 @@ This document covers milestones R0 to R8:
   request's structure; the route then chooses the deployment exactly as
   before. See [Auto routing](#auto-routing). **R8 is not learned routing:**
   no classifier, embedding, score, history, latency or cost is involved.
+- **R9.1:** optional content-aware classification. An `Auto` rule may say
+  `"classify": true`, and a classifier — itself a configured route — then
+  recommends one of the operator's candidate routes by what the request asks
+  for. It chooses a route only, never a deployment, and every failure falls
+  back deterministically. See
+  [Content-aware classification](#content-aware-classification-r91).
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -40,6 +46,7 @@ The [roadmap](#roadmap) lists what comes after.
 |---|---|---|
 | Client (Lightagent) | which capability it wants | a route name such as `Coder`, or `Auto` |
 | Auto rules (in the router, R8) | which logical route, when the client sent `Auto` | ordered rules over the request's structure — never a deployment or a node |
+| Classifier (a configured route, R9.1) | which candidate route, when a rule asks | a recommendation of one configured route name — never a deployment or a node |
 | **Router** | where the request goes | routes, the deployment registry, node health, routing policy, forwarding, stream relaying, failover, router logs and metrics |
 | Node (`hermes serve`) | how the model runs | its aliases, canonical ids, GGUF files, RAM admission, the scheduler and the engine |
 | Placement controller (in the router process, R7) | where a route is prepared | load requests to empty nodes, readiness confirmation, backoff — never a request's path |
@@ -131,7 +138,9 @@ silently ignored.
 | `auto_route` | none | `{"enabled": true, "fallback_route": "General", "rules": [...]}`: serve `Auto`. Without the section, `Auto` is an unknown model, exactly as before R8. See [Auto routing](#auto-routing). |
 | `auto_route.enabled` | `false` | Off unless set. A section that is present but off is still checked. |
 | `auto_route.fallback_route` | required | The route an `Auto` request goes to when no rule matches. |
-| `auto_route.rules[]` | `[]` | `{"name": "tools", "when": {...}, "route": "Coder"}`, tried in order. At most 64. |
+| `auto_route.rules[]` | `[]` | `{"name": "tools", "when": {...}, "route": "Coder"}`, tried in order. At most 64. A rule may say `"classify": true` instead of naming a `route` (R9.1). |
+| `auto_route.classifier` | none | `{"route": "RouterClassifier", "routes": ["General", "Coder", "Research"]}`: the classifier a classifying rule calls, and the candidates it may recommend. See [Content-aware classification](#content-aware-classification-r91). |
+| `routes[].description` | none | What the route is for, at most 200 characters. Told only to the classifier. |
 
 **Secrets are never written in the file.** Each node names its own environment
 variable, and nothing falls back to a shared key. A URL that contains a
@@ -371,10 +380,12 @@ route's deployments. The prompt estimate is the router's **lower bound**
 tokenization; a threshold compares against that bound. A body the router could
 not read well enough to count matches no threshold.
 
-**Nothing reads a prompt for meaning.** There is no "looks like code", "asks
-for maths" or "is research" condition, and no rule inspects message text for
-words such as "tool" or "function". Every condition is a field the client set
-or the endpoint it used.
+**No rule condition reads a prompt for meaning.** There is no "looks like
+code", "asks for maths" or "is research" condition, and no rule inspects
+message text for words such as "tool" or "function". Every condition is a
+field the client set or the endpoint it used. Meaning is read only by the
+[classifier](#content-aware-classification-r91), and only when a rule the
+operator wrote asks for it.
 
 A request the gateway would refuse — `tool_choice: "required"` with no tools,
 say — is refused with the gateway's own `400` before any route is chosen,
@@ -396,7 +407,8 @@ At startup, with the section on or off, the router refuses:
   `[A-Za-z0-9._-]`. A rule name is a metric label, so it is held to the node
   id's alphabet; `_fallback` is reserved for the fallback;
 - a rule with no conditions (it would match every request: that is what
-  `fallback_route` is for), a prompt threshold of `0`, and a rule no request can
+  `fallback_route` is for) — unless it classifies, which is how classification
+  becomes the catch-all after the deterministic rules — a prompt threshold of `0`, and a rule no request can
   meet: `min_prompt_tokens` above `max_prompt_tokens`; `endpoint: "completion"`
   with `requires_tools: true`, `requires_reasoning: true` or any `tool_choice`
   but `unspecified` (a text completion carries none of them); and
@@ -487,6 +499,171 @@ Choosing is a walk over at most 64 in-memory rules, comparing fields already
 read: no network call, no model, and nothing asynchronous. Ten thousand
 decisions that try every rule take well under the half second the unit test
 allows on a debug build.
+
+## Content-aware classification (R9.1)
+
+R8's rules see a request's structure. Some clients make structure useless for
+choosing a route: Lightagent `7d95232` declares its whole tool set on every
+turn, so `requires_tools: true` matches a greeting as surely as a coding task.
+R9.1 lets an `Auto` rule ask a **classifier** which route a request is for.
+It still chooses **only the logical route**; the route's own pipeline then
+chooses the deployment, as for every request.
+
+```text
+Auto ─▶ R8 rules, in order ─┬─ a rule names a route ──────────────────────────┐
+                            ├─ a rule says "classify" ─▶ classifier route ──┐ │
+                            └─ no rule matches ─▶ fallback_route ───────────┼─┤
+                                    chosen candidate │ or classifier fallback ┘ ▼
+                                                     └──────────────▶ logical route ─▶ health ─▶ capability
+                                                                         filter ─▶ affinity ─▶ policy ─▶ deployment
+```
+
+### Configuration
+
+```json
+"routes": [
+  { "name": "General",  "description": "Everyday conversation and small talk", "deployments": [ ... ] },
+  { "name": "Coder",    "description": "Software engineering, debugging, code generation", "deployments": [ ... ] },
+  { "name": "Research", "description": "Current events, web research, comparisons", "deployments": [ ... ] },
+  { "name": "ToolAgent", "deployments": [ ... ] },
+  { "name": "RouterClassifier", "deployments": [ { "node": "t420", "model": "QwenClassifier" } ] }
+],
+"auto_route": {
+  "enabled": true,
+  "fallback_route": "General",
+  "classifier": {
+    "route": "RouterClassifier",
+    "routes": ["General", "Coder", "Research"],
+    "fallback_route": "General",
+    "min_confidence": 0.65,
+    "timeout_ms": 30000,
+    "max_input_chars": 2000
+  },
+  "rules": [
+    { "name": "forced-tools",  "when": { "tool_choice": "required" },   "route": "ToolAgent" },
+    { "name": "large-context", "when": { "min_prompt_tokens": 12000 },  "route": "Research" },
+    { "name": "semantic",      "when": {}, "classify": true }
+  ]
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `classifier.route` | required | The configured route that classifies. Any route — typically a small instruct model on one node. Never `Auto`. |
+| `classifier.routes` | required | The candidates it may recommend, 1 to 16 configured routes, never `Auto`. Nothing else can be its answer. |
+| `classifier.fallback_route` | `auto_route.fallback_route` | Where a classification that fails or is unsure goes. |
+| `classifier.min_confidence` | 0.65 | A recommendation below this is not taken. 0 to 1. |
+| `classifier.timeout_ms` | **required** | How long a classification may take, 1 to 120 000. No default: see [Classification latency](#classification-latency). Never unlimited. |
+| `classifier.max_input_chars` | 2000 | How much of the request's text is sent, 1 to 32 000. |
+| `rules[].classify` | `false` | The rule asks the classifier instead of naming a `route` (exactly one of the two). A classifying rule may have an empty `when`. |
+| `routes[].description` | none | What the classifier is told the route is for. No deterministic decision reads it. |
+
+**Classification is opt-in twice over.** It needs the classifier section *and*
+a rule that says `"classify": true`. A classifier section with no such rule is
+inert, and a configuration without either is exactly R8. A request that names a
+route, an `Auto` request a deterministic rule resolves, and an `Auto` request no
+rule matches are never classified. Rules are still tried in order, so
+deterministic rules placed before the classifying rule always win.
+
+### What the classifier is, and what it sees
+
+The classifier is **a configured logical route**, called through the router's
+own pipeline as a nested request: its health, capability filtering, policy and
+failover decide which of its deployments answers. It never names a node, and a
+client can call it by name like any route (it is listed in `/v1/models`). The
+classification request carries `<request id>-classify`, its node's own key, and
+no session.
+
+It is sent one chat request — `temperature: 0`, `reasoning_effort: "none"`,
+48 tokens, not streamed — holding:
+
+- a system message listing the candidates, each with its description, and
+  asking for exactly `{"route": "<name>", "confidence": <0..1>}`. It is told
+  that declared tools alone do not mean a request needs them;
+- a user message with the request's structural traits (endpoint, whether
+  tools are declared, whether reasoning was asked for, the prompt estimate)
+  and the **last user message** — a completion's first prompt — cut to
+  `max_input_chars` characters (on a character boundary, marked
+  `(truncated)`). No earlier turn, system prompt, tool schema, alias or node
+  name is sent.
+
+### Answers, confidence and fallback
+
+The answer must be one JSON object (text around it, such as a code fence, is
+tolerated) naming one of the candidates, matched ignoring case, with a
+`confidence` between 0 and 1. The request then resolves:
+
+| Outcome | When | Route |
+|---|---|---|
+| `chosen` | a candidate, at or above `min_confidence` | that candidate |
+| `low_confidence` | a candidate, below `min_confidence` | the classifier's fallback |
+| `invalid` | not JSON, no `route`, a route that is not a candidate (a node name, `Auto`, a configured route outside `routes`), or a missing or out-of-range confidence | the classifier's fallback |
+| `unavailable` | the classifier route refused (`route_unavailable`, a node's `503`, …) | the classifier's fallback |
+| `timeout` | no answer within `timeout_ms`. The nested request is dropped, which closes its upstream connection. | the classifier's fallback |
+| `nested` | a classification request reached a classifying rule — impossible by configuration, and refused at run time too | the rule's fallback |
+
+**`Auto` never fails because the classifier did.** A route can never be
+invented: the answer is checked against the candidates, and only a configured
+route can be a candidate.
+
+**Recursion is impossible.** The classifier route and every candidate are
+refused at startup if they are `Auto`, and the classification is sent to the
+classifier route by name, so it never reaches `Auto`. A nested request that did
+would take its rule's fallback without classifying again.
+
+### After the route is chosen
+
+Nothing changes. The chosen route answers exactly as if the client had named
+it: [capability filtering](#capability-filtering) inside it, its
+[session affinity](#session-affinity) (keyed by the resolved route — a
+session's greeting and its coding question have separate affinities, never one
+under `Auto` or the classifier), its policy, its failover, its placement, and
+its name on the response and every stream chunk. Classification decides the
+logical route and nothing else. There is no cross-route fallback: if the chosen
+route cannot serve the request, that route's error is returned.
+
+### Classification latency
+
+Classification sits in front of the answer, and costs what one short
+generation on the classifier route costs. It is measured on its own —
+`classifier.duration_ms` in the trace and the
+`router_classifier_duration_seconds` histogram — and is **not** part of
+`routing_ms` or `router_routing_duration_seconds`, which keep their R6
+meaning: the router's own planning time.
+
+How long a classification takes depends on the classifier model, the hardware
+and backend it runs on, and the prompt length — so `timeout_ms` **has no
+default** and must be written in the classifier section. One observation, not a
+benchmark: Qwen3-1.7B (Q4_K_M) on the 4-core development CPU took roughly
+**13–44 s** per classification. A GPU, a smaller model, or a faster remote node
+can classify in well under a second and support a much shorter timeout. A
+timeout shorter than the classifier's real latency makes **every**
+classification time out and fall back — correct, but no longer classifying —
+so set it from the `router_classifier_duration_seconds` you observe. It is
+bounded at 120 000 ms: classification must never hold a request indefinitely.
+On timeout the classification request is cancelled (its upstream connection is
+closed) and the request continues at the classifier's fallback route.
+
+### Observability
+
+```json
+"requested_route": "Auto", "auto_rule": "semantic", "route": "Coder",
+"classifier": {"route": "RouterClassifier", "outcome": "chosen", "chosen_route": "Coder",
+               "confidence": 0.92, "duration_ms": 412.8, "request_id": "rtr-…-classify"}
+```
+
+`chosen_route` is what the classifier named, taken or not (a `low_confidence`
+trace shows what it would have chosen). The classification request has its own
+trace under the classifier route. One `auto route classified` log line records
+the same fields. No prompt, answer text or tool schema is ever in a trace, a
+log line, a metric or the admin view. Metrics:
+`router_classifier_requests_total{outcome}`,
+`router_classifier_route_total{route}` (chosen and taken), and
+`router_classifier_duration_seconds{outcome}`; `router_auto_route_decisions_total`
+counts the classifying rule under the route it finally resolved to.
+`GET /api/router/v1/auto` adds each rule's `classify` and a `classifier`
+block: its route, candidates with descriptions, fallback, threshold, timeout,
+input limit, the rules that invoke it, and outcome counts.
 
 ## Health
 
@@ -1141,7 +1318,7 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
 | `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
 | `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
-| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `decisions`. Read-only; rules change only with the file. |
+| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). Read-only; rules change only with the file. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
 ## Observability
@@ -1322,6 +1499,9 @@ or an address.
   `router_placement_failures_total{route,reason}`, and the histogram
   `router_placement_reconcile_duration_seconds` (one pass, without the loads
   it starts).
+- Classification (R9.1): `router_classifier_requests_total{outcome}`,
+  `router_classifier_route_total{route}`, and the histogram
+  `router_classifier_duration_seconds{outcome}`.
 - `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
   `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
   — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
@@ -1389,9 +1569,19 @@ clients cannot add labels by inventing model names.
   they are deliberately not counted.
 - **Upstream connection time is not separated** from the response-head time;
   see [Latency](#latency).
-- **`Auto` sees structure only.** It can tell a tool request from a plain chat,
-  but not a coding question from a poem. Content-aware choice would need a
-  classifier, which belongs to a later milestone.
+- **`Auto`'s rules see structure only.** They can tell a tool request from a
+  plain chat, but not a coding question from a poem. That is what a classifying
+  rule (R9.1) is for.
+- **A classifier is only as good as its model.** On the development box,
+  Qwen3-1.7B chose the intended route for 4 of 5 real prompts; it called a
+  GPU-announcement comparison `General`, not `Research`. A wrong but confident
+  answer is taken. Descriptions and the candidate list are the operator's
+  levers; nothing is learned from outcomes (that would be R9.2).
+- **Classification adds a generation to every classified request.** See
+  [Classification latency](#classification-latency). `timeout_ms` is required
+  precisely because no one value suits a GPU, a CPU and a remote classifier.
+- **The classifier route is a visible model.** It is a configured route, so it
+  is listed in `/v1/models` and a client may call it directly.
 - **`Auto`'s prompt threshold is the router's lower bound.** A prompt the model
   counts at 14 000 tokens may be estimated at 9 000, and miss a
   `min_prompt_tokens: 12000` rule. Set thresholds against the estimate; the
@@ -1465,7 +1655,8 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R8 (rule-based `Auto`) is built. Nothing after it is. Each
+R8 (rule-based `Auto`) and R9.1 (content-aware classification) are built.
+Nothing after them is. Each
 later step builds on the types above without changing the public route
 identity.
 
@@ -1476,7 +1667,10 @@ identity.
 | **R6** | Done: optional session affinity (explicit header, route-scoped, bounded, idle TTL, a preference only over valid candidates); TTFT, latency and planning histograms; one request id from client to node log, across failover; per-request routing traces; estimate-versus-node prompt-token telemetry. Deliberately left out: using any of it to route, soft affinity, persistence, and inferring sessions. |
 | **R7** | Done: per-route `min_ready` / `warm_standby` targets on allowed nodes, a reconciliation loop that loads installed models onto empty nodes through each node's control API, readiness by the router's own probe, the node's admission as the authority, bounded backoff, `/api/router/v1/placement`. Deliberately left out: unloading, swapping, rebalancing, downloading, and any use of latency or traffic. |
 | **R8** | Done: an opt-in `Auto` model that chooses the logical route by ordered, first-match rules over the R5 request requirements (endpoint, tools, `tool_choice`, reasoning, prompt estimate), with an explicit fallback; the route's own pipeline chooses the deployment; route-scoped affinity; the resolved route on every response; `requested_route`/`auto_rule` in traces, decision metrics and `/api/router/v1/auto`. Deliberately left out: prompt-content classification, scores, history, latency or cost, cross-route fallback, and live rule editing. |
-| **R9** | A learned or adaptive router, and mixture-of-agents integration. |
+| **R9.1** | Done: an opt-in classifier an `Auto` rule invokes with `"classify": true` — itself a configured route, called through the router's pipeline — choosing only among configured candidate routes (with optional route descriptions), with a confidence threshold, a timeout, bounded input, and a deterministic fallback for every failure; recursion refused; classifier time measured apart from `routing_ms`; traces, metrics and admin state. Deliberately left out: scores, history, latency, cross-route fallback, and orchestration. |
+| **R9.2** | Planned, after R9.1 is reviewed: bounded, explainable scoring of candidate **routes** (never deployments) from configured weights and route-level evidence, with a deterministic fallback and an off switch. |
+| **R9.3** | Planned: explicit, acyclic cross-route fallback chains for pre-response `route_unavailable` / `route_capability_mismatch` only; never mid-stream; kept apart from deployment failover. |
+| **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
 Out of scope for every one of these: a request-path model load, splicing one
 node's output into another's stream, and a dependency on distributed consensus.

@@ -35,6 +35,30 @@ pub struct SessionTrace {
     pub reassignment: Option<&'static str>,
 }
 
+/// An `Auto` request's classification (R9.1): what the classifier route
+/// recommended and whether it was taken. Never the text it was sent or the
+/// answer it gave.
+#[derive(Clone, Debug, Serialize)]
+pub struct ClassifierTrace {
+    /// The classifier route.
+    pub route: String,
+    /// `chosen`, `low_confidence`, `invalid`, `unavailable`, `timeout` or
+    /// `nested`. Only `chosen` makes `chosen_route` the request's route.
+    pub outcome: &'static str,
+    /// The candidate the classifier named, taken or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// The classification's own time, outside `routing_ms`.
+    pub duration_ms: f64,
+    /// The classification request's own id, findable in its own trace.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub input_truncated: bool,
+}
+
 /// One deployment the request was sent to.
 #[derive(Clone, Debug, Serialize)]
 pub struct AttemptTrace {
@@ -93,6 +117,9 @@ pub struct RoutingTrace {
     /// `Auto` matched no rule, and `route` is its fallback.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub auto_fallback: bool,
+    /// Present when `auto_rule` asked the classifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<ClassifierTrace>,
     pub endpoint: &'static str,
     pub stream: bool,
     pub policy: &'static str,
@@ -151,6 +178,7 @@ impl RoutingTrace {
             requested_route: route.to_owned(),
             auto_rule: None,
             auto_fallback: false,
+            classifier: None,
             endpoint,
             stream: false,
             policy,

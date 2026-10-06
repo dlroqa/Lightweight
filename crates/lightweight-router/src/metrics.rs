@@ -92,6 +92,10 @@ pub struct RouterMetrics {
     auto_decisions: Mutex<BTreeMap<(String, String), u64>>,
     /// `Auto` requests no rule matched, by the fallback route they went to.
     auto_fallbacks: Mutex<BTreeMap<String, u64>>,
+    /// Classifications, by outcome.
+    classifier_outcomes: Mutex<BTreeMap<&'static str, u64>>,
+    /// Routes classifications chose (outcome `chosen`), by route.
+    classifier_routes: Mutex<BTreeMap<String, u64>>,
     histograms: Histograms,
 }
 
@@ -292,6 +296,7 @@ struct Histograms {
     estimation_ratio: Family,
     estimation_error: Family,
     reconcile: Family,
+    classifier: Family,
 }
 
 impl Default for Histograms {
@@ -341,6 +346,11 @@ impl Default for Histograms {
                 "router_placement_reconcile_duration_seconds",
                 "One placement pass: reading health, comparing each route with its target, and starting loads. Loads themselves run afterwards and are not included.",
                 PLANNING,
+            ),
+            classifier: Family::new(
+                "router_classifier_duration_seconds",
+                "One Auto classification, from asking the classifier route to its verdict, timeout or failure, by outcome. Not part of router_routing_duration_seconds.",
+                SECONDS,
             ),
         }
     }
@@ -516,6 +526,29 @@ impl RouterMetrics {
             .filter(|((r, _), _)| r == rule)
             .map(|(_, count)| count)
             .sum()
+    }
+
+    pub fn record_classification(
+        &self,
+        outcome: &'static str,
+        chosen: Option<&str>,
+        elapsed: Duration,
+    ) {
+        bump(&self.classifier_outcomes, outcome);
+        if let Some(route) = chosen {
+            bump(&self.classifier_routes, route.to_owned());
+        }
+        self.histograms
+            .classifier
+            .observe(vec![("outcome", outcome.to_owned())], millis(elapsed));
+    }
+
+    /// Classifications so far, by outcome.
+    pub fn classifier_outcomes(&self) -> BTreeMap<&'static str, u64> {
+        self.classifier_outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn auto_fallbacks(&self) -> u64 {
@@ -951,6 +984,38 @@ impl RouterMetrics {
             );
         }
 
+        out.push_str(
+            "# HELP router_classifier_requests_total Auto classifications, by outcome: chosen, low_confidence, invalid, unavailable, timeout, nested.\n",
+        );
+        out.push_str("# TYPE router_classifier_requests_total counter\n");
+        for (outcome, count) in self
+            .classifier_outcomes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_classifier_requests_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+        out.push_str(
+            "# HELP router_classifier_route_total Routes Auto classifications chose and took, by route.\n",
+        );
+        out.push_str("# TYPE router_classifier_route_total counter\n");
+        for (route, count) in self
+            .classifier_routes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_classifier_route_total{{route=\"{}\"}} {count}",
+                escape(route)
+            );
+        }
+
         let h = &self.histograms;
         for family in [
             &h.request,
@@ -962,6 +1027,7 @@ impl RouterMetrics {
             &h.estimation_ratio,
             &h.estimation_error,
             &h.reconcile,
+            &h.classifier,
         ] {
             family.render(&mut out);
         }

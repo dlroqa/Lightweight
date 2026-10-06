@@ -260,6 +260,9 @@ pub struct Route {
     /// the ring under [`RoutePolicy::RoundRobin`], and the tie-break under
     /// [`RoutePolicy::LeastBusy`]. Never empty.
     pub deployments: Vec<DeploymentId>,
+    /// What the route is for, in the operator's words. Read only by the `Auto`
+    /// classifier (R9.1), which is told it; no deterministic decision reads it.
+    pub description: Option<String>,
     /// How many of this route's deployments the placement controller keeps
     /// loaded, and where it may load them. `None`: the controller never acts
     /// for this route, and the route is served exactly as before R7.
