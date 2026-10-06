@@ -8,7 +8,10 @@
 //! * **`/api/router/v1`** is the operator's read-only view of what is behind
 //!   the routes — nodes, deployments, health, session affinity, `Auto`'s
 //!   rules and recent routing traces. It shares `/v1`'s credential and never shows a node's
-//!   key, a session id (only a keyed fingerprint) or any request content.
+//!   key, a session id (only a keyed fingerprint) or any request content. Its
+//!   few `POST`s act on the router's own bookkeeping — run a placement pass,
+//!   check the classifier, reset adaptive scoring's route history — never on
+//!   the configuration.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -77,6 +80,10 @@ pub fn app_with_panel(state: Arc<RouterState>, web_root: Option<PathBuf>) -> Rou
         .route("/api/router/v1/traces", get(traces))
         .route("/api/router/v1/auto", get(auto_rules))
         .route("/api/router/v1/classifier/check", post(classifier_check))
+        .route(
+            "/api/router/v1/adaptive-scoring/reset",
+            post(adaptive_scoring_reset),
+        )
         .route("/api/router/v1/placement", get(placement))
         .route("/api/router/v1/placement/reconcile", post(reconcile))
         .fallback(fallback)
@@ -341,6 +348,10 @@ async fn metrics(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> R
                 &state.health.snapshot(),
                 &state.placement.loading(),
             ));
+            text.push_str(&crate::metrics::RouterMetrics::route_history_to_prometheus(
+                &state.route_history,
+                std::time::Instant::now(),
+            ));
             text
         },
     )
@@ -520,6 +531,116 @@ async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -
             }
             view
         }),
+        // Adaptive route scoring (R9.2): its settings, and each route's
+        // history as numbers. Never a request, session, deployment or node.
+        "adaptive_scoring": adaptive_scoring_view(&state, auto),
+    }))
+    .into_response()
+}
+
+fn adaptive_scoring_view(state: &RouterState, auto: &crate::auto_route::AutoRoute) -> Value {
+    let Some(scoring) = &auto.scoring else {
+        return json!({"configured": false, "enabled": false});
+    };
+    let mut view = scoring.view();
+    if let Some(object) = view.as_object_mut() {
+        object.insert("configured".into(), json!(true));
+        object.insert(
+            "classifier_baseline".into(),
+            json!(
+                auto.classifier
+                    .as_ref()
+                    .map(crate::scoring::classifier_baseline)
+            ),
+        );
+        let fallbacks: BTreeMap<&str, u64> = ["below_threshold", "no_verdict", "internal_error"]
+            .into_iter()
+            .map(|reason| (reason, state.metrics.scoring_fallbacks(reason)))
+            .collect();
+        object.insert("fallbacks".into(), json!(fallbacks));
+        object.insert(
+            "routes".into(),
+            json!(state.route_history.view(std::time::Instant::now())),
+        );
+    }
+    view
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetRequest {
+    /// One logical route; absent resets every route.
+    route: Option<String>,
+}
+
+/// `POST /api/router/v1/adaptive-scoring/reset`: forget adaptive scoring's
+/// route history — every route's, or with `{"route": "Coder"}` one route's.
+///
+/// Operator-only, behind the router's key like every other mutation here. It
+/// resets the history aggregates and nothing else: no route, rule, classifier
+/// setting, session affinity, placement, node or loaded model is touched.
+/// Prometheus counters stay monotonic; only the history scoring reads starts
+/// over.
+async fn adaptive_scoring_reset(
+    State(state): State<Arc<RouterState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    if !state.route_history.is_recording() {
+        return json_error(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::invalid_request(
+                "adaptive scoring is not configured and on, so there is no history to reset",
+                "adaptive_scoring_not_enabled",
+            ),
+        );
+    }
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        ResetRequest::default()
+    } else {
+        match serde_json::from_slice::<ResetRequest>(&body) {
+            Ok(request) => request,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::invalid_request(
+                        "the body must be empty, {}, or {\"route\": \"<a configured route>\"}",
+                        "invalid_request_body",
+                    ),
+                );
+            }
+        }
+    };
+    let route = match request.route.as_deref() {
+        None => None,
+        Some(requested) => match state.route_history.route_named(requested) {
+            Some(route) => Some(route.clone()),
+            None => {
+                return json_error(
+                    StatusCode::NOT_FOUND,
+                    &ErrorEnvelope::invalid_request(
+                        "that is not one of the configured routes",
+                        "route_not_found",
+                    )
+                    .with_param("route"),
+                );
+            }
+        },
+    };
+    let reset = state.route_history.reset(route.as_ref());
+    tracing::info!(
+        target: lightweight_observability::targets::ROUTER,
+        scope = if route.is_some() { "route" } else { "all" },
+        routes = reset.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        "adaptive scoring history reset"
+    );
+    axum::Json(json!({
+        "reset": if route.is_some() { "route" } else { "all" },
+        "routes": reset,
+        "reset_at": crate::classifier::unix_now(),
     }))
     .into_response()
 }
