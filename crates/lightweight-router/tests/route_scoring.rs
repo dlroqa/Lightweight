@@ -84,6 +84,8 @@ struct Script {
     serving: String,
     classifier: bool,
     tools: bool,
+    /// Answers every generation with a 500: one bad deployment.
+    broken: bool,
     hits: Arc<AtomicU32>,
 }
 
@@ -103,6 +105,7 @@ impl Node {
             serving: serving.to_owned(),
             classifier,
             tools,
+            broken: serving.starts_with("Broken"),
             hits: Arc::default(),
         };
         let app = axum::Router::new()
@@ -166,6 +169,9 @@ async fn generate(
         .and_then(|message| message["content"].as_str())
         .unwrap_or("")
         .to_owned();
+    if script.broken {
+        return error(500, "internal_error");
+    }
     if script.classifier {
         let (route, confidence) = pick(&text);
         let content = json!({"route": route, "confidence": confidence}).to_string();
@@ -403,6 +409,9 @@ struct Fleet {
     research: Node,
     tool_agent: Node,
     classifier: Node,
+    /// A deployment that answers every request with a 500, sharing the Pair
+    /// route with Coder's healthy one.
+    broken: Node,
     jev: (String, CancellationToken, Typesafe),
 }
 
@@ -422,6 +431,7 @@ impl Fleet {
             research: Node::with("ResearchAlias", false, false).await,
             tool_agent: Node::start("ToolAlias").await,
             classifier: Node::with("ClassifierAlias", true, true).await,
+            broken: Node::start("BrokenAlias").await,
             jev: (jev_base, jev_stop, typesafe),
         }
     }
@@ -456,7 +466,8 @@ impl Fleet {
                 {"id": "research", "url": self.research.base},
                 {"id": "tools", "url": self.tool_agent.base},
                 {"id": "classifier", "url": self.classifier.base},
-                {"id": "offline", "url": "http://127.0.0.1:9"}
+                {"id": "offline", "url": "http://127.0.0.1:9"},
+                {"id": "broken", "url": self.broken.base}
             ],
             "routes": [
                 {"name": "General", "deployments": [{"node": "general", "model": "GeneralAlias"}]},
@@ -464,6 +475,9 @@ impl Fleet {
                 {"name": "Research", "deployments": [{"node": "research", "model": "ResearchAlias"}]},
                 {"name": "Offline", "deployments": [{"node": "offline", "model": "OfflineAlias"}]},
                 {"name": "ToolAgent", "deployments": [{"node": "tools", "model": "ToolAlias"}]},
+                {"name": "Pair", "strategy": "round_robin", "deployments": [
+                    {"node": "broken", "model": "BrokenAlias"},
+                    {"node": "coder", "model": "CoderAlias"}]},
                 {"name": "RouterClassifier", "deployments": [{"node": "classifier", "model": "ClassifierAlias"}]}
             ],
             "auto_route": auto,
@@ -482,7 +496,8 @@ fn borderline_scoring() -> Value {
            "priors": {"General": 0.2}})
 }
 
-/// Direct traffic that makes General look reliable and Coder unreliable.
+/// Direct traffic: a success record for General, and 500s for Coder, which
+/// are observed and never scored.
 async fn favour_general(router: &Router) {
     for _ in 0..30 {
         assert_eq!(router.chat("General", "hello").await.0, 200);
@@ -570,7 +585,8 @@ async fn high_borderline_and_low_confidence_coder() {
     assert_eq!(trace["scoring"]["overrode"], false);
 
     // Borderline: within the bound, history and prior choose General.
-    let (status, body) = router.chat("Auto", "PICK Coder 0.70").await;
+    // (Coder's 500s are unscored: only General's successes and prior count.)
+    let (status, body) = router.chat("Auto", "PICK Coder 0.68").await;
     assert_eq!((status, body["model"].as_str()), (200, Some("General")));
     let trace = router.last_trace().await;
     let scoring = &trace["scoring"];
@@ -700,7 +716,8 @@ async fn history_counts_each_final_outcome_as_specified() {
                           "messages": [{"role": "user", "content": "hello"}]}))
         .await;
     assert_eq!(status, 200);
-    // server_error, and interrupted: scored failures.
+    // server_error and interrupted: one deployment's or connection's
+    // failure, observed and never scored.
     assert_eq!(router.chat("Coder", "FAIL500").await.0, 500);
     let (status, _) = router
         .chat_with(json!({"model": "Coder", "stream": true,
@@ -748,14 +765,15 @@ async fn history_counts_each_final_outcome_as_specified() {
 
     let coder = router.history("Coder").await;
     close(&coder["successes"], 2.0);
-    close(&coder["failures"], 2.0);
+    assert_eq!(coder["server_error"], 1, "{coder}");
+    assert_eq!(coder["interrupted"], 1, "{coder}");
     assert_eq!(
         coder["neutral"], 2,
         "client error and cancellation: {coder}"
     );
     assert_eq!(coder["unavailable"], 1, "{coder}");
-    close(&coder["effective_samples"], 4.0);
-    assert_eq!(coder["gated"], true, "4 < min_samples 20");
+    close(&coder["effective_samples"], 2.0);
+    assert_eq!(coder["gated"], true, "2 scored samples < min_samples 20");
     assert_eq!(coder["value"], 0.0);
 
     let research = router.history("Research").await;
@@ -774,7 +792,8 @@ async fn history_counts_each_final_outcome_as_specified() {
     let metrics = router.metrics().await;
     for line in [
         "router_route_history_observations_total{route=\"Coder\",outcome=\"success\"} 2",
-        "router_route_history_observations_total{route=\"Coder\",outcome=\"failure\"} 2",
+        "router_route_history_observations_total{route=\"Coder\",outcome=\"server_error\"} 1",
+        "router_route_history_observations_total{route=\"Coder\",outcome=\"interrupted\"} 1",
         "router_route_history_observations_total{route=\"Coder\",outcome=\"neutral\"} 2",
         "router_route_history_observations_total{route=\"Coder\",outcome=\"unavailable\"} 1",
         "router_route_history_observations_total{route=\"Research\",outcome=\"mismatch\"} 1",
@@ -789,7 +808,7 @@ async fn history_counts_each_final_outcome_as_specified() {
             line.strip_prefix("router_route_history_effective_samples{route=\"Coder\"} ")
         })
         .expect("the gauge");
-    close(&json!(samples.parse::<f64>().unwrap()), 4.0);
+    close(&json!(samples.parse::<f64>().unwrap()), 2.0);
 }
 
 #[tokio::test]
@@ -847,7 +866,10 @@ async fn a_winning_route_that_is_unavailable_answers_route_unavailable_and_nothi
     assert_eq!(trace["outcome"], "unavailable");
     let offline = router.history("Offline").await;
     assert_eq!(offline["unavailable"], 1);
-    assert_eq!(offline["failures"], 0.0, "unavailable is not scored");
+    assert_eq!(
+        offline["server_error"], 0,
+        "unavailable is not a server error"
+    );
     assert_eq!(offline["effective_samples"], 0.0);
 }
 
@@ -894,12 +916,12 @@ async fn reset_forgets_history_and_nothing_else() {
     assert!(body["reset_at"].as_u64().is_some());
     assert_eq!(body.as_object().unwrap().len(), 3, "sanitized: {body}");
     close(&router.history("General").await["successes"], 0.0);
-    close(&router.history("Coder").await["failures"], 30.0);
+    assert_eq!(router.history("Coder").await["server_error"], 30);
 
     let (status, body) = router.reset(None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["reset"], "all");
-    close(&router.history("Coder").await["failures"], 0.0);
+    assert_eq!(router.history("Coder").await["server_error"], 0);
     close(&router.history("Coder").await["successes"], 0.0);
 
     // Untouched: affinity, routes, placement, rules and classifier settings.
@@ -989,7 +1011,8 @@ async fn the_admin_view_shows_settings_and_aggregates_only() {
     for field in [
         "effective_samples",
         "successes",
-        "failures",
+        "server_error",
+        "interrupted",
         "success_rate",
         "value",
         "gated",
@@ -1014,6 +1037,88 @@ async fn the_admin_view_shows_settings_and_aggregates_only() {
     }
 }
 
+// --- deployment failures are not route evidence ----------------------------------------
+
+#[tokio::test]
+async fn one_broken_deployment_never_lowers_its_route() {
+    let fleet = Fleet::start().await;
+    let router = Router::start(fleet.config("lightweight", Some(borderline_scoring()))).await;
+    let coder_before = fleet.coder.hits();
+    // Pair takes turns: the broken deployment, then Coder's healthy one.
+    let mut statuses = Vec::new();
+    for _ in 0..42 {
+        statuses.push(router.chat("Pair", "hello").await.0);
+    }
+    // The existing 500 semantics, unchanged: a 500 is the answer, never
+    // retried on the healthy deployment.
+    assert_eq!(statuses.iter().filter(|s| **s == 500).count(), 21);
+    assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 21);
+    assert_eq!(fleet.broken.hits(), 21);
+    assert_eq!(
+        fleet.coder.hits() - coder_before,
+        21,
+        "no failover after a 500"
+    );
+
+    let pair = router.history("Pair").await;
+    assert_eq!(pair["server_error"], 21, "observed: {pair}");
+    close(&pair["effective_samples"], 21.0);
+    // Exactly what 21 successes alone give, n / (n + k) = 21/41: the broken
+    // deployment's 500s lowered nothing.
+    close(&pair["value"], 21.0 / 41.0);
+    assert_eq!(pair["gated"], false);
+}
+
+#[tokio::test]
+async fn server_errors_neither_lower_a_route_nor_open_its_history_gate() {
+    let fleet = Fleet::start().await;
+    let router = Router::start(fleet.config("lightweight", Some(borderline_scoring()))).await;
+    // One success and nineteen 500s is one sample, not twenty.
+    assert_eq!(router.chat("Coder", "hello").await.0, 200);
+    for _ in 0..19 {
+        assert_eq!(router.chat("Coder", "FAIL500").await.0, 500);
+    }
+    let coder = router.history("Coder").await;
+    close(&coder["effective_samples"], 1.0);
+    assert_eq!(coder["gated"], true, "{coder}");
+    assert_eq!(coder["value"], 0.0);
+    assert_eq!(coder["server_error"], 19);
+    // Many more change nothing.
+    for _ in 0..60 {
+        assert_eq!(router.chat("Coder", "FAIL500").await.0, 500);
+    }
+    let coder = router.history("Coder").await;
+    close(&coder["effective_samples"], 1.0);
+    assert_eq!(coder["value"], 0.0);
+    assert_eq!(coder["server_error"], 79);
+    // And an at-threshold verdict for Coder carries no history penalty: only
+    // General's configured prior separates them.
+    let _ = router.chat("Auto", "PICK Coder 0.65").await;
+    let scoring = &router.last_trace().await["scoring"];
+    assert_eq!(scoring["candidates"][0]["route"], "Coder");
+    assert_eq!(scoring["candidates"][0]["history_signal"], 0.0);
+    close(&scoring["candidates"][0]["total_score"], 0.65);
+}
+
+#[tokio::test]
+async fn interrupted_streams_never_lower_a_route() {
+    let fleet = Fleet::start().await;
+    let router = Router::start(fleet.config("lightweight", Some(borderline_scoring()))).await;
+    for _ in 0..25 {
+        let (status, _) = router
+            .chat_with(json!({"model": "Coder", "stream": true,
+                              "messages": [{"role": "user", "content": "BREAK"}]}))
+            .await;
+        assert_eq!(status, 200);
+    }
+    let trace = router.last_trace().await;
+    assert_eq!(trace["outcome"], "interrupted");
+    let coder = router.history("Coder").await;
+    assert_eq!(coder["interrupted"], 25, "{coder}");
+    close(&coder["effective_samples"], 0.0);
+    assert_eq!(coder["value"], 0.0);
+}
+
 // --- provider parity ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1026,7 +1131,7 @@ async fn jev_and_lightweight_verdicts_are_scored_alike() {
         let mut seen = Vec::new();
         for text in [
             "PICK Coder 0.95",
-            "PICK Coder 0.70",
+            "PICK Coder 0.68",
             "PICK Coder 0.40",
             "PICK General 0.9",
         ] {

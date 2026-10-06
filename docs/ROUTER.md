@@ -907,7 +907,7 @@ itself is `uncontested`.
 ```text
 score(route) = W_classifier · classifier_signal(route)   classifier signal ∈ [0, 1]
              + W_prior      · prior(route)               prior ∈ [0, 1], default 0
-             + W_history    · history(route)             history ∈ (−1, 1), 0 when unknown
+             + W_history    · history(route)             history ∈ [0, 1), 0 when unknown
 ```
 
 The verdict route wins ties. That is R9.1's `confidence ≥ min_confidence`
@@ -932,9 +932,11 @@ confidence − baseline  ≥  (W_prior · Δprior + W_history · Δhistory) / W_
 ```
 
 and the right side can be at most the **influence radius**
-`(W_prior + 2·W_history) / W_classifier`. A prior spans `[0, 1]` and history
-spans `(−1, 1)`, so the largest swing between two routes is
-`W_prior + 2·W_history`. Validation refuses any configuration whose radius is
+`(W_prior + 2·W_history) / W_classifier`. A prior spans `[0, 1]`, and the
+bound allows a history swing of `2·W_history`, as for a history term in
+`(−1, 1)`. Slice 1 scores successes only, so history is in `[0, 1)` and the
+realised swing is at most `W_history`: the bound is conservative, and stays
+valid if a route-level failure category is ever scored. Validation refuses any configuration whose radius is
 not **less than half of the accepted range**, `(1 − min_confidence) / 2`. It
 checks this against every configured provider block (the active one and a
 standby), so switching provider cannot silently break the guarantee:
@@ -949,8 +951,16 @@ the admin view and every scoring trace carry it.
 
 ### Route-success history
 
-Each configured route keeps one small aggregate in memory: decayed successes,
-decayed failures, and counters for what is observed but not scored. It never
+> **Observation is not scoring.** Adaptive route history records many outcome
+> categories, but only outcomes that can safely be attributed to route-level
+> quality participate in the scored history signal. Deployment and
+> infrastructure failures remain observable but do not train logical-route
+> preference. History answers "was this logical route a good choice?", never
+> "did the node picked for this request happen to behave?". That second
+> question belongs to health and the route's policy.
+
+Each configured route keeps one small aggregate in memory: decayed scored
+successes, and plain counters for everything observed but not scored. It never
 stores a request, prompt, session or deployment. It is recorded once per
 finished request, for the route that handled it, at the point the router knows
 the request's **final** outcome. A stream counts when it ends, not when its
@@ -958,39 +968,46 @@ response head arrived (`router_requests_total` counts at the head, so it is not
 used). **All** traffic to a route counts: direct requests as well as `Auto`.
 The router's own classification requests (`<id>-classify`) never count.
 
-| Final outcome | Counted as | Scored? |
+| Final outcome | Observed as | Scored? |
 |---|---|---|
-| `ok`: a completed response or stream | success | **yes** |
-| `server_error`: a 5xx answer | failure | **yes** |
-| `interrupted`: a committed stream the node broke off | failure | **yes** |
-| `unavailable` (`route_unavailable`), or every deployment refused with 502/503/504 before answering | unavailable | **no** |
-| `route_capability_mismatch` | mismatch | **no** |
-| `client_error`: any other 4xx | neutral | no |
-| `cancelled`: the client left | neutral | no |
+| `ok`: a completed response or stream | `success` | **yes** |
+| `server_error`: a 5xx answer | `server_error` | **no**: a 500 is never retried, so it is one deployment's answer; another deployment of the same route might have answered |
+| `interrupted`: a committed stream that broke off | `interrupted` | **no**: one node's stream, or its connection, failed |
+| `unavailable` (`route_unavailable`), or every deployment refused with 502/503/504 before answering | `unavailable` | **no**: capacity and readiness |
+| `route_capability_mismatch` | `mismatch` | **no**: fit, which R5 decides exactly per request |
+| `client_error`: any other 4xx | `neutral` | no |
+| `cancelled`: the client left | `neutral` | no |
 
-`route_unavailable` is **not scored on purpose**. It usually means a node is
-down, placement is incomplete, a model is still loading or a network blipped.
-It does not mean the route was the wrong choice. History must not learn
-"Research is a bad route" from "Research had nothing ready". A capability
-mismatch is about fit, which R5 decides exactly per request. Both are counted
-and shown, never scored.
+Every failure the router can see today is one deployment's, one node's or
+one connection's, and none can be told apart as the route's own. So slice 1
+scores **successes only** and manufactures no negative evidence. A failure
+category will enter the score only once it can be attributed to the route
+itself. In particular, `route_unavailable` usually means a node is down,
+placement is incomplete, a model is still loading or a network blipped.
+History must not learn "Research is a bad route" from "Research had nothing
+ready". Every unscored outcome is still counted in the admin view and in
+`router_route_history_observations_total`.
 
-The history signal, with `n` effective (decayed) samples and `s` effective
+**`effective_samples` counts scored observations only.** Server errors,
+interruptions, unavailability, mismatches, client errors and cancellations
+never bring a route closer to `min_samples`. One success and nineteen 500s is
+one sample, and history stays gated.
+
+The history signal, with `n` effective (decayed) scored samples, all of them
 successes:
 
 ```text
 n < min_samples   →  history = 0                          (neutral; "gated")
 otherwise         →  ŝ = (s + k/2) / (n + k)              (k = shrinkage_samples; shrunk toward 0.5)
-                     history = 2·ŝ − 1                     (in (−1, 1))
+                     history = 2·ŝ − 1  =  n / (n + k)     (in [0, 1))
 ```
 
-With the defaults, 20 successes out of 20 give `ŝ = 30/40 = 0.75` and
-`history = 0.5`, not 1.0. No route reaches ±1, however long its record.
+With the defaults, 20 successes give `ŝ = 30/40 = 0.75` and `history = 0.5`,
+not 1.0. No route reaches 1, however long its record.
 
-**Decay.** Both counts are multiplied by `2^(−Δt / half_life)` whenever they
-are read or updated. With no traffic, a route's `n` falls below `min_samples`
-and its history returns to neutral. A route avoided after failures therefore
-becomes winnable again on its own, after about `log2(n / min_samples)`
+**Decay.** The scored count is multiplied by `2^(−Δt / half_life)` whenever it
+is read or updated. With no traffic, a route's `n` falls below `min_samples`
+and its history returns to neutral, after about `log2(n / min_samples)`
 half-lives, with no exploration traffic.
 
 **Observation-bias safeguards.** All traffic counts, not just `Auto`'s. Missing
@@ -998,6 +1015,12 @@ history is neutral, never a penalty. Small samples are gated and shrunk. The
 influence is capped by the radius above. History decays. There is no random
 exploration, bandit or traffic probing. A biased history is contained by these
 bounds, or by a smaller `history` weight, never by randomness.
+
+Because only successes are scored, slice 1's history measures **recent
+successful volume**. A route that serves more traffic successfully accumulates
+more positive history than a quiet one, up to the cap. The radius, the gate,
+the shrinkage and the decay bound how far that can go. Even so, keep the
+`history` weight small (or 0, the default) until real traffic shows it helps.
 
 **In memory only.** History is process-local and starts empty when the router
 starts. There is no file, database or Redis. Every configuration change
@@ -1050,13 +1073,13 @@ It holds route names and numbers only:
   "weights": {"classifier": 1.0, "prior": 0.05, "history": 0.06},
   "classified_route": "Coder", "winner": "General", "overrode": true,
   "candidates": [
-    {"route": "Coder", "basis": "verdict", "confidence": 0.70, "prior": 0.0,
-     "classifier_signal": 0.70, "prior_signal": 0.0, "history_signal": -0.036, "total_score": 0.664,
-     "history": {"effective_samples": 30.0, "successes": 0.0, "failures": 30.0,
-                 "success_rate": 0.2, "value": -0.6, "gated": false}},
+    {"route": "Coder", "basis": "verdict", "confidence": 0.68, "prior": 0.0,
+     "classifier_signal": 0.68, "prior_signal": 0.0, "history_signal": 0.0, "total_score": 0.68,
+     "history": {"effective_samples": 0.0, "successes": 0.0,
+                 "success_rate": 0.5, "value": 0.0, "gated": true}},
     {"route": "General", "basis": "baseline", "confidence": 0.65, "prior": 0.2,
      "classifier_signal": 0.65, "prior_signal": 0.01, "history_signal": 0.036, "total_score": 0.696,
-     "history": {"effective_samples": 30.0, "successes": 30.0, "failures": 0.0,
+     "history": {"effective_samples": 30.0, "successes": 30.0,
                  "success_rate": 0.8, "value": 0.6, "gated": false}}
   ]
 }
@@ -1075,15 +1098,17 @@ route classified` log line adds `classified_route`, `scoring_reason` and
 `weights`, `influence_radius`, `priors`, `history` (`half_life_secs`,
 `half_life_provisional`, `min_samples`, `shrinkage_samples`),
 `classifier_baseline`, `fallbacks` (counts by reason), and `routes`. Each route
-row has `effective_samples`, `successes`, `failures`, `success_rate`, `value`,
-`gated`, `unavailable`, `mismatch`, `neutral` and `last_observed_at`. Without
+row has the scored signal (`effective_samples`, `successes`, `success_rate`,
+`value`, `gated`) and the observed-but-unscored counters (`server_error`,
+`interrupted`, `unavailable`, `mismatch`, `neutral`), plus `last_observed_at`. Without
 the section it is `{"configured": false, "enabled": false}`.
 
 Metrics, with bounded labels and scores never used as labels:
 `router_route_scoring_decisions_total{route,overrode}`,
 `router_route_scoring_fallback_total{reason}`,
 `router_route_history_observations_total{route,outcome}` (`success`,
-`failure`, `unavailable`, `mismatch`, `neutral`), and the gauges
+`server_error`, `interrupted`, `unavailable`, `mismatch`, `neutral`; every
+observation, scored or not), and the gauges
 `router_route_history_effective_samples{route}` and
 `router_route_history_signal{route}`.
 
@@ -2091,8 +2116,9 @@ clients cannot add labels by inventing model names.
   confident one.
 - **Adaptive scoring's history is young.** It lives in memory and restarts
   empty. Its one-hour half-life is a provisional starting point, not a
-  measurement. Its only evidence is success versus server failure, with no
-  latency and no context fit. And it can only tip a borderline accepted
+  measurement. Its only scored evidence is completed requests: failures are
+  shown but not scored, because none can yet be attributed to a route rather
+  than a deployment. It uses no latency and no context fit. And it can only tip a borderline accepted
   verdict toward the classifier's fallback: with one route and one
   confidence per classification, it cannot rank candidates the classifier
   did not name. Treat its weights as small until history from real traffic

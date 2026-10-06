@@ -18,7 +18,27 @@ R9.1, R9.1a and the classifier UI are unchanged.
 | 4 | Admin-only history reset. | `POST /api/router/v1/adaptive-scoring/reset`, empty body / `{}` for all, `{"route": "Coder"}` for one. Router key, like every control endpoint. Resets history aggregates only. |
 | 5 | No Jev per-option probabilities. | Only `Verdict { route, confidence }` is read. Nothing is fabricated for other candidates (section 19 remains future work). |
 | 6 | No route capability schema. | None added. R5 stays the capability authority. |
-| 7 | `route_unavailable` is not scored. | Observed (`unavailable` counter, metric) and never scored. A request every deployment turned away with 502/503/504 before answering counts the same way. Section 17 listed that case under `server_error`; it says the same thing as `route_unavailable` (nothing ready ran it), so Decision 7 governs it. |
+| 7 | `route_unavailable` is not scored. | Observed (`unavailable` counter, metric) and never scored. A request every deployment turned away with 502/503/504 before answering counts the same way. |
+
+**Observation is not scoring (pre-merge hardening, supersedes section 17).**
+Adaptive route history records many outcome categories, but only outcomes
+that can safely be attributed to route-level quality participate in the
+scored history signal. Deployment and infrastructure failures remain
+observable but do not train logical-route preference.
+
+- A committed `server_error` (500 is never retried) is one deployment's
+  answer, so it is observed as `server_error` and not scored.
+- An `interrupted` stream is one node's or one connection's failure. It is
+  observed as `interrupted` and not scored.
+- Nothing the router sees today can be attributed to the route as a whole, so
+  slice 1 scores **successes only**: `history = n/(n + k)`, in `[0, 1)`.
+- `effective_samples` counts scored successes only. No unscored outcome can
+  open the `min_samples` gate (1 success + 19 server errors = 1 sample).
+- The influence-radius bound keeps its `2·W_history` term. It is now
+  conservative, since the realised history swing is at most `W_history`.
+- Consequence: history measures recent successful volume, so a busier route
+  accrues more positive history, within the radius, gate, shrinkage and
+  decay. Keep the `history` weight small until real traffic justifies it.
 
 **The threshold is a hard boundary (supersedes open question 1 and section
 8's "chosen or low_confidence").** Scoring starts from R9.1's accepted

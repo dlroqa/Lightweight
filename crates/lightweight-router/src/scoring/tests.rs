@@ -152,11 +152,11 @@ fn strongest() -> Value {
     json!({"enabled": true, "weights": {"classifier": 1.0, "prior": 0.07, "history": 0.0524}})
 }
 
-/// The worst case for the verdict: the fallback has the top prior and a
-/// perfect record, the verdict route the bottom prior and a failed one.
+/// The worst case for the verdict: the fallback has the top prior and a long
+/// success record, the verdict route none (its server errors are unscored).
 fn stack_against_coder(setup: &Setup, now: Instant) {
     feed(setup, "General", Observation::Success, 5_000, now);
-    feed(setup, "Coder", Observation::Failure, 5_000, now);
+    feed(setup, "Coder", Observation::ServerError, 5_000, now);
 }
 
 // --- disabled / compatibility --------------------------------------------------
@@ -274,10 +274,10 @@ fn a_prior_and_history_may_decide_a_verdict_exactly_at_the_threshold() {
     assert_eq!(decision.trace.reason, ScoringReason::Scored);
     assert_eq!(decision.trace.classified_route, "Coder");
 
-    // History alone can decide it too.
+    // History alone can decide it too: General's record of successes.
     let setup = setup_history_only();
     let now = Instant::now();
-    feed(&setup, "Coder", Observation::Failure, 40, now);
+    feed(&setup, "General", Observation::Success, 40, now);
     assert_eq!(
         decide_at(&setup, &classified(&setup, "Coder", 0.65), now)
             .route
@@ -303,14 +303,14 @@ fn setup_history_only() -> Setup {
 
 #[test]
 fn a_verdict_below_the_threshold_is_rejected_and_never_resurrected() {
-    // Everything favours Coder: the top prior, a perfect record, and General
-    // with a failed one. R9.1 rejected Coder at 0.40, and that stands.
+    // Everything favours Coder: the top prior and a long success record, and
+    // General has none. R9.1 rejected Coder at 0.40, and that stands.
     let setup = setup(json!({"enabled": true,
         "weights": {"prior": 0.07, "history": 0.0524},
         "priors": {"Coder": 1.0}}));
     let now = Instant::now();
     feed(&setup, "Coder", Observation::Success, 5_000, now);
-    feed(&setup, "General", Observation::Failure, 5_000, now);
+    feed(&setup, "General", Observation::ServerError, 5_000, now);
     for confidence in [0.0, 0.10, 0.40, 0.60, 0.649_999_999] {
         let classification = classified(&setup, "Coder", confidence);
         assert_eq!(classification.outcome, ClassifierOutcome::LowConfidence);
@@ -429,7 +429,7 @@ fn property_no_valid_configuration_lets_priors_or_history_overturn_a_strong_clas
         let now = Instant::now();
         // The worst history for Coder and the best for General.
         feed(&setup, "General", Observation::Success, 2_000, now);
-        feed(&setup, "Coder", Observation::Failure, 2_000, now);
+        feed(&setup, "Coder", Observation::ServerError, 2_000, now);
         let radius = setup.scoring.weights.influence_radius();
         assert!(radius < 0.5 * (1.0 - min_confidence) || radius == 0.0);
         // Anywhere in the upper half of the accepted range.
@@ -468,9 +468,13 @@ fn property_scoring_moves_a_decision_only_within_the_influence_radius() {
             );
         }
     }
+    // With only successes scored, history spans [0, 1), so the swing it can
+    // actually produce is W_history (here ~0.052), within the validated
+    // radius of (prior + 2·history) / classifier, which stays conservative.
+    let realised = f64::from(overrides) / 1_000.0;
     assert!(
-        overrides > 100,
-        "the worst case does flip the band near the threshold"
+        realised > 0.04 && realised <= setup.scoring.weights.history + 0.001,
+        "the worst case flips the band near the threshold, and no more: {realised}"
     );
 }
 
@@ -495,10 +499,11 @@ fn a_bounded_prior_changes_a_borderline_result() {
         "Coder",
         "beyond the prior's reach"
     );
-    // A prior for the verdict route helps it hold, too.
+    // A prior for the verdict route helps it hold against the fallback's
+    // history, too.
     let setup = setup_with_coder_prior();
     let now = Instant::now();
-    feed(&setup, "Coder", Observation::Failure, 40, now);
+    feed(&setup, "General", Observation::Success, 40, now);
     assert_eq!(
         decide_at(&setup, &classified(&setup, "Coder", 0.66), now)
             .route
@@ -541,37 +546,57 @@ fn success_history_raises_a_route_within_its_cap() {
 }
 
 #[test]
-fn failure_history_lowers_a_route_within_its_cap() {
+fn server_errors_never_lower_a_route() {
+    // One upstream 500, then ten thousand: none is evidence about the route.
     let setup = setup_history_only();
     let now = Instant::now();
-    feed(&setup, "Coder", Observation::Failure, 10_000, now);
-    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.70), now);
-    assert_eq!(decision.route.as_str(), "General");
-    let coder = &decision.trace.candidates[0];
-    assert!(coder.history_signal < 0.0 && coder.history_signal > -0.08);
-    assert_eq!(
-        decide_at(&setup, &classified(&setup, "Coder", 0.74), now)
-            .route
-            .as_str(),
-        "Coder"
-    );
+    for count in [1, 9_999] {
+        feed(&setup, "Coder", Observation::ServerError, count, now);
+        let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), now);
+        assert_eq!(decision.route.as_str(), "Coder", "{count}");
+        let coder = &decision.trace.candidates[0];
+        assert_eq!(coder.history, HistorySignal::NEUTRAL);
+        assert_eq!(coder.history_signal, 0.0);
+    }
+    assert_eq!(setup.history.view(now)[1].server_error, 10_000);
+}
+
+#[test]
+fn interrupted_streams_never_lower_a_route() {
+    let setup = setup_history_only();
+    let now = Instant::now();
+    feed(&setup, "Coder", Observation::Interrupted, 5_000, now);
+    let decision = decide_at(&setup, &classified(&setup, "Coder", 0.65), now);
+    assert_eq!(decision.route.as_str(), "Coder");
+    assert_eq!(decision.trace.candidates[0].history, HistorySignal::NEUTRAL);
+    assert_eq!(setup.history.view(now)[1].interrupted, 5_000);
 }
 
 #[test]
 fn history_below_min_samples_does_not_count() {
     let setup = setup_history_only();
     let now = Instant::now();
-    feed(&setup, "Coder", Observation::Failure, 19, now);
+    // 19 successes for General are not yet evidence; the 20th is.
+    feed(&setup, "General", Observation::Success, 19, now);
     let decision = decide_at(&setup, &classified(&setup, "Coder", 0.66), now);
     assert_eq!(decision.route.as_str(), "Coder");
-    assert!(decision.trace.candidates[0].history.gated);
-    assert_eq!(decision.trace.candidates[0].history_signal, 0.0);
+    assert!(decision.trace.candidates[1].history.gated);
+    assert_eq!(decision.trace.candidates[1].history_signal, 0.0);
+    feed(&setup, "General", Observation::Success, 1, now);
+    assert_eq!(
+        decide_at(&setup, &classified(&setup, "Coder", 0.66), now)
+            .route
+            .as_str(),
+        "General"
+    );
 }
 
 #[test]
-fn unavailable_and_mismatch_never_move_the_score() {
+fn no_unscored_outcome_moves_the_score() {
     let setup = setup_history_only();
     let now = Instant::now();
+    feed(&setup, "Coder", Observation::ServerError, 1_000, now);
+    feed(&setup, "Coder", Observation::Interrupted, 1_000, now);
     feed(&setup, "Coder", Observation::Unavailable, 1_000, now);
     feed(&setup, "Coder", Observation::CapabilityMismatch, 1_000, now);
     feed(&setup, "Coder", Observation::Neutral, 1_000, now);
@@ -588,7 +613,7 @@ fn unavailable_and_mismatch_never_move_the_score() {
 fn history_fades_and_a_decision_recovers_without_exploration() {
     let setup = setup_history_only();
     let start = Instant::now();
-    feed(&setup, "Coder", Observation::Failure, 80, start);
+    feed(&setup, "General", Observation::Success, 80, start);
     let decide = |at| {
         decide_at(&setup, &classified(&setup, "Coder", 0.66), at)
             .route

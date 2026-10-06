@@ -2158,7 +2158,8 @@ name. `select.rs` and the deployment pipeline are unchanged.
   `h = 2ŝ − 1`.
 - **Recording.** At `Tracker::finish`, so a stream counts when it ends. All
   routes and all traffic count except nested classification requests.
-  `ok` is success; `server_error` and `interrupted` are failures;
+  `ok` is success; `server_error` and `interrupted` were scored failures
+  (**superseded by the hardening below: now observed, never scored**);
   `route_unavailable` and all-502/503/504 refusals count as `unavailable`;
   `route_capability_mismatch` as `mismatch`; client errors and cancellations
   as `neutral`. Only success and failure are scored.
@@ -2212,3 +2213,40 @@ capability declarations.
 
 **Next:** review of this branch (not merged). The UI follow-up and R9.3 each
 need explicit approval.
+
+### Pre-merge hardening: observation is not scoring
+
+Review found the gap: a committed 500 counted as a route failure. But 500 is
+never retried, so it is one deployment's answer. Its sibling deployment
+might have answered, and the router cannot tell route quality from deployment
+quality. The same holds for `interrupted`: a relay body error, or one node's
+stream ending without finishing.
+
+- **Now:** only `ok` is scored. `server_error` and `interrupted` join
+  `unavailable` (including the all-502/503/504 refusal), `mismatch` and
+  `neutral` as observed-only counters, shown in the admin view and in
+  `router_route_history_observations_total`.
+- `effective_samples` counts scored successes only, so 1 success plus 19
+  server errors is 1 sample and stays gated. `history = n/(n+k)` is in
+  [0, 1).
+- The radius bound is unchanged (it keeps `2·W_history` and is now
+  conservative). The threshold boundary, baseline, priors, min samples,
+  shrinkage and decay are unchanged.
+- Consequence, documented: history now measures recent successful volume, so
+  a busier route accrues more positive history within the bounds.
+- No proxy, retry, policy, health, affinity or placement code changed.
+- **Tests:** 7 new (4 unit, 3 end to end), several updated. Covered: one 500
+  leaves the signal unchanged and is counted; 10 000 500s stay neutral;
+  interrupted streams stay neutral; 1 success + 19 server errors stays gated;
+  a round-robin route with one always-500 deployment answers 21 × 500 (single
+  attempt, no failover) and 21 × 200, and its signal equals 21 successes'
+  21/41.
+- **Mutations:** 7 of 7 caught: 500 scored as a failure (9 tests failed),
+  interrupted scored as a failure (6), 500 counted toward samples (11),
+  plus re-checks of the hard boundary (5), the dominance bound (3), the gate
+  (14), and unavailable counted as a sample (5).
+- **Real smoke**, on the real `hermes router` binary with a `round_robin`
+  Coder of a broken and a healthy scripted deployment: 42 requests gave
+  21 × 500 (each 1 attempt on `broken`) and 21 × 200. History showed
+  `server_error` 21, `effective_samples` 21.00 and `value` 0.5122 (= 21/41).
+- **Validation:** `./scripts/check.sh` green on the first run: 1293 workspace tests (from 1286; router 367), contract 47/2.

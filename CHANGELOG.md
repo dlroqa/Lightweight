@@ -24,10 +24,13 @@ All notable changes to this project are documented in this file.
     reproduce R9.1 exactly.
   - Route-success history is per route and in memory only. It is recorded at
     each request's final outcome (direct and `Auto` traffic; never the
-    router's own classification requests). `ok` counts as success;
-    `server_error` and `interrupted` as failure. `route_unavailable`, an
-    all-502/503/504 refusal and `route_capability_mismatch` are observed but
-    never scored; client errors and cancellations are neutral. History is
+    router's own classification requests). Observation is not scoring:
+    only `ok` is scored (as success). `server_error` (one deployment's 500),
+    `interrupted`, `route_unavailable`, an all-502/503/504 refusal and
+    `route_capability_mismatch` are observed and shown but never scored,
+    because none can yet be attributed to the route rather than a deployment.
+    Client errors and cancellations are neutral. `effective_samples` counts
+    scored observations only. History is
     neutral below `min_samples` (20), shrunk toward 0.5, and decays with a
     configurable half-life (default 1 h, a provisional starting point). There
     is no random exploration.
