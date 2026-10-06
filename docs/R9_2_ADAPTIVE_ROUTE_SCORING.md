@@ -1,9 +1,66 @@
 # R9.2 — Adaptive logical-route scoring (design)
 
-Status: **design only**. Nothing in this document is implemented. No scoring
-code, configuration field, trace field, metric or UI control described here
-exists on `master` (`c493ce7`). R9.1, R9.1a and the classifier UI are merged
-and frozen; this design builds on them without changing them.
+Status: **slice 1 implemented** on `feature/router-route-scoring`
+(`crates/lightweight-router/src/scoring/`). The operator documentation is
+[ROUTER.md, Adaptive route scoring](ROUTER.md#adaptive-route-scoring-r92).
+This document was written before the seven review decisions were locked;
+**section 0 records those decisions and every place the implementation
+departs from the original text.** Where the two disagree, section 0 wins.
+R9.1, R9.1a and the classifier UI are unchanged.
+
+## 0. Locked decisions and implementation (slice 1)
+
+| # | Decision | Implemented as |
+|---|---|---|
+| 1 | Borderline accepted decisions may be influenced, within a strict bound; strong ones never. | Influence radius `(W_prior + 2·W_history) / W_classifier` must be **less than half the accepted range**, `(1 − min_confidence) / 2`, for every configured provider block (`MAX_INFLUENCE_SHARE = 0.5`). This replaces section 8's `Wp + 2·Ws < Wc·min_confidence`, which bounded only unnamed candidates and allowed a radius as large as the threshold itself. Property tests sweep random valid configurations against worst-case priors and history. |
+| 2 | No provider-specific weights. | One `weights` block. The provider is trace metadata only. `jev`/`lightweight` weight keys are refused as unknown. |
+| 3 | One-hour half-life, configurable, provisional. | `history.half_life_secs`, default 3600, bounds 60..=604800. Documented as an operational starting point, not tuned; the admin view says `half_life_provisional: true`. |
+| 4 | Admin-only history reset. | `POST /api/router/v1/adaptive-scoring/reset`, empty body / `{}` for all, `{"route": "Coder"}` for one. Router key, like every control endpoint. Resets history aggregates only. |
+| 5 | No Jev per-option probabilities. | Only `Verdict { route, confidence }` is read. Nothing is fabricated for other candidates (section 19 remains future work). |
+| 6 | No route capability schema. | None added. R5 stays the capability authority. |
+| 7 | `route_unavailable` is not scored. | Observed (`unavailable` counter, metric) and never scored. A request every deployment turned away with 502/503/504 before answering counts the same way. Section 17 listed that case under `server_error`; it says the same thing as `route_unavailable` (nothing ready ran it), so Decision 7 governs it. |
+
+**The threshold is a hard boundary (supersedes open question 1 and section
+8's "chosen or low_confidence").** Scoring starts from R9.1's accepted
+decision:
+
+```text
+confidence < min_confidence  →  R9.1 rejects the verdict; its fallback IS the decision
+                                 (reason below_threshold; the rejected route never contends)
+confidence = min_confidence  →  verdict and fallback tie on classifier signal; prior/history decide
+confidence > min_confidence  →  scored; overturned only within the influence radius
+```
+
+**`classifier_baseline`** is an explicit named function
+(`scoring::classifier_baseline`): the active provider's `min_confidence`,
+used as the fallback route's classifier signal, and only once a verdict was
+accepted.
+
+**Contenders are structural, not arithmetic.** With one verdict there are
+exactly two contenders: the verdict route (signal = its confidence) and the
+classifier fallback (signal = the baseline). Other candidates are not scored
+at all, rather than scored at `c = 0` and kept from winning by an inequality.
+A verdict naming the fallback is `uncontested`.
+
+**Implementation deltas from the text below:**
+
+- Config: `weights.success` is named `weights.history` (it weighs the history
+  term). `history.prior_strength` is named `history.shrinkage_samples`, to
+  avoid confusion with route priors. Defaults and bounds are unchanged.
+- Trace: `r91_route` is `classified_route`. Components are named
+  `classifier_signal`, `prior_signal`, `history_signal` and `total_score`.
+  `basis` is `verdict` or `baseline`. Reasons are `scored`, `uncontested`,
+  `below_threshold`, `no_verdict` and `internal_error`. Candidates are listed
+  verdict first, then baseline.
+- Metrics: `router_route_scoring_skipped_total` became
+  `router_route_scoring_fallback_total{reason}`; the history metric's label is
+  `outcome`; the per-route gauge is `router_route_history_signal` (the history
+  term) rather than a success-rate gauge; the margin histogram is not built.
+- History: `unavailable`, `mismatch` and `neutral` are plain counters, not
+  decayed values. They are shown and never scored.
+- History is recorded only while scoring is on (an absent or off section
+  records nothing).
+- No UI (section 24 is deferred to a follow-up).
 
 The one rule everything below obeys:
 
@@ -683,7 +740,11 @@ Integration tests (`tests/`, scripted nodes and the scripted TypeSafe server):
   never provider text.
 - The admin view of history is behind the router's existing client-key policy.
 
-## 29. Open questions
+## 29. Open questions (resolved for slice 1; see section 0)
+
+Questions 1, 2, 4, 6 and 7 are decided (Decisions 1, 2, 4, 6, 7 and the hard
+threshold boundary). Question 3 is answered provisionally (1 h, configurable,
+untuned). Question 5 stays open until the real Jev API is verified.
 
 1. **Low-confidence semantics when enabled:** is it acceptable that a
    `low_confidence` verdict can win when priors and history favour it, within

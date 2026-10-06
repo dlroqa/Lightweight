@@ -2118,3 +2118,97 @@ M10 adds three, each with the measurement that would close it:
   comment says exactly this rather than implying a derivation. A second machine
   scoring between 0.79 and 0.95 lands in the range nothing has evidence about,
   and is the reason to revisit it with that machine's data.
+
+## Router adaptive route scoring, R9.2 slice 1 (feature/router-route-scoring)
+
+Branched from validated `master` (`c493ce7`), with the design commit of the
+docs-only PR #40 cherry-picked so the design doc it updates is on the branch
+(a no-op if #40 merges first). R9.1, R9.1a and the classifier UI are untouched;
+R9.3 and R9.4 are not started.
+
+**The invariant.** Scoring ranks logical routes only. It is one pure
+function, `scoring::decide`, called at exactly one place
+(`proxy::resolve_auto`). It runs only for a classification and only while
+`auto_route.adaptive_scoring.enabled`, and its whole output is one route
+name. `select.rs` and the deployment pipeline are unchanged.
+
+**The seven locked decisions, as built** (full table:
+`docs/R9_2_ADAPTIVE_ROUTE_SCORING.md` section 0):
+
+- **Hard threshold boundary.** R9.1's `outcome` is the input. A
+  `low_confidence` verdict is `below_threshold`: the fallback is the decision,
+  and the rejected route is in the trace but never contends.
+- **Contenders.** Only an accepted verdict contends, against the classifier
+  fallback, whose signal is the explicit `scoring::classifier_baseline`
+  (= `min_confidence`). Other candidates have no signal and are not scored.
+  Ties go to the verdict.
+- **Score.** `Wc·signal + Wp·prior + Wh·history`, with defaults 1/0/0, which
+  reproduce R9.1 exactly.
+- **Dominance bound.** The influence radius `(Wp + 2·Wh)/Wc` must be
+  `< (1 − min_confidence)/2` for every configured provider block (active and
+  standby), so the upper half of the accepted range is never overturned.
+  This replaces the design's `Wp + 2·Ws < Wc·min_conf`, which bounded only
+  unnamed candidates.
+- **One weight set.** There are no provider weights; the provider is trace
+  metadata only.
+- **History.** One record per configured route, in memory. Decayed
+  successes and failures (half-life 1 h by default, configurable, documented
+  as provisional), gated to neutral below `min_samples` 20, shrunk
+  `(s + k/2)/(n + k)` with `k = shrinkage_samples` (default = `min_samples`),
+  `h = 2ŝ − 1`.
+- **Recording.** At `Tracker::finish`, so a stream counts when it ends. All
+  routes and all traffic count except nested classification requests.
+  `ok` is success; `server_error` and `interrupted` are failures;
+  `route_unavailable` and all-502/503/504 refusals count as `unavailable`;
+  `route_capability_mismatch` as `mismatch`; client errors and cancellations
+  as `neutral`. Only success and failure are scored.
+- **Reset.** `POST /api/router/v1/adaptive-scoring/reset` (router key):
+  everything, or `{"route": …}`. It touches history only.
+- **Observability.** A `scoring` trace block, `adaptive_scoring` in
+  `GET /auto`, the `validate-config` summary line, and five low-cardinality
+  metric families.
+
+**Verified by execution.**
+
+- *Mutation testing* (scratch script, each mutation reverted from git): 12 of
+  12 deliberate breaks were caught. They were: low-confidence verdict allowed
+  to contend (5 tests failed); dominance bound not validated (3); no
+  shrinkage (2); no `min_samples` gate (10); `route_unavailable` scored as a
+  failure (3); all-503 refusal scored as a failure (1); mismatch scored as a
+  failure (1); an off section still scoring (1); ties to the fallback (4);
+  nested requests counted (1); no decay (5); a non-candidate allowed to
+  contend (12).
+- *Real smoke*, run on the real `hermes router` binary. General was a real
+  `hermes serve` with SmolLM2-135M; Coder, Research and the classifier were
+  scripted stdlib-Python nodes answering `PICK <route> <confidence>`. Weights
+  were prior 0.05 and history 0.06 (radius 0.170), with prior General 0.2.
+  History was fed by 30 direct General requests (real generations, 30/30
+  `ok`) and 30 direct Coder requests (scripted 500s). Results:
+  - `PICK Coder 0.95` went to **Coder**: 0.914 against General's 0.696.
+  - `PICK Coder 0.70` went to **General**, answered by the real model: 0.666
+    against 0.696, `overrode: true`.
+  - `PICK Coder 0.40` went to **General** with `below_threshold`,
+    `rejected_route: Coder` and no candidates.
+  - The admin view showed General n 31.8 / signal +0.614 and Coder n 30.9 /
+    signal −0.568.
+  - A reset without the key got 401. Resetting `coder` cleared only Coder;
+    a reset-all cleared every route. The counters stayed monotonic and the
+    gauges went to 0.
+  - All smoke processes were stopped by PID. The user's gateway on 11434 was
+    untouched.
+- *Jev.* No `TYPESAFE_API_KEY` exists on this box, so real Jev was not
+  called. Provider parity is proven against a scripted TypeSafe server:
+  identical winners and reasons for both providers. The scripted server
+  sends a contradicting `probabilities` map, which is ignored.
+
+**Deliberately not built:** latency, context-fit or availability scoring; Jev
+per-option probabilities and provider calibration; persistence; exploration
+or learned weights; cross-route fallback (R9.3); MoA (R9.4); UI; and route
+capability declarations.
+
+- **Validation.** `./scripts/check.sh`: 1286 workspace tests (from 1228) (router
+  360: 226 unit including 45 scoring, plus 13 `tests/route_scoring.rs`);
+  contract 47/2. The first run hit the known `lightweight-backend-llamacpp` supervision load flake (`an_illegal_instruction_…`: `engine_start_timeout`), in a crate this branch does not touch; it passed 3/3 in isolation, and the full rerun was green.
+
+**Next:** review of this branch (not merged). The UI follow-up and R9.3 each
+need explicit approval.

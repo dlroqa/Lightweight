@@ -38,6 +38,13 @@ This document covers milestones R0 to R8, and R9.1:
   for. It chooses a route only, never a deployment, and every failure falls
   back deterministically. See
   [Content-aware classification](#content-aware-classification-r91).
+- **R9.2:** optional adaptive scoring of a classification. Off by default.
+  When on, an accepted classification is weighed against the classifier's
+  fallback route by the classifier's confidence, an operator prior per route,
+  and bounded, decaying route-success history. It ranks **logical routes
+  only, never deployments**, never overturns a confident classification, and
+  never revives one the classifier was unsure of. See
+  [Adaptive route scoring](#adaptive-route-scoring-r92).
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -738,7 +745,7 @@ tolerated) naming one of the candidates, matched ignoring case, with a
 
 | Outcome | When | Route |
 |---|---|---|
-| `chosen` | a candidate, at or above `min_confidence` | that candidate |
+| `chosen` | a candidate, at or above `min_confidence` | that candidate (with [adaptive scoring](#adaptive-route-scoring-r92) on, a borderline one may lose to the fallback) |
 | `low_confidence` | a candidate, below `min_confidence` | the classifier's fallback |
 | `invalid` | not JSON, no `route`, a route that is not a candidate (a node name, `Auto`, a configured route outside `routes`), or a missing or out-of-range confidence | the classifier's fallback |
 | `unavailable` | the classifier route refused (`route_unavailable`, a node's `503`, …) | the classifier's fallback |
@@ -813,6 +820,276 @@ outcome counts, a `status` (`last_success_at`, `last_failure_at`,
 under `lightweight` / `jev` with `active` — for Jev, `api_key_configured`,
 never the key. The trace's classifier object carries `provider` and, for Jev,
 `model` (the versioned id that answered).
+
+## Adaptive route scoring (R9.2)
+
+R9.1 takes a classification at face value: at or above `min_confidence` the
+named route wins, below it the fallback does. R9.2 adds a small, bounded,
+explainable second opinion for the **borderline** cases just above the
+threshold. It weighs the classifier's confidence against two more things: a
+preference the operator writes down, and how the routes have actually behaved
+recently.
+
+> **Scoring ranks logical routes only. It never ranks or chooses
+> deployments.** Its whole output is one route name. Health, capability
+> filtering, session affinity and the route's policy then choose the
+> deployment exactly as for a client that named the route.
+
+```text
+explicit route ─────────────────────────────────────────────┐ never scored
+Auto → deterministic rule (tool_choice=required → ToolAgent) ┤ never scored
+Auto → no rule matched → fallback_route ─────────────────────┤ never scored
+Auto → classifying rule → classifier (R9.1 / R9.1a)          │
+         ├─ no verdict (timeout, auth_error, …) → fallback ──┤ not scored: no_verdict
+         ├─ verdict below min_confidence → fallback ─────────┤ not scored: below_threshold
+         └─ verdict accepted → R9.2: verdict vs fallback ────┤ scored
+                                                             ▼
+                     logical route → health → R5 capability filter → affinity → policy
+```
+
+It is off by default. Absent, or `"enabled": false`, a request resolves exactly
+as in R9.1, with the same traces and metrics.
+
+### Configuration
+
+A sibling of `classifier` under `auto_route`:
+
+```json
+"adaptive_scoring": {
+  "enabled": true,
+  "weights": { "classifier": 1.0, "prior": 0.05, "history": 0.06 },
+  "priors": { "General": 0.2 },
+  "history": { "half_life_secs": 3600, "min_samples": 20, "shrinkage_samples": 20 }
+}
+```
+
+| Field | Default | Bounds | Meaning |
+|---|---|---|---|
+| `enabled` | `false` | | An off section is still validated. |
+| `weights.classifier` | `1.0` | `(0, 1]` | Weight of the classifier signal. |
+| `weights.prior` | `0.0` | `[0, 1]` | Weight of the operator's prior. |
+| `weights.history` | `0.0` | `[0, 1]` | Weight of route-success history. |
+| `priors` | none (all `0`) | each `[0, 1]` | A preference per route. Keys must be a classifier candidate or the classifier's fallback, and are matched as route names are. |
+| `history.half_life_secs` | `3600` | `60 ..= 604800` | How fast history fades. **One hour is a provisional operational starting point, not an empirically tuned value.** |
+| `history.min_samples` | `20` | `1 ..= 10000` | Effective samples below which a route's history is neutral. |
+| `history.shrinkage_samples` | `min_samples` | `1 ..= 10000` | Pseudo-samples a success rate is shrunk toward 0.5 by. |
+
+**The defaults are neutral.** With `prior` and `history` weights at 0, every
+decision is R9.1's. That makes `"enabled": true` with no weights a safe way to
+watch history accumulate (in traces, `/api/router/v1/auto` and metrics) before
+giving it any influence.
+
+There is **one** set of weights, shared by every classifier provider. There
+are no Jev- or Lightweight-specific weights: the provider is recorded in the
+trace as metadata, never weighed. Unknown keys are refused (`deny_unknown_fields`)
+at every level. That includes latency, exploration and persistence settings,
+which this version does not have.
+
+### What contends, and the classifier baseline
+
+A classifier returns one route and one confidence. It says nothing about the
+other candidates, and scoring invents nothing for them. So, once a verdict is
+**accepted**, exactly two routes contend:
+
+| Contender | Classifier signal |
+|---|---|
+| the verdict route | the verdict's own `confidence` |
+| the classifier's fallback route | the **classifier baseline**: the active provider's `min_confidence` |
+
+The **classifier baseline** is R9.1's decision rule restated as a score. A
+verdict is accepted only at or above `min_confidence`, so in a contest the
+fallback stands exactly where an accepted verdict had to be to beat it. Other
+candidates have no signal and never win. A verdict that names the fallback
+itself is `uncontested`.
+
+### The score
+
+```text
+score(route) = W_classifier · classifier_signal(route)   classifier signal ∈ [0, 1]
+             + W_prior      · prior(route)               prior ∈ [0, 1], default 0
+             + W_history    · history(route)             history ∈ (−1, 1), 0 when unknown
+```
+
+The verdict route wins ties. That is R9.1's `confidence ≥ min_confidence`
+rule at equality, and with `W_prior = W_history = 0` it makes every decision
+R9.1's.
+
+### The threshold is a hard boundary
+
+| Classifier confidence | What scoring does |
+|---|---|
+| **below `min_confidence`** | Nothing. R9.1 rejected the route and its fallback **is** the decision (`below_threshold`). The rejected route is recorded in the trace and is **not eligible**: no prior or history can revive it. |
+| **exactly at `min_confidence`** | The verdict and the fallback tie on classifier signal; prior and history decide, within their bound. With nothing else known the verdict wins. |
+| **just above** (within the influence radius) | Prior and history may move the decision to the fallback, within their bound. |
+| **well above** (beyond the influence radius) | The classifier decides alone. No prior or history can overturn it. |
+
+### How far scoring can move a decision
+
+The verdict wins whenever
+
+```text
+confidence − baseline  ≥  (W_prior · Δprior + W_history · Δhistory) / W_classifier
+```
+
+and the right side can be at most the **influence radius**
+`(W_prior + 2·W_history) / W_classifier`. A prior spans `[0, 1]` and history
+spans `(−1, 1)`, so the largest swing between two routes is
+`W_prior + 2·W_history`. Validation refuses any configuration whose radius is
+not **less than half of the accepted range**, `(1 − min_confidence) / 2`. It
+checks this against every configured provider block (the active one and a
+standby), so switching provider cannot silently break the guarantee:
+
+> A classification in the upper half of the accepted range is never
+> overturned, by any prior or any history.
+
+With `min_confidence` 0.65 the radius must be under 0.175. For example,
+`prior 0.05, history 0.06` gives 0.17, so only confidences in `[0.65, 0.82)`
+can be reconsidered. `hermes router validate-config` prints the radius, and
+the admin view and every scoring trace carry it.
+
+### Route-success history
+
+Each configured route keeps one small aggregate in memory: decayed successes,
+decayed failures, and counters for what is observed but not scored. It never
+stores a request, prompt, session or deployment. It is recorded once per
+finished request, for the route that handled it, at the point the router knows
+the request's **final** outcome. A stream counts when it ends, not when its
+response head arrived (`router_requests_total` counts at the head, so it is not
+used). **All** traffic to a route counts: direct requests as well as `Auto`.
+The router's own classification requests (`<id>-classify`) never count.
+
+| Final outcome | Counted as | Scored? |
+|---|---|---|
+| `ok`: a completed response or stream | success | **yes** |
+| `server_error`: a 5xx answer | failure | **yes** |
+| `interrupted`: a committed stream the node broke off | failure | **yes** |
+| `unavailable` (`route_unavailable`), or every deployment refused with 502/503/504 before answering | unavailable | **no** |
+| `route_capability_mismatch` | mismatch | **no** |
+| `client_error`: any other 4xx | neutral | no |
+| `cancelled`: the client left | neutral | no |
+
+`route_unavailable` is **not scored on purpose**. It usually means a node is
+down, placement is incomplete, a model is still loading or a network blipped.
+It does not mean the route was the wrong choice. History must not learn
+"Research is a bad route" from "Research had nothing ready". A capability
+mismatch is about fit, which R5 decides exactly per request. Both are counted
+and shown, never scored.
+
+The history signal, with `n` effective (decayed) samples and `s` effective
+successes:
+
+```text
+n < min_samples   →  history = 0                          (neutral; "gated")
+otherwise         →  ŝ = (s + k/2) / (n + k)              (k = shrinkage_samples; shrunk toward 0.5)
+                     history = 2·ŝ − 1                     (in (−1, 1))
+```
+
+With the defaults, 20 successes out of 20 give `ŝ = 30/40 = 0.75` and
+`history = 0.5`, not 1.0. No route reaches ±1, however long its record.
+
+**Decay.** Both counts are multiplied by `2^(−Δt / half_life)` whenever they
+are read or updated. With no traffic, a route's `n` falls below `min_samples`
+and its history returns to neutral. A route avoided after failures therefore
+becomes winnable again on its own, after about `log2(n / min_samples)`
+half-lives, with no exploration traffic.
+
+**Observation-bias safeguards.** All traffic counts, not just `Auto`'s. Missing
+history is neutral, never a penalty. Small samples are gated and shrunk. The
+influence is capped by the radius above. History decays. There is no random
+exploration, bandit or traffic probing. A biased history is contained by these
+bounds, or by a smaller `history` weight, never by randomness.
+
+**In memory only.** History is process-local and starts empty when the router
+starts. There is no file, database or Redis. Every configuration change
+already needs a restart, so a topology change also resets history.
+
+### Resetting history
+
+```sh
+curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:11500/api/router/v1/adaptive-scoring/reset
+curl -X POST -H "Authorization: Bearer $KEY" -d '{"route": "Coder"}' \
+     http://127.0.0.1:11500/api/router/v1/adaptive-scoring/reset
+```
+
+This forgets every route's history, or one route's, and nothing else. It does
+not touch the route configuration, `Auto` rules, classifier settings, session
+affinity, placement, node state or loaded models. It uses the router's key,
+like every other control endpoint. The answer is `{"reset": "all"|"route",
+"routes": [...], "reset_at": <unix>}`. Errors are `404 route_not_found`,
+`400 invalid_request_body`, and `409 adaptive_scoring_not_enabled` when
+scoring is absent or off. Prometheus counters stay monotonic; only the history
+scoring reads starts over. Use it after swapping a route's model at run time,
+when the old model's record no longer describes the route.
+
+### What scoring does not do
+
+- **Choose a deployment, or read anything deployment-, node- or
+  session-level.** No per-deployment latency, load, health, placement
+  readiness or affinity enters a score.
+- **Latency or context-fit scoring.** TTFT and durations are measured as before
+  and never consulted. R5 remains the exact context and capability gate.
+- **Penalise availability.** See above.
+- **Try another route.** If the winning route cannot serve the request, the
+  client gets that route's `route_unavailable` or
+  `route_capability_mismatch`, and no second route is chosen (that is R9.3).
+- **Wait for, or ask for, a load.**
+- **Learn weights, explore, or use Jev's per-option probabilities.** Only the
+  provider-neutral route and confidence are read.
+- **Add route capability declarations.** R5's observed deployment capabilities
+  stay the one capability authority.
+
+### Observability
+
+A `scoring` block in the trace, whenever scoring is on and a classifier ran.
+It holds route names and numbers only:
+
+```json
+"scoring": {
+  "enabled": true, "reason": "scored",
+  "classifier_baseline": 0.65, "influence_radius": 0.17,
+  "weights": {"classifier": 1.0, "prior": 0.05, "history": 0.06},
+  "classified_route": "Coder", "winner": "General", "overrode": true,
+  "candidates": [
+    {"route": "Coder", "basis": "verdict", "confidence": 0.70, "prior": 0.0,
+     "classifier_signal": 0.70, "prior_signal": 0.0, "history_signal": -0.036, "total_score": 0.664,
+     "history": {"effective_samples": 30.0, "successes": 0.0, "failures": 30.0,
+                 "success_rate": 0.2, "value": -0.6, "gated": false}},
+    {"route": "General", "basis": "baseline", "confidence": 0.65, "prior": 0.2,
+     "classifier_signal": 0.65, "prior_signal": 0.01, "history_signal": 0.036, "total_score": 0.696,
+     "history": {"effective_samples": 30.0, "successes": 30.0, "failures": 0.0,
+                 "success_rate": 0.8, "value": 0.6, "gated": false}}
+  ]
+}
+```
+
+`reason` is `scored`, `uncontested`, `below_threshold` (with `rejected_route` and
+`rejected_confidence`), `no_verdict`, or `internal_error` (a non-finite score,
+unreachable with a valid configuration; R9.1's route stands). The three
+signals of a candidate sum to its `total_score`. The R9.1 `classifier` block
+is unchanged: it records the classifier's own judgement (`chosen`,
+`low_confidence`, …) even when scoring then picked the fallback. The `auto
+route classified` log line adds `classified_route`, `scoring_reason` and
+`scoring_overrode`.
+
+`GET /api/router/v1/auto` gains `adaptive_scoring`: `configured`, `enabled`,
+`weights`, `influence_radius`, `priors`, `history` (`half_life_secs`,
+`half_life_provisional`, `min_samples`, `shrinkage_samples`),
+`classifier_baseline`, `fallbacks` (counts by reason), and `routes`. Each route
+row has `effective_samples`, `successes`, `failures`, `success_rate`, `value`,
+`gated`, `unavailable`, `mismatch`, `neutral` and `last_observed_at`. Without
+the section it is `{"configured": false, "enabled": false}`.
+
+Metrics, with bounded labels and scores never used as labels:
+`router_route_scoring_decisions_total{route,overrode}`,
+`router_route_scoring_fallback_total{reason}`,
+`router_route_history_observations_total{route,outcome}` (`success`,
+`failure`, `unavailable`, `mismatch`, `neutral`), and the gauges
+`router_route_history_effective_samples{route}` and
+`router_route_history_signal{route}`.
+
+Scoring is arithmetic over at most two contenders. It makes no network call,
+no model call and no I/O, and it is counted inside `routing_ms`. A unit test
+bounds 10 000 decisions in a debug build.
 
 ## Health
 
@@ -1542,7 +1819,8 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
 | `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
 | `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
-| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). Read-only; rules change only with the file. |
+| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). With scoring, an `adaptive_scoring` block (settings and per-route history; see [Observability](#observability-2)). Read-only; rules change only with the file. |
+| `POST /api/router/v1/adaptive-scoring/reset` | Forgets adaptive scoring's route history: all routes, or `{"route": "Coder"}` for one. Touches nothing else. `409 adaptive_scoring_not_enabled` when scoring is absent or off. See [Resetting history](#resetting-history). |
 | `POST /api/router/v1/classifier/check` | Checks the active classifier provider now and records the result: for Jev, `GET /v1/models` (key accepted, model listed); for the Lightweight provider, whether its classifier route is available. Sanitized report; never classifies. `409 classifier_not_configured` without a classifier. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
 
@@ -1728,6 +2006,12 @@ or an address.
   `router_classifier_route_total{provider,route}`, and the histogram
   `router_classifier_duration_seconds{provider,outcome}`. `provider` is
   `lightweight` or `jev`; outcomes are a fixed list.
+- Adaptive scoring (R9.2, only while on):
+  `router_route_scoring_decisions_total{route,overrode}`,
+  `router_route_scoring_fallback_total{reason}`,
+  `router_route_history_observations_total{route,outcome}`,
+  `router_route_history_effective_samples{route}`,
+  `router_route_history_signal{route}`.
 - `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
   `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
   — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
@@ -1802,7 +2086,17 @@ clients cannot add labels by inventing model names.
   Qwen3-1.7B chose the intended route for 4 of 5 real prompts; it called a
   GPU-announcement comparison `General`, not `Research`. A wrong but confident
   answer is taken. Descriptions and the candidate list are the operator's
-  levers; nothing is learned from outcomes (that would be R9.2).
+  levers. With [adaptive scoring](#adaptive-route-scoring-r92) on, route
+  history can tip a *borderline* accepted verdict toward the fallback, never a
+  confident one.
+- **Adaptive scoring's history is young.** It lives in memory and restarts
+  empty. Its one-hour half-life is a provisional starting point, not a
+  measurement. Its only evidence is success versus server failure, with no
+  latency and no context fit. And it can only tip a borderline accepted
+  verdict toward the classifier's fallback: with one route and one
+  confidence per classification, it cannot rank candidates the classifier
+  did not name. Treat its weights as small until history from real traffic
+  justifies more.
 - **Classification adds a generation to every classified request.** See
   [Classification latency](#classification-latency). `timeout_ms` is required
   precisely because no one value suits a GPU, a CPU and a remote classifier.
@@ -1888,8 +2182,8 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R8 (rule-based `Auto`) and R9.1 (content-aware classification) are built.
-Nothing after them is. Each
+R8 (rule-based `Auto`), R9.1 (content-aware classification) and the first
+slice of R9.2 (adaptive route scoring) are built. Nothing after them is. Each
 later step builds on the types above without changing the public route
 identity.
 
@@ -1903,7 +2197,7 @@ identity.
 | **R9.1** | Done: an opt-in classifier an `Auto` rule invokes with `"classify": true` — itself a configured route, called through the router's pipeline — choosing only among configured candidate routes (with optional route descriptions), with a confidence threshold, a timeout, bounded input, and a deterministic fallback for every failure; recursion refused; classifier time measured apart from `routing_ms`; traces, metrics and admin state. Deliberately left out: scores, history, latency, cross-route fallback, and orchestration. |
 | **R9.1a** | Done: a provider-neutral classifier boundary (`classifier/`: `lightweight`, `jev`) with one `Classification` result; TypeSafe Jev System One as an optional provider (typed Choice over the candidates, its own confidence, bearer key from the environment, https, bounded failures, no retries); per-provider settings; sanitized admin state, a start-up check and `POST /api/router/v1/classifier/check`. Deliberately left out: provider chains, scoring, and anything after the route is chosen. |
 | **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
-| **R9.2** | Designed, not built ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): bounded, explainable scoring of candidate **routes** (never deployments) from the classifier's verdict, configured priors and decayed route-level success history, with a deterministic fallback to R9.1 and an off switch. |
+| **R9.2** | Slice 1 done ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): off-by-default scoring of an accepted classification's verdict route against the classifier fallback (whose signal is the explicit classifier baseline), by classifier signal, operator priors and bounded, shrunk, decaying, in-memory route-success history; a hard below-threshold boundary; an influence radius validated under half the accepted range; `route_unavailable` and mismatch observed, never scored; traces, metrics, admin view and an admin history reset. Deliberately left out: latency and context-fit scoring, Jev per-option probabilities, provider calibration, availability penalties, persistence, exploration, learned weights, and any UI. |
 | **R9.3** | Planned: explicit, acyclic cross-route fallback chains for pre-response `route_unavailable` / `route_capability_mismatch` only; never mid-stream; kept apart from deployment failover. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
