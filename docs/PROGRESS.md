@@ -2354,3 +2354,34 @@ signal plus a bounded operator prior, which choose the logical-route winner.
 Route history is observational telemetry only: `weights.history` must be 0,
 and a below-threshold verdict is never resurrected. Any change to R9.2 now
 needs explicit approval. R9.3 is at the design stage only.
+
+## Router cross-route fallback, R9.3 (DESIGN ONLY: docs/r9.3-cross-route-fallback-design)
+
+`docs/R9_3_CROSS_ROUTE_FALLBACK.md`. There is no code, configuration,
+metric, trace field or UI. The facts were read from `master` (`ef4f868`):
+
+- **Qualifying outcomes are all uncommitted terminal paths of
+  `route_request`:** plan-time `RouteUnavailable`, plan-time
+  `CapabilityMismatch`, every attempt failing without an answer
+  (`route_unavailable`), and every deployment refusing with 502/503/504 (the
+  last node's refusal is returned).
+- **Commit is the response head** (`Attempt::Committed`), for streams and
+  bodies alike.
+- **No request deadline exists**: there is only `connect_timeout` (5 s).
+- **Nodes never execute tools**: the only `Command::new` is the engine
+  supervisor. So side-effect commit cannot precede response commit.
+- **Affinity is keyed by route and session.**
+
+**Recommended first slice** (`feature/router-cross-route-fallback`):
+- `auto_route.cross_route_fallback`: flat, ordered, non-transitive lists,
+  at most 3 entries;
+- `Auto`-resolved requests only; never explicit, `default` or nested;
+- triggers `route_unavailable`, `route_exhausted` and
+  `route_capability_mismatch`, only after same-route failover;
+- configuration order only, with no reclassification, re-scoring, history,
+  latency, 500 or mid-stream trigger;
+- the response names the serving route, and the trace keeps the initial and
+  final routes.
+
+Nine open questions are listed in section 29. Implementation needs explicit
+approval.
