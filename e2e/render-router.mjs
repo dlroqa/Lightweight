@@ -1,0 +1,209 @@
+// Render the panel as a router serves it (`hermes router --web-root`) and
+// assert the router screens: Auto rules, the classifier provider selector and
+// panels, Test Connection against the real router, every check status in
+// words, field validation, and that the TypeSafe key never reaches the browser.
+//
+// As render.mjs: properties, not pixels. Each screen is screenshotted for a
+// person to eyeball on the pull request.
+//
+// Environment:
+//   PANEL_BASE       the router's origin (default http://127.0.0.1:11500)
+//   OUT_DIR          where screenshots land (default screens)
+//   SECRET_SENTINEL  the TypeSafe key the router was started with; it must
+//                    appear in no response body, DOM or browser storage
+
+import { mkdir } from "node:fs/promises";
+import { chromium } from "playwright";
+
+const BASE = (process.env.PANEL_BASE ?? "http://127.0.0.1:11500").replace(/\/+$/, "");
+const OUT_DIR = process.env.OUT_DIR ?? "screens";
+const SECRET = process.env.SECRET_SENTINEL ?? "";
+const TIMEOUT = Number(process.env.RENDER_SETTLE_MS ?? 15000);
+
+const failures = [];
+function check(condition, message) {
+  if (!condition) failures.push(message);
+  console.log(`  [${condition ? "ok" : "FAIL"}] ${message}`);
+}
+
+async function main() {
+  if (!SECRET) throw new Error("SECRET_SENTINEL is required, to prove the key never reaches the browser");
+  await mkdir(OUT_DIR, { recursive: true });
+  const browser = await chromium.launch();
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    colorScheme: "dark",
+    deviceScaleFactor: 2,
+  });
+  const page = await context.newPage();
+  const errors = [];
+  const bodies = [];
+  page.on("pageerror", (err) => errors.push(String(err)));
+  page.on("response", async (response) => {
+    if (!response.url().startsWith(BASE)) return;
+    try {
+      bodies.push({ url: response.url(), text: await response.text() });
+    } catch {
+      // A redirect or aborted response has no body to inspect.
+    }
+  });
+
+  // --- Auto Routing -----------------------------------------------------------------
+  await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Auto Routing", exact: true }).waitFor({ timeout: TIMEOUT });
+  check(page.url().endsWith("#/auto"), "a router's panel opens on Auto Routing");
+  const semantic = page.locator('tr[data-rule="semantic"]');
+  await semantic.waitFor({ timeout: TIMEOUT });
+  check((await semantic.innerText()).includes("Semantic classification"), "a classify rule reads as Semantic classification");
+  check(
+    (await page.locator('tr[data-rule="tools"]').innerText()).includes("Route directly to Coder"),
+    "a direct rule reads as Route directly to Coder",
+  );
+  check(!(await page.getByText("Dashboard", { exact: true }).count()), "gateway-only sections are not offered on a router");
+  await page.screenshot({ path: `${OUT_DIR}/router-auto.png`, fullPage: true });
+
+  // --- Classifier: Jev, as running -----------------------------------------------------
+  await page.goto(`${BASE}/#/classifier`, { waitUntil: "domcontentloaded" });
+  await page.getByText("Classifier Provider", { exact: true }).waitFor({ timeout: TIMEOUT });
+  const jevRadio = page.getByRole("radio", { name: /Jev \/ TypeSafe/ });
+  const lwRadio = page.getByRole("radio", { name: /Lightweight/ });
+  check(await jevRadio.isChecked(), "the provider selector shows the running provider (Jev)");
+  const jevPanel = page.locator('[data-panel="jev"]');
+  check(await jevPanel.isVisible(), "the Jev panel is shown for Jev");
+  check(
+    (await page.locator("[data-privacy-notice]").innerText()).includes("Jev is an external classifier provider"),
+    "the external-provider privacy notice is visible",
+  );
+  check((await page.getByLabel("Base URL").inputValue()) === process.env.EXPECT_BASE_URL, "the base URL is read from the router");
+  check((await page.getByLabel("API Key Environment Variable").inputValue()) === "TYPESAFE_API_KEY", "the key's variable name is shown");
+  check((await page.locator('[data-key-status="configured"]').count()) === 1, "the key status reads Configured");
+  check((await page.getByLabel("Model — required").inputValue()) === "jev-latest", "the model is read from the router");
+  check((await page.getByLabel("Timeout (ms) — required").inputValue()) === "5000", "the timeout is read from the router");
+  check(
+    (await page.locator("[data-include-user-text]").innerText()).includes("structural request traits"),
+    "include-user-text Off explains what Jev still receives",
+  );
+  await page.getByRole("switch", { name: "Include user message text in classifier request" }).click();
+  check(
+    (await page.locator("[data-include-user-text]").innerText()).includes("bounded last user message may be sent"),
+    "include-user-text On explains what is sent",
+  );
+  for (const route of ["General", "Coder", "Research"]) {
+    check((await page.locator(`[data-candidate="${route}"]`).count()) === 1, `candidate ${route} is offered`);
+  }
+  check((await page.locator('[data-candidate="Auto"]').count()) === 0, "Auto is never a candidate");
+  check(
+    (await page.getByLabel("Description — Coder").inputValue()).startsWith("Programming"),
+    "route descriptions are shown and editable",
+  );
+  check((await page.getByLabel("Classifier Fallback Route").inputValue()) === "General", "the fallback route is shown");
+  check(
+    (await page.locator("[data-config-snippet]").innerText()).includes('"provider": "jev"'),
+    "a valid draft produces the canonical configuration",
+  );
+  await page.screenshot({ path: `${OUT_DIR}/router-classifier-jev.png`, fullPage: true });
+
+  // --- Test Connection, against the real router and scripted TypeSafe -----------------
+  await page.getByRole("button", { name: "Test Connection" }).click();
+  await page.locator('[data-check-status="ok"]').waitFor({ timeout: TIMEOUT });
+  check((await page.locator('[data-check-status="ok"]').innerText()).includes("Connected"), "Test Connection reaches the real provider: Connected");
+
+  // Every other status, as the router would report it.
+  const statuses = {
+    api_key_missing: "API key missing",
+    auth_error: "Authentication failed",
+    rate_limited: "Provider rate limited the request",
+    provider_error: "Provider error",
+    connection_error: "Could not reach the provider",
+    timeout: "Connection timed out",
+    invalid_response: "Unexpected response",
+    model_not_listed: "Pinned versions may still be accepted",
+  };
+  for (const [status, words] of Object.entries(statuses)) {
+    await page.route("**/api/router/v1/classifier/check", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          provider: "jev",
+          status,
+          model: "jev-1.13.0",
+          model_listed: status === "model_not_listed" ? false : undefined,
+          checked_at: Math.floor(Date.now() / 1000),
+          duration_ms: 42,
+        }),
+      }),
+    );
+    await page.getByRole("button", { name: "Test Connection" }).click();
+    const shown = page.locator(`[data-check-status="${status}"]`);
+    await shown.waitFor({ timeout: TIMEOUT });
+    const text = await shown.innerText();
+    check(text.includes(words) && !/invalid model/i.test(text), `${status} reads as “${words}”`);
+    if (status === "model_not_listed") {
+      await page.screenshot({ path: `${OUT_DIR}/router-check-model-not-listed.png`, fullPage: true });
+    }
+    await page.unroute("**/api/router/v1/classifier/check");
+  }
+
+  // --- validation ------------------------------------------------------------------------
+  const timeout = page.getByLabel("Timeout (ms) — required");
+  await timeout.fill("");
+  check(await page.getByText(/Required\. Choose a bound/).isVisible(), "an empty timeout is refused as required");
+  check(await page.getByRole("button", { name: "Use 5000" }).isVisible(), "5000 ms is offered as a suggestion, not inserted");
+  await timeout.fill("999999");
+  check(await page.getByText("Must be between 1 and 120000 ms.").isVisible(), "a timeout over 120000 ms is refused");
+  check((await page.locator("[data-config-snippet]").count()) === 0, "an invalid draft produces no configuration");
+  await timeout.fill("5000");
+  await page.getByLabel("Minimum Confidence").fill("1.5");
+  check(await page.getByText("Must be a number between 0 and 1.").isVisible(), "a confidence above 1 is refused");
+  await page.getByLabel("Minimum Confidence").fill("0.65");
+  await page.getByLabel("Maximum Input Characters").fill("0");
+  check(await page.getByText("Must be between 1 and 32000.").isVisible(), "a maximum input of 0 is refused");
+  await page.getByLabel("Maximum Input Characters").fill("2000");
+  await page.getByLabel("Base URL").fill("http://api.typesafe.ai");
+  check(await page.getByText(/Must use https/).isVisible(), "a plain-http remote base URL is refused");
+  await page.getByLabel("Base URL").fill(process.env.EXPECT_BASE_URL);
+  await page.getByLabel("Model — required").fill("jev-1.13.0");
+  check(
+    (await page.locator("[data-config-snippet]").innerText()).includes('"model": "jev-1.13.0"'),
+    "a manually pinned model is accepted",
+  );
+
+  // --- switching provider ---------------------------------------------------------------
+  await lwRadio.check();
+  check(await page.locator('[data-panel="lightweight"]').isVisible(), "choosing Lightweight shows the Lightweight panel");
+  check(!(await jevPanel.isVisible()), "and hides the Jev panel");
+  check((await page.getByLabel("Classifier Route").inputValue()) === "Research", "the standby Lightweight settings are read");
+  check(
+    (await page.locator("[data-config-snippet]").innerText()).includes('"provider": "lightweight"'),
+    "switching changes only the classifier section",
+  );
+  await page.screenshot({ path: `${OUT_DIR}/router-classifier-lightweight.png`, fullPage: true });
+  await jevRadio.check();
+  check(await jevPanel.isVisible(), "choosing Jev again shows the Jev panel");
+
+  // --- the key never reaches the browser ------------------------------------------------
+  const html = await page.content();
+  const storage = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));
+  check(!html.includes(SECRET), "the TypeSafe key is not in the page");
+  check(!storage.includes(SECRET), "the TypeSafe key is not in browser storage");
+  const leaked = bodies.filter((body) => body.text.includes(SECRET)).map((body) => body.url);
+  check(leaked.length === 0, `the TypeSafe key is in no response (${bodies.length} inspected)${leaked.length ? `: ${leaked.join(", ")}` : ""}`);
+  check(errors.length === 0, `no uncaught page error${errors.length ? `: ${errors[0]}` : ""}`);
+
+  await context.close();
+  await browser.close();
+
+  console.log(`\nScreenshots written to ${OUT_DIR}/`);
+  if (failures.length) {
+    console.error(`\n${failures.length} router render check(s) failed:`);
+    for (const f of failures) console.error(`  - ${f}`);
+    process.exit(1);
+  }
+  console.log("All router render checks passed.");
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
