@@ -2685,5 +2685,5 @@ Recommended design:
 - cancellation stays `cancelled`;
 - never a routing signal, an R9.2 input or a history observation.
 
-**Next:** review of this design (STOP). Implementation (R9.3.2.1, section 33)
+**Next:** review of this design (STOP). Implementation (R9.3.2 slice 1, section 33)
 needs explicit approval. R9.4 is not started.

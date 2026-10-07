@@ -723,7 +723,7 @@ Each must be caught by at least one test above:
 - The budget UI card (section 26).
 - Any interaction with R9.4.
 
-## 33. Recommended first implementation slice (R9.3.2.1)
+## 33. Recommended first implementation slice (R9.3.2 slice 1)
 
 1. `RequestDeadline` (section 6) created in `forward_as`, passed by value;
    nested classifier inherits.
