@@ -2184,6 +2184,24 @@ or an address.
   transition are in `router_cross_route_fallback_total` and in the trace. A
   request refused before any route was chosen is counted under `Auto` or
   `_unknown`.
+
+  *Frozen for R9.3.2, which is not implemented and not emitted by this
+  version:* the [Pre-Commit Request
+  Budget](R9_3_2_SHARED_REQUEST_BUDGET.md) will add a fifth outcome,
+  `request_budget_exhausted`.
+  - It is **not** `server_error` (an actual server failure) and not
+    `unavailable` (an availability failure). It means the configured
+    pre-commit budget was the causal terminal condition.
+  - It is used **only** when the budget caused the request to end. A route
+    result that already completed keeps its own outcome, even if the clock
+    has since passed the deadline.
+  - Still one count per client request.
+  - The label is the terminal attempted route (`Auto → Coder → General`, cut
+    while General is uncommitted, counts `route="General"`). Before any
+    route attempt it is `Auto` for an `Auto` request, or the client-named
+    route for an explicit one. A route is never invented.
+  - It is neutral and unscored in R9.2 route history, and never affects
+    route choice or fallback order.
 - `router_failovers_total{route}`
 - `router_routing_decisions_total{route,policy,reason}`. Failovers by policy are
   the `*_failover` reasons; affinity hits are `session_affinity`.
@@ -2413,6 +2431,7 @@ identity.
 | **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
 | **R9.2** | Slice 1 done ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): off-by-default scoring of an accepted classification's verdict route against the classifier fallback (whose signal is the explicit classifier baseline), by classifier signal and operator priors only; a hard below-threshold boundary; an influence radius `prior / classifier` validated under half the accepted range; route-history observations (decayed, shown, resettable) that never affect routing, with `weights.history` required to be 0; traces, metrics, admin view and an admin history reset. Deliberately left out: history scoring until a route-attributable quality signal exists, latency and context-fit scoring, Jev per-option probabilities, provider calibration, availability penalties, persistence, exploration, learned weights, and any UI. |
 | **R9.3** | R9.3.1 done ([design](R9_3_CROSS_ROUTE_FALLBACK.md)): explicit, ordered per-route fallback lists (`auto_route.cross_route_fallback`, at most 3, acyclic, never transitive) for `Auto`-resolved requests only, after same-route failover and before response commit, on `route_unavailable`, `route_exhausted` and `route_capability_mismatch`. The response names the serving route; an exhausted list returns the final route's own error; requests are counted once. Deliberately left out: explicit-route fallback, context-overflow, 500 or latency triggers, a shared request budget, reason-specific lists, and UI. |
+| **R9.3.2** | Design frozen, **not implemented** ([design](R9_3_2_SHARED_REQUEST_BUDGET.md)): an opt-in shared Pre-Commit Request Budget (`request.pre_commit_budget_ms`), with one absolute monotonic deadline per client request. It is shared by classification, same-route failover and cross-route fallback, checked before each new attempt, and caps existing timeouts. It ends with a causal `504 request_budget_exhausted` and a distinct `router_requests_total` outcome. It is never a routing signal and is neutral to R9.2 history. Deliberately left out: post-commit/stream deadlines, client-supplied deadlines, per-route budgets, latency-aware selection. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
 Out of scope for every one of these: a request-path model load, splicing one
