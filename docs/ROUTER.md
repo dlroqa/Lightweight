@@ -2144,7 +2144,14 @@ Labels are only configured names — a route, its policy, a deployment — or a
 reason from a fixed list. Never a session, a request id, a prompt, a tool name
 or an address.
 
-- `router_requests_total{route,outcome}`
+- `router_requests_total{route,outcome}`: each client request counted
+  **once**, under its **final** logical route, the one that served it or
+  last failed it. After a cross-route fallback that is the fallback route,
+  not the route `Auto` first chose: `Auto → Coder → General` (served) counts
+  `{route="General",outcome="ok"}` once. The initial route and each
+  transition are in `router_cross_route_fallback_total` and in the trace. A
+  request refused before any route was chosen is counted under `Auto` or
+  `_unknown`.
 - `router_failovers_total{route}`
 - `router_routing_decisions_total{route,policy,reason}`. Failovers by policy are
   the `*_failover` reasons; affinity hits are `session_affinity`.

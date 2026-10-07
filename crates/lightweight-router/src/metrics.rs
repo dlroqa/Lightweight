@@ -920,7 +920,7 @@ impl RouterMetrics {
         let mut out = String::new();
 
         out.push_str(
-            "# HELP router_requests_total Requests the router answered, by route and outcome.\n",
+            "# HELP router_requests_total Client requests the router answered, each counted once, by outcome and the final logical route (the one that served or last failed it, after any cross-route fallback; the initial route of a fallback is in router_cross_route_fallback_total).\n",
         );
         out.push_str("# TYPE router_requests_total counter\n");
         for ((route, outcome), count) in self

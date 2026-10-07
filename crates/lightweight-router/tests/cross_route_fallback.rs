@@ -1005,6 +1005,13 @@ async fn at_most_four_routes_are_attempted_and_the_last_ones_error_is_returned()
         metrics.contains("router_requests_total{route=\"Reasoning\",outcome=\"unavailable\"} 1")
     );
     assert!(!metrics.contains("router_requests_total{route=\"Coder\""));
+    assert!(
+        metrics.contains(
+            "# HELP router_requests_total Client requests the router answered, each counted \
+             once, by outcome and the final logical route"
+        ),
+        "the HELP text states the final-route semantic"
+    );
 }
 
 #[tokio::test]
