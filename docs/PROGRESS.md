@@ -2652,3 +2652,38 @@ There is no backend config mutation API.
 **Operational state:** the R9.3.1 backend and the R9.3 UI are operationally
 complete. R9.3.2 (shared request budget) is design only, on
 `design/router-shared-request-budget`. R9.4 is not started.
+
+## Router shared request budget, R9.3.2 (DESIGN ONLY: design/router-shared-request-budget)
+
+Branched from validated master `49ce10d`. The only addition is
+`docs/R9_3_2_SHARED_REQUEST_BUDGET.md`. There is no runtime code, config,
+metric, trace field, admin field or UI.
+
+The timeout inventory was verified in code. On the request path today:
+- a 5 s connect timeout per attempt, which resets on every deployment and
+  route;
+- the classifier `timeout_ms` (required, 1–120000), applied once;
+- the node's 600 s queue wait.
+
+The upstream response head, body/stream reads and inference are unbounded,
+and there is no overall deadline. A Lightweight node commits a **streamed**
+request's head immediately but a **non-streamed** one only after the whole
+generation, so a pre-commit budget bounds a non-streamed generation.
+
+Recommended design:
+- an opt-in `request.pre_commit_budget_ms` (1000–3600000, 0 refused, no
+  default value);
+- one monotonic `RequestDeadline` created at `received` in `forward_as`
+  (after the body is read, before parse, classification and routing),
+  passed by value, and inherited by the nested classifier;
+- applies to all client requests, and covers R9.1, R9.2, planning, every
+  same-route attempt and every cross-route fallback with no reset;
+- caps each wait at min(own limit, remaining);
+- stops governing at the response commit;
+- `504 request_budget_exhausted`, only when the budget stopped further
+  work; otherwise the existing error stands;
+- cancellation stays `cancelled`;
+- never a routing signal, an R9.2 input or a history observation.
+
+**Next:** review of this design (STOP). Implementation (R9.3.2.1, section 33)
+needs explicit approval. R9.4 is not started.
