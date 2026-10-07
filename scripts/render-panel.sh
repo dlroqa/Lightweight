@@ -17,12 +17,16 @@
 # It then does the same for the panel as a router serves it
 # (`lightweight router --web-root`), with the classifier on Jev pointed at a
 # scripted TypeSafe endpoint (`e2e/mock-jev.mjs`), so Test Connection runs
-# through the real router without ever calling the real API.
+# through the real router without ever calling the real API. Two scripted
+# nodes (`e2e/mock-node.mjs`) start empty and are loaded mid-render, so the
+# router serves a real cross-route fallback that succeeds as well as one that
+# exhausts its list.
 #
 # Environment:
 #   GATEWAY_PORT  gateway/panel port        (default 11434)
 #   ROUTER_PORT   router/panel port         (default 11500)
 #   JEV_PORT      scripted TypeSafe port    (default 11501)
+#   NODE_PORT     first scripted node port  (default 11502; the second is +1)
 #   OUT_DIR       where screenshots land    (default e2e/screens)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,6 +34,9 @@ cd "$(dirname "$0")/.."
 GATEWAY_PORT="${GATEWAY_PORT:-11434}"
 ROUTER_PORT="${ROUTER_PORT:-11500}"
 JEV_PORT="${JEV_PORT:-11501}"
+NODE_PORT="${NODE_PORT:-11502}"
+CODER_NODE_PORT="$NODE_PORT"
+GENERAL_NODE_PORT="$((NODE_PORT + 1))"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -47,10 +54,11 @@ GATEWAY_PID=""
 ROUTER_LOG="$WORK/router.log"
 ROUTER_PID=""
 JEV_PID=""
+NODES_PID=""
 
 cleanup() {
   local status=$?
-  for pid in "$ROUTER_PID" "$JEV_PID" "$GATEWAY_PID"; do
+  for pid in "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
@@ -107,16 +115,32 @@ MOCK_JEV_PORT="$JEV_PORT" MOCK_JEV_KEY="$JEV_KEY" node e2e/mock-jev.mjs >"$WORK/
 JEV_PID=$!
 wait_for "http://127.0.0.1:$JEV_PORT/health" "scripted TypeSafe" "$JEV_PID"
 
+echo "== start scripted nodes (ports $CODER_NODE_PORT, $GENERAL_NODE_PORT) =="
+# A second Coder deployment that refuses with 503 and a second General one that
+# answers. Both start with no model, so until the render loads them every route
+# is unavailable, as with the gateway alone. Started before the router, so its
+# first probe finds them.
+MOCK_NODES="$CODER_NODE_PORT:Coder:503,$GENERAL_NODE_PORT:General:200" \
+  node e2e/mock-node.mjs >"$WORK/nodes.log" 2>&1 &
+NODES_PID=$!
+wait_for "http://127.0.0.1:$CODER_NODE_PORT/health" "scripted Coder node" "$NODES_PID"
+wait_for "http://127.0.0.1:$GENERAL_NODE_PORT/health" "scripted General node" "$NODES_PID"
+
 echo "== start router (port $ROUTER_PORT) =="
-# Nodes point at the gateway above; whether they are healthy does not matter
-# to these screens. Jev is active, with a Lightweight block kept as standby.
+# Nodes point at the gateway above and the scripted nodes; whether the gateway
+# is healthy does not matter to these screens. Jev is active, with a
+# Lightweight block kept as standby.
 cat >"$WORK/router.json" <<JSON
 {
   "listen": ["127.0.0.1:$ROUTER_PORT"],
-  "nodes": [{"id": "local", "url": "http://127.0.0.1:$GATEWAY_PORT"}],
+  "nodes": [
+    {"id": "local", "url": "http://127.0.0.1:$GATEWAY_PORT"},
+    {"id": "coder-b", "url": "http://127.0.0.1:$CODER_NODE_PORT"},
+    {"id": "general-b", "url": "http://127.0.0.1:$GENERAL_NODE_PORT"}
+  ],
   "routes": [
-    {"name": "General", "description": "Everyday conversation and questions", "deployments": [{"node": "local", "model": "General"}]},
-    {"name": "Coder", "description": "Programming, debugging and code generation", "deployments": [{"node": "local", "model": "Coder"}]},
+    {"name": "General", "description": "Everyday conversation and questions", "deployments": [{"node": "local", "model": "General"}, {"node": "general-b", "model": "General"}]},
+    {"name": "Coder", "description": "Programming, debugging and code generation", "deployments": [{"node": "local", "model": "Coder"}, {"node": "coder-b", "model": "Coder"}]},
     {"name": "Research", "deployments": [{"node": "local", "model": "Research"}]}
   ],
   "auto_route": {
@@ -149,6 +173,8 @@ wait_for "http://127.0.0.1:$ROUTER_PORT/health" "router" "$ROUTER_PID"
 
 echo "== render the router's panel in a headless browser =="
 PANEL_BASE="http://127.0.0.1:$ROUTER_PORT" OUT_DIR="$OUT_DIR" SECRET_SENTINEL="$JEV_KEY" \
-  EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" node e2e/render-router.mjs
+  EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" \
+  MOCK_NODE_URLS="http://127.0.0.1:$CODER_NODE_PORT,http://127.0.0.1:$GENERAL_NODE_PORT" \
+  node e2e/render-router.mjs
 
 echo "Panel render complete. Screenshots in $OUT_DIR/"

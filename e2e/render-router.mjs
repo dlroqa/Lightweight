@@ -136,6 +136,66 @@ async function main() {
   await page.locator(".card", { has: page.locator("[data-fallback-summary]") }).screenshot({ path: `${OUT_DIR}/router-fallback-summary.png` });
   await page.locator(".card", { has: page.locator("[data-fallback-traces]") }).screenshot({ path: `${OUT_DIR}/router-fallback-traces.png` });
 
+  // The approved R9.3 wording, held in place: exactly the three triggers, every
+  // exclusion, and the final-route meaning of the response and the counter.
+  check((await page.locator("[data-trigger]").count()) === 3, "exactly three triggers are listed, none the router lacks");
+  check(exclusions.includes("Explicit route requests") && exclusions.includes("after it started"), "explicit routes and failures after the stream started are listed as never falling back");
+  check((await page.locator("[data-identity-help]").innerText()).includes("Auto → Coder → General"), "response identity is explained with Auto → Coder → General");
+  check((await page.locator("[data-requests-total-help]").innerText()).includes("not the route Auto first chose"), "router_requests_total is not the route Auto first chose");
+
+  // --- Cross-route fallback that succeeds ------------------------------------------------
+  // Load the scripted nodes: Coder's second deployment now refuses with 503
+  // (same-route failover has nowhere left to go: route_exhausted) and General's
+  // second deployment answers. The router sees them on its next probe.
+  const nodeUrls = (process.env.MOCK_NODE_URLS ?? "").split(",").filter(Boolean);
+  check(nodeUrls.length === 2, "the two scripted nodes are given to the render");
+  for (const url of nodeUrls) await fetch(`${url}/control/load`, { method: "POST" });
+  const ready = Date.now() + TIMEOUT;
+  let available = [];
+  while (Date.now() < ready) {
+    const routes = await (await fetch(`${BASE}/api/router/v1/routes`)).json();
+    available = routes.data.filter((route) => route.available).map((route) => route.name);
+    if (available.includes("Coder") && available.includes("General")) break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  check(available.includes("Coder") && available.includes("General"), "the router sees the loaded Coder and General deployments");
+  const servedRequest = await fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "Auto",
+      tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+      messages: [{ role: "user", content: "render successful fallback" }],
+    }),
+  });
+  const served = await servedRequest.json();
+  const servedId = servedRequest.headers.get("x-request-id") ?? "";
+  check(servedRequest.status === 200, "an Auto request whose Coder route is exhausted is answered by General");
+  check(served.model === "General", `the response names the final route: model "General" (got ${JSON.stringify(served.model)})`);
+  check(servedId.length > 0, "the response carries its request id");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const success = page.locator(`[data-fallback-trace="${servedId}"]`);
+  await success.waitFor({ timeout: TIMEOUT });
+  const successText = await success.innerText();
+  check(successText.includes("Requested Auto") && successText.includes("initial Coder") && successText.includes("final General"), "the successful trace shows requested Auto, initial Coder, final General");
+  check(successText.includes("Served by General"), "the successful trace reads Served by General");
+  check((await success.locator("[data-trace-exhausted]").count()) === 0 && !successText.includes("Exhausted"), "the successful trace is not marked exhausted");
+  const steps = await success.locator("[data-trace-step]").evaluateAll((items) => items.map((item) => item.getAttribute("data-trace-step")));
+  check(JSON.stringify(steps) === JSON.stringify(["Coder", "General"]), `the steps are Coder then General (got ${JSON.stringify(steps)})`);
+  const coderStep = await success.locator('[data-trace-step="Coder"]').innerText();
+  const generalStep = await success.locator('[data-trace-step="General"]').innerText();
+  check(coderStep.includes("Route exhausted (route_exhausted)"), "Coder's step renders its fallback reason, route_exhausted");
+  check(generalStep.includes("answered (200)"), "General's step renders it answered (ok, 200)");
+  check(coderStep.includes("coder-b") && coderStep.includes("503") && !coderStep.includes("general-b"), "Coder's same-route attempt (coder-b, 503) stays with Coder");
+  check(generalStep.includes("general-b") && !generalStep.includes("coder-b"), "General's same-route attempt (general-b) stays with General");
+  check((await page.locator("[data-identity-help]").innerText()).includes('model: "General"'), "the response identity help agrees with the served response");
+  const transitions = await page.locator('[data-transition="Coder->General"]').innerText();
+  check(transitions.includes("route_unavailable: 1") && transitions.includes("route_exhausted: 1"), "the Coder → General counter now holds both reasons");
+  check((await page.locator('[data-exhausted-route="Coder"]').innerText()).includes("route_unavailable: 1") && !(await page.locator('[data-exhausted-route="Coder"]').innerText()).includes("route_exhausted"), "a fallback that succeeded is not counted as exhausted");
+  const exhaustedTrace = page.locator("[data-fallback-trace]", { has: page.locator("[data-trace-exhausted]") });
+  check((await exhaustedTrace.count()) === 1, "the earlier exhausted trace is still listed, still exhausted");
+  await success.screenshot({ path: `${OUT_DIR}/router-fallback-success-trace.png` });
+
   // --- Classifier: Jev, as running -----------------------------------------------------
   await page.goto(`${BASE}/#/classifier`, { waitUntil: "domcontentloaded" });
   await page.getByText("Classifier Provider", { exact: true }).waitFor({ timeout: TIMEOUT });
