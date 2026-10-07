@@ -1,8 +1,8 @@
 # R9.3.2 — Shared Pre-Commit Request Budget (design)
 
 Status: **design FROZEN** (PR #45, merged as `790bbc1`). **Slice 1
-(section 43) is implemented on `feature/router-shared-request-budget`, not
-released.** The operator documentation is the [Pre-commit request
+(section 43) is implemented, merged (PR #49, merge commit `eefa5b2`) and
+FROZEN; not released** (v0.6.0 does not contain it). The operator documentation is the [Pre-commit request
 budget](ROUTER.md#pre-commit-request-budget-r932) section of `ROUTER.md`;
 section 44 below records how the implementation read the points this design
 left open. No frozen invariant was changed. No UI exists. A change to a

@@ -2925,3 +2925,63 @@ passed.`; `request_budget` 38 (Linux) / 36 (others) and
 artifacts "Artifact checks passed.", icons "icons ok", render panel 110
 `[ok]`, 0 failed. No release workflow run since v0.6.0's own; no new tag or
 release.
+
+### R9.3.2 slice 1 MERGED and FROZEN
+
+PR #49 (final head `dc020a4`) merged with a merge commit as **`eefa5b2`**,
+the validated master head. v0.6.0 (`a8f0c89`) is unchanged and remains the
+latest release; slice 1 is not in any release yet.
+
+**Frozen behaviour:**
+- One request-owned pre-commit deadline: a single absolute monotonic
+  `tokio::time::Instant` per client request, made once at `received` (after
+  the body is read, before parsing/routing; body-read time excluded), never
+  reset, passed by value; no `remaining_ms` is propagated.
+- Shared by classification (nested request inherits it), R9.2, same-route
+  failover and cross-route fallback; checked before every new attempt;
+  existing limits remain ceilings, effective wait = min(own limit, remaining);
+  response-head wait and the node queue bounded externally.
+- Deterministic race: `timeout_at`, operation polled first, so a ready
+  result wins; no unbiased `select!` on the request path.
+- Causal `504`, `type: "server_error"`, `code: "request_budget_exhausted"`,
+  only for a cut wait or a refused start; completed outcomes never
+  rewritten.
+- `router_requests_total` counts it once as its own outcome
+  `request_budget_exhausted` (never `server_error`) under the terminal
+  attempted route, or `Auto` / the named route before any attempt; no
+  invented route; no transition counted for an unstarted fallback.
+- Disabled (key absent) = no budget metric samples at all; `0` invalid.
+- Neutral to R9.2 history (cut = `neutral`, refused = unobserved), to node
+  health and to placement. Applies to explicit routes, which still never
+  cross-route fall back. Pre-commit only: nothing after the response head
+  changes. No config-write API. No R9.4 behaviour.
+
+**Master validation (`eefa5b2`, push):** check
+[37674569075](https://github.com/dlroqa/Lightweight/actions/runs/37674569075)
+and render panel
+[37674569235](https://github.com/dlroqa/Lightweight/actions/runs/37674569235),
+both attempt 1, no reruns. Linux x64, Windows x64, macOS x64, macOS arm64:
+contract suite `47 passed, 2 skipped`; secrets gate `ok no credentials, home
+paths or machine addresses in tracked files`; frontend `# pass 56 / # fail
+0`; desktop `# pass 26 / # fail 0`; `All checks passed.`; budget tests 0
+failed. Flatpak "Flatpak checks passed.", Linux artifacts "Artifact checks
+passed.", render icons "icons ok", render panel 110 `[ok]`, 0 failed.
+
+**Post-merge real-router smoke** (`hermes router` built from `eefa5b2`,
+scripted nodes): 12/12 — explicit success; explicit 504 with no General
+fallback (1.505 s); same-route sharing (cut at 2.006 s, not 3.0); cross-route
+sharing (General cut at 2.005 s); exhausted budget blocks the next fallback
+(504, General 0 hits, no transition); provider timeout first → R9.1 fallback;
+budget first during classification → 504, no route attempted; stream relayed
+3 s past a 1 s budget; a completed `server_busy` and a `route_unavailable`
+stay the answer past the deadline; node stays healthy; `router_requests_total`
+once under General.
+
+**Deferred (not part of this freeze):** a budget-cut request may render in
+the frozen R9.3 card as "Served by <route>" although the client got `504
+request_budget_exhausted` (its trace keeps `exhausted: false`). To be handled
+later in a separate, narrow UI follow-up; the wording is not decided here.
+Also deferred: the budget UI card, a post-commit stream deadline, node
+deadline forwarding, client-supplied deadlines.
+
+**Next:** nothing started. R9.4 not started; no release.
