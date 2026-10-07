@@ -1,9 +1,12 @@
 # R9.3.2 — Shared Pre-Commit Request Budget (design)
 
-Status: **design FROZEN** (PR #45, merged as `790bbc1`). Nothing is
-implemented: no runtime code, configuration, metric, trace field, admin field
-or UI exists for anything in this document. Implementation (section 43) needs
-explicit approval. A change to a frozen invariant needs a new design review.
+Status: **design FROZEN** (PR #45, merged as `790bbc1`). **Slice 1
+(section 43) is implemented on `feature/router-shared-request-budget`, not
+released.** The operator documentation is the [Pre-commit request
+budget](ROUTER.md#pre-commit-request-budget-r932) section of `ROUTER.md`;
+section 44 below records how the implementation read the points this design
+left open. No frozen invariant was changed. No UI exists. A change to a
+frozen invariant needs a new design review.
 
 It builds on these frozen pieces: the R9.3 design
 ([R9_3_CROSS_ROUTE_FALLBACK.md](R9_3_CROSS_ROUTE_FALLBACK.md); its decision 6
@@ -1204,6 +1207,24 @@ explicit approval:
 
 Not in the slice: UI, any post-commit deadline, client deadlines, any change
 to R9.3.1, R9.4.
+
+## 44. Implementation notes (slice 1)
+
+How the implementation read points the design left open. None changes an
+invariant.
+
+| Point | Reading |
+|---|---|
+| `router_request_budget_configured_seconds` "0 when disabled" (section 33) vs "no new series values" with no config (section 31, B1) | Section 31 wins: with no budget, **none** of the three budget series is exposed. With one, the gauge is the configured value. |
+| `"pre_commit_budget_ms": null` | Refused like `0`. Absence is the only way to disable it (section 29). |
+| The nested classification request in `router_requests_total` | Counted under its classifier route, as nested requests always have been, with outcome `request_budget_exhausted` when its own timer ended it. It records none of the three budget metrics (section 33). |
+| A cut deployment attempt in `attempts[*]` | Row `outcome: "request_budget_exhausted"`, no status, no `response_ms`. |
+| A cut fallback route in `cross_route_fallback.attempts` | Its row reads `outcome: "failed"`, `reason: "request_budget_exhausted"`. `exhausted` stays `false` and `final_route` is that route (section 32). |
+| A refused transition (section 19) | The trace's `cross_route_fallback` block is written with the failed route as `final_route`, `exhausted: false`, and no row for the refused route. |
+| Stage for a refusal of the initial route's first deployment found only after planning | `route_planning` with `next_unattempted_route`, as for the check before planning; the route is not observed and the label is `Auto` / the named route. |
+| A fallback route whose first deployment is refused after its transition was counted (the clock passing during microseconds of planning) | Stage `cross_route_fallback`, no `next_unattempted_route`, labelled with that route (its transition was counted), not observed in history. |
+| A committed non-success answer (a `500`, a non-model `404`, a `400`) | It commits as before: the trace records the budget at commit, and the remaining-at-commit histogram observes it. |
+| Test hooks | `PhaseDelays.after_attempt_ms` (test-only, zero from a file) places "an attempt failed just as the budget ran out" exactly, beside the existing planning delays. |
 
 ## Appendix A. Questions resolved
 

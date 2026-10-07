@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Router: shared pre-commit request budget (R9.3.2 slice 1).** An optional
+  `request.pre_commit_budget_ms` (1 000 – 3 600 000; absent = off, exactly as
+  before; `0` refused) gives each client request **one** deadline, from the
+  moment the router has its body until its response starts:
+  - classification, scoring, every same-route deployment attempt and every
+    cross-route fallback route share it; nothing gets a fresh budget;
+  - no new attempt starts once it is spent, and every wait before the
+    response starts — connect, response head (a node's queue included), the
+    classifier — ends no later than the deadline. Existing timeouts stay and
+    fire first when they are shorter;
+  - applies to explicit routes and `Auto` alike; an explicit route still
+    never falls back to another route;
+  - only before the response starts. A non-streamed response starts only
+    when it is complete, so for non-streamed requests it bounds the whole
+    generation; a streamed one is bounded only until streaming starts;
+  - when the budget is the cause, the request ends with `504` and code
+    `request_budget_exhausted`, counted once in `router_requests_total` under
+    its own outcome (never `server_error`). A route error that already
+    happened is returned unchanged;
+  - neutral to route history and node health; never a routing input;
+  - a `request_budget` trace block, `router_request_budget_*` metrics (only
+    while configured), and `GET /api/router/v1/request-budget`.
+
 ## [0.6.0] - 2026-10-07
 
 This release completes the router's **adaptive orchestration stack**, up to
