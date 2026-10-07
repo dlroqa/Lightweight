@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **Router panel: cross-route fallback.** Auto Routing gains three cards:
+  - a summary: configured or not, Auto-only scope, at most 3 fallback routes,
+    the three triggers and the exclusions, each list as a chain with the
+    non-transitive rule stated, same-route versus cross-route, counts per
+    transition and reason, exhausted lists, and the response-identity and
+    `router_requests_total` meanings;
+  - a validated draft of the lists, which produces the
+    `cross_route_fallback` snippet to copy, then `validate-config` and a
+    restart, with no write API;
+  - recent fallbacks from the router's traces: initial route, then each
+    attempt, then the final route, or *Exhausted*.
+
+  This is read-only, uses the existing panel components, adds no new
+  backend endpoint, and stores nothing in the browser.
+
 - **Router explicit cross-route fallback (R9.3.1).** An optional
   `auto_route.cross_route_fallback` maps a route to an ordered list of at
   most 3 other routes. If the route an `Auto` request resolved to cannot

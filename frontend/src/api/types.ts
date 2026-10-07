@@ -706,4 +706,66 @@ export interface AutoView {
   fallback_decisions?: number;
   rules?: AutoRuleView[];
   classifier?: ClassifierView | null;
+  /** Explicit cross-route fallback (R9.3.1). Absent from older routers. */
+  cross_route_fallback?: CrossRouteFallbackView;
+}
+
+/** `GET /api/router/v1/auto` → `cross_route_fallback`. */
+export interface CrossRouteFallbackView {
+  configured: boolean;
+  /** Initial route → its ordered fallback routes. */
+  chains: Record<string, string[]>;
+  max_routes: number;
+  triggers: string[];
+  /** Always `"auto"`: explicit route requests never fall back. */
+  applies_to: string;
+  /** From route → to route → reason → count. */
+  counts: Record<string, Record<string, Record<string, number>>>;
+  /** Initial route → the last route's reason → count. */
+  exhausted: Record<string, Record<string, number>>;
+}
+
+/** One logical-route attempt of a request that fell back. */
+export interface FallbackAttemptView {
+  route: string;
+  /** `committed` or `failed`. */
+  outcome: string;
+  reason?: string;
+}
+
+/** A routing trace's `cross_route_fallback` block. */
+export interface FallbackTraceView {
+  initial_route: string;
+  final_route: string;
+  exhausted: boolean;
+  attempts: FallbackAttemptView[];
+}
+
+/** One deployment attempt in a routing trace. */
+export interface DeploymentAttemptView {
+  /** The logical route it was tried for (R9.3.1). */
+  route?: string;
+  deployment: string;
+  reason: string;
+  outcome: string;
+  upstream_status?: number;
+}
+
+/** The parts of a routing trace the panel reads. */
+export interface RoutingTraceView {
+  request_id: string;
+  received_at: number;
+  route: string;
+  requested_route: string;
+  outcome: string;
+  status?: number;
+  attempts?: DeploymentAttemptView[];
+  cross_route_fallback?: FallbackTraceView;
+}
+
+/** `GET /api/router/v1/traces`. */
+export interface TracesBody {
+  object: string;
+  capacity: number;
+  data: RoutingTraceView[];
 }
