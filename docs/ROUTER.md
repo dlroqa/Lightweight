@@ -1371,6 +1371,10 @@ HTTP/1.1 504 Gateway Timeout
 
 The usual `X-Request-Id` (the same id every attempt used), and no
 `Retry-After`. The message names the configured budget only.
+`type: "server_error"` is the envelope every router and gateway 5xx uses
+(`route_unavailable`, `upstream_failed`); what the request *counts as* is
+separate: `router_requests_total` says `request_budget_exhausted`, never
+`server_error`, and route history stays `neutral`.
 
 It is **causal, not clock-based.** The `504` is returned only when the budget
 is the reason the request could not go on: it cut a wait that had not

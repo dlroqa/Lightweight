@@ -2894,3 +2894,34 @@ state is proven deterministically in-process by `b11` with the test-only
 
 **Next:** GitHub Actions full matrix on the draft PR; STOP for review. No
 release; R9.4 not started.
+
+### R9.3.2 slice 1 review (PR #49 at `48b2f62`)
+
+Decisions approved and frozen in review (docs only; no runtime change):
+- **Disabled budget emits no budget metric samples.** Absent key = feature
+  off = no `router_request_budget_*` series at all; `0` stays invalid. The
+  design's section 33 "0 when disabled" was corrected to match.
+- **SMOKE E accepted on two layers:** "The exact refused-fallback start
+  condition must be proven deterministically in integration tests. The real
+  binary must prove that an exhausted request budget cannot permit the next
+  fallback route to execute or be counted." Layer 1: `b11` (General 0 hits,
+  `next_unattempted_route: "General"`, no `Coder→General` transition, 504).
+  Layer 2: the binary runs (504 `request_budget_exhausted`, General never
+  attempted, no transition counted, nothing past the deadline). No timing
+  hacks added.
+- **Envelope:** `504`, `type: "server_error"`, `code:
+  "request_budget_exhausted"` is the workspace's 5xx convention; the metric
+  outcome stays `request_budget_exhausted` and history stays `neutral`.
+- Connect-hang tests Linux-only (platform reason in design section 44);
+  frozen R9.3 card "Served by" wording on a fallback cut deferred.
+
+Actions evidence for `48b2f62` (check 37627845811, render 37627846102, both
+attempt 1, no reruns): on Linux x64, Windows x64, macOS x64 and arm64 the
+contract suite logged `47 passed, 2 skipped`, the secrets gate `ok no
+credentials, home paths or machine addresses in tracked files`, frontend
+`# pass 56 / # fail 0`, desktop `# pass 26 / # fail 0`, then `All checks
+passed.`; `request_budget` 38 (Linux) / 36 (others) and
+`request_budget_gateway` 2 passed. Flatpak "Flatpak checks passed.", Linux
+artifacts "Artifact checks passed.", icons "icons ok", render panel 110
+`[ok]`, 0 failed. No release workflow run since v0.6.0's own; no new tag or
+release.

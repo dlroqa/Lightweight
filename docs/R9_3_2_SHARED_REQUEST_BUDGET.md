@@ -877,7 +877,7 @@ Low cardinality, new names only:
 |---|---|---|---|
 | `router_request_budget_exhausted_total` | counter | `stage` (4 values) | client requests ended by the budget, once each |
 | `router_request_budget_remaining_at_commit_seconds` | histogram | none | budget left when a budgeted request committed: the headroom operators tune by |
-| `router_request_budget_configured_seconds` | gauge | none | the configured budget; 0 when disabled |
+| `router_request_budget_configured_seconds` | gauge | none | the configured budget. **Absent when disabled** (frozen in review of PR #49): with no budget configured, none of the three budget series is exposed — never a `0` gauge, since `0` is an invalid configuration, not "off" |
 
 - Units are seconds, the repository's convention for every router histogram
   and duration gauge (`router_request_duration_seconds`,
@@ -1160,6 +1160,12 @@ R9.3.2 slice 1 is done only when **all** of these hold:
    checks are unchanged and green.
 8. A real-router smoke ran: the budget cuts a scripted slow node, and an
    explicit route and an Auto fallback chain both share one deadline.
+   **Refused fallback start (two-layer evidence, approved in review of PR
+   #49):** "The exact refused-fallback start condition must be proven
+   deterministically in integration tests. The real binary must prove that
+   an exhausted request budget cannot permit the next fallback route to
+   execute or be counted." No timing hacks are used to force the exact race
+   on the binary.
 9. `docs/ROUTER.md` has an operator section with section 13's
    stream/non-stream table, the absence/zero/bounds rules and
    tuning guidance.
@@ -1215,7 +1221,10 @@ invariant.
 
 | Point | Reading |
 |---|---|
-| `router_request_budget_configured_seconds` "0 when disabled" (section 33) vs "no new series values" with no config (section 31, B1) | Section 31 wins: with no budget, **none** of the three budget series is exposed. With one, the gauge is the configured value. |
+| `router_request_budget_configured_seconds` "0 when disabled" (section 33) vs "no new series values" with no config (section 31, B1) | Section 31 wins: with no budget, **none** of the three budget series is exposed. With one, the gauge is the configured value. **Approved and frozen** in review of PR #49; section 33 now says so. |
+| The `504` envelope `type` vs the metric outcome | The envelope is `type: "server_error"`, the workspace's type for every 5xx (`ErrorKind::openai_type`) and the type of the router's own `503 route_unavailable` and `502 upstream_failed`. `router_requests_total` still counts `outcome="request_budget_exhausted"`, never `server_error`, and route history reads the trace outcome, not the envelope or the status, so the request stays `neutral`. |
+| The hanging-connect tests (B13, M15) | Linux only: there a SYN to a full accept queue is dropped, so a connect hangs as one to an unreachable host does. Windows and macOS answer it with a reset (an ordinary refusal), so the hang cannot be made deterministic there. The cap is one code path for connect and head on every platform, and the head-wait, queue and non-streamed cut tests run everywhere. |
+| The frozen R9.3 card on a fallback cut | The trace keeps `cross_route_fallback.exhausted: false` (time ran out, not the list), so the frozen card reads "Served by <route>" for such a trace although the request got a `504`. The backend semantics are as designed; the card's wording is a deferred follow-up for the budget UI work, not changed in slice 1. |
 | `"pre_commit_budget_ms": null` | Refused like `0`. Absence is the only way to disable it (section 29). |
 | The nested classification request in `router_requests_total` | Counted under its classifier route, as nested requests always have been, with outcome `request_budget_exhausted` when its own timer ended it. It records none of the three budget metrics (section 33). |
 | A cut deployment attempt in `attempts[*]` | Row `outcome: "request_budget_exhausted"`, no status, no `response_ms`. |
