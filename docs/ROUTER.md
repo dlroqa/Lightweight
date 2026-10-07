@@ -140,6 +140,7 @@ silently ignored.
 | `health.timeout_secs` | 3 | How long one probe may take. Must not exceed the interval. |
 | `health.failure_threshold` | 2 | How many consecutive failures make a healthy node unhealthy. |
 | `request.connect_timeout_secs` | 5 | How long a request waits to connect to a node. A generation itself has no timeout, because a CPU prefill can take minutes. |
+| `request.pre_commit_budget_ms` | none | Optional, 1 000 – 3 600 000. One shared time budget per client request, from the moment the router has its body until its response starts. Absent: no budget, exactly the behaviour without it. `0` is refused. See [Pre-commit request budget](#pre-commit-request-budget-r932). |
 | `nodes[].enabled` | `true` | The operator's off switch. A disabled node is never probed or sent traffic, and its key is not required. |
 | `session_affinity.enabled` | `false` | Keep a client-named session on the deployment its last request succeeded on. Off unless set: without it, routing is exactly R5's. See [Session affinity](#session-affinity). |
 | `session_affinity.header` | `X-Lightweight-Session` | The request header a session id is read from. Compared ignoring case. `Authorization`, `Cookie`, `X-Request-Id` and other headers that already mean something are refused. |
@@ -172,7 +173,9 @@ any:
 - a URL that is malformed, uses a scheme other than `http` or `https`, or carries
   credentials, a query or a fragment;
 - an environment variable that is missing or empty;
-- out-of-range health or request timings;
+- out-of-range health or request timings, including a
+  `request.pre_commit_budget_ms` outside 1 000 – 3 600 000 (`0` and `null`
+  are refused: leaving the key out is the only way to run without a budget);
 - a placement with `min_ready` 0, no `allowed_nodes`, an allowed node with no
   deployment in that route, a node listed twice, or a target larger than the
   route's deployment count (it could never be met); placement timings below 1
@@ -1229,11 +1232,13 @@ The file is refused at load for:
   are not affected.
 - **No placement action.** A route still loading is simply
   `route_unavailable`.
-- **No shared deadline.** R9.3.1 does not introduce an end-to-end request
-  budget. A chain whose nodes time out at connect adds up to
+- **No deadline of its own.** R9.3.1 adds no end-to-end request budget.
+  Without one, a chain whose nodes time out at connect adds up to
   `request.connect_timeout_secs` per deployment per route attempt. Keep
   chains short. Health probing keeps known-down nodes out of plans at no
-  cost.
+  cost. With [`request.pre_commit_budget_ms`](#pre-commit-request-budget-r932)
+  set, every route of the chain shares the request's one deadline, and a
+  fallback route gets only what is left.
 - **Counting.** `router_requests_total` counts each client request **once**,
   under the final route. Route history (R9.2, observational) records each
   route attempt.
@@ -1261,6 +1266,243 @@ configured routes and the three reasons only. Logs: `cross-route fallback`
 `cross_route_fallback`: `configured`, `chains`, `max_routes`, `triggers`,
 `applies_to: "auto"`, `counts` (from → to → reason) and `exhausted`
 (initial route → reason). There is no UI yet.
+
+## Pre-commit request budget (R9.3.2)
+
+Status: **slice 1 implemented on `feature/router-shared-request-budget`, not
+released.** Design: [R9_3_2_SHARED_REQUEST_BUDGET.md](R9_3_2_SHARED_REQUEST_BUDGET.md).
+
+An optional time budget for one client request. It answers one question:
+
+> Is this client request still allowed to spend more time trying to reach
+> response commit?
+
+It never chooses, scores, filters or orders a route, a deployment or a
+fallback. It only decides whether more work may **start**, and how long a
+wait may **last**, before the response starts.
+
+```json
+"request": { "connect_timeout_secs": 5, "pre_commit_budget_ms": 30000 }
+```
+
+| Value | Meaning |
+|---|---|
+| key absent | no budget: exactly the behaviour without the feature — no timer, no new status, no trace block, no budget metric series |
+| `1000` – `3600000` | the budget, in milliseconds |
+| `0`, `null`, below 1 000, above 3 600 000 | refused at load. `0` is **not** "unlimited": absence already means that |
+
+`hermes router validate-config` prints the budget when one is set, and warns
+(without refusing) when a classifier `timeout_ms` is at least the budget: a
+slow classification could then use all of it.
+
+### One deadline per client request
+
+- **Start:** when the router has the whole request body, at the same instant
+  every other router-side duration starts (`duration_ms`, TTFT). Time spent
+  uploading the body does not count. `routing_ms`, TTFT and `duration_ms` keep
+  their meanings.
+- **One absolute deadline**, on a monotonic clock, made once and never reset.
+  Classification, R9.2 scoring, planning, every same-route deployment attempt
+  and every cross-route fallback route spend it. A second deployment, or a
+  fallback route, gets **only what is left**:
+
+  ```
+  budget 30 s
+  classifier 3 s · Coder/A 8 s · Coder/B 7 s          used 18 s, left 12 s
+  General/A 9 s (route_exhausted)                      used 27 s, left 3 s
+  Reasoning: starts, capped at 3 s                     not a fresh 30 s
+  ```
+- The router's own classification request **inherits** the client request's
+  deadline; it never starts one of its own.
+- **All client requests**, explicit routes (`model: "Coder"`) and `Auto`
+  alike. An explicit route still **never** falls back to another route: its
+  answer is that route, its error, or a budget `504`.
+
+### Where it acts
+
+**Before new work starts.** No attempt starts once the budget is spent: not
+classification, not the initial route's first deployment, not another
+deployment (same-route failover and context-overflow failover alike), not a
+fallback route. Nothing is sent, no slot is taken, no failover or
+`router_cross_route_fallback_total` transition is counted for it.
+
+**On every wait before the response starts.** Each wait ends at the earlier
+of its own limit and the deadline:
+
+| Wait | Its own limit | With a budget |
+|---|---|---|
+| connect | `request.connect_timeout_secs` | the earlier of the two. 100 ms left and a 5 s connect timeout: the request ends at about 100 ms |
+| response head (incl. a node's queue) | none | the time left. A node's 600 s queue never holds the router past the deadline |
+| reading a 4xx/5xx body to decide what it means | none | the time left |
+| classification (Jev or Lightweight) | the classifier's `timeout_ms` | the earlier of the two |
+
+Whichever limit fires decides what happens next. A connect timeout that fires
+first is the node's failure, counted against its health, and same-route
+failover continues as before. A classifier timeout that fires first is
+R9.1's `timeout`, and the classifier's fallback route is used. When the
+**deadline** fires first — or both fall due at the same instant — the
+request ends: no classifier fallback route, no scoring, no further route.
+
+**Never after the response starts.** Once a response head is committed, the
+budget is neither held nor checked: no route switch, no retry, no fallback, no
+spliced answer, and no stream is cut because the deadline has since passed.
+
+### Streamed and non-streamed answers
+
+A Lightweight node sends a streamed response's head at once, but a
+non-streamed response's head only when the whole generation is done. So the
+same budget bounds different things:
+
+| Request | Head arrives | The budget bounds |
+|---|---|---|
+| `stream: true` | at once; queueing happens inside the stream | connect + head: roughly the time until streaming starts. Queue, prefill and generation come **after** commit and are not budgeted |
+| `stream: false` | only after queueing and the **whole** generation | connect + node queue + prefill + the **whole generation** |
+
+For non-streamed traffic the budget is therefore a total generation limit.
+This is intentional in slice 1 and is why it is opt-in with no default.
+
+### The answer when the budget ends a request
+
+```json
+HTTP/1.1 504 Gateway Timeout
+{"error": {"message": "The router's pre-commit request budget of 30000 ms ran out before a response started.",
+           "type": "server_error", "code": "request_budget_exhausted"}}
+```
+
+The usual `X-Request-Id` (the same id every attempt used), and no
+`Retry-After`. The message names the configured budget only.
+`type: "server_error"` is the envelope every router and gateway 5xx uses
+(`route_unavailable`, `upstream_failed`); what the request *counts as* is
+separate: `router_requests_total` says `request_budget_exhausted`, never
+`server_error`, and route history stays `neutral`.
+
+It is **causal, not clock-based.** The `504` is returned only when the budget
+is the reason the request could not go on: it cut a wait that had not
+finished, or it refused to start a step the rules would otherwise have
+started. A request that already ended for a reason of its own keeps that
+answer, whatever the clock says:
+
+| Situation (budget 30 s) | Answer |
+|---|---|
+| General answers `route_unavailable` at 29.9 s; the deadline passes while that is answered | `503 route_unavailable` |
+| General is still waiting for its response head at 30.0 s | `504 request_budget_exhausted` |
+| Coder `route_exhausted` at 30.0 s, General next in the list | `504`; General is not attempted |
+| Coder `route_exhausted` at 30.0 s, the list empty | Coder's own error |
+| a deployment answers `500` | the `500` |
+
+A result that is ready when the deadline falls due wins; the deadline wins
+only over a wait that has not finished. A client that disconnects is
+`cancelled`, never budget exhaustion.
+
+### What it never touches
+
+- **Routing.** R9.1 classification, R9.2 scoring, the policies, R9.3.1's
+  rules and fallback order, R5 capability filtering and session affinity do
+  not read the budget. Same-route failover precedence and every R9.3.1 rule
+  are unchanged.
+- **Route history (R9.2).** A route whose wait was cut is observed `neutral`.
+  A route the budget refused was never attempted and is not observed. A route
+  whose own failure completed keeps the observation it earned.
+- **Node health.** A cut attempt is not the node's failure; its health is
+  untouched.
+- **Placement (R7).** A request never waits for, triggers or steers a load.
+
+### Observability
+
+- **Trace** (`request_budget`, present only when a budget is configured):
+  committed — `{"configured_ms": 30000, "elapsed_before_commit_ms": 27120,
+  "remaining_at_commit_ms": 2880, "exhausted": false}`; ended by the budget —
+  `{"configured_ms": 30000, "elapsed_ms": 30004, "remaining_ms": 0,
+  "exhausted": true, "stage": "cross_route_fallback",
+  "next_unattempted_route": "Reasoning"}`; ended any other way without a
+  response — `elapsed_ms`, `remaining_ms` and `exhausted: false`. The trace
+  `outcome` is `request_budget_exhausted`; a cut deployment attempt's
+  `outcome` is `request_budget_exhausted`; the classifier block's `outcome`
+  is `request_budget_exhausted` when the deadline ended classification.
+  - `stage`: `classifier`, `route_planning` (before the initial route's
+    first attempt), `same_route_attempt` (the initial route had started) or
+    `cross_route_fallback`.
+  - `next_unattempted_route`: only when a start check refused a whole
+    logical route — the initial route in `route_planning`, or the next
+    fallback route at a transition. Never for a cut attempt, a refused
+    deployment or the classifier stage.
+  - After a cut on a fallback route, `cross_route_fallback.exhausted` stays
+    `false` (time ran out, not the list), and that route's attempt row
+    reads `failed` / `request_budget_exhausted`.
+- **`router_requests_total`**: once per client request, with its own
+  outcome `request_budget_exhausted` — never `server_error`, never
+  `unavailable`. Labelled with the terminal attempted route (`Auto → Coder →
+  General`, cut on General, counts `route="General"`); before any route
+  attempt, `Auto` for an `Auto` request or the route an explicit request
+  named. No route is invented. The router's own classification request is
+  counted under its classifier route, as nested requests always have been.
+- **Budget metrics** (exposed only when a budget is configured):
+  `router_request_budget_configured_seconds` (gauge),
+  `router_request_budget_exhausted_total{stage}` (client requests only, the
+  four stages above), and the histogram
+  `router_request_budget_remaining_at_commit_seconds` (the headroom to tune
+  by). No label carries a request id, route, session, prompt, node or number.
+- `router_classifier_requests_total{outcome="request_budget_exhausted"}` when
+  the deadline ended classification. It is never `timeout`, and the admin
+  view's classifier status does not record it as a provider failure.
+- **Logs:** `pre-commit request budget exhausted` (`request_id`, `route`,
+  `requested_route`, `stage`, `next_unattempted_route`, `budget_ms`,
+  `elapsed_ms`); `request finished` gains `request_budget_stage`.
+- **Admin:** `GET /api/router/v1/request-budget`, read-only, under the
+  router's usual client key:
+
+  ```json
+  {"object": "router.request_budget", "configured": true, "pre_commit_budget_ms": 30000,
+   "scope": "all_client_requests", "governs": "pre_commit", "exhaustions_total": 12,
+   "exhaustions_by_stage": {"classifier": 1, "route_planning": 0,
+                            "same_route_attempt": 7, "cross_route_fallback": 4}}
+  ```
+
+  Without a budget: `configured: false`, `pre_commit_budget_ms: null`, zero
+  counts. There is no write endpoint and no panel card yet.
+
+### Upstream cancellation (measured)
+
+When the budget cuts a wait, the router drops that attempt: its connection is
+closed, its slot released and the client answered at once.
+
+- **Streamed:** cancellation upstream was already proven: the node's writes
+  fail and it stops.
+- **Non-streamed, measured on a real gateway** (mock engine; test
+  `b38_b39_a_non_streamed_generation_is_cut_and_the_node_stops_generating`):
+  a 10 s generation under a 1 s budget. The client got its `504` at 1.02 s.
+  By the time it did, the node's generation had already stopped: closing the
+  connection drops the gateway's request handler, and with it the engine's
+  generation stream and its slot. **The router never waits for the
+  generation to finish.**
+- **Non-streamed, measured on a real CPU engine** (2026-10-07, manual run:
+  `hermes serve` with Qwen3-1.7B Q4_K_M behind `hermes router`, budget
+  5 000 ms, `max_tokens` 400; this box decodes about 1.5 tokens/s, so the
+  answer would have taken minutes). The client got `504
+  request_budget_exhausted` at 5.004 s. The node's engine used 2.5 cores in
+  the second after the `504` and none from the next second on, and a 1-token
+  request sent straight to the one-slot node 3 s later was answered in
+  1.17 s instead of queueing behind the abandoned generation: the engine
+  stopped within about a second.
+- A Jev classification is dropped with its HTTPS request; whether Jev stops
+  its own work is Jev's.
+
+### Choosing a budget
+
+There is no default, and no number here is a recommendation: measure.
+Look at `router_upstream_response_seconds` (time to a response head, which
+for non-streamed requests includes the whole generation), the classifier's
+`router_classifier_duration_seconds`, and how long your slowest acceptable
+failover chain takes. Then watch
+`router_request_budget_remaining_at_commit_seconds` (headroom) and
+`router_request_budget_exhausted_total{stage}` (what the budget is ending).
+On CPU nodes a long non-streamed answer can legitimately take minutes; a
+budget shorter than that turns such answers into `504`s.
+
+Not in slice 1: a deadline after the response starts (stream lifetime), a
+client-supplied deadline, per-route or per-model budgets, forwarding the
+deadline to nodes, a minimum-remaining threshold, a request-body read
+deadline, and a panel card.
 
 ## Health
 
@@ -2159,7 +2401,10 @@ one attempt went and why; a trace says what happened over the whole request:
 
 `outcome` is `ok`, `client_error`, `server_error`, `unavailable`,
 `interrupted` (a committed stream that ended without `[DONE]`: the node broke
-off or sent an in-band error) or `cancelled` (the client went away). A
+off or sent an in-band error), `cancelled` (the client went away) or
+`request_budget_exhausted` (the [pre-commit request
+budget](#pre-commit-request-budget-r932) ended it; a `request_budget` block
+appears whenever a budget is configured). A
 `context_overflow` object appears after an overflow failover. No trace holds a
 prompt, a message, a tool argument, a credential or a session id.
 
@@ -2185,9 +2430,8 @@ or an address.
   request refused before any route was chosen is counted under `Auto` or
   `_unknown`.
 
-  *Frozen for R9.3.2, which is not implemented and not emitted by this
-  version:* the [Pre-Commit Request
-  Budget](R9_3_2_SHARED_REQUEST_BUDGET.md) will add a fifth outcome,
+  With a [pre-commit request budget](#pre-commit-request-budget-r932)
+  configured (R9.3.2 slice 1, unreleased), a fifth outcome can appear:
   `request_budget_exhausted`.
   - It is **not** `server_error` (an actual server failure) and not
     `unavailable` (an availability failure). It means the configured
@@ -2243,6 +2487,10 @@ or an address.
 - Cross-route fallback (R9.3.1):
   `router_cross_route_fallback_total{from_route,to_route,reason}` and
   `router_cross_route_fallback_exhausted_total{route,reason}`.
+- Pre-commit request budget (R9.3.2, only while configured):
+  `router_request_budget_configured_seconds`,
+  `router_request_budget_exhausted_total{stage}` and the histogram
+  `router_request_budget_remaining_at_commit_seconds`.
 - `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
   `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
   — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
@@ -2431,7 +2679,7 @@ identity.
 | **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
 | **R9.2** | Slice 1 done ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): off-by-default scoring of an accepted classification's verdict route against the classifier fallback (whose signal is the explicit classifier baseline), by classifier signal and operator priors only; a hard below-threshold boundary; an influence radius `prior / classifier` validated under half the accepted range; route-history observations (decayed, shown, resettable) that never affect routing, with `weights.history` required to be 0; traces, metrics, admin view and an admin history reset. Deliberately left out: history scoring until a route-attributable quality signal exists, latency and context-fit scoring, Jev per-option probabilities, provider calibration, availability penalties, persistence, exploration, learned weights, and any UI. |
 | **R9.3** | R9.3.1 done ([design](R9_3_CROSS_ROUTE_FALLBACK.md)): explicit, ordered per-route fallback lists (`auto_route.cross_route_fallback`, at most 3, acyclic, never transitive) for `Auto`-resolved requests only, after same-route failover and before response commit, on `route_unavailable`, `route_exhausted` and `route_capability_mismatch`. The response names the serving route; an exhausted list returns the final route's own error; requests are counted once. Deliberately left out: explicit-route fallback, context-overflow, 500 or latency triggers, a shared request budget, reason-specific lists, and UI. |
-| **R9.3.2** | Design frozen, **not implemented** ([design](R9_3_2_SHARED_REQUEST_BUDGET.md)): an opt-in shared Pre-Commit Request Budget (`request.pre_commit_budget_ms`), with one absolute monotonic deadline per client request. It is shared by classification, same-route failover and cross-route fallback, checked before each new attempt, and caps existing timeouts. It ends with a causal `504 request_budget_exhausted` and a distinct `router_requests_total` outcome. It is never a routing signal and is neutral to R9.2 history. Deliberately left out: post-commit/stream deadlines, client-supplied deadlines, per-route budgets, latency-aware selection. |
+| **R9.3.2** | Slice 1 implemented on `feature/router-shared-request-budget`, **not released**; see [Pre-commit request budget](#pre-commit-request-budget-r932) ([design](R9_3_2_SHARED_REQUEST_BUDGET.md)): an opt-in shared Pre-Commit Request Budget (`request.pre_commit_budget_ms`), with one absolute monotonic deadline per client request. It is shared by classification, same-route failover and cross-route fallback, checked before each new attempt, and caps existing timeouts. It ends with a causal `504 request_budget_exhausted` and a distinct `router_requests_total` outcome. It is never a routing signal and is neutral to R9.2 history. Deliberately left out: post-commit/stream deadlines, client-supplied deadlines, per-route budgets, latency-aware selection. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
 Out of scope for every one of these: a request-path model load, splicing one

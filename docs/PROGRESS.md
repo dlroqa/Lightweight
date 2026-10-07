@@ -2836,3 +2836,92 @@ CHANGELOG is unchanged, because it records shipped behaviour only.
 **Next:** release v0.6.0 from validated master, with R9.3.2 runtime still
 paused. `feature/router-shared-request-budget` stays untouched. R9.4 is not
 started.
+
+## Router shared request budget, R9.3.2 slice 1 (feature/router-shared-request-budget)
+
+**Baseline.** master = `v0.6.0` = `a8f0c89`. The branch was at `49935b1`
+with **zero** unique commits (`git log origin/master..branch` empty; branch an
+ancestor of master) and was fast-forwarded to `a8f0c89`; its tree matched
+master's before any change.
+
+**Built** exactly to the frozen design (`docs/R9_3_2_SHARED_REQUEST_BUDGET.md`,
+section 44 records the readings of points it left open):
+- `budget.rs`: `RequestBudget` (one absolute `tokio::time::Instant`, `Copy`,
+  no setter), `bound` = `timeout_at` (operation polled first), `Stage`,
+  `BudgetTrace`.
+- Config `request.pre_commit_budget_ms` (absent = off; 0, null, <1000,
+  >3 600 000 refused); `validate-config` prints it and warns when a classifier
+  timeout ≥ the budget.
+- `proxy.rs`: made once in `forward_as` at `received`; inherited by
+  `forward_nested`; start checks before classification, the initial route,
+  each further deployment (before its failover is counted) and each fallback
+  route (before its transition is counted); each attempt's connect + head +
+  pre-decision body read capped; commit snapshot; causal `504`.
+- Classifier: wait = min(provider, deadline); tie → request budget; nested
+  `504` recognised by a response-extension marker; new outcome
+  `request_budget_exhausted`, not a provider failure.
+- Metrics (only when configured), trace block, `router_requests_total`
+  outcome, admin `GET /api/router/v1/request-budget`. No UI.
+
+**Tests.** 22 new unit tests (budget 8 incl. 1 000-run race and a source
+check that no deciding module reads the budget and no unbiased `select!`
+races it; config 9; classifier 5 under paused time), 38 scripted-node
+integration tests (`tests/request_budget.rs`, named by design id, incl. a
+Linux-only hanging-connect pair), 2 real-gateway tests
+(`tests/request_budget_gateway.rs`: 600 s node queue cut at 1 s; non-streamed
+cancellation), 3 frontend model tests (B44 tolerance). Every existing test
+unchanged and green.
+
+**Mutations M1–M28** (M25 split a/b), applied one at a time, all **caught**.
+M3 (fresh nested deadline) first survived: the parent's cap masked it. Added
+`b42_the_nested_request_ends_on_the_parents_deadline` (the nested trace must
+end by its own inherited timer, not `cancelled`), which catches it.
+
+**Upstream cancellation measured.** Mock engine via real gateway: the
+generation stopped before the client even read its 504. Real CPU (Qwen3-1.7B,
+budget 5 s): 504 at 5.004 s; engine idle within ~1 s; the slot free for the
+next request. Best outcome of design section 26.
+
+**Real-router smoke** (`hermes router` binary, scripted Python nodes):
+A, B, C (504 at 2.003 s, not 3.0), D (2.006 s, General), F, G (incl. the
+validate-config warning), H (stream relayed 3 s past a 1 s budget), I, J,
+K, L passed. **E** (Coder's failure completing exactly as the deadline
+passes) could not be placed on the binary: 6/6 SIGSTOP-across-the-deadline
+runs ended as a cut Coder attempt (504, `same_route_attempt`, General 0 hits,
+no transition), which is correct but not the refused-transition state. That
+state is proven deterministically in-process by `b11` with the test-only
+`after_attempt_ms` hook.
+
+**Next:** GitHub Actions full matrix on the draft PR; STOP for review. No
+release; R9.4 not started.
+
+### R9.3.2 slice 1 review (PR #49 at `48b2f62`)
+
+Decisions approved and frozen in review (docs only; no runtime change):
+- **Disabled budget emits no budget metric samples.** Absent key = feature
+  off = no `router_request_budget_*` series at all; `0` stays invalid. The
+  design's section 33 "0 when disabled" was corrected to match.
+- **SMOKE E accepted on two layers:** "The exact refused-fallback start
+  condition must be proven deterministically in integration tests. The real
+  binary must prove that an exhausted request budget cannot permit the next
+  fallback route to execute or be counted." Layer 1: `b11` (General 0 hits,
+  `next_unattempted_route: "General"`, no `Coder→General` transition, 504).
+  Layer 2: the binary runs (504 `request_budget_exhausted`, General never
+  attempted, no transition counted, nothing past the deadline). No timing
+  hacks added.
+- **Envelope:** `504`, `type: "server_error"`, `code:
+  "request_budget_exhausted"` is the workspace's 5xx convention; the metric
+  outcome stays `request_budget_exhausted` and history stays `neutral`.
+- Connect-hang tests Linux-only (platform reason in design section 44);
+  frozen R9.3 card "Served by" wording on a fallback cut deferred.
+
+Actions evidence for `48b2f62` (check 37627845811, render 37627846102, both
+attempt 1, no reruns): on Linux x64, Windows x64, macOS x64 and arm64 the
+contract suite logged `47 passed, 2 skipped`, the secrets gate `ok no
+credentials, home paths or machine addresses in tracked files`, frontend
+`# pass 56 / # fail 0`, desktop `# pass 26 / # fail 0`, then `All checks
+passed.`; `request_budget` 38 (Linux) / 36 (others) and
+`request_budget_gateway` 2 passed. Flatpak "Flatpak checks passed.", Linux
+artifacts "Artifact checks passed.", icons "icons ok", render panel 110
+`[ok]`, 0 failed. No release workflow run since v0.6.0's own; no new tag or
+release.

@@ -75,8 +75,9 @@ pub struct AttemptTrace {
     pub deployment: String,
     /// The routing reason for this attempt.
     pub reason: &'static str,
-    /// `committed`, `failed` (no answer, or one that moved the request on), or
-    /// `context_overflow`.
+    /// `committed`, `failed` (no answer, or one that moved the request on),
+    /// `context_overflow`, or `request_budget_exhausted` (the pre-commit
+    /// budget cut it before a response head arrived).
     pub outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_status: Option<u16>,
@@ -139,6 +140,10 @@ pub struct RoutingTrace {
     /// `route` above is the final route.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_route_fallback: Option<crate::fallback::FallbackTrace>,
+    /// Present only when a pre-commit request budget is configured (R9.3.2):
+    /// its state at commit, or how the request ended without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_budget: Option<crate::budget::BudgetTrace>,
     pub endpoint: &'static str,
     pub stream: bool,
     pub policy: &'static str,
@@ -176,7 +181,8 @@ pub struct RoutingTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     /// `ok`, `client_error`, `server_error`, `unavailable`, `interrupted` (a
-    /// committed stream the node broke off), or `cancelled` (the client left).
+    /// committed stream the node broke off), `cancelled` (the client left), or
+    /// `request_budget_exhausted` (the pre-commit budget ended it, R9.3.2).
     pub outcome: &'static str,
 }
 
@@ -200,6 +206,7 @@ impl RoutingTrace {
             classifier: None,
             scoring: None,
             cross_route_fallback: None,
+            request_budget: None,
             endpoint,
             stream: false,
             policy,

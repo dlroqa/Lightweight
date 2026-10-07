@@ -48,6 +48,7 @@ use serde_json::{Value, json};
 
 use crate::RouterState;
 use crate::auto_route::is_auto;
+use crate::budget::RequestBudget;
 use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
 use crate::proxy::Endpoint;
@@ -254,6 +255,12 @@ pub enum ClassifierOutcome {
     /// A classification request reached a classifying rule itself. Prevented
     /// by validation; kept so recursion is impossible rather than unlikely.
     Nested,
+    /// The client request's pre-commit budget (R9.3.2) ran out first: the
+    /// start check refused to classify, the request deadline came no later
+    /// than the provider's own, or the nested classification request was
+    /// itself ended by the budget. Not a provider failure, and the request
+    /// ends here: no classifier fallback route is taken.
+    RequestBudgetExhausted,
 }
 
 impl ClassifierOutcome {
@@ -269,6 +276,7 @@ impl ClassifierOutcome {
             Self::ConnectionError => "connection_error",
             Self::ProviderError => "provider_error",
             Self::Nested => "nested",
+            Self::RequestBudgetExhausted => crate::budget::EXHAUSTED,
         }
     }
 
@@ -397,39 +405,67 @@ impl Classification {
 /// for every provider. On timeout the provider's call is dropped — for the
 /// Lightweight provider that closes the nested request's upstream connection,
 /// for Jev the HTTPS request.
+///
+/// With a pre-commit request budget (R9.3.2) nothing is asked once it has run
+/// out, and the wait ends at the earlier of the provider's own timeout and
+/// the request's deadline. Which of the two fired decides the outcome: the
+/// provider's is `timeout` (R9.1's fallback follows); the request's — also
+/// when both are the same instant — is `request_budget_exhausted`, and the
+/// request ends. The nested Lightweight request inherits the same budget.
 pub async fn classify(
     state: &Arc<RouterState>,
     classifier: &RouteClassifier,
     input: &ClassificationInput,
     request_id: &str,
+    budget: Option<RequestBudget>,
 ) -> Classification {
     let started = Instant::now();
     let limits = classifier.limits();
     let mut nested_id = String::new();
+    if crate::budget::expired(budget) {
+        return Classification {
+            provider: classifier.provider.kind(),
+            outcome: ClassifierOutcome::RequestBudgetExhausted,
+            verdict: None,
+            duration: Duration::ZERO,
+            request_id: nested_id,
+            input_truncated: input.truncated,
+        };
+    }
+    // One wait, ending at whichever deadline comes first. The provider's is
+    // taken from now; the request's is the one it has had since it arrived.
+    let provider_deadline = tokio::time::Instant::now() + limits.timeout;
+    let budget_first = budget.is_some_and(|budget| budget.deadline() <= provider_deadline);
+    let deadline = match budget {
+        Some(budget) => provider_deadline.min(budget.deadline()),
+        None => provider_deadline,
+    };
     let result = match &classifier.provider {
         ClassifierProvider::Lightweight(lightweight) => {
             nested_id = format!("{request_id}-classify");
-            tokio::time::timeout(
-                limits.timeout,
+            tokio::time::timeout_at(
+                deadline,
                 lightweight::call(
                     state,
                     lightweight,
                     &classifier.candidates,
                     input,
                     &nested_id,
+                    budget,
                 ),
             )
             .await
         }
         ClassifierProvider::Jev(jev) => {
-            tokio::time::timeout(
-                limits.timeout,
+            tokio::time::timeout_at(
+                deadline,
                 jev::call(&state.client, jev, &classifier.candidates, input),
             )
             .await
         }
     };
     let (outcome, verdict) = match result {
+        Err(_) if budget_first => (ClassifierOutcome::RequestBudgetExhausted, None),
         Err(_) => (ClassifierOutcome::Timeout, None),
         Ok(Err(outcome)) => (outcome, None),
         Ok(Ok(verdict)) if verdict.confidence < limits.min_confidence => {
@@ -466,7 +502,10 @@ impl ClassifierStatus {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if outcome.provider_answered() {
             inner.last_success = Some(unix_now());
-        } else if outcome != ClassifierOutcome::Nested {
+        } else if !matches!(
+            outcome,
+            ClassifierOutcome::Nested | ClassifierOutcome::RequestBudgetExhausted
+        ) {
             inner.last_failure = Some((unix_now(), outcome.as_str()));
         }
     }
@@ -1165,5 +1204,132 @@ mod tests {
             lightweight::parse_answer(br#"{"choices": []}"#, candidates),
             Err("no_content")
         );
+    }
+
+    // --- R9.3.2: the classifier's own timeout and the request's budget -------------
+
+    /// A Jev provider at `base` that accepts connections and never answers,
+    /// with a provider timeout of `timeout_ms`.
+    async fn silent_jev(
+        timeout_ms: u64,
+    ) -> (
+        Arc<RouterState>,
+        RouteClassifier,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counting = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        let file = file(json!({"enabled": true, "fallback_route": "General",
+            "classifier": {"provider": "jev", "routes": ["General", "Coder"],
+                           "jev": {"model": "jev-latest", "timeout_ms": timeout_ms, "base_url": base}},
+            "rules": [{"name": "semantic", "when": {}, "classify": true}]}));
+        let config = crate::config::validate(file, &|name| {
+            (name == "TYPESAFE_API_KEY").then(|| "test-key".to_owned())
+        })
+        .expect("valid");
+        let classifier = config.auto.as_ref().unwrap().classifier.clone().unwrap();
+        (
+            Arc::new(RouterState::new(&config).unwrap()),
+            classifier,
+            accepted,
+        )
+    }
+
+    fn some_input() -> ClassificationInput {
+        input(
+            &json!({"messages": [{"role": "user", "content": "hello"}]}),
+            100,
+        )
+    }
+
+    async fn classify_under(timeout_ms: u64, budget_ms: Option<u64>) -> ClassifierOutcome {
+        let (state, classifier, _) = silent_jev(timeout_ms).await;
+        let budget = budget_ms.map(|ms| RequestBudget::start(Duration::from_millis(ms)));
+        classify(&state, &classifier, &some_input(), "rid", budget)
+            .await
+            .outcome
+    }
+
+    /// B7 / Case A: the provider's timeout first, budget left: `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn the_provider_timeout_first_is_a_timeout() {
+        assert_eq!(
+            classify_under(1_000, Some(5_000)).await,
+            ClassifierOutcome::Timeout
+        );
+        assert_eq!(
+            classify_under(1_000, None).await,
+            ClassifierOutcome::Timeout
+        );
+    }
+
+    /// B8 / B43 / Case B (M8): the request's deadline first — a 120 s
+    /// provider timeout under a 2 s budget — is the budget's, never `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_deadline_first_is_budget_exhaustion() {
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            classify_under(MAX_TIMEOUT_MS, Some(2_000)).await,
+            ClassifierOutcome::RequestBudgetExhausted
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(2_000),
+            "dropped at 2 s"
+        );
+    }
+
+    /// Section 8's attribution tie: both deadlines at the same instant belong
+    /// to the request budget, every time.
+    #[tokio::test(start_paused = true)]
+    async fn a_tie_belongs_to_the_request_budget() {
+        for _ in 0..50 {
+            assert_eq!(
+                classify_under(1_000, Some(1_000)).await,
+                ClassifierOutcome::RequestBudgetExhausted
+            );
+        }
+    }
+
+    /// B9 (#14): a spent budget asks nothing — no connection is even opened.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_budget_never_asks_the_provider() {
+        let (state, classifier, accepted) = silent_jev(5_000).await;
+        let budget = RequestBudget::start(Duration::from_millis(1_000));
+        tokio::time::advance(Duration::from_millis(1_000)).await;
+        let classification =
+            classify(&state, &classifier, &some_input(), "rid", Some(budget)).await;
+        assert_eq!(
+            classification.outcome,
+            ClassifierOutcome::RequestBudgetExhausted
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Budget exhaustion is not a provider failure (section 15).
+    #[test]
+    fn budget_exhaustion_is_never_recorded_as_a_provider_failure() {
+        let status = ClassifierStatus::default();
+        status.record(ClassifierOutcome::RequestBudgetExhausted);
+        assert!(status.view()["last_failure_kind"].is_null());
+        status.record(ClassifierOutcome::Timeout);
+        assert_eq!(status.view()["last_failure_kind"], "timeout");
+        assert_eq!(
+            ClassifierOutcome::RequestBudgetExhausted.as_str(),
+            "request_budget_exhausted"
+        );
+        assert!(!ClassifierOutcome::RequestBudgetExhausted.provider_answered());
     }
 }

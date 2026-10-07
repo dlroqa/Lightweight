@@ -113,6 +113,12 @@ impl RouteName {
         &self.0
     }
 
+    /// A fixed label the router itself counts requests under — `Auto` —
+    /// never a name a client typed or the operator configured.
+    pub(crate) fn label(name: &'static str) -> Self {
+        Self(name.to_owned())
+    }
+
     /// Whether a client's `model` value names this route.
     pub fn matches(&self, requested: &str) -> bool {
         alias::same_name(&self.0, requested)

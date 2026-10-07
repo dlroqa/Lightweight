@@ -37,6 +37,11 @@ pub enum Outcome {
     /// No deployment could take it. Separate from `server_error` because it
     /// is the one number that says capacity, not correctness, ran out.
     Unavailable,
+    /// The configured pre-commit request budget (R9.3.2) was the causal
+    /// terminal condition. Never `server_error`: an operator-chosen budget,
+    /// slow hardware or several legitimate attempts sharing it are not a
+    /// server fault.
+    RequestBudgetExhausted,
 }
 
 impl Outcome {
@@ -46,6 +51,7 @@ impl Outcome {
             Self::ClientError => "client_error",
             Self::ServerError => "server_error",
             Self::Unavailable => "unavailable",
+            Self::RequestBudgetExhausted => crate::budget::EXHAUSTED,
         }
     }
 
@@ -112,6 +118,9 @@ pub struct RouterMetrics {
     /// `Auto` requests whose whole fallback list failed, by initial route and
     /// the last route's reason.
     cross_route_exhausted: Mutex<BTreeMap<(String, &'static str), u64>>,
+    /// Client requests the pre-commit budget ended (R9.3.2), by stage. Never
+    /// a nested classification request.
+    budget_exhausted: Mutex<BTreeMap<&'static str, u64>>,
     histograms: Histograms,
 }
 
@@ -313,6 +322,9 @@ struct Histograms {
     estimation_error: Family,
     reconcile: Family,
     classifier: Family,
+    /// Rendered with the other budget series, and only when one is
+    /// configured.
+    budget_remaining: Family,
 }
 
 impl Default for Histograms {
@@ -366,6 +378,11 @@ impl Default for Histograms {
             classifier: Family::new(
                 "router_classifier_duration_seconds",
                 "One Auto classification, from asking the classifier to its verdict, timeout or failure, by provider and outcome. Not part of router_routing_duration_seconds.",
+                SECONDS,
+            ),
+            budget_remaining: Family::new(
+                "router_request_budget_remaining_at_commit_seconds",
+                "Pre-commit request budget left when a budgeted client request committed its response head: the headroom a budget is tuned by.",
                 SECONDS,
             ),
         }
@@ -692,6 +709,65 @@ impl RouterMetrics {
         {
             out.entry(route.clone()).or_default().insert(reason, *count);
         }
+        out
+    }
+
+    /// A client request the pre-commit budget ended, at `stage`.
+    pub fn record_budget_exhausted(&self, stage: crate::budget::Stage) {
+        bump(&self.budget_exhausted, stage.as_str());
+    }
+
+    pub fn budget_exhausted(&self, stage: crate::budget::Stage) -> u64 {
+        read(&self.budget_exhausted, &stage.as_str())
+    }
+
+    pub fn budget_exhausted_total(&self) -> u64 {
+        crate::budget::Stage::ALL
+            .iter()
+            .map(|stage| self.budget_exhausted(*stage))
+            .sum()
+    }
+
+    /// The budget left when a budgeted client request committed.
+    pub fn observe_budget_remaining(&self, remaining: Duration) {
+        self.histograms
+            .budget_remaining
+            .observe(Vec::new(), millis(remaining));
+    }
+
+    pub fn budget_remaining_observations(&self) -> u64 {
+        self.histograms.budget_remaining.count(&Vec::new())
+    }
+
+    /// The pre-commit budget's series — only when one is configured, so a
+    /// router without one exposes exactly what it did before R9.3.2.
+    pub fn budget_to_prometheus(&self, configured: Option<Duration>) -> String {
+        let mut out = String::new();
+        let Some(configured) = configured else {
+            return out;
+        };
+        out.push_str(
+            "# HELP router_request_budget_configured_seconds The pre-commit request budget each client request gets, from the moment the router has its body to its response head.\n",
+        );
+        out.push_str("# TYPE router_request_budget_configured_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "router_request_budget_configured_seconds {}",
+            format_unit(configured.as_secs_f64())
+        );
+        out.push_str(
+            "# HELP router_request_budget_exhausted_total Client requests the pre-commit request budget ended with 504 request_budget_exhausted, each counted once, by stage: classifier, route_planning, same_route_attempt, cross_route_fallback.\n",
+        );
+        out.push_str("# TYPE router_request_budget_exhausted_total counter\n");
+        for stage in crate::budget::Stage::ALL {
+            let _ = writeln!(
+                out,
+                "router_request_budget_exhausted_total{{stage=\"{}\"}} {}",
+                stage.as_str(),
+                self.budget_exhausted(stage)
+            );
+        }
+        self.histograms.budget_remaining.render(&mut out);
         out
     }
 
@@ -1129,7 +1205,7 @@ impl RouterMetrics {
         }
 
         out.push_str(
-            "# HELP router_classifier_requests_total Auto classifications, by provider and outcome: chosen, low_confidence, invalid, unavailable, timeout, auth_error, rate_limited, connection_error, provider_error, nested.\n",
+            "# HELP router_classifier_requests_total Auto classifications, by provider and outcome: chosen, low_confidence, invalid, unavailable, timeout, auth_error, rate_limited, connection_error, provider_error, nested, request_budget_exhausted.\n",
         );
         out.push_str("# TYPE router_classifier_requests_total counter\n");
         for ((provider, outcome), count) in self

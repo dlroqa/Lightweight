@@ -65,7 +65,8 @@ use serde_json::Value;
 use crate::RouterState;
 use crate::affinity::{AffinityKey, Established, Reassignment};
 use crate::auto_route::{AUTO_ROUTE, AutoRoute};
-use crate::classifier::{Classification, ClassificationInput};
+use crate::budget::{self, BudgetTrace, ExhaustedMarker, RequestBudget, Stage};
+use crate::classifier::{Classification, ClassificationInput, ClassifierOutcome, RouteClassifier};
 use crate::domain::{
     CapabilityGap, DeploymentId, Node, Route, RouteName, RoutingFailure, RoutingReason,
 };
@@ -166,9 +167,16 @@ struct Tracker {
     /// outcome does not say: a capability mismatch, or every deployment
     /// refusing before answering.
     observation: Option<Observation>,
+    /// The client request's pre-commit budget (R9.3.2), when one is
+    /// configured: the same value at every stage, never re-made.
+    budget: Option<RequestBudget>,
+    /// The budget refused this route before anything was sent to it, so it
+    /// was never attempted and route history observes nothing.
+    unobserved: bool,
 }
 
 impl Tracker {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: &Arc<RouterState>,
         request_id: &str,
@@ -177,6 +185,7 @@ impl Tracker {
         endpoint: Endpoint,
         received: Instant,
         nested: bool,
+        budget: Option<RequestBudget>,
     ) -> Self {
         Self {
             state: Arc::clone(state),
@@ -187,6 +196,8 @@ impl Tracker {
             finished: false,
             nested,
             observation: None,
+            budget,
+            unobserved: false,
         }
     }
 
@@ -206,18 +217,28 @@ impl Tracker {
         }
         // Route history (R9.2) learns from the final outcome, here: a stream
         // counts once it has ended, not when its head arrived. (A route an
-        // `Auto` request fell back from is observed when it is left.)
-        observe_route(
-            &self.state,
-            &self.route,
-            self.observation
-                .unwrap_or_else(|| Observation::of_outcome(outcome)),
-            self.nested,
-        );
+        // `Auto` request fell back from is observed when it is left.) A route
+        // the budget refused was never attempted, and is not observed.
+        if !self.unobserved {
+            observe_route(
+                &self.state,
+                &self.route,
+                self.observation
+                    .unwrap_or_else(|| Observation::of_outcome(outcome)),
+                self.nested,
+            );
+        }
         let trace = &mut self.trace;
         trace.duration_ms = millis(elapsed);
         trace.status = status;
         trace.outcome = outcome;
+        // Ended without a commit, for whatever reason of its own: the budget's
+        // state at that moment. (A commit or an exhaustion wrote its own.)
+        if let Some(budget) = &self.budget
+            && trace.request_budget.is_none()
+        {
+            trace.request_budget = Some(BudgetTrace::ended(budget));
+        }
         tracing::info!(
             target: targets::ROUTER,
             request_id = trace.request_id.as_str(),
@@ -237,6 +258,7 @@ impl Tracker {
             duration_ms = trace.duration_ms,
             estimated_prompt_tokens = trace.estimated_prompt_tokens,
             actual_prompt_tokens = trace.actual_prompt_tokens,
+            request_budget_stage = trace.request_budget.as_ref().and_then(|budget| budget.stage),
             "request finished"
         );
         self.state.traces.push(trace.clone());
@@ -252,6 +274,7 @@ impl Tracker {
         self.route = route.name.clone();
         self.policy = route.policy.as_str();
         self.observation = None;
+        self.unobserved = false;
         let trace = &mut self.trace;
         trace.route = route.name.to_string();
         trace.policy = self.policy;
@@ -266,6 +289,17 @@ impl Tracker {
         trace.final_deployment = None;
         trace.context_overflow = None;
         trace.routing_ms = 0.0;
+    }
+}
+
+impl Tracker {
+    /// The budget refused `route`'s first attempt: count the request under
+    /// `label` — `Auto`, or the route the client named — never under a route
+    /// nothing was sent to, and observe no route at all.
+    fn unattempted(&mut self, label: RouteName) {
+        self.trace.route = label.to_string();
+        self.route = label;
+        self.unobserved = true;
     }
 }
 
@@ -380,6 +414,10 @@ pub struct PhaseDelays {
     pub before_planning_ms: AtomicU64,
     /// Slept at the start of planning, inside the measured window.
     pub during_planning_ms: AtomicU64,
+    /// Slept after each deployment attempt that did not commit, before the
+    /// next step's budget check: lets a test place "the attempt failed just
+    /// as the budget ran out" exactly.
+    pub after_attempt_ms: AtomicU64,
 }
 
 async fn pause(delay: &AtomicU64) {
@@ -410,7 +448,7 @@ pub async fn forward(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Response {
-    forward_as(state, endpoint, headers, body, false).await
+    forward_as(state, endpoint, headers, body, false, None).await
 }
 
 /// Forward a request the router itself makes — a classification — through
@@ -420,13 +458,17 @@ pub async fn forward(
 /// reaches a classifying `Auto` rule takes the rule's fallback rather than
 /// classifying again. Boxed because it is called from inside the pipeline it
 /// runs.
+///
+/// It inherits the client request's pre-commit budget, `budget`, and never
+/// starts one of its own: one client request has one deadline.
 pub(crate) fn forward_nested(
     state: Arc<RouterState>,
     endpoint: Endpoint,
     headers: HeaderMap,
     body: Bytes,
+    budget: Option<RequestBudget>,
 ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-    Box::pin(async move { forward_as(state, endpoint, &headers, &body, true).await })
+    Box::pin(async move { forward_as(state, endpoint, &headers, &body, true, budget).await })
 }
 
 async fn forward_as(
@@ -435,10 +477,19 @@ async fn forward_as(
     headers: &HeaderMap,
     body: &Bytes,
     nested: bool,
+    inherited: Option<RequestBudget>,
 ) -> Response {
     // The router has the whole request from here: every router-side duration
     // starts now.
     let received = Instant::now();
+    // R9.3.2: the client request's one pre-commit deadline, from the same
+    // moment — after the body was read, before anything else. Made here and
+    // nowhere else; a nested classification request runs on its parent's.
+    let budget = if nested {
+        inherited
+    } else {
+        state.request_budget.map(RequestBudget::start)
+    };
     let active = state.metrics.enter();
     let request_id = request_id(headers);
     let mut response = route_request(
@@ -450,6 +501,7 @@ async fn forward_as(
         active,
         received,
         nested,
+        budget,
     )
     .await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
@@ -470,6 +522,7 @@ async fn route_request(
     active: ActiveGuard,
     received: Instant,
     nested: bool,
+    budget: Option<RequestBudget>,
 ) -> Response {
     let mut request = match parse(body) {
         Ok(request) => request,
@@ -509,6 +562,7 @@ async fn route_request(
                 request_id,
                 planning_started,
                 nested,
+                budget,
             )
             .await
             {
@@ -524,7 +578,33 @@ async fn route_request(
                     scoring = resolved.scoring;
                     resolved.route
                 }
-                Err(refusal) => return *refusal,
+                Err(AutoStop::Refused(refusal)) => return *refusal,
+                Err(AutoStop::BudgetExhausted {
+                    classification,
+                    rule,
+                }) => {
+                    // No route was attempted, and none is invented: the
+                    // request is counted and traced under `Auto`.
+                    let mut tracker = Tracker::new(
+                        state,
+                        request_id,
+                        &auto_route_name(),
+                        NO_POLICY,
+                        endpoint,
+                        received,
+                        nested,
+                        budget,
+                    );
+                    tracker.unobserved = true;
+                    tracker.trace.requested_route = AUTO_ROUTE.to_owned();
+                    tracker.trace.auto_rule = rule;
+                    tracker.trace.stream = request.get("stream") == Some(&Value::Bool(true));
+                    if let Some(classifier) = auto.classifier.as_ref() {
+                        tracker.trace.classifier =
+                            Some(classifier_trace(*classification, classifier));
+                    }
+                    return exhaust(state, tracker, Stage::Classifier, None);
+                }
             }
         }
         None => state.topology.resolve(requested),
@@ -559,6 +639,7 @@ async fn route_request(
         endpoint,
         received,
         nested,
+        budget,
     );
     // R9.3.1: the routes an `Auto` request may move to if its initial route
     // cannot execute — read once, here, from the initial route's own list,
@@ -569,6 +650,7 @@ async fn route_request(
         (Some(_), Some(auto)) if !nested => auto.cross_route_fallback.chain(&route.name).to_vec(),
         _ => Vec::new(),
     };
+    let is_auto = auto_rule.is_some();
     if let Some(rule) = auto_rule {
         tracker.trace.requested_route = AUTO_ROUTE.to_owned();
         tracker.trace.auto_fallback = rule.is_none();
@@ -581,24 +663,7 @@ async fn route_request(
             .as_ref()
             .and_then(|auto| auto.classifier.as_ref()),
     ) {
-        tracker.trace.classifier = Some(ClassifierTrace {
-            provider: classification.provider.as_str(),
-            route: classifier.provider.route().map(ToString::to_string),
-            model: classification
-                .verdict
-                .as_ref()
-                .and_then(|verdict| verdict.model.clone())
-                .or_else(|| classifier.provider.model().map(str::to_owned)),
-            outcome: classification.outcome.as_str(),
-            chosen_route: classification
-                .verdict
-                .as_ref()
-                .map(|verdict| verdict.route.to_string()),
-            confidence: classification.verdict.as_ref().map(|v| v.confidence),
-            duration_ms: millis(classification.duration),
-            request_id: classification.request_id,
-            input_truncated: classification.input_truncated,
-        });
+        tracker.trace.classifier = Some(classifier_trace(classification, classifier));
     }
     tracker.trace.scoring = scoring;
     tracker.trace.stream = request.get("stream") == Some(&Value::Bool(true));
@@ -638,6 +703,19 @@ async fn route_request(
     };
     tracker.trace.estimated_prompt_tokens = needs.prompt_tokens;
 
+    // R9.3.2: the start check before the initial route's first attempt. If
+    // the budget is already spent, nothing is sent and no route is counted
+    // as attempted: the request is `Auto`'s or the named route's.
+    if budget::expired(budget) {
+        let label = if is_auto {
+            auto_route_name()
+        } else {
+            route.name.clone()
+        };
+        tracker.unattempted(label);
+        return exhaust(state, tracker, Stage::RoutePlanning, Some(&route.name));
+    }
+
     // One route attempt at a time: the route's own pipeline, start to finish,
     // same-route failover included. Only an uncommitted failure for one of
     // the three fallback reasons may move the request to the next route of
@@ -648,6 +726,7 @@ async fn route_request(
     let mut remaining = fallback_plan.iter();
     let mut hops: Vec<FallbackAttemptTrace> = Vec::new();
     loop {
+        let on_fallback = !hops.is_empty();
         let failure = match attempt_route(
             state,
             endpoint,
@@ -659,11 +738,44 @@ async fn route_request(
             tracker,
             active,
             planning_started,
+            budget,
         )
         .await
         {
             RouteEnd::Committed(response) => return response,
             RouteEnd::Failed(failure) => *failure,
+            RouteEnd::BudgetExhausted(stop) => {
+                let BudgetStop {
+                    mut tracker,
+                    before_first_attempt,
+                } = *stop;
+                let stage = if on_fallback {
+                    // The fallback route was entered: its transition counted.
+                    // It is the terminal route; the chain did not run out.
+                    if let Some(block) = tracker.trace.cross_route_fallback.as_mut()
+                        && let Some(last) = block.attempts.last_mut()
+                    {
+                        last.outcome = "failed";
+                        last.reason = Some(budget::EXHAUSTED);
+                    }
+                    if before_first_attempt {
+                        tracker.unobserved = true;
+                    }
+                    Stage::CrossRouteFallback
+                } else if before_first_attempt {
+                    let label = if is_auto {
+                        auto_route_name()
+                    } else {
+                        route.name.clone()
+                    };
+                    tracker.unattempted(label);
+                    Stage::RoutePlanning
+                } else {
+                    Stage::SameRouteAttempt
+                };
+                let next = (before_first_attempt && !on_fallback).then_some(&route.name);
+                return exhaust(state, tracker, stage, next);
+            }
         };
         let next = failure
             .reason
@@ -672,6 +784,33 @@ async fn route_request(
         let (Some(reason), Some(next)) = (failure.reason, next) else {
             return conclude_chain(state, request_id, initial, hops, failure);
         };
+
+        // R9.3.2: the start check before a fallback route, before its
+        // transition is counted. The failed route's own failure completed and
+        // keeps what it earned; the next route is never attempted.
+        if budget::expired(budget) {
+            let RouteFailure {
+                outcome,
+                observation,
+                route: failed,
+                mut tracker,
+                ..
+            } = failure;
+            tracker.observation =
+                Some(observation.unwrap_or_else(|| Observation::of_outcome(outcome.as_str())));
+            hops.push(FallbackAttemptTrace {
+                route: failed.to_string(),
+                outcome: "failed",
+                reason: Some(reason.as_str()),
+            });
+            tracker.trace.cross_route_fallback = Some(FallbackTrace {
+                initial_route: initial.name.to_string(),
+                final_route: failed.to_string(),
+                exhausted: false,
+                attempts: hops,
+            });
+            return exhaust(state, tracker, Stage::CrossRouteFallback, Some(&next.name));
+        }
 
         // The failed route's own observation, as a final request's would be
         // recorded; the request itself is counted once, at the end.
@@ -783,6 +922,119 @@ enum RouteEnd {
     /// Nothing was committed: the route's own error, not yet sent. Boxed, as
     /// refusals are: it is the rare path.
     Failed(Box<RouteFailure>),
+    /// The pre-commit budget (R9.3.2) stopped the route: it cut an attempt in
+    /// flight, or refused to start the next one. Nothing was committed.
+    BudgetExhausted(Box<BudgetStop>),
+}
+
+/// A route attempt the pre-commit budget stopped.
+struct BudgetStop {
+    tracker: Tracker,
+    /// The budget refused the route's first deployment attempt: nothing was
+    /// sent to this route at all.
+    before_first_attempt: bool,
+}
+
+/// `Auto`'s fixed name, as a route label. Never a name a client typed.
+fn auto_route_name() -> RouteName {
+    RouteName::label(AUTO_ROUTE)
+}
+
+/// End a request the pre-commit budget stopped (R9.3.2): `504
+/// request_budget_exhausted`, counted once in `router_requests_total` under
+/// the tracker's route — the terminal attempted route, or `Auto` / the named
+/// route when none was attempted — and once by `stage`.
+///
+/// Called only where the budget is the causal reason the request cannot go
+/// on: an attempt it cut, or a start it refused. A request that already ended
+/// with an outcome of its own never comes here, whatever the clock says.
+fn exhaust(
+    state: &RouterState,
+    mut tracker: Tracker,
+    stage: Stage,
+    next_unattempted: Option<&RouteName>,
+) -> Response {
+    let Some(budget) = tracker.budget else {
+        // Unreachable: only a configured budget stops a request.
+        tracker.finish(None, Outcome::ServerError.as_str());
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &server_error("the request ended unexpectedly", "internal_error"),
+        );
+    };
+    // A nested classification request reports to its parent, which counts
+    // the client request once; it records no budget metric of its own.
+    if !tracker.nested {
+        state.metrics.record_budget_exhausted(stage);
+    }
+    state
+        .metrics
+        .record_request(tracker.route.as_str(), Outcome::RequestBudgetExhausted);
+    tracker.trace.request_budget = Some(BudgetTrace::exhausted(
+        &budget,
+        stage,
+        next_unattempted.map(ToString::to_string),
+    ));
+    tracing::warn!(
+        target: targets::ROUTER,
+        request_id = tracker.trace.request_id.as_str(),
+        route = tracker.route.as_str(),
+        requested_route = tracker.trace.requested_route.as_str(),
+        stage = stage.as_str(),
+        next_unattempted_route = next_unattempted.map(RouteName::as_str),
+        budget_ms = u64::try_from(budget.configured().as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms = millis(budget.elapsed()),
+        nested = tracker.nested,
+        "pre-commit request budget exhausted"
+    );
+    tracker.finish(
+        Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+        Outcome::RequestBudgetExhausted.as_str(),
+    );
+    budget_exhausted_response(budget.configured())
+}
+
+/// The `504` a request the budget ended is answered with. It names the
+/// configured budget only — never a node, model, route or prompt — and
+/// carries no `Retry-After`: nothing says a retry would be faster.
+fn budget_exhausted_response(configured: Duration) -> Response {
+    let mut response = json_error(
+        StatusCode::GATEWAY_TIMEOUT,
+        &server_error(
+            format!(
+                "The router's pre-commit request budget of {} ms ran out before a response started.",
+                configured.as_millis()
+            ),
+            budget::EXHAUSTED,
+        ),
+    );
+    response.extensions_mut().insert(ExhaustedMarker);
+    response
+}
+
+/// A classification, as its trace shows it.
+fn classifier_trace(
+    classification: Classification,
+    classifier: &RouteClassifier,
+) -> ClassifierTrace {
+    ClassifierTrace {
+        provider: classification.provider.as_str(),
+        route: classifier.provider.route().map(ToString::to_string),
+        model: classification
+            .verdict
+            .as_ref()
+            .and_then(|verdict| verdict.model.clone())
+            .or_else(|| classifier.provider.model().map(str::to_owned)),
+        outcome: classification.outcome.as_str(),
+        chosen_route: classification
+            .verdict
+            .as_ref()
+            .map(|verdict| verdict.route.to_string()),
+        confidence: classification.verdict.as_ref().map(|v| v.confidence),
+        duration_ms: millis(classification.duration),
+        request_id: classification.request_id,
+        input_truncated: classification.input_truncated,
+    }
 }
 
 /// A route attempt that committed nothing, with everything needed either to
@@ -837,6 +1089,7 @@ async fn attempt_route(
     mut tracker: Tracker,
     mut active: Option<ActiveGuard>,
     planning_started: Instant,
+    budget: Option<RequestBudget>,
 ) -> RouteEnd {
     let policy = route.policy.as_str();
     // The session, if the client named one and affinity is on, and the
@@ -1037,6 +1290,14 @@ async fn attempt_route(
         let Some(node) = state.topology.node(&candidate.node) else {
             continue;
         };
+        // R9.3.2: no attempt starts once the budget is spent — no lease, no
+        // connection, nothing sent, no failover counted.
+        if budget::expired(budget) {
+            return RouteEnd::BudgetExhausted(Box::new(BudgetStop {
+                tracker,
+                before_first_attempt: attempts_made == 0,
+            }));
+        }
         // One slot per attempt, held for exactly as long as the attempt: the
         // first choice's was reserved when it was chosen, a failover's is taken
         // here. A failed attempt's lease is dropped at the end of this
@@ -1061,7 +1322,30 @@ async fn attempt_route(
         attempts_made += 1;
         let rest = &plan.candidates[attempt + 1..];
         let is_sticky = attempt == 0 && plan.sticky == Some(Sticky::Hit);
-        let (outcome, sent) = attempt_one(&context, request).await;
+        // Connect, response head and any pre-decision error-body read, capped
+        // by the budget: the connect timeout becomes min(its own, what is
+        // left), and the unbounded head wait — a node's queue included — what
+        // is left. A cut attempt is dropped, which closes its connection; it
+        // is not the node's failure, so its health is untouched.
+        let Ok((outcome, sent)) = budget::bound(budget, attempt_one(&context, request)).await
+        else {
+            tracker.trace.attempts.push(AttemptTrace {
+                route: route.name.to_string(),
+                deployment: candidate.deployment.to_string(),
+                reason: decision.reason.as_str(),
+                outcome: budget::EXHAUSTED,
+                upstream_status: None,
+                response_ms: None,
+            });
+            drop(lease);
+            return RouteEnd::BudgetExhausted(Box::new(BudgetStop {
+                tracker,
+                before_first_attempt: false,
+            }));
+        };
+        if !matches!(outcome, Attempt::Committed(_)) {
+            pause(&state.phase_delays.after_attempt_ms).await;
+        }
         let mut record = |outcome: &'static str| {
             tracker.trace.attempts.push(AttemptTrace {
                 route: route.name.to_string(),
@@ -1084,6 +1368,14 @@ async fn attempt_route(
                     last_refusal = refusal;
                 }
                 if rest.iter().any(|next| larger_than(next, too_small)) {
+                    // The next deployment's start check, before its failover
+                    // is counted: an attempt that never starts is not one.
+                    if budget::expired(budget) {
+                        return RouteEnd::BudgetExhausted(Box::new(BudgetStop {
+                            tracker,
+                            before_first_attempt: false,
+                        }));
+                    }
                     state.metrics.record_failover(route.name.as_str());
                 }
             }
@@ -1130,6 +1422,12 @@ async fn attempt_route(
                     // The node's own answer stands: the route is available, and
                     // the router could not have known this before sending.
                     break;
+                }
+                if budget::expired(budget) {
+                    return RouteEnd::BudgetExhausted(Box::new(BudgetStop {
+                        tracker,
+                        before_first_attempt: false,
+                    }));
                 }
                 after_overflow = true;
                 state.metrics.record_failover(route.name.as_str());
@@ -1199,6 +1497,14 @@ async fn attempt_route(
                     plan.policy.as_str(),
                     decision.reason.as_str(),
                 );
+                // The budget's state at commit, its last word: from here on it
+                // is neither held nor polled.
+                if let Some(budget) = &budget {
+                    tracker.trace.request_budget = Some(BudgetTrace::committed(budget));
+                    if !tracker.nested {
+                        state.metrics.observe_budget_remaining(budget.remaining());
+                    }
+                }
                 let held = InFlight {
                     _active: active.take(),
                     _lease: lease,
@@ -1273,6 +1579,18 @@ async fn attempt_route(
     }
 }
 
+/// Why `Auto` resolved no route.
+enum AutoStop {
+    /// The gateway would refuse the request: the refusal, already counted.
+    Refused(Box<Response>),
+    /// The pre-commit budget ran out before or during classification (R9.3.2).
+    /// The request ends here: no classifier fallback, no scoring, no route.
+    BudgetExhausted {
+        classification: Box<Classification>,
+        rule: Option<String>,
+    },
+}
+
 /// What `Auto` resolved one request to.
 struct AutoResolution<'a> {
     /// The route the rules named. Always configured — validation saw to it —
@@ -1306,6 +1624,7 @@ struct AutoResolution<'a> {
 /// route history. That is the only thing scoring can change, and it changes
 /// only which logical route; a rejected or failed classification resolves
 /// exactly as above.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_auto<'a>(
     state: &'a Arc<RouterState>,
     auto: &'a AutoRoute,
@@ -1314,7 +1633,8 @@ async fn resolve_auto<'a>(
     request_id: &str,
     planning_started: Instant,
     nested: bool,
-) -> Result<AutoResolution<'a>, Box<Response>> {
+    budget: Option<RequestBudget>,
+) -> Result<AutoResolution<'a>, AutoStop> {
     let needs = match requirements::extract(endpoint, body) {
         Ok(needs) => needs,
         Err(refusal) => {
@@ -1334,7 +1654,7 @@ async fn resolve_auto<'a>(
             state
                 .metrics
                 .record_request(AUTO_ROUTE, Outcome::ClientError);
-            return Err(refusal);
+            return Err(AutoStop::Refused(refusal));
         }
     };
     let decision = auto.decide(&needs);
@@ -1347,10 +1667,37 @@ async fn resolve_auto<'a>(
                 &needs,
                 classifier.limits().max_input_chars,
             );
-            Some(crate::classifier::classify(state, classifier, &input, request_id).await)
+            Some(crate::classifier::classify(state, classifier, &input, request_id, budget).await)
         }
         None => None,
     };
+    // R9.3.2: the request deadline ran out before or during classification.
+    // No subsystem may create more work: not R9.1's fallback route, not
+    // scoring, not planning. Counted as a classification outcome of its own,
+    // never `timeout`, and never as a provider failure.
+    if let Some(classification) = classification.as_ref().filter(|classification| {
+        classification.outcome == ClassifierOutcome::RequestBudgetExhausted
+    }) {
+        tracing::info!(
+            target: targets::ROUTER,
+            request_id,
+            auto_rule = decision.rule_label(),
+            classifier_provider = classification.provider.as_str(),
+            classifier_outcome = classification.outcome.as_str(),
+            classifier_duration_ms = millis(classification.duration),
+            "auto route classification ended by the request budget"
+        );
+        state.metrics.record_classification(
+            classification.provider.as_str(),
+            classification.outcome.as_str(),
+            None,
+            classification.duration,
+        );
+        return Err(AutoStop::BudgetExhausted {
+            classification: Box::new(classification.clone()),
+            rule: decision.rule.map(str::to_owned),
+        });
+    }
     // R9.2: only a classification, only while scoring is on, only a route.
     let scored = match (
         &classification,

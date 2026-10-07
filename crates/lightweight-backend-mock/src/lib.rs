@@ -245,6 +245,13 @@ impl MockBackend {
         self.peak_in_flight.load(Ordering::Relaxed)
     }
 
+    /// Generations in flight right now. Falls back to zero when a generation
+    /// ends or is dropped, so a test can watch whether a client going away
+    /// actually stopped the engine.
+    pub fn generations_in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
     pub async fn make_resident(&self, model: ModelId, n_ctx: u32) -> LoadedModel {
         self.make_resident_with(model, RuntimeParams::default().with_context(n_ctx))
             .await

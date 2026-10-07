@@ -174,12 +174,26 @@ const fn default_threshold() -> u32 {
 pub struct RequestFile {
     #[serde(default = "default_connect_secs")]
     pub connect_timeout_secs: u64,
+    /// The pre-commit request budget (R9.3.2), in milliseconds. Absent: no
+    /// budget, exactly the behaviour before it existed. `0` is refused, not
+    /// "unlimited": absence already means that.
+    #[serde(default, deserialize_with = "present_millis")]
+    pub pre_commit_budget_ms: Option<u64>,
+}
+
+/// A number when the key is written. `null` is refused rather than read as
+/// "disabled": absence is the one way to say that.
+fn present_millis<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 impl Default for RequestFile {
     fn default() -> Self {
         Self {
             connect_timeout_secs: default_connect_secs(),
+            pre_commit_budget_ms: None,
         }
     }
 }
@@ -405,12 +419,35 @@ pub struct RouterConfig {
     pub client_key: Option<Secret>,
     pub health: HealthPolicy,
     pub connect_timeout: Duration,
+    /// Each client request's pre-commit budget, when one is configured.
+    pub pre_commit_budget: Option<Duration>,
     pub affinity: AffinityPolicy,
     /// How many recent routing traces to keep. `0` keeps none.
     pub trace_capacity: usize,
     pub placement: PlacementPolicy,
     /// The `auto_route` section, when the file has one — on or off.
     pub auto: Option<AutoRoute>,
+}
+
+impl RouterConfig {
+    /// What is valid but probably not meant. Never a reason to refuse.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let (Some(budget), Some(classifier)) = (
+            self.pre_commit_budget,
+            self.auto.as_ref().and_then(|auto| auto.classifier.as_ref()),
+        ) && classifier.limits().timeout >= budget
+        {
+            warnings.push(format!(
+                "the classifier's timeout_ms ({} ms) is at least request.pre_commit_budget_ms \
+                 ({} ms): a slow classification can use the whole budget, and the request then \
+                 ends with 504 request_budget_exhausted before any route is tried",
+                classifier.limits().timeout.as_millis(),
+                budget.as_millis()
+            ));
+        }
+        warnings
+    }
 }
 
 /// One reason a configuration was refused.
@@ -462,6 +499,11 @@ pub enum ConfigError {
     TimeoutExceedsInterval,
     #[error("request.connect_timeout_secs must be at least 1")]
     BadConnectTimeout,
+    #[error(
+        "request.pre_commit_budget_ms must be between {minimum} and {maximum} \
+         (omit it to run without a budget; 0 does not mean unlimited)"
+    )]
+    BadPreCommitBudget { minimum: u64, maximum: u64 },
     #[error("session_affinity.header {header:?} {problem}")]
     BadSessionHeader {
         header: String,
@@ -570,6 +612,17 @@ pub fn validate(
     if file.request.connect_timeout_secs == 0 {
         errors.push(ConfigError::BadConnectTimeout);
     }
+    let pre_commit_budget = file.request.pre_commit_budget_ms.and_then(|ms| {
+        if (crate::budget::MIN_BUDGET_MS..=crate::budget::MAX_BUDGET_MS).contains(&ms) {
+            Some(Duration::from_millis(ms))
+        } else {
+            errors.push(ConfigError::BadPreCommitBudget {
+                minimum: crate::budget::MIN_BUDGET_MS,
+                maximum: crate::budget::MAX_BUDGET_MS,
+            });
+            None
+        }
+    });
     let affinity = validate_affinity(&file.session_affinity, &mut errors);
     let placement = validate_placement(&file.placement, &mut errors);
     if file.traces.capacity > MAX_TRACE_CAPACITY {
@@ -624,6 +677,7 @@ pub fn validate(
         client_key,
         health,
         connect_timeout: Duration::from_secs(file.request.connect_timeout_secs),
+        pre_commit_budget,
         affinity,
         trace_capacity: file.traces.capacity,
         placement,
@@ -1144,6 +1198,98 @@ mod tests {
                 Some("Bearer t420-secret".to_owned())
             ]
         );
+    }
+
+    // --- R9.3.2: the pre-commit request budget (B41) ---------------------------
+
+    fn with_budget(value: serde_json::Value) -> serde_json::Value {
+        let mut file = valid();
+        file["request"] = json!({"pre_commit_budget_ms": value});
+        file
+    }
+
+    fn budget_errors(value: serde_json::Value) -> Vec<ConfigError> {
+        validate(parse(with_budget(value)), &env_with(KEYS))
+            .expect_err("refused")
+            .0
+    }
+
+    #[test]
+    fn budget_absent_is_no_budget() {
+        let config = validate(parse(valid()), &env_with(KEYS)).expect("valid");
+        assert_eq!(config.pre_commit_budget, None);
+        assert!(config.warnings().is_empty());
+    }
+
+    #[test]
+    fn budget_minimum_is_accepted() {
+        let config = validate(parse(with_budget(json!(1_000))), &env_with(KEYS)).expect("valid");
+        assert_eq!(config.pre_commit_budget, Some(Duration::from_millis(1_000)));
+    }
+
+    #[test]
+    fn budget_maximum_is_accepted() {
+        let config =
+            validate(parse(with_budget(json!(3_600_000))), &env_with(KEYS)).expect("valid");
+        assert_eq!(
+            config.pre_commit_budget,
+            Some(Duration::from_millis(3_600_000))
+        );
+    }
+
+    #[test]
+    fn budget_zero_is_refused_not_unlimited() {
+        let errors = budget_errors(json!(0));
+        assert_eq!(
+            errors,
+            [ConfigError::BadPreCommitBudget {
+                minimum: 1_000,
+                maximum: 3_600_000
+            }]
+        );
+        assert!(errors[0].to_string().contains("0 does not mean unlimited"));
+    }
+
+    #[test]
+    fn budget_below_minimum_is_refused() {
+        assert_eq!(budget_errors(json!(999)).len(), 1);
+    }
+
+    #[test]
+    fn budget_above_maximum_is_refused() {
+        assert_eq!(budget_errors(json!(3_600_001)).len(), 1);
+    }
+
+    #[test]
+    fn budget_null_or_negative_or_a_misspelt_key_is_refused() {
+        // `null` is not a second spelling of "disabled": absence is the only one.
+        assert!(serde_json::from_value::<RouterFile>(with_budget(json!(null))).is_err());
+        assert!(serde_json::from_value::<RouterFile>(with_budget(json!(-1))).is_err());
+        let mut file = valid();
+        file["request"] = json!({"pre_commit_budget": 30_000});
+        assert!(
+            serde_json::from_value::<RouterFile>(file).is_err(),
+            "the section still refuses unknown keys"
+        );
+    }
+
+    #[test]
+    fn a_classifier_timeout_at_least_the_budget_warns_but_is_valid() {
+        let mut file = with_budget(json!(5_000));
+        file["auto_route"] = json!({
+            "enabled": true, "fallback_route": "Fast",
+            "classifier": {"routes": ["Coder", "Fast"],
+                           "lightweight": {"route": "Fast", "timeout_ms": 5_000}},
+            "rules": [{"name": "semantic", "when": {}, "classify": true}]
+        });
+        let config = validate(parse(file.clone()), &env_with(KEYS)).expect("valid");
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("5000 ms"), "{warnings:?}");
+
+        file["auto_route"]["classifier"]["lightweight"]["timeout_ms"] = json!(4_999);
+        let config = validate(parse(file), &env_with(KEYS)).expect("valid");
+        assert!(config.warnings().is_empty());
     }
 
     #[test]
