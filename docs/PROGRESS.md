@@ -2792,3 +2792,47 @@ Master `790bbc1` was validated:
 **Next:** `feature/router-shared-request-budget` is created from validated
 master after this record merges. There is no implementation until explicit
 approval. R9.4 is not started.
+
+### R9.3.2 metric decision FROZEN: `request_budget_exhausted` outcome
+
+This was approved after the design merged and is recorded in docs only.
+There is no runtime change.
+
+`router_requests_total` gains a distinct terminal outcome,
+`request_budget_exhausted`. It is never folded into `server_error`:
+
+| Outcome | Meaning |
+|---|---|
+| `server_error` | an actual server or internal failure |
+| `unavailable` | a route or deployment availability failure |
+| `request_budget_exhausted` | the configured pre-commit budget was the causal terminal condition |
+
+- **Causal only.** A completed route result is never relabelled because the
+  clock passed the deadline. Example A (General `route_unavailable` at
+  29.9 s, then the budget expires at 30.0 s) keeps the route's own outcome.
+  Example B (General uncommitted, waiting for its head at the deadline)
+  counts `request_budget_exhausted`.
+- **One count per client request.** It is never counted per deployment
+  attempt, same-route retry, cross-route fallback or classifier attempt.
+- **Terminal attempted route.** `Auto → Coder → General` with General cut
+  counts `route="General"`, never Coder or Auto.
+- **Before any route attempt.** The label is `Auto` for an `Auto` request,
+  or the client-named route for an explicit one (`model: "Coder"` counts
+  `route="Coder"`). A route is never invented.
+- **R9.2 history stays neutral.** Exhaustion is unscored, never a
+  route-quality failure, never a route-choice input and never a
+  fallback-order input.
+
+Recorded in:
+- `docs/R9_3_2_SHARED_REQUEST_BUDGET.md`: section 34 (frozen block, outcome
+  table, examples), invariant I14, appendix row 14, B30 extended, new
+  mutation M28 ("counted as `server_error`");
+- `docs/ROUTER.md`: a metrics note marked "not implemented and not emitted
+  by this version", and an R9.3.2 roadmap row (design frozen, not
+  implemented).
+
+CHANGELOG is unchanged, because it records shipped behaviour only.
+
+**Next:** release v0.6.0 from validated master, with R9.3.2 runtime still
+paused. `feature/router-shared-request-budget` stays untouched. R9.4 is not
+started.

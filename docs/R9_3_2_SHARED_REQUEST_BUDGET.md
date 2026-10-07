@@ -43,7 +43,7 @@ ids (B*n*) refer to section 39.
 | I11 | **Same-route and cross-route attempts share the one budget.** | B4, B5 |
 | I12 | **Node queue / response-head wait is bounded by the remaining budget.** | B14, B15 |
 | I13 | **Streaming/non-streaming asymmetry is intentional** (section 13). | B21, B22 |
-| I14 | **`router_requests_total` counts one per client request.** It uses the terminal attempted route when one exists. It never invents a route when none was attempted (section 34). | B28–B30 |
+| I14 | **`router_requests_total` counts one per client request**, with its own outcome `request_budget_exhausted` (never `server_error`), used only when the budget is causal. The label is the terminal attempted route when one exists. Before any attempt it is `Auto` or the client-named route; a route is never invented (section 34, frozen). | B28–B30 |
 | I15 | **Upstream non-streamed cancellation must be measured** in implementation. The 504 must be prompt even if the upstream continues. | B38, B39 |
 | I16 | **Config absent = disabled; `0` = invalid.** | B1, B41 |
 | I17 | **R9.4 remains untouched.** | — |
@@ -901,20 +901,61 @@ Effect on existing metrics:
 
 ## 34. `router_requests_total` semantics
 
+> **Frozen decision (approved after the design merged; recorded by PR
+> "docs(router): freeze request budget outcome semantics").**
+> `request_budget_exhausted` is its **own terminal outcome** of
+> `router_requests_total`. It is **never** folded into `server_error`. It is
+> used **only** when the pre-commit budget causally ended the request
+> (section 7). R9.3.2 runtime is not implemented. No released version emits
+> this value until the implementation ships.
+
 The established rule holds: **one client request → one
 `router_requests_total` observation.** It is never multiplied by deployment
-attempts, same-route retries or fallback routes.
+attempts, same-route retries, cross-route fallbacks or classifier attempts.
 
-- **Outcome label:** a new value, `request_budget_exhausted`, alongside `ok`,
-  `client_error`, `server_error` and `unavailable`.
-  - This follows the precedent of `unavailable`, which was split from
-    `server_error` because "capacity, not correctness, ran out". Time ran
-    out here, not correctness. Counting it as `server_error` would show a
-    route correctness failure, which is the opposite of section 16.
-  - It is additive. The value appears only when the budget is configured
-    and fires.
-  - The metric's HELP text does not list outcome values, so it needs no
-    change. The R9.3 UI's HELP lock check stays valid.
+**Outcome label:** a new value, `request_budget_exhausted`, alongside `ok`,
+`client_error`, `server_error` and `unavailable`. The outcomes mean:
+
+| Outcome | Meaning |
+|---|---|
+| `server_error` | an actual server or internal failure |
+| `unavailable` | a route or deployment availability failure |
+| `request_budget_exhausted` | the configured pre-commit request budget was the **causal terminal condition** |
+
+Budget exhaustion is not necessarily a server fault. Its causes include:
+- an operator-chosen budget;
+- slow classifier execution or slow CPU inference;
+- node queueing or network latency;
+- slower hardware;
+- several legitimate same-route and cross-route attempts sharing the budget.
+
+So `server_error` would misreport it, and so would `unavailable`. This
+follows the precedent of `unavailable`, which was split from `server_error`
+because "capacity, not correctness, ran out".
+
+**The outcome is causal, not clock-based** (section 7):
+- **Example A:** General returns `route_unavailable` at 29.9 s, and the
+  budget expires at 30.0 s afterwards. The outcome stays the route's normal
+  outcome (`unavailable`), **not** `request_budget_exhausted`. A completed
+  route result is never relabelled because the clock passed the deadline.
+- **Example B:** General is still uncommitted, waiting for its response head,
+  when the deadline expires. The outcome is `request_budget_exhausted`.
+
+**Compatibility:**
+- The value is additive. It appears only when the budget is configured and
+  fires, so with no budget the series are unchanged.
+- The metric's HELP text does not list outcome values and needs no change.
+  The R9.3 UI's HELP lock check stays valid.
+- Dashboards that sum `server_error` will **not** include budget exhaustion,
+  which is intended. Operators should alert on it separately.
+
+**Route-quality history is separate** (section 16). A
+`request_budget_exhausted` request is neutral and unscored in R9.2 route
+history. It never raises or lowers a route's score, never counts as a route
+quality failure, never influences a future route choice and never affects
+R9.3 fallback ordering. Metric observability and route-quality history are
+separate concerns.
+
 - **Route label:**
 
 | When the budget stopped the request | `route` label | Why |
@@ -924,10 +965,15 @@ attempts, same-route retries or fallback routes.
 | an `Auto` request, before any route attempt began (`classifier` or `route_planning` stage) | **`Auto`** | existing convention: `resolve_auto` counts an Auto request that ends before a route takes it under the fixed `AUTO_ROUTE` label, "a fixed name, never one a client typed". No logical route is invented: neither the classifier's verdict nor its `fallback_route` nor the resolved-but-unattempted route |
 | an explicit request, before its first attempt began (`route_planning` stage) | the route the client named | existing convention: an explicit request's pre-attempt refusals already count under the named route (the requirements refusal in `route_request`). The client chose it; nothing is invented. In practice reachable only under controlled time. |
 
-Example: `Auto → Coder → General`, and the budget expires while General is
-uncommitted:
-`router_requests_total{route="General",outcome="request_budget_exhausted"} += 1`
-and nothing else.
+Examples:
+
+| Request | Budget expires | Counted |
+|---|---|---|
+| `Auto → Coder → General` | while General is uncommitted | `{route="General",outcome="request_budget_exhausted"}` once. **Not** Coder, **not** Auto, and no other entry. |
+| `Auto` | before its first route attempt | `{route="Auto",outcome="request_budget_exhausted"}` once |
+| explicit `model: "Coder"` | before the Coder attempt begins | `{route="Coder",outcome="request_budget_exhausted"}` once |
+
+No route name is ever fabricated.
 
 The existing `_unknown` label (`UNKNOWN_ROUTE`) stays reserved for names that
 resolve to no route. It is never used for budget exhaustion.
@@ -1035,7 +1081,7 @@ question.
 | B27 | same request id | one id on every attempt, every node log, the 504 and the trace; nested `{id}-classify` inherits the deadline |
 | B28 | `router_requests_total` once | multi-deployment, multi-route expiry increments it exactly once |
 | B29 | terminal-route label | `Auto → Coder → General`, expiry while General is uncommitted: `route="General", outcome="request_budget_exhausted"` |
-| B30 | expiry before any route | Auto expiry during classification: `route="Auto"`; never the verdict, `fallback_route` or `_unknown` |
+| B30 | expiry before any route | Auto expiry during classification: `route="Auto"`; never the verdict, `fallback_route` or `_unknown`. Explicit `Coder` expiry before its attempt: `route="Coder"`. Outcome `request_budget_exhausted` in both. |
 | B31 | R9.2 history neutrality | a cut route gets `neutral` only; a refused (never-attempted) route gets no observation; a completed qualifying failure keeps the observation it earns with no budget; never `server_error` |
 | B32 | R9.2 scoring independence | identical scoring decisions for any remaining budget, including none |
 | B33 | fallback order independence | identical fallback order and eligibility for any remaining budget |
@@ -1086,6 +1132,7 @@ test:
 | M25 | remove the max bound, or allow `0` as unlimited | B41 |
 | M26 | mark node health failed on a budget cut | B13, B45 |
 | M27 | let explicit routes cross-route fallback when a budget is set | B17 |
+| M28 | count budget exhaustion as `server_error` in `router_requests_total` | B29, B30 |
 
 ## 41. Implementation acceptance criteria
 
@@ -1095,7 +1142,7 @@ R9.3.2 slice 1 is done only when **all** of these hold:
 2. B1–B45 pass. B38/B39 ran against a real gateway, and their result is
    written in `docs/ROUTER.md` with one of section 26's acceptable outcomes.
    "Router waits for the full generation" fails the slice.
-3. Mutations M1–M27 were applied one at a time and each was caught. The
+3. Mutations M1–M28 were applied one at a time and each was caught. The
    result is recorded in `docs/PROGRESS.md`.
 4. With no config, behaviour is byte-identical (B1). Every existing router,
    classifier and R9.3.1 test passes unmodified. No test or lint was
@@ -1151,7 +1198,7 @@ explicit approval:
 6. The trace block and outcome; the `router_requests_total` outcome value
    and label rules (section 34); the three metrics; the classifier outcome
    value; `GET /api/router/v1/request-budget`.
-7. Tests B1–B45, mutations M1–M27, the real-gateway cancellation measurement
+7. Tests B1–B45, mutations M1–M28, the real-gateway cancellation measurement
    and a real-router smoke.
 8. The `docs/ROUTER.md` operator section.
 
@@ -1175,7 +1222,7 @@ to R9.3.1, R9.4.
 | 11 | Representation? | **One absolute `tokio::time::Instant`**; remaining derived by `saturating_duration_since`. |
 | 12 | Cap existing limits? | **Yes**: min(own limit, remaining); unbounded waits get the remainder. |
 | 13 | Config? | **`request.pre_commit_budget_ms`**, absent = disabled, `0` invalid, 1 000 – 3 600 000. |
-| 14 | `router_requests_total`? | **Once**; outcome `request_budget_exhausted`; terminal attempted route; `Auto` (Auto) or the named route (explicit) before any attempt. |
+| 14 | `router_requests_total`? | **Frozen:** once; its own outcome `request_budget_exhausted` (not `server_error`), used only when the budget is causal; terminal attempted route; `Auto` (Auto) or the named route (explicit) before any attempt. |
 | 15 | Trace stage vocabulary? | `classifier`, `route_planning`, `same_route_attempt`, `cross_route_fallback`. |
 | 16 | Nested classifier request? | Inherits the deadline and start checks; records no budget metric; its 504 maps to classifier outcome `request_budget_exhausted`. |
 | 17 | Upstream cancellation? | Router side immediate. Node side proven for streams; **measured for non-streamed in implementation** (B38/B39). |
