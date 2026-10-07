@@ -2673,9 +2673,9 @@ generation, so a pre-commit budget bounds a non-streamed generation.
 Recommended design:
 - an opt-in `request.pre_commit_budget_ms` (1000–3600000, 0 refused, no
   default value);
-- one monotonic `RequestDeadline` created at `received` in `forward_as`
-  (after the body is read, before parse, classification and routing),
-  passed by value, and inherited by the nested classifier;
+- one monotonic deadline created at `received` in `forward_as` (after the
+  body is read, before parse, classification and routing), passed by value,
+  and inherited by the nested classifier;
 - applies to all client requests, and covers R9.1, R9.2, planning, every
   same-route attempt and every cross-route fallback with no reset;
 - caps each wait at min(own limit, remaining);
@@ -2685,5 +2685,65 @@ Recommended design:
 - cancellation stays `cancelled`;
 - never a routing signal, an R9.2 input or a history observation.
 
-**Next:** review of this design (STOP). Implementation (R9.3.2 slice 1, section 33)
-needs explicit approval. R9.4 is not started.
+### Design hardening (PR #45, before merge)
+
+The design was restructured into the 43 required sections, with a
+frozen-invariants table (I1–I17) at the top. The approved refinements are
+now explicit:
+
+- **Causal exhaustion (section 7).** The 504 is returned only when a wait
+  was cut before its operation completed, or a start check refused a step
+  the frozen rules would have started. Example A (General's
+  `route_unavailable` at 29.9 s) stays `route_unavailable`. Example B (still
+  waiting for the head at 30 s) is a 504. Nothing is rewritten after the
+  fact.
+- **Deterministic race (section 8).** Every bounded wait is `timeout_at`.
+  Verified in the locked tokio 1.53.1: `Timeout::poll` polls the operation
+  before the delay, so a ready operation always wins. An unbiased `select!`
+  is forbidden. Ties at a start check count as expired, and ties between
+  the classifier and the budget go to the budget. Fake-time tests repeat
+  each case 1 000 times.
+- **One absolute deadline (section 9).** `RequestBudget { deadline:
+  tokio::time::Instant, … }`. Remaining time is derived with
+  `saturating_duration_since`; no `remaining_ms` is passed between stages.
+- **Pre-commit naming and scope (sections 12–13).** The streamed versus
+  non-streamed asymmetry is accepted. A post-commit stream or lifetime
+  deadline is a separate future feature.
+- **Start check before new work (section 19).** It covers six start points.
+  An unstarted attempt takes no lease, no transition, no failover count and
+  no trace attempt. `next_unattempted_route` is recorded only for a refused
+  route.
+- **Timeouts and the budget.** Local limits stay as ceilings, at min(own,
+  remaining) (sections 20–22). An unbounded head wait and the node queue get
+  the remainder. A budget cut never marks node health.
+- **Classifier timeout versus the budget (sections 14–15).**
+  - The nested classifier inherits the deadline and its start checks, and
+    records no budget metric.
+  - On a budget expiry the classifier outcome is `request_budget_exhausted`,
+    never `timeout`, and there is no R9.1 fallback.
+- **Explicit routes (section 23).** The budget applies; cross-route fallback
+  still does not.
+- **R9.2 neutrality (section 16).** A cut route gets the `Neutral`
+  observation (already what `Observation::of_outcome` returns for an unknown
+  outcome). A refused route gets no observation. A completed qualifying
+  failure keeps its normal observation.
+- **`router_requests_total` (section 34).**
+  - Counted once, with a new outcome value `request_budget_exhausted`,
+    following the `unavailable` precedent; the HELP text is unchanged.
+  - The label is the terminal attempted route.
+  - Before any attempt, the label follows existing conventions: `Auto` for
+    an Auto request (the `resolve_auto` pre-routing label), or the named
+    route for an explicit one. No route is invented, and `_unknown` is never
+    used.
+- **Upstream cancellation (section 26).** Measuring non-streamed
+  cancellation is an acceptance requirement. Waiting for the full
+  generation fails the slice.
+- **Config and tests.**
+  - Absent = disabled, `0` = invalid, bounds 1 000 – 3 600 000 (sections
+    28–30).
+  - Test plan B1–B45, mutation plan M1–M27, and acceptance criteria in
+    section 41.
+
+**Next:** merge PR #45 after a green Actions matrix, validate master, then
+freeze. Implementation (R9.3.2 slice 1, section 43) needs explicit approval.
+R9.4 is not started.
