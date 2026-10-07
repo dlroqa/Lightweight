@@ -2506,3 +2506,39 @@ frozen R9.3.1 definition with no deviation. R9.4 is not started.
 
 **Next:** review of this branch (not merged). A UI follow-up and any R9.3.x
 or R9.4 work need explicit approval.
+
+### R9.3.1 MERGED and FROZEN
+
+PR #43 was merged as `cf3380b`. The reviewed head was `3c4352e`; before
+merging I added `ea8b14e`, a documentation-only fix stating that
+`router_requests_total` counts each request once under its **final**
+logical route, which a test now asserts. All 8 jobs were green on
+`ea8b14e`, and the merged tree is identical to it.
+
+Master was validated:
+- local `check.sh` green, with 1328 tests and contract 47/2;
+- Actions check run 37556974060 (all 7 jobs) and render panel run
+  37556974202, green;
+- no release workflow ran.
+
+Real-router smoke A–I on the master binary all passed:
+- A: Auto → Coder (down) → General, `model: General`, with trace
+  initial/final.
+- B: Coder/A down, Coder/B healthy → CoderB, no fallback.
+- C: both deployments refused 503 → `route_exhausted` (a distinct reason
+  and metric) → General.
+- D: explicit Coder got its own 503; General was not hit.
+- E: a 500 was returned as is.
+- F: a committed stream broke in-band.
+- G: Coder → General → Reasoning; Research was hit 0 times.
+- H: `model` named the final route.
+- I: one `router_requests_total` count under the final route, with
+  `router_cross_route_fallback_total` showing the transition.
+
+**Frozen:** an `Auto`-selected route goes through normal same-route
+routing. On a qualifying pre-commit route-level failure
+(`route_unavailable`, `route_exhausted` or `route_capability_mismatch`), the
+request follows the initial route's flat list, and each fallback route uses
+normal deployment routing again. Frozen exclusions: explicit routes, 500,
+context overflow, post-commit failures, classifier retry, R9.2 re-scoring,
+history, latency, placement actions, transitive traversal, and MoA.
