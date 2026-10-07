@@ -1269,8 +1269,8 @@ configured routes and the three reasons only. Logs: `cross-route fallback`
 
 ## Pre-commit request budget (R9.3.2)
 
-Status: **slice 1 implemented on `feature/router-shared-request-budget`, not
-released.** Design: [R9_3_2_SHARED_REQUEST_BUDGET.md](R9_3_2_SHARED_REQUEST_BUDGET.md).
+Status: **slice 1 merged (PR #49, `eefa5b2`) and frozen; not yet in a
+release.** Design: [R9_3_2_SHARED_REQUEST_BUDGET.md](R9_3_2_SHARED_REQUEST_BUDGET.md).
 
 An optional time budget for one client request. It answers one question:
 
@@ -2431,7 +2431,7 @@ or an address.
   `_unknown`.
 
   With a [pre-commit request budget](#pre-commit-request-budget-r932)
-  configured (R9.3.2 slice 1, unreleased), a fifth outcome can appear:
+  configured (R9.3.2 slice 1, merged, not yet released), a fifth outcome can appear:
   `request_budget_exhausted`.
   - It is **not** `server_error` (an actual server failure) and not
     `unavailable` (an availability failure). It means the configured
@@ -2679,7 +2679,7 @@ identity.
 | **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
 | **R9.2** | Slice 1 done ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): off-by-default scoring of an accepted classification's verdict route against the classifier fallback (whose signal is the explicit classifier baseline), by classifier signal and operator priors only; a hard below-threshold boundary; an influence radius `prior / classifier` validated under half the accepted range; route-history observations (decayed, shown, resettable) that never affect routing, with `weights.history` required to be 0; traces, metrics, admin view and an admin history reset. Deliberately left out: history scoring until a route-attributable quality signal exists, latency and context-fit scoring, Jev per-option probabilities, provider calibration, availability penalties, persistence, exploration, learned weights, and any UI. |
 | **R9.3** | R9.3.1 done ([design](R9_3_CROSS_ROUTE_FALLBACK.md)): explicit, ordered per-route fallback lists (`auto_route.cross_route_fallback`, at most 3, acyclic, never transitive) for `Auto`-resolved requests only, after same-route failover and before response commit, on `route_unavailable`, `route_exhausted` and `route_capability_mismatch`. The response names the serving route; an exhausted list returns the final route's own error; requests are counted once. Deliberately left out: explicit-route fallback, context-overflow, 500 or latency triggers, a shared request budget, reason-specific lists, and UI. |
-| **R9.3.2** | Slice 1 implemented on `feature/router-shared-request-budget`, **not released**; see [Pre-commit request budget](#pre-commit-request-budget-r932) ([design](R9_3_2_SHARED_REQUEST_BUDGET.md)): an opt-in shared Pre-Commit Request Budget (`request.pre_commit_budget_ms`), with one absolute monotonic deadline per client request. It is shared by classification, same-route failover and cross-route fallback, checked before each new attempt, and caps existing timeouts. It ends with a causal `504 request_budget_exhausted` and a distinct `router_requests_total` outcome. It is never a routing signal and is neutral to R9.2 history. Deliberately left out: post-commit/stream deadlines, client-supplied deadlines, per-route budgets, latency-aware selection. |
+| **R9.3.2** | Slice 1 merged (PR #49) and **frozen**, **not released**; see [Pre-commit request budget](#pre-commit-request-budget-r932) ([design](R9_3_2_SHARED_REQUEST_BUDGET.md)): an opt-in shared Pre-Commit Request Budget (`request.pre_commit_budget_ms`), with one absolute monotonic deadline per client request. It is shared by classification, same-route failover and cross-route fallback, checked before each new attempt, and caps existing timeouts. It ends with a causal `504 request_budget_exhausted` and a distinct `router_requests_total` outcome. It is never a routing signal and is neutral to R9.2 history. Deliberately left out: post-commit/stream deadlines, client-supplied deadlines, per-route budgets, latency-aware selection. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
 Out of scope for every one of these: a request-path model load, splicing one
