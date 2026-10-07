@@ -2581,3 +2581,74 @@ config write API. Traces are read from the existing
 - **Real UI smoke:** local `scripts/render-panel.sh` (gateway on 18434, the
   user's 11434 untouched) passed 89 checks with 0 failures. The summary and
   trace cards were also captured and reviewed.
+
+### Finalization: a successful fallback rendered live
+
+The render covered only an exhausted list, so before merging, `4415a58`
+added a successful one. Two scripted nodes (`e2e/mock-node.mjs`) join the
+render router as second Coder and General deployments. They start with no
+model, so the exhausted scenario runs exactly as before. The render then
+loads them, and a real `Auto` tools request goes Coder (`coder-b` 503,
+`route_exhausted`) → General (`general-b` 200, `model: "General"`).
+
+The real panel shows:
+- requested Auto, initial Coder, final General, and *Served by General*;
+- no exhausted marker;
+- the steps Coder then General, with Coder's reason;
+- each route's same-route attempt under its own route;
+- both reasons on the Coder → General counter, and no new exhausted count.
+
+Lock checks were added for exactly three triggers, the explicit-route and
+post-start exclusions, and the identity and `router_requests_total` help.
+The render now passes 110 checks (gateway 10, router 100; router was 79).
+Frontend unit tests: 53. Nothing under `crates/` changed.
+
+### R9.3 UI MERGED and FROZEN
+
+PR #44 was merged as `49ce10d` (head `4415a58`, merge commit,
+`--match-head-commit`). On `4415a58`, Actions check run 37565148063 (all 7
+jobs) and render panel run 37565148008 were green.
+
+Master was validated:
+- local `cargo fmt --check` and `cargo clippy --workspace --all-targets -D
+  warnings` clean;
+- Actions check run 37565790532 (`check.sh` on Linux, Windows, macOS x64 and
+  arm64, plus Flatpak, Linux artifacts and render icons) green;
+- render panel run 37565790560 green, at 110/110;
+- no Rust changed since `cf3380b`;
+- no release workflow ran.
+
+**Router-panel smoke on master** was the render panel run above: the real
+router binary serving the real panel in a real browser. Every item passed:
+- the card loads, with the Coder → General chain, max 3, the three triggers
+  and the four exclusions (explicit route, 500, context overflow, post-start
+  stream);
+- the non-transitive help, same-route versus cross-route, `model` help and
+  `router_requests_total` help are shown;
+- the snippet is generated and Copy is read back canonical from the
+  clipboard; a cycle is blocked and named, and every other refusal works;
+- the `validate-config` and restart-required steps are shown;
+- the counters render, and both the successful and the exhausted live traces
+  render;
+- the classifier screen passes all its checks, the gateway panel's nine
+  screens are unchanged, and the TypeSafe key leaks nowhere.
+
+**Frozen R9.3 UI contract.** On the existing router panel, **Auto Routing →
+Cross-Route Fallback** shows:
+- Auto-only scope, max 3 fallback routes (at most 4 logical-route attempts),
+  the three approved triggers and the explicit exclusions;
+- the non-transitive rule, and same-route failover kept distinct from
+  cross-route fallback;
+- the configured lists, transition counters by reason, and exhausted counts;
+- successful and exhausted trace paths;
+- `response.model` = final serving route, and `router_requests_total` once
+  per request under the final route;
+- the validated snippet workflow: draft → frontend validation → canonical
+  `cross_route_fallback` snippet → Copy → paste into `router.json` →
+  `hermes router validate-config` → restart.
+
+There is no backend config mutation API.
+
+**Operational state:** the R9.3.1 backend and the R9.3 UI are operationally
+complete. R9.3.2 (shared request budget) is design only, on
+`design/router-shared-request-budget`. R9.4 is not started.
