@@ -4,6 +4,49 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-07
+
+This release completes the router's **adaptive orchestration stack**, up to
+and including bounded cross-route recovery. It builds on v0.5.0's federated
+routing foundation, which already included:
+- multi-node routes;
+- health-aware failover;
+- capability filtering;
+- the `priority`, `round_robin` and `least_busy` policies.
+
+New in v0.6.0:
+- **Observability and session affinity (R6).**
+- **Placement and warm standby (R7).**
+- **Rule-based `Auto` routing (R8).**
+- **Content-aware classification (R9.1)**, through a provider-neutral
+  classifier boundary with **Lightweight and TypeSafe Jev providers
+  (R9.1a)**, plus the router panel's **Auto Routing and Classifier
+  screens**.
+- **Adaptive logical-route scoring (R9.2).** It uses the classifier signal
+  and bounded operator priors. Route history is **observational only** and
+  never steers routing.
+- **Explicit cross-route fallback (R9.3.1)**, with its **panel cards**:
+  - `Auto` requests only, after same-route failover and before the response
+    commits;
+  - on `route_unavailable`, `route_exhausted` and
+    `route_capability_mismatch` only;
+  - one flat, non-transitive list per initial route, with at most 3 fallback
+    routes;
+  - traces, counters and the admin view;
+  - `response.model` names the final serving route, and
+    `router_requests_total` counts each request once under its final route.
+
+**Not in this release:**
+- **R9.3.2 shared pre-commit request-budget enforcement is NOT part of
+  v0.6.0.** Its design is frozen in `docs/R9_3_2_SHARED_REQUEST_BUDGET.md`,
+  but there is no runtime support. There is no `request.pre_commit_budget_ms`
+  setting, no `504 request_budget_exhausted`, and no
+  `request_budget_exhausted` metric outcome.
+- No client-supplied deadlines and no post-commit stream deadline.
+- No R9.4 / mixture-of-agents.
+- No transitive fallback graphs and no explicit-route cross-route fallback.
+- No latency-based route selection and no route-history scoring.
+
 ### Added
 
 - **Router panel: cross-route fallback.** Auto Routing gains three cards:
@@ -572,7 +615,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dlroqa/Lightweight/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dlroqa/Lightweight/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dlroqa/Lightweight/compare/v0.2.4...v0.4.0
