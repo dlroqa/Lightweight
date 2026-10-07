@@ -2747,3 +2747,48 @@ now explicit:
 **Next:** merge PR #45 after a green Actions matrix, validate master, then
 freeze. Implementation (R9.3.2 slice 1, section 43) needs explicit approval.
 R9.4 is not started.
+
+### R9.3.2 design MERGED and FROZEN
+
+PR #45 was merged as `790bbc1` (merge commit, `--match-head-commit`).
+- Previous head: `8465a69`. Reviewed final head: `8d6c26a`.
+- The final diff was docs only: this file and
+  `docs/R9_3_2_SHARED_REQUEST_BUDGET.md`.
+- On `8d6c26a`, Actions check run 37599670526 (all 7 jobs) and render panel
+  run 37599670492 were green.
+
+Master `790bbc1` was validated:
+- Actions check run 37600945837 was green: `check.sh`, including the secrets
+  gate, on Linux x64, Windows x64, macOS x64 and macOS arm64, plus Flatpak,
+  Linux artifacts and render icons.
+- Render panel run 37600945880 was green.
+- Local `cargo fmt --check` was clean, and no Rust changed since `49ce10d`.
+- No release workflow ran.
+
+**R9.3.2 design = frozen.** The strongest invariants:
+- one client request = one absolute monotonic deadline;
+- the budget is pre-commit only, and belongs to the client request;
+- the budget is causal, not merely clock-based;
+- deadline/error precedence is deterministic (`timeout_at` polls the
+  operation first; no unbiased `select!`);
+- the budget is checked before starting new work;
+- existing per-operation limits remain, capped by the remaining budget;
+- the classifier/provider timeout stays distinct from the overall deadline;
+- the budget applies to explicit routes too, and explicit routes still do not
+  cross-route fallback;
+- budget expiry is neutral to R9.2 history;
+- same-route attempts share one budget, and cross-route attempts share one
+  budget;
+- the node queue and response-head wait are bounded by the remaining budget;
+- post-commit behaviour is unchanged;
+- the streaming/non-streaming asymmetry is intentional;
+- `router_requests_total` remains one per request: the terminal attempted
+  route when one exists, and no invented route when none does;
+- upstream non-streamed cancellation must be measured during
+  implementation;
+- config absent = disabled, and zero = invalid;
+- R9.4 remains untouched.
+
+**Next:** `feature/router-shared-request-budget` is created from validated
+master after this record merges. There is no implementation until explicit
+approval. R9.4 is not started.
