@@ -1,9 +1,9 @@
 # R9.3.2 — Shared Pre-Commit Request Budget (design)
 
-Status: **design only; nothing implemented.** No runtime code, configuration,
-metric, trace field, admin field or UI exists for anything in this document.
-This revision is the final, hardened design. It is frozen when it is merged.
-Implementation (section 43) needs explicit approval.
+Status: **design FROZEN** (PR #45, merged as `790bbc1`). Nothing is
+implemented: no runtime code, configuration, metric, trace field, admin field
+or UI exists for anything in this document. Implementation (section 43) needs
+explicit approval. A change to a frozen invariant needs a new design review.
 
 It builds on these frozen pieces: the R9.3 design
 ([R9_3_CROSS_ROUTE_FALLBACK.md](R9_3_CROSS_ROUTE_FALLBACK.md); its decision 6
