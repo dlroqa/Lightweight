@@ -1697,6 +1697,47 @@ async fn b42_the_nested_classifier_request_inherits_the_deadline() {
     );
 }
 
+/// B42/B27 (#62, M3): the nested classification request runs on its
+/// parent's very deadline. It starts 300 ms after its parent here; a deadline
+/// of its own would come 300 ms later, the parent would cut it first, and its
+/// trace would read `cancelled`. Inherited, its own timer ends it at the same
+/// instant, and its budget's elapsed time is measured from the client's start.
+#[tokio::test]
+async fn b42_the_nested_request_ends_on_the_parents_deadline() {
+    let fleet = Fleet::start().await;
+    fleet.classifier.set(HANG);
+    let router = Router::start(
+        fleet.config(Some(classifying(json!({}), 10_000))),
+        Some(MIN_BUDGET),
+    )
+    .await;
+    router.before_planning(300);
+    let response = router
+        .post(
+            json!({"model": "Auto", "messages": [{"role": "user", "content": "PICK Coder 0.9"}]}),
+            &[("x-request-id", "nested-deadline")],
+        )
+        .await;
+    assert_eq!(response.status(), 504);
+    let traces = router.get("/api/router/v1/traces?limit=50").await;
+    let nested = traces["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|trace| trace["request_id"] == "nested-deadline-classify")
+        .cloned()
+        .expect("the nested request's trace");
+    assert_eq!(nested["outcome"], "request_budget_exhausted", "{nested}");
+    let budget = &nested["request_budget"];
+    assert_eq!(budget["configured_ms"], MIN_BUDGET);
+    assert!(
+        budget["elapsed_ms"].as_u64().unwrap() >= MIN_BUDGET,
+        "measured from the client's start: {budget}"
+    );
+    assert_eq!(router.state.metrics.budget_exhausted_total(), 1);
+    assert_eq!(router.exhausted(Stage::Classifier), 1);
+}
+
 /// B42, the nested request's same-route failover: its first classifier
 /// deployment failed just as the budget ran out, so its second is never asked.
 #[tokio::test]

@@ -223,3 +223,56 @@ describe("what the router reports", () => {
     ]);
   });
 });
+
+// R9.3.2: a request the pre-commit budget ended while on a fallback route. The
+// frozen screen predates these values; it must show them as written and never
+// fail on them (design test B44).
+describe("request-budget values the screen predates", () => {
+  it("lists a budget-ended fallback with its raw outcome and reason", () => {
+    const body = {
+      object: "list",
+      data: [
+        {
+          request_id: "budget",
+          route: "General",
+          requested_route: "Auto",
+          status: 504,
+          outcome: "request_budget_exhausted",
+          request_budget: {
+            configured_ms: 2000,
+            elapsed_ms: 2004,
+            remaining_ms: 0,
+            exhausted: true,
+            stage: "cross_route_fallback",
+          },
+          attempts: [
+            { route: "Coder", deployment: "coder/A", reason: "priority", outcome: "failed", upstream_status: 503 },
+            { route: "General", deployment: "general/G", reason: "priority", outcome: "request_budget_exhausted" },
+          ],
+          cross_route_fallback: {
+            initial_route: "Coder",
+            final_route: "General",
+            exhausted: false,
+            attempts: [
+              { route: "Coder", outcome: "failed", reason: "route_exhausted" },
+              { route: "General", outcome: "failed", reason: "request_budget_exhausted" },
+            ],
+          },
+        },
+      ],
+    } as unknown as TracesBody;
+    const traces = fallbackTraces(body);
+    assert.deepEqual(traces.map((t) => t.request_id), ["budget"]);
+    assert.deepEqual(deploymentsByRoute(traces[0]!), [
+      { route: "Coder", deployments: ["coder/A (failed 503)"] },
+      { route: "General", deployments: ["general/G (request_budget_exhausted)"] },
+    ]);
+    assert.equal(reasonLabel("request_budget_exhausted"), "request_budget_exhausted");
+  });
+
+  it("counts a refused transition nowhere", () => {
+    // The router never counts a transition to a route the budget refused, so
+    // the counts the screen reads simply do not contain it.
+    assert.deepEqual(transitionRows({ configured: true, counts: {}, exhausted: {} } as unknown as CrossRouteFallbackView), []);
+  });
+});

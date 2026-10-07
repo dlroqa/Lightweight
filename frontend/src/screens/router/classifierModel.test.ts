@@ -27,6 +27,7 @@ import {
   isLogicalRoute,
   keyStatus,
   normalizeBaseUrl,
+  outcomeLabel,
   ruleAction,
   validateDraft,
 } from "./classifierModel.ts";
@@ -374,5 +375,14 @@ describe("what the router reports, in words", () => {
   it("tells a semantic rule from a direct one", () => {
     assert.equal(ruleAction({ route: "Coder", classify: false }), "Route directly to Coder");
     assert.equal(ruleAction({ route: "General", classify: true }), "Semantic classification");
+  });
+});
+
+// R9.3.2 adds a classification outcome this frozen screen was built before.
+// It must show it as written, never fail on it (design test B44).
+describe("a request-budget outcome the screen predates", () => {
+  it("is shown as the router wrote it", () => {
+    assert.equal(outcomeLabel("request_budget_exhausted"), "request_budget_exhausted");
+    assert.equal(outcomeLabel("timeout"), "Timed out (fallback)");
   });
 });
