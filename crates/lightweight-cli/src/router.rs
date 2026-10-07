@@ -50,11 +50,21 @@ pub fn validate(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, S
             .map_or("none (`default` is refused)", |route| route.name.as_str()),
     ));
     summarize(&config, out);
+    for warning in config.warnings() {
+        out.push_str(&format!("  warning: {warning}\n"));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 /// The route table, as the operator configured it.
 fn summarize(config: &RouterConfig, out: &mut String) {
+    if let Some(budget) = config.pre_commit_budget {
+        out.push_str(&format!(
+            "  pre-commit request budget: {} ms for every client request, until its response \
+             starts (a non-streamed answer starts only when it is complete)\n",
+            budget.as_millis()
+        ));
+    }
     for route in config.topology.routes() {
         let deployments: Vec<&str> = route
             .deployments

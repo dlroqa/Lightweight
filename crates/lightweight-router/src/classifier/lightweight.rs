@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::{Candidate, ClassificationInput, ClassifierOutcome, Limits, Verdict};
 use crate::RouterState;
+use crate::budget::RequestBudget;
 use crate::domain::{Route, RouteName};
 use crate::proxy::{Endpoint, REQUEST_ID_HEADER};
 
@@ -162,22 +163,38 @@ pub fn parse_answer(body: &[u8], candidates: &[Candidate]) -> Result<Verdict, &'
 /// The request goes through the router's own pipeline as a nested request
 /// (`<request id>-classify`): the classifier route's health, capabilities and
 /// policy choose where it runs. Dropping this future — on timeout — drops the
-/// nested request, which closes its upstream connection.
+/// nested request, which closes its upstream connection. The nested request
+/// inherits the client request's pre-commit budget and starts none of its own.
 pub(super) async fn call(
     state: &Arc<RouterState>,
     classifier: &LightweightClassifier,
     candidates: &[Candidate],
     input: &ClassificationInput,
     nested_id: &str,
+    budget: Option<RequestBudget>,
 ) -> Result<Verdict, ClassifierOutcome> {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(nested_id) {
         headers.insert(REQUEST_ID_HEADER, value);
     }
     let body = Bytes::from(request_body(&classifier.route, candidates, input).to_string());
-    let response =
-        crate::proxy::forward_nested(Arc::clone(state), Endpoint::ChatCompletions, headers, body)
-            .await;
+    let response = crate::proxy::forward_nested(
+        Arc::clone(state),
+        Endpoint::ChatCompletions,
+        headers,
+        body,
+        budget,
+    )
+    .await;
+    // The nested request ran out of the budget it inherited: the router's own
+    // marker, never a node's 504 of the same name.
+    if response
+        .extensions()
+        .get::<crate::budget::ExhaustedMarker>()
+        .is_some()
+    {
+        return Err(ClassifierOutcome::RequestBudgetExhausted);
+    }
     if !response.status().is_success() {
         return Err(ClassifierOutcome::Unavailable);
     }

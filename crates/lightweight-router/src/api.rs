@@ -79,6 +79,7 @@ pub fn app_with_panel(state: Arc<RouterState>, web_root: Option<PathBuf>) -> Rou
         .route("/api/router/v1/sessions", get(sessions))
         .route("/api/router/v1/traces", get(traces))
         .route("/api/router/v1/auto", get(auto_rules))
+        .route("/api/router/v1/request-budget", get(request_budget))
         .route("/api/router/v1/classifier/check", post(classifier_check))
         .route(
             "/api/router/v1/adaptive-scoring/reset",
@@ -352,6 +353,7 @@ async fn metrics(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> R
                 &state.route_history,
                 std::time::Instant::now(),
             ));
+            text.push_str(&state.metrics.budget_to_prometheus(state.request_budget));
             text
         },
     )
@@ -466,6 +468,35 @@ async fn reconcile(State(state): State<Arc<RouterState>>, headers: HeaderMap) ->
 /// `GET /api/router/v1/auto`: `Auto`'s rules in the order they are tried,
 /// each with the route it chooses and how often it has. Read-only: rules
 /// change only with the configuration file.
+/// The pre-commit request budget (R9.3.2): what is configured and how often it
+/// ended a request. Read-only, and never anything about one request.
+async fn request_budget(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
+    if let Some(refusal) = authorize(&state, &headers) {
+        return refusal;
+    }
+    let by_stage: serde_json::Map<String, Value> = crate::budget::Stage::ALL
+        .iter()
+        .map(|stage| {
+            (
+                stage.as_str().to_owned(),
+                json!(state.metrics.budget_exhausted(*stage)),
+            )
+        })
+        .collect();
+    axum::Json(json!({
+        "object": "router.request_budget",
+        "configured": state.request_budget.is_some(),
+        "pre_commit_budget_ms": state
+            .request_budget
+            .map(|budget| u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)),
+        "scope": "all_client_requests",
+        "governs": "pre_commit",
+        "exhaustions_total": state.metrics.budget_exhausted_total(),
+        "exhaustions_by_stage": by_stage,
+    }))
+    .into_response()
+}
+
 async fn auto_rules(State(state): State<Arc<RouterState>>, headers: HeaderMap) -> Response {
     if let Some(refusal) = authorize(&state, &headers) {
         return refusal;

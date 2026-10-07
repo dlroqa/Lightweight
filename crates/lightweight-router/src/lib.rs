@@ -31,6 +31,7 @@
 pub mod affinity;
 pub mod api;
 pub mod auto_route;
+pub mod budget;
 pub mod capability;
 pub mod classifier;
 pub mod config;
@@ -80,6 +81,10 @@ pub struct RouterState {
     /// Shared by probes and requests, so connections to a node are pooled.
     pub client: reqwest::Client,
     pub metrics: RouterMetrics,
+    /// Each client request's pre-commit budget (R9.3.2), when configured.
+    /// Only the duration: the deadline is the request's own, made when it
+    /// arrives, and never kept here.
+    pub request_budget: Option<std::time::Duration>,
     /// Per-route policy state and the per-deployment in-flight counts.
     pub selector: Selector,
     /// The `auto_route` section, if the file has one. Only ever chooses a
@@ -159,6 +164,7 @@ impl RouterState {
             auth,
             client,
             metrics: RouterMetrics::default(),
+            request_budget: config.pre_commit_budget,
             selector,
             auto: config.auto.clone(),
             route_history: crate::scoring::HistoryBook::new(
