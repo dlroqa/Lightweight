@@ -69,6 +69,9 @@ pub struct ClassifierTrace {
 /// One deployment the request was sent to.
 #[derive(Clone, Debug, Serialize)]
 pub struct AttemptTrace {
+    /// The logical route this deployment was tried for: the request's route,
+    /// or — after a cross-route fallback (R9.3.1) — an earlier one.
+    pub route: String,
     pub deployment: String,
     /// The routing reason for this attempt.
     pub reason: &'static str,
@@ -131,6 +134,11 @@ pub struct RoutingTrace {
     /// logical route won and why, by named components. Never a deployment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring: Option<crate::scoring::ScoringTrace>,
+    /// Present when an `Auto` request moved to a fallback route (R9.3.1):
+    /// the initial and final routes, and every route attempt with its reason.
+    /// `route` above is the final route.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_route_fallback: Option<crate::fallback::FallbackTrace>,
     pub endpoint: &'static str,
     pub stream: bool,
     pub policy: &'static str,
@@ -191,6 +199,7 @@ impl RoutingTrace {
             auto_fallback: false,
             classifier: None,
             scoring: None,
+            cross_route_fallback: None,
             endpoint,
             stream: false,
             policy,

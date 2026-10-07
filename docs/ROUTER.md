@@ -46,6 +46,12 @@ This document covers milestones R0 to R8, and R9.1:
   confident classification, and never revives one the classifier was unsure
   of. See
   [Adaptive route scoring](#adaptive-route-scoring-r92).
+- **R9.3.1:** optional explicit cross-route fallback for `Auto` requests.
+  If the route `Auto` chose cannot execute (`route_unavailable`,
+  `route_exhausted`, `route_capability_mismatch`), the next route the
+  operator listed for it is tried. This happens only before commit and only
+  after same-route failover; the list is never transitive and never longer
+  than three entries. See [Cross-route fallback](#cross-route-fallback-r931).
 
 The [roadmap](#roadmap) lists what comes after.
 
@@ -434,10 +440,11 @@ operator's to choose.
   the chosen route: a `tools → Coder` rule does not prove every `Coder`
   deployment takes tools, and one that does not is passed over as for any
   request. If none can, the answer is `Coder`'s `route_capability_mismatch`.
-- **It never tries another route.** If the chosen route has nothing available,
-  the client gets that route's `503 route_unavailable` — not the fallback, and
-  not the next rule. Context-overflow failover stays inside the chosen route
-  too. Cross-route fallback would be multi-route failover; R8 has none.
+- **It never tries another route by itself.** If the chosen route has
+  nothing available, the client gets that route's `503 route_unavailable`,
+  not the fallback and not the next rule, unless the operator listed
+  fallback routes for it ([cross-route fallback](#cross-route-fallback-r931),
+  R9.3.1). Context-overflow failover always stays inside the chosen route.
 - **It never waits or loads.** A route that placement is still loading answers
   `route_unavailable` at once. `Auto` has no placement of its own and never
   asks for a load; the chosen route's placement target is the one that applies.
@@ -1109,6 +1116,151 @@ history "signal" gauge: no quality score exists to report.
 Scoring is arithmetic over at most two contenders. It makes no network call,
 no model call and no I/O, and it is counted inside `routing_ms`. A unit test
 bounds 10 000 decisions in a debug build.
+
+## Cross-route fallback (R9.3.1)
+
+When the logical route an `Auto` request resolved to **cannot execute** it,
+the router may try the next logical route the operator listed for that
+route, **before anything was committed** to the client. It is explicit
+recovery from a route's inability to execute. It is not reclassification,
+re-scoring, deployment failover, a quality retry or mixture-of-agents. Design:
+[R9_3_CROSS_ROUTE_FALLBACK.md](R9_3_CROSS_ROUTE_FALLBACK.md).
+
+```text
+Auto → R8 rule / R9.1 classifier / R9.2 score / fallback_route → initial route
+   → that route's own pipeline: health → R5 → affinity → policy → same-route failover
+        committed (any status)                                   → the answer
+        route_unavailable | route_exhausted | route_capability_mismatch (pre-commit)
+          → next entry of the initial route's list → the same pipeline again
+        anything else, or the list used up                       → that route's own error
+```
+
+### Configuration
+
+Under `auto_route`:
+
+```json
+"cross_route_fallback": {
+  "Coder":     ["General", "Reasoning"],
+  "Research":  ["General"],
+  "ToolAgent": ["General"]
+}
+```
+
+Each key is a route `Auto` can resolve to. Its value is the **complete,
+ordered** list of routes to try after it, with at most **3** entries
+(`MAX_FALLBACK_ROUTES`, fixed). So a request makes at most four
+logical-route attempts. There is no separate `enabled` flag: an absent
+section, or a route with no entry, means no cross-route fallback, and nothing
+changes.
+
+The file is refused at load for:
+- an unknown source or target, `Auto`, `default`, any reserved name, the
+  classifier's route, or an empty name;
+- an empty list, or one longer than 3 entries;
+- a self-reference, or a duplicate (compared ignoring case);
+- a source `Auto` can never resolve to;
+- a **cycle anywhere** in the union of all lists. Requests never walk that
+  graph, but a cycle is refused anyway.
+
+### Rules
+
+- **`Auto` only.** Only a request whose original `model` was `Auto` is
+  eligible, however `Auto` chose its route: a deterministic R8 rule (for
+  example `tool_choice=required → ToolAgent`), the R9.1 classifier, R9.2
+  scoring, or `fallback_route`. A client that named a route (`Coder`, in any
+  case or spelling), asked for `default`, or sent no `model` gets that route
+  or its error. The router's own classification requests never fall back.
+- **Same-route failover first.** A route fails only after its own pipeline
+  has finished: every deployment its plan listed was tried with the usual
+  pre-response failover. If one deployment refuses and another answers, the
+  route answered.
+- **Three triggers, all before commit:**
+
+  | `reason` | When |
+  |---|---|
+  | `route_unavailable` | no available deployment at planning, or every attempt failed without an answer (unreachable, a transport error before the head, `404 model_not_found`) |
+  | `route_exhausted` | every planned deployment was tried, and the route ended on a 502/503/504 refusal sent before any answer |
+  | `route_capability_mismatch` | no available deployment can serve this request's requirements |
+
+- **Never:**
+  - a 500, or any other committed answer;
+  - one deployment's refusal while candidates remain;
+  - `context_length_exceeded` (R5's in-route overflow failover is
+    unchanged);
+  - 429 or other 4xx;
+  - latency, TTFT or answer quality;
+  - a stream that breaks after commit;
+  - client cancellation;
+  - a classifier failure;
+  - anything from R9.2.
+- **The list is read once and never transitive.** The initial route's list
+  is copied into the request and followed in order. A fallback route's own
+  list is never consulted: with `Coder: [General, Reasoning]` and
+  `General: [Research]`, a request that started on Coder tries Coder,
+  General, Reasoning, and never Research.
+- **Nothing is weakened or re-decided.** Each fallback route runs R5 with the
+  request's original requirements: a `tool_choice=required` request is never
+  sent to a route that cannot do tools. The classifier is not asked again,
+  R9.2 does not score again, and no prior, history or latency picks the next
+  route. The file's order does.
+- **The commit boundary.** The decision is taken at the response head. Once
+  a deployment's answer is committed (stream or body, content, reasoning or
+  tool-call deltas), the route can no longer change, and no answer is ever
+  spliced from two routes. Today nodes execute no tools: tool calls are run
+  by the client after it receives a committed response. So nothing with an
+  external side effect can precede the head. **Future constraint:** if
+  Lightweight ever executes server-side side effects before commit, fallback
+  must also stop at that side-effect boundary.
+
+### What the client and the operator see
+
+- **`model` names the route that served the response**, for bodies, tool
+  calls and every stream frame. `Auto → Coder → General` answers `"model":
+  "General"`.
+- **An exhausted list returns the final attempted route's own error**, as
+  that route returns it (`503 route_unavailable` naming it, a node's
+  502/503/504 refusal, or `400 route_capability_mismatch`). There is no new
+  error code.
+- **One request id** across every route and deployment attempt.
+- **Affinity is per route.** Each route uses its own `(route, session)`
+  affinity. A fallback that succeeds settles the session for *that* route
+  only. The initial route's entry is untouched, and future `Auto` decisions
+  are not affected.
+- **No placement action.** A route still loading is simply
+  `route_unavailable`.
+- **No shared deadline.** R9.3.1 does not introduce an end-to-end request
+  budget. A chain whose nodes time out at connect adds up to
+  `request.connect_timeout_secs` per deployment per route attempt. Keep
+  chains short. Health probing keeps known-down nodes out of plans at no
+  cost.
+- **Counting.** `router_requests_total` counts each client request **once**,
+  under the final route. Route history (R9.2, observational) records each
+  route attempt.
+
+Trace (route names and reasons only; `route` is the final route, and each
+deployment attempt carries its `route`):
+
+```json
+"requested_route": "Auto", "route": "General",
+"cross_route_fallback": {
+  "initial_route": "Coder", "final_route": "General", "exhausted": false,
+  "attempts": [
+    {"route": "Coder",   "outcome": "failed", "reason": "route_exhausted"},
+    {"route": "General", "outcome": "committed"}
+  ]
+}
+```
+
+Metrics: `router_cross_route_fallback_total{from_route,to_route,reason}` and
+`router_cross_route_fallback_exhausted_total{route,reason}`, labelled with
+configured routes and the three reasons only. Logs: `cross-route fallback`
+(`request_id`, `initial_route`, `from_route`, `to_route`, `reason`,
+`attempt`) and `cross-route fallback ended without an answer`
+(`final_route`, `exhausted`). `GET /api/router/v1/auto` gains
+`cross_route_fallback`: `configured`, `chains`, `max_routes`, `triggers`,
+`applies_to: "auto"`, `counts` (from → to → reason) and `exhausted`
+(initial route → reason). There is no UI yet.
 
 ## Health
 
@@ -1838,7 +1990,7 @@ only as `"bearer"` or `"none"`.
 | `GET /api/router/v1/sessions` | Whether affinity is on, its header, TTL and limit, how many sessions are live, evictions by reason, and each live entry: `route`, `session` (an 8-hex-digit keyed fingerprint, never the id), `deployment`, `age_secs`, `idle_secs`. |
 | `GET /api/router/v1/placement` | Whether placement runs, its interval and load timeout, the last pass, and per route with a target: `min_ready`, `warm_standby`, `target`, `ready`, `ready_standby`, `loading`, `pending_loads`, `status`, and each deployment's `state`, `allowed`, `last_result` (action, result, reason, the node's code, time, duration), `consecutive_failures`, `retry_in_secs`. |
 | `POST /api/router/v1/placement/reconcile` | Runs a placement pass now. It plans exactly what the interval would; it cannot name a node, force a load or skip a backoff. `202`, or `409 placement_not_configured`. |
-| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). With scoring, an `adaptive_scoring` block (settings, `history_mode: "observational"`, `history_affects_scoring: false`, and per-route history observations; see [Observability](#observability-2)). Read-only; rules change only with the file. |
+| `GET /api/router/v1/auto` | Whether `Auto` is configured and on, its `fallback_route` and `fallback_decisions`, and its rules in the order they are tried: `position`, `name`, `when` (as written), `condition` (`requires_tools=true AND requires_reasoning=true`), `route`, `classify`, `decisions`. With a classifier, a `classifier` block (route, candidates and descriptions, fallback, `min_confidence`, `timeout_ms`, `max_input_chars`, `invoked_by`, `outcomes`). With scoring, an `adaptive_scoring` block (settings, `history_mode: "observational"`, `history_affects_scoring: false`, and per-route history observations; see [Observability](#observability-2)), and a `cross_route_fallback` block (lists, `max_routes`, `triggers`, `applies_to`, counts and exhaustions). Read-only; rules change only with the file. |
 | `POST /api/router/v1/adaptive-scoring/reset` | Forgets adaptive scoring's route history: all routes, or `{"route": "Coder"}` for one. Touches nothing else. `409 adaptive_scoring_not_enabled` when scoring is absent or off. See [Resetting history](#resetting-history). |
 | `POST /api/router/v1/classifier/check` | Checks the active classifier provider now and records the result: for Jev, `GET /v1/models` (key accepted, model listed); for the Lightweight provider, whether its classifier route is available. Sanitized report; never classifies. `409 classifier_not_configured` without a classifier. |
 | `GET /api/router/v1/traces?limit=N` | The most recent routing traces, newest first (default 50, at most `traces.capacity`). See [Routing traces](#routing-traces). |
@@ -1992,7 +2144,14 @@ Labels are only configured names — a route, its policy, a deployment — or a
 reason from a fixed list. Never a session, a request id, a prompt, a tool name
 or an address.
 
-- `router_requests_total{route,outcome}`
+- `router_requests_total{route,outcome}`: each client request counted
+  **once**, under its **final** logical route, the one that served it or
+  last failed it. After a cross-route fallback that is the fallback route,
+  not the route `Auto` first chose: `Auto → Coder → General` (served) counts
+  `{route="General",outcome="ok"}` once. The initial route and each
+  transition are in `router_cross_route_fallback_total` and in the trace. A
+  request refused before any route was chosen is counted under `Auto` or
+  `_unknown`.
 - `router_failovers_total{route}`
 - `router_routing_decisions_total{route,policy,reason}`. Failovers by policy are
   the `*_failover` reasons; affinity hits are `session_affinity`.
@@ -2031,6 +2190,9 @@ or an address.
   `router_route_history_observations_total{route,outcome}` and
   `router_route_history_effective_samples{route}` (observational: route
   history does not affect routing in slice 1).
+- Cross-route fallback (R9.3.1):
+  `router_cross_route_fallback_total{from_route,to_route,reason}` and
+  `router_cross_route_fallback_exhausted_total{route,reason}`.
 - `Auto` (R8): `router_auto_route_decisions_total{rule,route}` and
   `router_auto_route_fallback_total{route}`. `rule` is a configured rule name
   — bounded (at most 64) and held to a label-safe alphabet — or `_fallback`.
@@ -2201,8 +2363,9 @@ mostly `target/debug/incremental`, which Cargo rebuilds on demand.
 
 ## Roadmap
 
-R8 (rule-based `Auto`), R9.1 (content-aware classification) and the first
-slice of R9.2 (adaptive route scoring) are built. Nothing after them is. Each
+R8 (rule-based `Auto`), R9.1 (content-aware classification), the first
+slice of R9.2 (adaptive route scoring) and R9.3.1 (explicit cross-route
+fallback) are built. Nothing after them is. Each
 later step builds on the types above without changing the public route
 identity.
 
@@ -2217,7 +2380,7 @@ identity.
 | **R9.1a** | Done: a provider-neutral classifier boundary (`classifier/`: `lightweight`, `jev`) with one `Classification` result; TypeSafe Jev System One as an optional provider (typed Choice over the candidates, its own confidence, bearer key from the environment, https, bounded failures, no retries); per-provider settings; sanitized admin state, a start-up check and `POST /api/router/v1/classifier/check`. Deliberately left out: provider chains, scoring, and anything after the route is chosen. |
 | **R9.1a UI** | Done: the panel served by the router (`--web-root`) with Auto Routing and Classifier screens — provider status, Test Connection, a validated settings draft that produces the canonical configuration to paste. Deliberately left out: writing `router.json` from the panel, and a test-classification endpoint. |
 | **R9.2** | Slice 1 done ([design](R9_2_ADAPTIVE_ROUTE_SCORING.md)): off-by-default scoring of an accepted classification's verdict route against the classifier fallback (whose signal is the explicit classifier baseline), by classifier signal and operator priors only; a hard below-threshold boundary; an influence radius `prior / classifier` validated under half the accepted range; route-history observations (decayed, shown, resettable) that never affect routing, with `weights.history` required to be 0; traces, metrics, admin view and an admin history reset. Deliberately left out: history scoring until a route-attributable quality signal exists, latency and context-fit scoring, Jev per-option probabilities, provider calibration, availability penalties, persistence, exploration, learned weights, and any UI. |
-| **R9.3** | Designed, not built ([design](R9_3_CROSS_ROUTE_FALLBACK.md)): explicit, ordered, non-transitive per-route fallback lists for `Auto`-resolved requests only, after same-route failover is exhausted, before response commit; triggers `route_unavailable`, `route_exhausted` (every deployment refused 502/503/504) and `route_capability_mismatch`; no 500, latency or quality trigger, no reclassification or re-scoring, never mid-stream; kept apart from deployment failover. |
+| **R9.3** | R9.3.1 done ([design](R9_3_CROSS_ROUTE_FALLBACK.md)): explicit, ordered per-route fallback lists (`auto_route.cross_route_fallback`, at most 3, acyclic, never transitive) for `Auto`-resolved requests only, after same-route failover and before response commit, on `route_unavailable`, `route_exhausted` and `route_capability_mismatch`. The response names the serving route; an exhausted list returns the final route's own error; requests are counted once. Deliberately left out: explicit-route fallback, context-overflow, 500 or latency triggers, a shared request budget, reason-specific lists, and UI. |
 | **R9.4** | Planned: mixture-of-agents orchestration — parallel expert routes and one aggregator route, each through the normal pipeline, bounded fan-out, defined partial-failure rules, depth 1. |
 
 Out of scope for every one of these: a request-path model load, splicing one

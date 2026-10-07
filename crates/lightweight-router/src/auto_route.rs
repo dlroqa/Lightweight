@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::classifier::{ClassifierFile, RouteClassifier};
 use crate::config::ConfigError;
 use crate::domain::{Route, RouteName};
+use crate::fallback::{CrossRouteFallback, CrossRouteFallbackFile};
 use crate::proxy::Endpoint;
 use crate::requirements::{RequestRequirements, ToolChoiceRequirement};
 use crate::scoring::{AdaptiveScoring, AdaptiveScoringFile};
@@ -77,6 +78,10 @@ pub struct AutoRouteFile {
     /// off: a classification resolves exactly as R9.1 resolves it.
     #[serde(default)]
     pub adaptive_scoring: Option<AdaptiveScoringFile>,
+    /// Explicit cross-route fallback (R9.3.1): an initial route, and the
+    /// routes to try after it when it cannot execute. Absent: none.
+    #[serde(default)]
+    pub cross_route_fallback: Option<CrossRouteFallbackFile>,
 }
 
 /// One rule, as written.
@@ -255,6 +260,9 @@ pub struct AutoRoute {
     pub classifier: Option<RouteClassifier>,
     /// How a classification is scored, when the file says (R9.2).
     pub scoring: Option<AdaptiveScoring>,
+    /// Which routes an `Auto` request may move to when its route cannot
+    /// execute (R9.3.1). Empty when the file has none.
+    pub cross_route_fallback: CrossRouteFallback,
 }
 
 /// The route `Auto` chose for one request, and why.
@@ -481,6 +489,27 @@ pub(crate) fn validate(
         }
     }
 
+    // Validated last: it needs every route `Auto` can resolve to.
+    let cross_route_fallback = match (&raw.cross_route_fallback, &fallback) {
+        (Some(raw_fallback), Ok(auto_fallback)) if errors.len() == before => {
+            let mut reachable: Vec<&RouteName> = rules.iter().map(|rule| &rule.route).collect();
+            reachable.push(auto_fallback);
+            if let Some(classifier) = &classifier {
+                reachable.extend(classifier.candidates.iter().map(|c| &c.route));
+                reachable.push(&classifier.fallback);
+            }
+            let classifier_routes: Vec<&RouteName> = classifier
+                .iter()
+                .flat_map(|classifier| {
+                    std::iter::once(&classifier.provider).chain(classifier.standby.as_ref())
+                })
+                .filter_map(crate::classifier::ClassifierProvider::route)
+                .collect();
+            crate::fallback::validate(raw_fallback, routes, &reachable, &classifier_routes, errors)
+        }
+        _ => Some(CrossRouteFallback::default()),
+    };
+
     if errors.len() > before {
         return None;
     }
@@ -490,6 +519,7 @@ pub(crate) fn validate(
         rules,
         classifier,
         scoring,
+        cross_route_fallback: cross_route_fallback?,
     })
 }
 

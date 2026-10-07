@@ -106,6 +106,12 @@ pub struct RouterMetrics {
     /// observation (`success`, `failure`, `unavailable`, `mismatch`,
     /// `neutral`). Only while scoring is on.
     route_history_observations: Mutex<BTreeMap<(String, &'static str), u64>>,
+    /// Cross-route fallbacks taken (R9.3.1), by the route left, the route
+    /// tried next, and why.
+    cross_route_fallbacks: Mutex<BTreeMap<(String, String, &'static str), u64>>,
+    /// `Auto` requests whose whole fallback list failed, by initial route and
+    /// the last route's reason.
+    cross_route_exhausted: Mutex<BTreeMap<(String, &'static str), u64>>,
     histograms: Histograms,
 }
 
@@ -632,6 +638,63 @@ impl RouterMetrics {
         out
     }
 
+    pub fn record_cross_route_fallback(&self, from: &str, to: &str, reason: &'static str) {
+        bump(
+            &self.cross_route_fallbacks,
+            (from.to_owned(), to.to_owned(), reason),
+        );
+    }
+
+    pub fn record_cross_route_exhausted(&self, route: &str, reason: &'static str) {
+        bump(&self.cross_route_exhausted, (route.to_owned(), reason));
+    }
+
+    pub fn cross_route_fallbacks(&self, from: &str, to: &str, reason: &'static str) -> u64 {
+        read(
+            &self.cross_route_fallbacks,
+            &(from.to_owned(), to.to_owned(), reason),
+        )
+    }
+
+    pub fn cross_route_exhausted(&self, route: &str, reason: &'static str) -> u64 {
+        read(&self.cross_route_exhausted, &(route.to_owned(), reason))
+    }
+
+    /// Every fallback taken so far: `from → to → reason → count`.
+    pub fn cross_route_fallback_counts(
+        &self,
+    ) -> BTreeMap<String, BTreeMap<String, BTreeMap<&'static str, u64>>> {
+        let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<&'static str, u64>>> =
+            BTreeMap::new();
+        for ((from, to, reason), count) in self
+            .cross_route_fallbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            out.entry(from.clone())
+                .or_default()
+                .entry(to.clone())
+                .or_default()
+                .insert(reason, *count);
+        }
+        out
+    }
+
+    /// Every exhausted chain so far: `initial route → last reason → count`.
+    pub fn cross_route_exhausted_counts(&self) -> BTreeMap<String, BTreeMap<&'static str, u64>> {
+        let mut out: BTreeMap<String, BTreeMap<&'static str, u64>> = BTreeMap::new();
+        for ((route, reason), count) in self
+            .cross_route_exhausted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            out.entry(route.clone()).or_default().insert(reason, *count);
+        }
+        out
+    }
+
     pub fn auto_fallbacks(&self) -> u64 {
         self.auto_fallbacks
             .lock()
@@ -857,7 +920,7 @@ impl RouterMetrics {
         let mut out = String::new();
 
         out.push_str(
-            "# HELP router_requests_total Requests the router answered, by route and outcome.\n",
+            "# HELP router_requests_total Client requests the router answered, each counted once, by outcome and the final logical route (the one that served or last failed it, after any cross-route fallback; the initial route of a fallback is in router_cross_route_fallback_total).\n",
         );
         out.push_str("# TYPE router_requests_total counter\n");
         for ((route, outcome), count) in self
@@ -1141,6 +1204,40 @@ impl RouterMetrics {
             let _ = writeln!(
                 out,
                 "router_route_history_observations_total{{route=\"{}\",outcome=\"{outcome}\"}} {count}",
+                escape(route)
+            );
+        }
+
+        out.push_str(
+            "# HELP router_cross_route_fallback_total Auto requests moved to the next listed logical route before commit, by the route left, the route tried and the reason: route_unavailable, route_exhausted, route_capability_mismatch.\n",
+        );
+        out.push_str("# TYPE router_cross_route_fallback_total counter\n");
+        for ((from, to, reason), count) in self
+            .cross_route_fallbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_cross_route_fallback_total{{from_route=\"{}\",to_route=\"{}\",reason=\"{reason}\"}} {count}",
+                escape(from),
+                escape(to)
+            );
+        }
+        out.push_str(
+            "# HELP router_cross_route_fallback_exhausted_total Auto requests whose whole fallback list failed before commit, by initial route and the last route's reason.\n",
+        );
+        out.push_str("# TYPE router_cross_route_fallback_exhausted_total counter\n");
+        for ((route, reason), count) in self
+            .cross_route_exhausted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "router_cross_route_fallback_exhausted_total{{route=\"{}\",reason=\"{reason}\"}} {count}",
                 escape(route)
             );
         }
