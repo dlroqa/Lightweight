@@ -2581,3 +2581,169 @@ config write API. Traces are read from the existing
 - **Real UI smoke:** local `scripts/render-panel.sh` (gateway on 18434, the
   user's 11434 untouched) passed 89 checks with 0 failures. The summary and
   trace cards were also captured and reviewed.
+
+### Finalization: a successful fallback rendered live
+
+The render covered only an exhausted list, so before merging, `4415a58`
+added a successful one. Two scripted nodes (`e2e/mock-node.mjs`) join the
+render router as second Coder and General deployments. They start with no
+model, so the exhausted scenario runs exactly as before. The render then
+loads them, and a real `Auto` tools request goes Coder (`coder-b` 503,
+`route_exhausted`) → General (`general-b` 200, `model: "General"`).
+
+The real panel shows:
+- requested Auto, initial Coder, final General, and *Served by General*;
+- no exhausted marker;
+- the steps Coder then General, with Coder's reason;
+- each route's same-route attempt under its own route;
+- both reasons on the Coder → General counter, and no new exhausted count.
+
+Lock checks were added for exactly three triggers, the explicit-route and
+post-start exclusions, and the identity and `router_requests_total` help.
+The render now passes 110 checks (gateway 10, router 100; router was 79).
+Frontend unit tests: 53. Nothing under `crates/` changed.
+
+### R9.3 UI MERGED and FROZEN
+
+PR #44 was merged as `49ce10d` (head `4415a58`, merge commit,
+`--match-head-commit`). On `4415a58`, Actions check run 37565148063 (all 7
+jobs) and render panel run 37565148008 were green.
+
+Master was validated:
+- local `cargo fmt --check` and `cargo clippy --workspace --all-targets -D
+  warnings` clean;
+- Actions check run 37565790532 (`check.sh` on Linux, Windows, macOS x64 and
+  arm64, plus Flatpak, Linux artifacts and render icons) green;
+- render panel run 37565790560 green, at 110/110;
+- no Rust changed since `cf3380b`;
+- no release workflow ran.
+
+**Router-panel smoke on master** was the render panel run above: the real
+router binary serving the real panel in a real browser. Every item passed:
+- the card loads, with the Coder → General chain, max 3, the three triggers
+  and the four exclusions (explicit route, 500, context overflow, post-start
+  stream);
+- the non-transitive help, same-route versus cross-route, `model` help and
+  `router_requests_total` help are shown;
+- the snippet is generated and Copy is read back canonical from the
+  clipboard; a cycle is blocked and named, and every other refusal works;
+- the `validate-config` and restart-required steps are shown;
+- the counters render, and both the successful and the exhausted live traces
+  render;
+- the classifier screen passes all its checks, the gateway panel's nine
+  screens are unchanged, and the TypeSafe key leaks nowhere.
+
+**Frozen R9.3 UI contract.** On the existing router panel, **Auto Routing →
+Cross-Route Fallback** shows:
+- Auto-only scope, max 3 fallback routes (at most 4 logical-route attempts),
+  the three approved triggers and the explicit exclusions;
+- the non-transitive rule, and same-route failover kept distinct from
+  cross-route fallback;
+- the configured lists, transition counters by reason, and exhausted counts;
+- successful and exhausted trace paths;
+- `response.model` = final serving route, and `router_requests_total` once
+  per request under the final route;
+- the validated snippet workflow: draft → frontend validation → canonical
+  `cross_route_fallback` snippet → Copy → paste into `router.json` →
+  `hermes router validate-config` → restart.
+
+There is no backend config mutation API.
+
+**Operational state:** the R9.3.1 backend and the R9.3 UI are operationally
+complete. R9.3.2 (shared request budget) is design only, on
+`design/router-shared-request-budget`. R9.4 is not started.
+
+## Router shared request budget, R9.3.2 (DESIGN ONLY: design/router-shared-request-budget)
+
+Branched from validated master `49ce10d`. The only addition is
+`docs/R9_3_2_SHARED_REQUEST_BUDGET.md`. There is no runtime code, config,
+metric, trace field, admin field or UI.
+
+The timeout inventory was verified in code. On the request path today:
+- a 5 s connect timeout per attempt, which resets on every deployment and
+  route;
+- the classifier `timeout_ms` (required, 1–120000), applied once;
+- the node's 600 s queue wait.
+
+The upstream response head, body/stream reads and inference are unbounded,
+and there is no overall deadline. A Lightweight node commits a **streamed**
+request's head immediately but a **non-streamed** one only after the whole
+generation, so a pre-commit budget bounds a non-streamed generation.
+
+Recommended design:
+- an opt-in `request.pre_commit_budget_ms` (1000–3600000, 0 refused, no
+  default value);
+- one monotonic deadline created at `received` in `forward_as` (after the
+  body is read, before parse, classification and routing), passed by value,
+  and inherited by the nested classifier;
+- applies to all client requests, and covers R9.1, R9.2, planning, every
+  same-route attempt and every cross-route fallback with no reset;
+- caps each wait at min(own limit, remaining);
+- stops governing at the response commit;
+- `504 request_budget_exhausted`, only when the budget stopped further
+  work; otherwise the existing error stands;
+- cancellation stays `cancelled`;
+- never a routing signal, an R9.2 input or a history observation.
+
+### Design hardening (PR #45, before merge)
+
+The design was restructured into the 43 required sections, with a
+frozen-invariants table (I1–I17) at the top. The approved refinements are
+now explicit:
+
+- **Causal exhaustion (section 7).** The 504 is returned only when a wait
+  was cut before its operation completed, or a start check refused a step
+  the frozen rules would have started. Example A (General's
+  `route_unavailable` at 29.9 s) stays `route_unavailable`. Example B (still
+  waiting for the head at 30 s) is a 504. Nothing is rewritten after the
+  fact.
+- **Deterministic race (section 8).** Every bounded wait is `timeout_at`.
+  Verified in the locked tokio 1.53.1: `Timeout::poll` polls the operation
+  before the delay, so a ready operation always wins. An unbiased `select!`
+  is forbidden. Ties at a start check count as expired, and ties between
+  the classifier and the budget go to the budget. Fake-time tests repeat
+  each case 1 000 times.
+- **One absolute deadline (section 9).** `RequestBudget { deadline:
+  tokio::time::Instant, … }`. Remaining time is derived with
+  `saturating_duration_since`; no `remaining_ms` is passed between stages.
+- **Pre-commit naming and scope (sections 12–13).** The streamed versus
+  non-streamed asymmetry is accepted. A post-commit stream or lifetime
+  deadline is a separate future feature.
+- **Start check before new work (section 19).** It covers six start points.
+  An unstarted attempt takes no lease, no transition, no failover count and
+  no trace attempt. `next_unattempted_route` is recorded only for a refused
+  route.
+- **Timeouts and the budget.** Local limits stay as ceilings, at min(own,
+  remaining) (sections 20–22). An unbounded head wait and the node queue get
+  the remainder. A budget cut never marks node health.
+- **Classifier timeout versus the budget (sections 14–15).**
+  - The nested classifier inherits the deadline and its start checks, and
+    records no budget metric.
+  - On a budget expiry the classifier outcome is `request_budget_exhausted`,
+    never `timeout`, and there is no R9.1 fallback.
+- **Explicit routes (section 23).** The budget applies; cross-route fallback
+  still does not.
+- **R9.2 neutrality (section 16).** A cut route gets the `Neutral`
+  observation (already what `Observation::of_outcome` returns for an unknown
+  outcome). A refused route gets no observation. A completed qualifying
+  failure keeps its normal observation.
+- **`router_requests_total` (section 34).**
+  - Counted once, with a new outcome value `request_budget_exhausted`,
+    following the `unavailable` precedent; the HELP text is unchanged.
+  - The label is the terminal attempted route.
+  - Before any attempt, the label follows existing conventions: `Auto` for
+    an Auto request (the `resolve_auto` pre-routing label), or the named
+    route for an explicit one. No route is invented, and `_unknown` is never
+    used.
+- **Upstream cancellation (section 26).** Measuring non-streamed
+  cancellation is an acceptance requirement. Waiting for the full
+  generation fails the slice.
+- **Config and tests.**
+  - Absent = disabled, `0` = invalid, bounds 1 000 – 3 600 000 (sections
+    28–30).
+  - Test plan B1–B45, mutation plan M1–M27, and acceptance criteria in
+    section 41.
+
+**Next:** merge PR #45 after a green Actions matrix, validate master, then
+freeze. Implementation (R9.3.2 slice 1, section 43) needs explicit approval.
+R9.4 is not started.
