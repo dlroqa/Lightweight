@@ -9,6 +9,7 @@
 import type {
   ApiErrorBody,
   AutoView,
+  TracesBody,
   ClassifierCheckReport,
   RouterRoutesBody,
   VersionBody,
@@ -338,6 +339,8 @@ export const routerApi = {
   version: () => request<VersionBody>("/version", undefined, "router"),
   routes: () => request<RouterRoutesBody>("/api/router/v1/routes", undefined, "router"),
   auto: () => request<AutoView>("/api/router/v1/auto", undefined, "router"),
+  traces: (limit = 50) =>
+    request<TracesBody>(`/api/router/v1/traces?limit=${limit}`, undefined, "router"),
   checkClassifier: () =>
     request<ClassifierCheckReport>(
       "/api/router/v1/classifier/check",

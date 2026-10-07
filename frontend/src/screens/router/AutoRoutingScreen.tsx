@@ -8,6 +8,7 @@ import { Empty, ErrorState, Loading, Pill, Row } from "../../components/Bits";
 import { TopBar } from "../../components/Shell";
 import { usePoll } from "../../hooks/usePoll";
 import { isLogicalRoute, ruleAction } from "./classifierModel";
+import { CrossRouteFallbackSection } from "./CrossRouteFallback";
 
 /**
  * The router's `Auto` rules and its logical routes, read-only.
@@ -19,6 +20,7 @@ import { isLogicalRoute, ruleAction } from "./classifierModel";
 export function AutoRoutingScreen() {
   const auto = usePoll(routerApi.auto, 5000);
   const routes = usePoll(routerApi.routes, 10_000);
+  const traces = usePoll(routerApi.traces, 10_000);
 
   return (
     <>
@@ -35,6 +37,14 @@ export function AutoRoutingScreen() {
           <>
             <AutoCard auto={auto.data} />
             <RulesCard auto={auto.data} />
+            {auto.data.configured && (
+              <CrossRouteFallbackSection
+                auto={auto.data}
+                routes={routes.data}
+                traces={traces.data}
+                tracesError={traces.error}
+              />
+            )}
           </>
         ) : null}
         <RoutesCard routes={routes.data} error={routes.error} loading={routes.loading} />

@@ -349,7 +349,7 @@ function Settings({ auto, routes }: { auto: AutoView; routes: RouterRouteView[] 
   );
 }
 
-function Field({
+export function Field({
   label,
   help,
   problem,

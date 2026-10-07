@@ -62,6 +62,80 @@ async function main() {
   check(!(await page.getByText("Dashboard", { exact: true }).count()), "gateway-only sections are not offered on a router");
   await page.screenshot({ path: `${OUT_DIR}/router-auto.png`, fullPage: true });
 
+  // --- Cross-route fallback (R9.3.1) ---------------------------------------------------
+  // Every route here is unavailable (the gateway serves none of these models),
+  // so a tools request to Auto goes Coder → General and exhausts the list:
+  // real counters, a real exhausted chain and a real trace to render.
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: BASE });
+  const fallbackRequest = await fetch(`${BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "Auto",
+      tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+      messages: [{ role: "user", content: "render fallback" }],
+    }),
+  });
+  check(fallbackRequest.status === 503, "an Auto request whose list is exhausted gets the last route's own 503");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const summary = page.locator("[data-fallback-summary]");
+  await summary.waitFor({ timeout: TIMEOUT });
+  check(await page.getByRole("heading", { name: "Cross-Route Fallback", exact: true }).isVisible(), "the Cross-Route Fallback card renders on Auto Routing");
+  check((await summary.innerText()).includes("Auto-selected routes only"), "it says it applies to Auto-selected routes only");
+  check((await page.locator("[data-max-routes]").innerText()).trim() === "3", "the maximum of 3 fallback routes is shown");
+  for (const reason of ["route_unavailable", "route_exhausted", "route_capability_mismatch"]) {
+    check((await page.locator(`[data-trigger="${reason}"]`).count()) === 1, `trigger ${reason} is listed`);
+  }
+  check((await page.locator("[data-explicit-warning]").innerText()).includes("Explicit route requests return that route's error"), "the explicit-route warning is shown");
+  const exclusions = await page.locator("[data-exclusions]").innerText();
+  check(exclusions.includes("500") && exclusions.includes("Context overflow"), "500 and context overflow are listed as never falling back");
+  const chain = await page.locator('[data-chain="Coder"]').innerText();
+  check(chain.includes("Coder") && chain.includes("General"), "the Coder → General list renders");
+  check((await page.locator("[data-non-transitive]").innerText()).includes("do not recursively apply their own fallback lists"), "the non-transitive rule is explained");
+  check((await page.locator("[data-same-vs-cross]").innerText()).includes("Coder/A → Coder/B"), "same-route failover is distinguished from cross-route fallback");
+  const transition = await page.locator('[data-transition="Coder->General"]').innerText();
+  check(transition.includes("route_unavailable: 1"), "the Coder → General fallback is counted by reason");
+  check((await page.locator('[data-exhausted-route="Coder"]').innerText()).includes("route_unavailable: 1"), "the exhausted list is counted");
+  check((await page.locator("[data-identity-help]").innerText()).includes('model: "General"'), "response identity is explained");
+  check((await page.locator("[data-requests-total-help]").innerText()).includes("counts each client request once"), "router_requests_total's final-route meaning is explained");
+  const trace = page.locator("[data-fallback-trace]").first();
+  await trace.waitFor({ timeout: TIMEOUT });
+  const traceText = await trace.innerText();
+  check(traceText.includes("Requested Auto") && traceText.includes("initial Coder") && traceText.includes("final General"), "the trace shows requested, initial and final routes");
+  check((await trace.locator('[data-trace-step="Coder"]').innerText()).includes("route_unavailable"), "the trace shows Coder failing as route_unavailable");
+  check((await trace.locator("[data-trace-exhausted]").count()) === 1 && traceText.includes("Exhausted"), "the exhausted chain is shown as exhausted");
+
+  // The draft: valid as running, then every refusal, then the snippet again.
+  check((await page.locator("[data-fallback-snippet]").innerText()).includes('"Coder": ['), "the running lists produce a snippet");
+  await page.locator("[data-fallback-snippet]").getByRole("button", { name: "Copy to clipboard" }).click();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  check(copied.startsWith('"cross_route_fallback": {') && copied.includes('"General"'), "Copy puts the canonical snippet on the clipboard");
+  check((await page.locator("[data-fallback-snippet]").innerText()).includes("hermes router validate-config"), "the validate-config step is shown");
+  check(await page.locator("[data-restart-required]").isVisible(), "the restart-required step is shown");
+  await page.locator("[data-draft-add]").click();
+  const newRow = page.locator("[data-draft-row]").last();
+  await newRow.locator("[data-draft-source]").selectOption("General");
+  await newRow.locator("[data-draft-targets]").fill("Coder");
+  check((await page.locator("[data-draft-cycle]").innerText()).includes("Fallback cycle detected: Coder → General → Coder"), "a two-route cycle is refused and named");
+  check((await page.locator("[data-fallback-snippet]").count()) === 0, "a cycle produces no snippet");
+  for (const [targets, words] of [
+    ["Missing", "is not one of the router's routes"],
+    ["Research", "is the classifier's route"],
+    ["Auto", "is Auto itself"],
+    ["General", "cannot fall back to itself"],
+    ["Coder, coder", "listed more than once"],
+    ["Coder, Research, Missing, Other", "At most 3 fallback routes"],
+  ]) {
+    await newRow.locator("[data-draft-targets]").fill(targets);
+    check((await newRow.locator("[data-draft-problem]").innerText()).includes(words), `“${targets}” is refused: ${words}`);
+  }
+  await newRow.getByRole("button", { name: /Remove list/ }).click();
+  check((await page.locator("[data-fallback-snippet]").count()) === 1, "removing the bad list brings the snippet back");
+  await page.screenshot({ path: `${OUT_DIR}/router-fallback.png`, fullPage: true });
+  // The panel scrolls inside its own container, so the cards are captured whole.
+  await page.locator(".card", { has: page.locator("[data-fallback-summary]") }).screenshot({ path: `${OUT_DIR}/router-fallback-summary.png` });
+  await page.locator(".card", { has: page.locator("[data-fallback-traces]") }).screenshot({ path: `${OUT_DIR}/router-fallback-traces.png` });
+
   // --- Classifier: Jev, as running -----------------------------------------------------
   await page.goto(`${BASE}/#/classifier`, { waitUntil: "domcontentloaded" });
   await page.getByText("Classifier Provider", { exact: true }).waitFor({ timeout: TIMEOUT });

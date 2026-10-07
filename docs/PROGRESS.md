@@ -2542,3 +2542,42 @@ request follows the initial route's flat list, and each fallback route uses
 normal deployment routing again. Frozen exclusions: explicit routes, 500,
 context overflow, post-commit failures, classifier retry, R9.2 re-scoring,
 history, latency, placement actions, transitive traversal, and MoA.
+
+## Router cross-route fallback UI (feature/router-cross-route-fallback-ui)
+
+Branched from validated master `cf3380b`, where R9.3.1 is frozen. The panel's
+existing **Auto Routing** screen gains three cards, built only from existing
+pieces: `Card`, `Pill`, `Row`, `Empty`, `Loading`, the notice and table
+styles, the classifier screen's `Field` (now exported), and `CodeBlock` with
+its Copy button. There is no new screen, app or backend endpoint, and no
+config write API. Traces are read from the existing
+`GET /api/router/v1/traces`.
+
+- **`fallbackModel.ts`** (pure, no React). It holds:
+  - the triggers, exclusions and `MAX_FALLBACK_ROUTES`;
+  - context from the running router: routes, routes `Auto` reaches, and the
+    classifier's route;
+  - the draft and its validation, mirroring `fallback.rs`, including a cycle
+    finder that names the cycle;
+  - the canonical snippet;
+  - transition and exhaustion totals;
+  - fallback traces, with deployment attempts grouped by route so
+    same-route failover stays visible as distinct.
+- **`CrossRouteFallback.tsx`:** the summary, draft and recent-fallback
+  cards. The draft is seeded once from the router, and polling never
+  overwrites typing.
+- **Tests:**
+  - `fallbackModel.test.ts` adds 27 unit tests (frontend total 53, from 26).
+  - `e2e/render-router.mjs` adds 31 checks against a real router; the render
+    harness's router now has `cross_route_fallback: {"Coder": ["General"]}`,
+    and a real exhausted Auto request feeds the counters and the trace.
+  - The checks cover the card, scope, bound, triggers, explicit warning,
+    exclusions, chain, non-transitive and same-versus-cross help, counts,
+    exhaustion, identity and `router_requests_total` help, the trace,
+    snippet, Copy (read back from the clipboard), the `validate-config` and
+    restart steps, and refusals for a two-route cycle, unknown, classifier,
+    Auto, self, duplicate and over-3.
+  - Gateway and classifier checks are unchanged.
+- **Real UI smoke:** local `scripts/render-panel.sh` (gateway on 18434, the
+  user's 11434 untouched) passed 89 checks with 0 failures. The summary and
+  trace cards were also captured and reviewed.

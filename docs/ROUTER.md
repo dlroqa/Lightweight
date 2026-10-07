@@ -1930,6 +1930,38 @@ reads either *Route directly to &lt;route&gt;* or *Semantic classification* (a r
 written `"classify": true`), with its decision count, and the logical routes
 with their descriptions and availability.
 
+**Auto Routing** also has three cross-route fallback cards (R9.3.1; see
+[Cross-route fallback](#cross-route-fallback-r931)):
+
+- **Cross-Route Fallback**, a summary. It shows:
+  - whether lists are configured, that fallback applies to Auto-selected
+    routes only, and the maximum of 3 fallback routes;
+  - the three triggers with what each means, and what never falls back
+    (explicit routes, 500, context overflow, a stream that failed after it
+    started);
+  - each list as a chain (`Coder → General → Reasoning`), with the
+    non-transitive rule stated beside it: only the initial route's list is
+    used, and fallback routes' own lists are not followed;
+  - how same-route failover (`Coder/A → Coder/B`) differs from cross-route
+    fallback (`Coder → General`);
+  - the router's counters: fallbacks per `from → to` transition by reason,
+    and exhausted lists;
+  - two notes: `model` names the final serving route, and
+    `router_requests_total` counts each request once under its final route.
+- **Draft fallback lists**, seeded from the running router. Each list is an
+  initial route (only routes `Auto` can choose are offered) plus its fallback
+  routes in order. The draft is checked as the router will check it: unknown
+  routes, `Auto`, `default`, the classifier's route, an empty list, more than
+  3 entries, a self-reference, duplicates (ignoring case), a second list for
+  the same route, and any cycle ("Fallback cycle detected: Coder → General →
+  Coder"). A valid draft becomes the canonical `cross_route_fallback`
+  snippet, with Copy, then `hermes router validate-config` and a restart.
+  Nothing is saved from the panel; the router has no config write API.
+- **Recent cross-route fallbacks**, from `GET /api/router/v1/traces`. Each
+  request that changed route shows its requested, initial and final routes,
+  each route attempt with its reason (and that route's deployment attempts,
+  the same-route part, beside it), and *Exhausted* when the list ran out.
+
 **Classifier** has three parts:
 
 - **Provider status** — the running provider, whether it is active, the API key

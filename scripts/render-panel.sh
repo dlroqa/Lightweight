@@ -137,7 +137,8 @@ cat >"$WORK/router.json" <<JSON
         "include_user_text": false
       },
       "lightweight": {"route": "Research", "timeout_ms": 30000}
-    }
+    },
+    "cross_route_fallback": {"Coder": ["General"]}
   }
 }
 JSON
