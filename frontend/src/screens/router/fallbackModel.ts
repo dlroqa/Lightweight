@@ -47,11 +47,62 @@ export const EXCLUSIONS = [
   "A stream that fails after it started",
 ];
 
+/** The trace outcome and attempt reason the pre-commit request budget (R9.3.2) ends a request with. */
+export const BUDGET_EXHAUSTED = "request_budget_exhausted";
+
 export function reasonLabel(reason: string | undefined | null): string {
   if (!reason) return "";
   return TRIGGERS.find((t) => t.reason === reason)?.label
-    ?? (reason === "context_length_exceeded" ? "Context overflow" : reason);
+    ?? (reason === "context_length_exceeded"
+      ? "Context overflow"
+      : reason === BUDGET_EXHAUSTED
+        ? "Budget expired"
+        : reason);
 }
+
+/** How a request that changed route ended, in the card's words. */
+export interface TraceVerdict {
+  kind: "budget" | "exhausted" | "served";
+  label: string;
+}
+
+/**
+ * The most specific terminal state of a trace, in this order:
+ *
+ * 1. The pre-commit request budget ended it (`outcome:
+ *    "request_budget_exhausted"`, or its `request_budget` block says so). The
+ *    client got a 504 before any response started, so nothing was served —
+ *    even though R9.3's own block keeps `exhausted: false` (time ran out, not
+ *    the list). Named after what the trace actually holds: the route a start
+ *    check refused (`next_unattempted_route`, never attempted), the
+ *    classification, or the route whose attempt was cut. No route is invented.
+ * 2. The fallback list ran out: the last route's own error.
+ * 3. A route answered.
+ *
+ * A trace without a `request_budget` block (no budget configured, or a router
+ * from before R9.3.2) reads exactly as before.
+ */
+export function traceVerdict(trace: RoutingTraceView): TraceVerdict {
+  const budget = trace.request_budget;
+  const block = trace.cross_route_fallback;
+  if (trace.outcome === BUDGET_EXHAUSTED || budget?.exhausted === true) {
+    if (budget?.next_unattempted_route) {
+      return { kind: "budget", label: `Budget expired before attempting ${budget.next_unattempted_route}` };
+    }
+    if (budget?.stage === "classifier") {
+      return { kind: "budget", label: "Budget expired during classification" };
+    }
+    const route = block?.final_route ?? trace.route;
+    return route && route !== AUTO
+      ? { kind: "budget", label: `Budget expired while attempting ${route}` }
+      : { kind: "budget", label: "Budget expired before any route was attempted" };
+  }
+  if (block?.exhausted) return { kind: "exhausted", label: "Exhausted" };
+  return { kind: "served", label: `Served by ${block?.final_route ?? trace.route}` };
+}
+
+/** `Auto`'s fixed label: never a route that was attempted. */
+const AUTO = "Auto";
 
 /** One list being drafted: an initial route and its fallback routes, as typed. */
 export interface ChainDraft {

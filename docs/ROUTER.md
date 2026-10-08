@@ -1429,6 +1429,16 @@ only over a wait that has not finished. A client that disconnects is
   - After a cut on a fallback route, `cross_route_fallback.exhausted` stays
     `false` (time ran out, not the list), and that route's attempt row
     reads `failed` / `request_budget_exhausted`.
+  - **Panel:** the R9.3 *Recent cross-route fallbacks* card reads the
+    request's terminal state before R9.3's own block, so a request the budget
+    ended never reads "Served by". It shows "Budget expired while attempting
+    General" for a cut, "Budget expired before attempting General" when a
+    start check refused General (`next_unattempted_route`), and says the
+    client got `504 request_budget_exhausted`; the cut step reads "Budget
+    expired". Precedence: budget, then an exhausted list, then served. A
+    trace without a `request_budget` block reads exactly as before. Explicit
+    requests and classifier-stage exhaustion never appear in that card,
+    which lists only requests that changed route.
 - **`router_requests_total`**: once per client request, with its own
   outcome `request_budget_exhausted` — never `server_error`, never
   `unavailable`. Labelled with the terminal attempted route (`Auto → Coder →

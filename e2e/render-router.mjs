@@ -316,6 +316,86 @@ async function main() {
   await jevRadio.check();
   check(await jevPanel.isVisible(), "choosing Jev again shows the Jev panel");
 
+  // --- a request the pre-commit budget ended (R9.3.2) -------------------------------------
+  // A second router, with `pre_commit_budget_ms: 1500`: Coder refuses with 503
+  // and General accepts and never answers. The R9.3 trace card must never call
+  // such a request served. The two shapes the binary cannot be timed into
+  // (a fallback refused just as the budget ran out, and classification ended
+  // by it) are rendered from fixtures shaped exactly like the merged router's
+  // traces (crates/lightweight-router/tests/request_budget.rs, b11 and b08).
+  const BUDGET_BASE = (process.env.BUDGET_PANEL_BASE ?? "").replace(/\/+$/, "");
+  check(BUDGET_BASE.length > 0, "the budget router is given to the render");
+  const ask = async (body) => {
+    const response = await fetch(`${BUDGET_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, id: response.headers.get("x-request-id") ?? "", body: await response.json() };
+  };
+  const cut = await ask({
+    model: "Auto",
+    tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+    messages: [{ role: "user", content: "render a budget cut" }],
+  });
+  check(cut.status === 504 && cut.body?.error?.code === "request_budget_exhausted", `Auto → Coder → General, General cut: 504 request_budget_exhausted (got ${cut.status})`);
+  const explicit = await ask({ model: "General", messages: [{ role: "user", content: "render an explicit cut" }] });
+  check(explicit.status === 504 && explicit.body?.error?.code === "request_budget_exhausted", `an explicit General request is cut too: 504 (got ${explicit.status})`);
+
+  const refusedId = "render-budget-refused";
+  const classifierId = "render-budget-classifier";
+  const fixtures = [
+    {
+      request_id: refusedId, received_at: 0, route: "Coder", requested_route: "Auto",
+      outcome: "request_budget_exhausted", status: 504,
+      attempts: [{ route: "Coder", deployment: "coder/Coder", reason: "priority", outcome: "failed", upstream_status: 503 }],
+      request_budget: { configured_ms: 1500, elapsed_ms: 1602, remaining_ms: 0, exhausted: true,
+                        stage: "cross_route_fallback", next_unattempted_route: "General" },
+      cross_route_fallback: { initial_route: "Coder", final_route: "Coder", exhausted: false,
+                              attempts: [{ route: "Coder", outcome: "failed", reason: "route_exhausted" }] },
+    },
+    {
+      request_id: classifierId, received_at: 0, route: "Auto", requested_route: "Auto",
+      outcome: "request_budget_exhausted", status: 504, attempts: [],
+      request_budget: { configured_ms: 1500, elapsed_ms: 1501, remaining_ms: 0, exhausted: true, stage: "classifier" },
+    },
+  ];
+  const budgetPage = await context.newPage();
+  budgetPage.on("pageerror", (err) => errors.push(String(err)));
+  await budgetPage.route(/\/api\/router\/v1\/traces/, async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.data = [...fixtures, ...(body.data ?? [])];
+    await route.fulfill({ response, json: body });
+  });
+  await budgetPage.goto(`${BUDGET_BASE}/#/auto`, { waitUntil: "domcontentloaded" });
+  const cutTrace = budgetPage.locator(`[data-fallback-trace="${cut.id}"]`);
+  await cutTrace.waitFor({ timeout: TIMEOUT });
+  const cutText = await cutTrace.innerText();
+  check(cutText.includes("Budget expired while attempting General"), "a budget cut on General reads: Budget expired while attempting General");
+  check(!cutText.includes("Served by"), "a budget cut on General never reads as served");
+  check((await cutTrace.locator('[data-trace-verdict="budget"]').count()) === 1, "its verdict is the budget, not served or exhausted");
+  check((await cutTrace.locator("[data-trace-budget]").innerText()).includes("504 request_budget_exhausted before any response started"), "it says the client got 504 before any response started");
+  check((await cutTrace.locator("[data-trace-exhausted]").count()) === 0 && !cutText.includes("Exhausted"), "a budget cut is not shown as an exhausted list");
+  check((await cutTrace.locator('[data-trace-step="General"]').innerText()).includes("Budget expired (request_budget_exhausted)"), "General's step reads Budget expired");
+  check((await cutTrace.locator('[data-trace-step="Coder"]').innerText()).includes("Route exhausted (route_exhausted)"), "Coder's step keeps its own fallback reason");
+  await cutTrace.screenshot({ path: `${OUT_DIR}/router-budget-cut-trace.png` });
+
+  const refused = budgetPage.locator(`[data-fallback-trace="${refusedId}"]`);
+  const refusedText = await refused.innerText();
+  check(refusedText.includes("Budget expired before attempting General"), "a fallback refused by the budget reads: Budget expired before attempting General");
+  check(!refusedText.includes("Served by") && !refusedText.includes("while attempting General"), "the refused route is never shown as served or attempted");
+  const refusedSteps = await refused.locator("[data-trace-step]").evaluateAll((items) => items.map((item) => item.getAttribute("data-trace-step")));
+  check(JSON.stringify(refusedSteps) === JSON.stringify(["Coder"]), `only Coder is listed as a step (got ${JSON.stringify(refusedSteps)})`);
+  await refused.screenshot({ path: `${OUT_DIR}/router-budget-refused-trace.png` });
+
+  check((await budgetPage.locator(`[data-fallback-trace="${explicit.id}"]`).count()) === 0, "an explicit request never appears as a cross-route fallback");
+  check((await budgetPage.locator(`[data-fallback-trace="${classifierId}"]`).count()) === 0, "classification ended by the budget invents no route and no fallback");
+  check((await budgetPage.locator('[data-trace-verdict="served"]').count()) === 0, "nothing on the budget router reads as served");
+  await budgetPage.close();
+  // The first router's traces are untouched by any of this: success still reads
+  // served and the exhausted list still reads exhausted (checked above).
+
   // --- the key never reaches the browser ------------------------------------------------
   const html = await page.content();
   const storage = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));

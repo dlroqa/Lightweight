@@ -9,6 +9,7 @@ import type {
   AutoView,
   CrossRouteFallbackView,
   RouterRouteView,
+  RoutingTraceView,
   TracesBody,
 } from "../../api/types.ts";
 import {
@@ -25,6 +26,7 @@ import {
   hasChainProblems,
   parseTargets,
   reasonLabel,
+  traceVerdict,
   transitionRows,
   validateChains,
   type ChainDraft,
@@ -267,12 +269,148 @@ describe("request-budget values the screen predates", () => {
       { route: "Coder", deployments: ["coder/A (failed 503)"] },
       { route: "General", deployments: ["general/G (request_budget_exhausted)"] },
     ]);
-    assert.equal(reasonLabel("request_budget_exhausted"), "request_budget_exhausted");
+    // Since the budget wording follow-up the reason reads in words.
+    assert.equal(reasonLabel("request_budget_exhausted"), "Budget expired");
   });
 
   it("counts a refused transition nowhere", () => {
     // The router never counts a transition to a route the budget refused, so
     // the counts the screen reads simply do not contain it.
     assert.deepEqual(transitionRows({ configured: true, counts: {}, exhausted: {} } as unknown as CrossRouteFallbackView), []);
+  });
+});
+
+// The budget wording follow-up: a request the pre-commit budget (R9.3.2)
+// ended must never read as served. Fixtures are the trace shapes the merged
+// router writes (crates/lightweight-router/tests/request_budget.rs).
+describe("what a trace's terminal state reads as", () => {
+  const trace = (fields: Record<string, unknown>) =>
+    ({ request_id: "r", received_at: 0, requested_route: "Auto", ...fields }) as unknown as RoutingTraceView;
+  const fallback = (final: string, attempts: unknown[], exhausted = false) => ({
+    initial_route: "Coder",
+    final_route: final,
+    exhausted,
+    attempts,
+  });
+  const coderFailed = { route: "Coder", outcome: "failed", reason: "route_exhausted" };
+
+  it("1. a fallback route that answered is served", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "ok", status: 200,
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "committed" }]),
+    }));
+    assert.deepEqual(verdict, { kind: "served", label: "Served by General" });
+  });
+
+  it("2. a budget cut on General reads as an attempt, never as served", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 2000, elapsed_ms: 2004, remaining_ms: 0, exhausted: true, stage: "cross_route_fallback" },
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "request_budget_exhausted" }]),
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired while attempting General" });
+    assert.ok(!verdict.label.includes("Served"));
+  });
+
+  it("3. a budget spent before General started names General as not attempted", () => {
+    const verdict = traceVerdict(trace({
+      route: "Coder", outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 1000, elapsed_ms: 1102, remaining_ms: 0, exhausted: true,
+                        stage: "cross_route_fallback", next_unattempted_route: "General" },
+      cross_route_fallback: fallback("Coder", [coderFailed]),
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired before attempting General" });
+    assert.ok(!verdict.label.includes("Served") && !verdict.label.includes("while attempting General"));
+  });
+
+  it("4. classification ended by the budget invents no route", () => {
+    const verdict = traceVerdict(trace({
+      route: "Auto", outcome: "request_budget_exhausted", status: 504, attempts: [],
+      request_budget: { configured_ms: 1000, elapsed_ms: 1001, remaining_ms: 0, exhausted: true, stage: "classifier" },
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired during classification" });
+  });
+
+  it("5. an explicit Coder request cut by the budget names Coder, with no fallback", () => {
+    const verdict = traceVerdict(trace({
+      route: "Coder", requested_route: "Coder", outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 1000, elapsed_ms: 1003, remaining_ms: 0, exhausted: true, stage: "same_route_attempt" },
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired while attempting Coder" });
+    assert.ok(!verdict.label.includes("General"));
+  });
+
+  it("6. an exhausted list (route_unavailable) reads as before", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "unavailable", status: 503,
+      request_budget: { configured_ms: 30000, elapsed_ms: 4, remaining_ms: 29996, exhausted: false },
+      cross_route_fallback: fallback("General", [
+        { route: "Coder", outcome: "failed", reason: "route_unavailable" },
+        { route: "General", outcome: "failed", reason: "route_unavailable" },
+      ], true),
+    }));
+    assert.deepEqual(verdict, { kind: "exhausted", label: "Exhausted" });
+  });
+
+  it("7. a route error that completed before the deadline (server_busy) is not budget wording", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "server_error", status: 503,
+      request_budget: { configured_ms: 1500, elapsed_ms: 1600, remaining_ms: 0, exhausted: false },
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "route_exhausted" }], true),
+    }));
+    assert.equal(verdict.kind, "exhausted");
+    assert.ok(!verdict.label.includes("Budget"));
+  });
+
+  it("8. a stream that committed before the deadline is served, whatever came after", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "ok", status: 200,
+      request_budget: { configured_ms: 1000, elapsed_before_commit_ms: 12, remaining_at_commit_ms: 988, exhausted: false },
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "committed" }]),
+    }));
+    assert.deepEqual(verdict, { kind: "served", label: "Served by General" });
+  });
+
+  it("9. the terminal outcome alone is enough: budget wins over the generic served wording", () => {
+    // Defensive: a trace whose outcome says the budget ended it reads so,
+    // even if its block were missing or did not say `exhausted`.
+    for (const request_budget of [undefined, { configured_ms: 1000, exhausted: false }]) {
+      const verdict = traceVerdict(trace({
+        route: "General", outcome: "request_budget_exhausted", status: 504, request_budget,
+        cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "request_budget_exhausted" }]),
+      }));
+      assert.deepEqual(verdict, { kind: "budget", label: "Budget expired while attempting General" });
+    }
+  });
+
+  it("10/11. a trace with no budget block (no budget, or a v0.6.0 router) reads exactly as before", () => {
+    const served = traceVerdict(trace({
+      route: "General", outcome: "ok", status: 200,
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "committed" }]),
+    }));
+    assert.deepEqual(served, { kind: "served", label: "Served by General" });
+    const exhausted = traceVerdict(trace({
+      route: "General", outcome: "unavailable", status: 503,
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "route_unavailable" }], true),
+    }));
+    assert.deepEqual(exhausted, { kind: "exhausted", label: "Exhausted" });
+  });
+
+  it("12. Auto stays Auto when no route started", () => {
+    const verdict = traceVerdict(trace({
+      route: "Auto", outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 1000, elapsed_ms: 1100, remaining_ms: 0, exhausted: true, stage: "route_planning" },
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired before any route was attempted" });
+    const named = traceVerdict(trace({
+      route: "Auto", outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 1000, exhausted: true, stage: "route_planning", next_unattempted_route: "General" },
+    }));
+    assert.deepEqual(named, { kind: "budget", label: "Budget expired before attempting General" });
+  });
+
+  it("the budget-cut step reads in words, with the code beside it", () => {
+    assert.equal(reasonLabel("request_budget_exhausted"), "Budget expired");
+    assert.equal(reasonLabel("route_unavailable"), "Route unavailable");
   });
 });

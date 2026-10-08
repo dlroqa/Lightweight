@@ -10,7 +10,10 @@
 // small chat completion, anything else is a refusal sent before any answer.
 //
 // Environment: MOCK_NODES (required), a comma-separated list of
-// `port:model:status`, for example `11502:Coder:503,11503:General:200`.
+// `port:model:status[:loaded]`, for example `11502:Coder:503,11503:General:200`.
+// `status` may be `hang`: the node accepts the request and never answers (a
+// queue that never moves, a generation that never ends), which is what a
+// router's pre-commit request budget cuts. `:loaded` starts the node loaded.
 
 import { createServer } from "node:http";
 
@@ -18,10 +21,11 @@ const specs = (process.env.MOCK_NODES ?? "")
   .split(",")
   .filter(Boolean)
   .map((spec) => {
-    const [port, model, status] = spec.split(":");
-    return { port: Number(port), model, status: Number(status) };
+    const [port, model, status, initially] = spec.split(":");
+    const hang = status === "hang";
+    return { port: Number(port), model, status: hang ? 0 : Number(status), hang, loaded: initially === "loaded" };
   });
-if (!specs.length || specs.some((s) => !s.port || !s.model || !s.status)) {
+if (!specs.length || specs.some((s) => !s.port || !s.model || (!s.status && !s.hang))) {
   console.error("MOCK_NODES must list port:model:status entries");
   process.exit(2);
 }
@@ -32,7 +36,7 @@ const FEATURES = {
 };
 
 for (const spec of specs) {
-  let loaded = false;
+  let loaded = spec.loaded;
   const server = createServer((request, response) => {
     const json = (status, body) => {
       response.writeHead(status, { "content-type": "application/json" });
@@ -59,6 +63,7 @@ for (const spec of specs) {
       }
       if (request.method === "POST" && request.url === "/v1/chat/completions") {
         if (!loaded) return json(404, { error: { message: "no model is loaded", type: "invalid_request_error", code: "model_not_found" } });
+        if (spec.hang) return; // never answered: the client gives up first
         if (spec.status !== 200) {
           return json(spec.status, { error: { message: `${spec.model} is scripted to refuse`, type: "server_error", code: "unavailable" } });
         }
