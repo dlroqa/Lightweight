@@ -3214,3 +3214,77 @@ the same-route attempt detail is plain text with no tone.
 
 **Next:** nothing started. Release-readiness review (likely v0.7.0) is the
 next separate task. R9.4 not started; no release.
+
+## Release v0.7.0 (release/v0.7.0)
+
+**Scope audited.** `v0.6.0` (`a8f0c89`) .. `63b4993`: PRs #49–#54, 18
+commits, 26 files. Runtime only from #49 (R9.3.2 slice 1: `budget.rs`,
+`proxy.rs`, `config.rs`, `metrics.rs`, `api.rs`, classifier, trace, CLI
+`validate-config` output, a mock-backend test accessor). Frontend only from
+#51 and #53 (`fallbackModel.ts`, `CrossRouteFallback.tsx`, trace types).
+The rest is tests, render harness and docs. Nothing in `crates/` changed after
+`eefa5b2`, and nothing in `frontend/`, `e2e/` or `scripts/` after `a454a47`.
+No workflow, packaging or manifest change, and no R9.4 code.
+
+**Release preparation.** PR #55 (`release/v0.7.0`, head `76cbce3`,
+`release: prepare v0.7.0`). It touches the same seven files as v0.6.0's
+`3345c4f`: `Cargo.toml`, `Cargo.lock` (18 workspace crates,
+`cargo update --workspace --offline`), both `package.json` files and both
+lines in each `package-lock.json`, plus `CHANGELOG.md` `[0.7.0] -
+2026-10-08`. The changelog has a summary, compatibility and upgrade notes,
+**Not in this release**, Added (R9.3.2) and Fixed (trace truthfulness, #51
+and #53). PR check
+[37804525792](https://github.com/dlroqa/Lightweight/actions/runs/37804525792)
+and render
+[37804525778](https://github.com/dlroqa/Lightweight/actions/runs/37804525778)
+both passed on attempt 1. On all four platforms: contract `47 passed, 2
+skipped`, secrets `ok no credentials, home paths or machine addresses in
+tracked files`, frontend `# pass 100 / # fail 0`, desktop `# pass 26 /
+# fail 0`, and `workspace 0.7.0`. Render panel 165 `[ok]`, 0 failed. The
+AppImage and the installed Flatpak each ran their packaged `hermes 0.7.0`.
+
+**Release commit.** Merge **`e2eb732`** (tree identical to `76cbce3`).
+Master check
+[37808116200](https://github.com/dlroqa/Lightweight/actions/runs/37808116200)
+and render
+[37808116194](https://github.com/dlroqa/Lightweight/actions/runs/37808116194)
+are green with the same results. **One rerun:** on attempt 1, macOS x64
+failed with "The hosted runner lost communication with the server" during
+`check.sh`. The step never completed and no log was uploaded, so this was
+infrastructure, not a test. That job alone was rerun and passed on attempt 2
+(contract 47/2, secrets ok, frontend 100/0, desktop 26/0).
+
+**Release.** Before tagging, no `v0.7.0` tag or release existed and no
+workflow was running. Annotated tag `v0.7.0` (object `3ad1dab`, `Release
+v0.7.0`) is on `e2eb732`. Release run
+[37815809575](https://github.com/dlroqa/Lightweight/actions/runs/37815809575)
+passed on attempt 1: the Flatpak, linux-x64, macos-universal, windows-x64,
+the Intel half of the DMG, and the draft job. Each build ran what it
+produced, and each reports `hermes 0.7.0` / "version 0.7.0" (the Windows
+installer included). Provenance attestation covers 7 subjects
+([54031582](https://github.com/dlroqa/Lightweight/attestations/54031582),
+Rekor), and `gh attestation verify` passed for all 7. No `workflow_dispatch`
+dry run was used, so there is no `dry-run-*` draft. Published from the
+inspected draft with `gh release edit --draft=false --latest`.
+
+**Published state.**
+<https://github.com/dlroqa/Lightweight/releases/tag/v0.7.0>, Latest, not a
+prerelease. It has 8 assets: the mac-universal DMG, the Windows x64
+installer, the Linux Flatpak and AppImage, the three `hermes` CLI archives
+(aarch64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu),
+and `SHA256SUMS`. All return HTTP 200, as do both source archives.
+`sha256sum -c SHA256SUMS` on the downloaded assets passed 7/7, and the
+GitHub asset digests equal `SHA256SUMS` 7/7. The notes are the CHANGELOG
+`[0.7.0]` section, unchanged from the inspected draft. v0.6.0 (`f43a6fb` ->
+`a8f0c89`, 8 assets, digests and publish time) is unchanged. There are no
+draft releases and no extra tags.
+
+**Contents.** R9.3.2 shared pre-commit request budget, plus the frozen
+budget, context-overflow and "Served by" / step-tone presentation
+truthfulness. Not included: R9.4 / MoA, a post-commit or lifetime deadline,
+a client deadline, a budget settings UI, and explicit-route or transitive
+fallback. Known panel limits are unchanged: the cross-route card lists only
+requests that changed route, and same-route attempt detail has no tone.
+
+**Next:** nothing started. v0.7.0 is immutable. Any later fix ships as a new
+version. R9.4 stays untouched until it is separately approved.
