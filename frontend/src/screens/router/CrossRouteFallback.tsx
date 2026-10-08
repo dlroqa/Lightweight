@@ -454,6 +454,15 @@ function TraceSteps({ trace }: { trace: RoutingTraceView }) {
             </div>
           </li>
         )}
+        {verdict.kind === "context_overflow" && (
+          <li data-trace-context-overflow>
+            <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />
+            <div>
+              {verdict.label}: the client got {block.final_route}&apos;s own 400 context_length_exceeded; no
+              response was served.
+            </div>
+          </li>
+        )}
         {verdict.kind === "exhausted" && (
           <li data-trace-exhausted>
             <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />

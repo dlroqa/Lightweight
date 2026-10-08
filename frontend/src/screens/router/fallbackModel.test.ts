@@ -414,3 +414,97 @@ describe("what a trace's terminal state reads as", () => {
     assert.equal(reasonLabel("route_unavailable"), "Route unavailable");
   });
 });
+
+describe("a request a context overflow ended", () => {
+  const trace = (fields: Record<string, unknown>) =>
+    ({ request_id: "r", received_at: 0, requested_route: "Auto", ...fields }) as unknown as RoutingTraceView;
+  const fallback = (final: string, attempts: unknown[], exhausted = false) => ({
+    initial_route: "Coder",
+    final_route: final,
+    exhausted,
+    attempts,
+  });
+  const coderFailed = { route: "Coder", outcome: "failed", reason: "route_exhausted" };
+  const coderDeployment = { route: "Coder", deployment: "coder/Coder", reason: "priority", outcome: "failed", upstream_status: 503 };
+  const generalOverflow = { route: "General", deployment: "general/General", reason: "priority", outcome: "context_overflow", upstream_status: 400 };
+  // Exactly what the router records for Coder (503) → General (400 context_length_exceeded).
+  const overflowOnGeneral = (fields: Record<string, unknown> = {}) => trace({
+    route: "General", outcome: "client_error", status: 400,
+    attempts: [coderDeployment, generalOverflow],
+    cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "context_length_exceeded" }]),
+    ...fields,
+  });
+
+  it("Coder → General, General overflows: names General as attempted, never served, never exhausted", () => {
+    const verdict = traceVerdict(overflowOnGeneral());
+    assert.deepEqual(verdict, { kind: "context_overflow", label: "Context limit exceeded while attempting General" });
+    assert.ok(!verdict.label.includes("Served") && !verdict.label.includes("Exhausted"));
+    assert.ok(!verdict.label.includes("Coder") && !verdict.label.includes("Auto") && !verdict.label.includes("Budget"));
+  });
+
+  it("an Auto request that overflowed on its first route reads the same, with no fallback invented", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "client_error", status: 400, attempts: [generalOverflow],
+    }));
+    assert.deepEqual(verdict, { kind: "context_overflow", label: "Context limit exceeded while attempting General" });
+  });
+
+  it("an explicit General request that overflowed names General", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", requested_route: "General", outcome: "client_error", status: 400, attempts: [generalOverflow],
+    }));
+    assert.deepEqual(verdict, { kind: "context_overflow", label: "Context limit exceeded while attempting General" });
+  });
+
+  it("another client error is never read as a context overflow", () => {
+    const committed400 = { route: "General", deployment: "general/General", reason: "priority", outcome: "committed", upstream_status: 400 };
+    const withFallback = traceVerdict(trace({
+      route: "General", outcome: "client_error", status: 400, attempts: [coderDeployment, committed400],
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "committed" }]),
+    }));
+    assert.notEqual(withFallback.kind, "context_overflow");
+    assert.ok(!withFallback.label.includes("Context"));
+    const explicit = traceVerdict(trace({
+      route: "General", requested_route: "General", outcome: "client_error", status: 400, attempts: [committed400],
+    }));
+    assert.notEqual(explicit.kind, "context_overflow");
+  });
+
+  it("an overflow a larger deployment then answered is served", () => {
+    const verdict = traceVerdict(trace({
+      route: "General", outcome: "ok", status: 200,
+      attempts: [generalOverflow, { route: "General", deployment: "general/Large", reason: "context_overflow_failover", outcome: "committed", upstream_status: 200 }],
+    }));
+    assert.deepEqual(verdict, { kind: "served", label: "Served by General" });
+  });
+
+  it("the request budget still wins, even over a defensive overflow-shaped trace", () => {
+    const verdict = traceVerdict(overflowOnGeneral({
+      outcome: "request_budget_exhausted", status: 504,
+      request_budget: { configured_ms: 1500, elapsed_ms: 1600, remaining_ms: 0, exhausted: true, stage: "cross_route_fallback" },
+    }));
+    assert.deepEqual(verdict, { kind: "budget", label: "Budget expired while attempting General" });
+  });
+
+  it("a request budget that did not end it changes nothing", () => {
+    const verdict = traceVerdict(overflowOnGeneral({
+      request_budget: { configured_ms: 30000, elapsed_before_commit_ms: 9, remaining_at_commit_ms: 29991, exhausted: false },
+    }));
+    assert.equal(verdict.kind, "context_overflow");
+  });
+
+  it("success, an exhausted list and a committed stream read exactly as before", () => {
+    assert.deepEqual(traceVerdict(trace({
+      route: "General", outcome: "ok", status: 200, stream: true,
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "committed" }]),
+    })), { kind: "served", label: "Served by General" });
+    assert.deepEqual(traceVerdict(trace({
+      route: "General", outcome: "unavailable", status: 503,
+      cross_route_fallback: fallback("General", [coderFailed, { route: "General", outcome: "failed", reason: "route_unavailable" }], true),
+    })), { kind: "exhausted", label: "Exhausted" });
+  });
+
+  it("a context-overflow step still reads Context overflow, with the code beside it", () => {
+    assert.equal(reasonLabel("context_length_exceeded"), "Context overflow");
+  });
+});

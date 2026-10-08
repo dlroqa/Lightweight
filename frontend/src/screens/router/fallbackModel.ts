@@ -50,10 +50,13 @@ export const EXCLUSIONS = [
 /** The trace outcome and attempt reason the pre-commit request budget (R9.3.2) ends a request with. */
 export const BUDGET_EXHAUSTED = "request_budget_exhausted";
 
+/** The node's structured code for a prompt longer than its context. */
+export const CONTEXT_OVERFLOW = "context_length_exceeded";
+
 export function reasonLabel(reason: string | undefined | null): string {
   if (!reason) return "";
   return TRIGGERS.find((t) => t.reason === reason)?.label
-    ?? (reason === "context_length_exceeded"
+    ?? (reason === CONTEXT_OVERFLOW
       ? "Context overflow"
       : reason === BUDGET_EXHAUSTED
         ? "Budget expired"
@@ -62,7 +65,7 @@ export function reasonLabel(reason: string | undefined | null): string {
 
 /** How a request that changed route ended, in the card's words. */
 export interface TraceVerdict {
-  kind: "budget" | "exhausted" | "served";
+  kind: "budget" | "context_overflow" | "exhausted" | "served";
   label: string;
 }
 
@@ -76,8 +79,13 @@ export interface TraceVerdict {
  *    the list). Named after what the trace actually holds: the route a start
  *    check refused (`next_unattempted_route`, never attempted), the
  *    classification, or the route whose attempt was cut. No route is invented.
- * 2. The fallback list ran out: the last route's own error.
- * 3. A route answered.
+ * 2. The last route attempted refused the prompt as longer than its context
+ *    (`context_length_exceeded`), and no larger deployment was left: the
+ *    client got that route's own `400`. R9.3's block keeps `exhausted: false`
+ *    for it (the chain stopped, the list did not run out), so it is read from
+ *    the structured reason the router recorded, never from `client_error`.
+ * 3. The fallback list ran out: the last route's own error.
+ * 4. A route answered.
  *
  * A trace without a `request_budget` block (no budget configured, or a router
  * from before R9.3.2) reads exactly as before.
@@ -97,8 +105,31 @@ export function traceVerdict(trace: RoutingTraceView): TraceVerdict {
       ? { kind: "budget", label: `Budget expired while attempting ${route}` }
       : { kind: "budget", label: "Budget expired before any route was attempted" };
   }
+  const overflowed = contextOverflowRoute(trace);
+  if (overflowed) {
+    return { kind: "context_overflow", label: `Context limit exceeded while attempting ${overflowed}` };
+  }
   if (block?.exhausted) return { kind: "exhausted", label: "Exhausted" };
   return { kind: "served", label: `Served by ${block?.final_route ?? trace.route}` };
+}
+
+/**
+ * The route whose context overflow ended the request, if one did. With a
+ * fallback block, its last route attempt says so (`failed` /
+ * `context_length_exceeded`). Without one (an `Auto` request that never moved,
+ * or an explicit route), the request's last deployment attempt was refused as
+ * `context_overflow` and the client got that `client_error`.
+ */
+function contextOverflowRoute(trace: RoutingTraceView): string | undefined {
+  const block = trace.cross_route_fallback;
+  if (block) {
+    const last = block.attempts.at(-1);
+    return last?.outcome === "failed" && last.reason === CONTEXT_OVERFLOW ? last.route : undefined;
+  }
+  const last = trace.attempts?.at(-1);
+  return trace.outcome === "client_error" && last?.outcome === "context_overflow"
+    ? last.route ?? trace.route
+    : undefined;
 }
 
 /** `Auto`'s fixed label: never a route that was attempted. */

@@ -396,6 +396,70 @@ async function main() {
   // The first router's traces are untouched by any of this: success still reads
   // served and the exhausted list still reads exhausted (checked above).
 
+  // --- a request a context overflow ended, and a stream that outlived its budget --------
+  // Two more routers, both Auto → Coder (503) → General. On the first, General
+  // refuses the prompt with `400 context_length_exceeded`: R9.3's block keeps
+  // `exhausted: false` (the chain stopped, the list did not run out), and the
+  // card must not call it served. On the second, General streams for about
+  // two seconds past a 1500 ms pre-commit budget: committed, so served.
+  const OVERFLOW_BASE = (process.env.OVERFLOW_PANEL_BASE ?? "").replace(/\/+$/, "");
+  const STREAM_BASE = (process.env.STREAM_PANEL_BASE ?? "").replace(/\/+$/, "");
+  check(OVERFLOW_BASE.length > 0 && STREAM_BASE.length > 0, "the overflow and stream routers are given to the render");
+  const send = async (base, body) => {
+    const started = Date.now();
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    return { status: response.status, id: response.headers.get("x-request-id") ?? "", text, ms: Date.now() - started };
+  };
+  const toolRequest = (content, extra = {}) => ({
+    model: "Auto",
+    tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+    messages: [{ role: "user", content }],
+    ...extra,
+  });
+
+  const overflow = await send(OVERFLOW_BASE, toolRequest("render a context overflow"));
+  check(overflow.status === 400 && overflow.text.includes("context_length_exceeded"), `Auto → Coder → General, General overflows: 400 context_length_exceeded (got ${overflow.status})`);
+  const overflowPage = await context.newPage();
+  overflowPage.on("pageerror", (err) => errors.push(String(err)));
+  await overflowPage.goto(`${OVERFLOW_BASE}/#/auto`, { waitUntil: "domcontentloaded" });
+  const overflowTrace = overflowPage.locator(`[data-fallback-trace="${overflow.id}"]`);
+  await overflowTrace.waitFor({ timeout: TIMEOUT });
+  const overflowText = await overflowTrace.innerText();
+  check(overflowText.includes("Context limit exceeded while attempting General"), "a context overflow on General reads: Context limit exceeded while attempting General");
+  check(!overflowText.includes("Served by"), "a context overflow on General never reads as served");
+  check(!overflowText.includes("Exhausted") && (await overflowTrace.locator("[data-trace-exhausted]").count()) === 0, "a context overflow is not shown as an exhausted list");
+  check(!overflowText.includes("Budget"), "a context overflow is not shown as a budget expiry");
+  check((await overflowTrace.locator('[data-trace-verdict="context_overflow"]').count()) === 1, "its verdict is the context overflow");
+  check((await overflowTrace.locator("[data-trace-context-overflow]").innerText()).includes("the client got General's own 400 context_length_exceeded"), "it says the client got General's own 400");
+  check((await overflowTrace.locator('[data-trace-step="General"]').innerText()).includes("Context overflow (context_length_exceeded)"), "General's step reads Context overflow");
+  check((await overflowTrace.locator('[data-trace-step="Coder"]').innerText()).includes("Route exhausted (route_exhausted)"), "Coder's step keeps its own fallback reason");
+  await overflowTrace.screenshot({ path: `${OUT_DIR}/router-context-overflow-trace.png` });
+  const explicitOverflow = await send(OVERFLOW_BASE, { model: "General", messages: [{ role: "user", content: "render an explicit overflow" }] });
+  check(explicitOverflow.status === 400, `an explicit General request overflows too: 400 (got ${explicitOverflow.status})`);
+  await overflowPage.reload({ waitUntil: "domcontentloaded" });
+  await overflowPage.locator(`[data-fallback-trace="${overflow.id}"]`).waitFor({ timeout: TIMEOUT });
+  check((await overflowPage.locator(`[data-fallback-trace="${explicitOverflow.id}"]`).count()) === 0, "an explicit overflow never appears as a cross-route fallback");
+  check((await overflowPage.locator('[data-trace-verdict="served"]').count()) === 0, "nothing on the overflow router reads as served");
+  await overflowPage.close();
+
+  const streamed = await send(STREAM_BASE, toolRequest("render a stream", { stream: true }));
+  check(streamed.status === 200 && streamed.text.includes("data: [DONE]") && streamed.ms > 1500, `Auto → Coder → General streams 200 to [DONE] past the 1500 ms budget (${streamed.ms} ms)`);
+  const streamPage = await context.newPage();
+  streamPage.on("pageerror", (err) => errors.push(String(err)));
+  await streamPage.goto(`${STREAM_BASE}/#/auto`, { waitUntil: "domcontentloaded" });
+  const streamTrace = streamPage.locator(`[data-fallback-trace="${streamed.id}"]`);
+  await streamTrace.waitFor({ timeout: TIMEOUT });
+  const streamText = await streamTrace.innerText();
+  check(streamText.includes("Served by General") && (await streamTrace.locator('[data-trace-verdict="served"]').count()) === 1, "a committed stream reads: Served by General");
+  check(!streamText.includes("Budget") && !streamText.includes("Context limit"), "a committed stream has no budget or context-overflow wording");
+  await streamTrace.screenshot({ path: `${OUT_DIR}/router-stream-served-trace.png` });
+  await streamPage.close();
+
   // --- the key never reaches the browser ------------------------------------------------
   const html = await page.content();
   const storage = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));

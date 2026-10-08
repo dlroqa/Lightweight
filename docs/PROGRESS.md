@@ -3084,3 +3084,41 @@ and no context-overflow routing, trace or capability behaviour changes.
 
 **Next:** nothing started. Separate decision on the context-overflow
 follow-up, then release readiness. R9.4 not started; no release.
+
+## R9.3 context-overflow wording follow-up (feature/router-context-overflow-ui-wording)
+
+From frozen master `357a61b`. **Presentation only:** no Rust, no trace,
+metric, config, API or routing change; R9.3.1 fallback semantics, the R9.3.2
+slice 1 backend and the request-budget UI wording stay frozen.
+
+**The mismatch.** Auto → Coder (503) → General, General answering `400
+context_length_exceeded`: the client got 400, the trace reads `outcome:
+client_error` with `cross_route_fallback.exhausted: false` (the chain
+stopped; the list did not run out), and the card read "Served by General"
+because anything not exhausted fell through to served.
+
+**The trace already says it.** `conclude_chain` records the last route
+attempt as `failed` / `context_length_exceeded` only when the chain ended
+with no fallback reason and that route's own `context_overflow` was set,
+which the router sets only from the node's structured `error.code`. Without
+a fallback block, the last deployment attempt reads `context_overflow` and
+the request `client_error`. No field was missing.
+
+**The fix.** `traceVerdict()` gains one verdict, between the budget and the
+exhausted list: "Context limit exceeded while attempting {route}", the
+route being the one whose attempt overflowed (General, never Coder or
+Auto). The card adds a line: the client got that route's own `400
+context_length_exceeded`; no response was served. Precedence: request
+budget, context overflow, exhausted list, served. Any other `client_error`
+is not read as an overflow; an overflow a larger deployment then answered
+is served.
+
+**Tests.** 9 model tests (frontend 77 passing, was 68). Render: two more
+routers sharing the budget router's refusing Coder (`mock-node.mjs` gains
+`overflow` and `stream`): a live overflow on General, a live explicit
+overflow (never in the card) and a live stream relayed past a 1500 ms
+budget ("Served by General"). 142 render checks locally, 0 failed (the
+original 126 unchanged). Local tip: `render-panel.sh` builds the frontend
+only when `frontend/dist` is missing, so rebuild it after a frontend change.
+
+R9.4 not started; no release.
