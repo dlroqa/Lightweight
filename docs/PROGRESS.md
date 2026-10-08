@@ -3020,3 +3020,67 @@ chain that ends on a context overflow on a fallback route also keeps
 `exhausted: false`, so the card still reads "Served by" for it.
 
 R9.4 not started; no release.
+
+### R9.3.2 budget wording follow-up MERGED and FROZEN
+
+PR #51 (final head `6e3b082`) merged with a merge commit as **`a17dab2`**,
+the validated master head. Presentation only: no file under `crates/`,
+no Cargo, packaging or workflow change; R9.3.2 slice 1 backend stays frozen
+as recorded above. v0.6.0 (`a8f0c89`) is unchanged and remains the latest
+release; neither slice 1 nor this follow-up is in any release yet.
+
+**Frozen behaviour (R9.3 *Recent cross-route fallbacks* card):**
+- Precedence: request-budget terminal state, then an exhausted fallback
+  list, then served. A budget-terminal trace never reads "Served by".
+- Success still reads "Served by <route>".
+- A budget cut on an attempted route reads "Budget expired while attempting
+  <route>"; the cut step reads "Budget expired (request_budget_exhausted)"
+  and the card says the client got `504 request_budget_exhausted` before any
+  response started.
+- A next fallback refused by the start check (`next_unattempted_route`)
+  reads "Budget expired before attempting <route>" and is not listed as a
+  step: it is never shown as attempted or served.
+- Classifier-stage exhaustion invents no route (model verdict "Budget
+  expired during classification"; it never appears in the card).
+- Explicit-route exhaustion (verdict "Budget expired while attempting
+  <route>") implies no fallback and never appears in the card.
+- Normal failures (exhausted list, no budget) and a stream committed before
+  the deadline keep their existing wording; a trace without a
+  `request_budget` block reads exactly as before.
+- No request-budget configuration UI, no post-commit deadline, no trace,
+  metric, config, API or routing change.
+
+**Master validation (`a17dab2`, push):** check
+[37724692646](https://github.com/dlroqa/Lightweight/actions/runs/37724692646)
+and render panel
+[37724692555](https://github.com/dlroqa/Lightweight/actions/runs/37724692555),
+both attempt 1, no reruns. Linux x64, Windows x64, macOS x64, macOS arm64:
+contract suite `47 passed, 2 skipped`; secrets gate `ok no credentials, home
+paths or machine addresses in tracked files`; frontend `# pass 68 / # fail
+0`; desktop `# pass 26 / # fail 0`; `All checks passed.`. Flatpak "Flatpak
+checks passed.", Linux artifacts "Artifact checks passed.", render icons
+"icons ok", render panel 126 `[ok]`, 0 failed.
+
+**Post-merge UI smoke** (`hermes router` and `frontend/dist` built from
+`a17dab2`, scripted nodes, headless Chromium on the card): 21/21 — Auto →
+Coder (503) → General (200) "Served by General"; General cut at 1.509 s →
+504, "Budget expired while attempting General", nothing served; refused
+next fallback (fixture, router b11 shape) "Budget expired before attempting
+General", steps `[Coder]` only; classifier exhaustion (fixture, b08 shape)
+no card row; explicit Coder 504 at 1.509 s, trace has no fallback block,
+verdict "Budget expired while attempting Coder"; no-budget router "Served by
+General" with no `request_budget` block; Coder 503 → General 503 "Exhausted";
+stream relayed 3.5 s past a 1.5 s budget, outcome `ok`, "Served by General".
+Screenshots of the CI render and the smoke inspected by eye.
+
+**Known deferred UI issue (not fixed, out of scope):** a fallback flow
+ending in context overflow may still render "Served by <route>" because the
+existing R9.3 fallback trace keeps `exhausted: false` for that terminal
+condition. Observed live in the smoke: Coder 503 → General `400
+context_length_exceeded`, client got 400, trace `outcome: client_error`,
+card "Served by General". This is separate from the R9.3.2 request-budget
+wording fix and requires its own follow-up; its wording is not decided here,
+and no context-overflow routing, trace or capability behaviour changes.
+
+**Next:** nothing started. Separate decision on the context-overflow
+follow-up, then release readiness. R9.4 not started; no release.
