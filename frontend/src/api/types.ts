@@ -761,6 +761,23 @@ export interface RoutingTraceView {
   status?: number;
   attempts?: DeploymentAttemptView[];
   cross_route_fallback?: FallbackTraceView;
+  /** The pre-commit request budget (R9.3.2). Present only when one is configured. */
+  request_budget?: RequestBudgetTraceView;
+}
+
+/** A routing trace's `request_budget` block (R9.3.2). Timings and bounded values only. */
+export interface RequestBudgetTraceView {
+  configured_ms: number;
+  /** `true` only when the request was answered `504 request_budget_exhausted`. */
+  exhausted: boolean;
+  /** `classifier`, `route_planning`, `same_route_attempt` or `cross_route_fallback`. */
+  stage?: string;
+  /** A logical route the budget refused to start: never attempted, never served. */
+  next_unattempted_route?: string;
+  elapsed_before_commit_ms?: number;
+  remaining_at_commit_ms?: number;
+  elapsed_ms?: number;
+  remaining_ms?: number;
 }
 
 /** `GET /api/router/v1/traces`. */

@@ -19,6 +19,7 @@ import {
   fallbackTraces,
   hasChainProblems,
   reasonLabel,
+  traceVerdict,
   transitionRows,
   validateChains,
   type ChainDraft,
@@ -405,6 +406,7 @@ function RecentCard({ traces, error }: { traces: TracesBody | null; error: ApiEr
 function TraceSteps({ trace }: { trace: RoutingTraceView }) {
   const block = trace.cross_route_fallback!;
   const groups = deploymentsByRoute(trace);
+  const verdict = traceVerdict(trace);
   return (
     <div
       data-fallback-trace={trace.request_id}
@@ -415,11 +417,11 @@ function TraceSteps({ trace }: { trace: RoutingTraceView }) {
           Requested <strong>{trace.requested_route}</strong> · initial <strong>{block.initial_route}</strong> ·
           final <strong data-trace-final>{block.final_route}</strong>
         </span>
-        {block.exhausted ? (
-          <Pill tone="danger">Exhausted</Pill>
-        ) : (
-          <Pill tone="ok">Served by {block.final_route}</Pill>
-        )}
+        <span data-trace-verdict={verdict.kind}>
+          <Pill tone={verdict.kind === "served" ? "ok" : verdict.kind === "exhausted" ? "danger" : "warn"}>
+            {verdict.label}
+          </Pill>
+        </span>
         <code style={{ fontSize: 12, color: "var(--text-muted)" }}>{trace.request_id}</code>
       </div>
       <ol style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: 4 }}>
@@ -444,7 +446,15 @@ function TraceSteps({ trace }: { trace: RoutingTraceView }) {
             </li>
           );
         })}
-        {block.exhausted && (
+        {verdict.kind === "budget" && (
+          <li data-trace-budget>
+            <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />
+            <div>
+              {verdict.label}: the client got 504 request_budget_exhausted before any response started.
+            </div>
+          </li>
+        )}
+        {verdict.kind === "exhausted" && (
           <li data-trace-exhausted>
             <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />
             <div>Exhausted: the client got {block.final_route}&apos;s own error.</div>

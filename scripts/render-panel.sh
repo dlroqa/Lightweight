@@ -26,7 +26,9 @@
 #   GATEWAY_PORT  gateway/panel port        (default 11434)
 #   ROUTER_PORT   router/panel port         (default 11500)
 #   JEV_PORT      scripted TypeSafe port    (default 11501)
-#   NODE_PORT     first scripted node port  (default 11502; the second is +1)
+#   NODE_PORT     first scripted node port  (default 11502; the second is +1;
+#                 +2 is a second router with a pre-commit request budget, and
+#                 +3/+4 its two scripted nodes)
 #   OUT_DIR       where screenshots land    (default e2e/screens)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,6 +39,11 @@ JEV_PORT="${JEV_PORT:-11501}"
 NODE_PORT="${NODE_PORT:-11502}"
 CODER_NODE_PORT="$NODE_PORT"
 GENERAL_NODE_PORT="$((NODE_PORT + 1))"
+# A second router with a pre-commit request budget (R9.3.2), and its own two
+# scripted nodes, so the first router and its checks stay exactly as they are.
+BUDGET_ROUTER_PORT="$((NODE_PORT + 2))"
+BUDGET_CODER_PORT="$((NODE_PORT + 3))"
+BUDGET_GENERAL_PORT="$((NODE_PORT + 4))"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -55,16 +62,20 @@ ROUTER_LOG="$WORK/router.log"
 ROUTER_PID=""
 JEV_PID=""
 NODES_PID=""
+BUDGET_ROUTER_LOG="$WORK/budget-router.log"
+BUDGET_ROUTER_PID=""
+BUDGET_NODES_PID=""
 
 cleanup() {
   local status=$?
-  for pid in "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
+  for pid in "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
   if [ "$status" -ne 0 ]; then
     echo "== gateway server log =="; [ -f "$GATEWAY_LOG" ] && cat "$GATEWAY_LOG" || echo "(none)"
     echo "== router log =="; [ -f "$ROUTER_LOG" ] && cat "$ROUTER_LOG" || echo "(none)"
+    echo "== budget router log =="; [ -f "$BUDGET_ROUTER_LOG" ] && cat "$BUDGET_ROUTER_LOG" || echo "(none)"
   fi
   rm -rf "$WORK"
   exit "$status"
@@ -171,8 +182,44 @@ TYPESAFE_API_KEY="$JEV_KEY" ./target/debug/lightweight router --config "$WORK/ro
 ROUTER_PID=$!
 wait_for "http://127.0.0.1:$ROUTER_PORT/health" "router" "$ROUTER_PID"
 
+echo "== start budget nodes (ports $BUDGET_CODER_PORT, $BUDGET_GENERAL_PORT) =="
+# Coder refuses with 503 (route_exhausted, a fallback reason); General accepts
+# and never answers, so the request budget cuts it. Both start loaded.
+MOCK_NODES="$BUDGET_CODER_PORT:Coder:503:loaded,$BUDGET_GENERAL_PORT:General:hang:loaded" \
+  node e2e/mock-node.mjs >"$WORK/budget-nodes.log" 2>&1 &
+BUDGET_NODES_PID=$!
+wait_for "http://127.0.0.1:$BUDGET_CODER_PORT/health" "scripted budget Coder node" "$BUDGET_NODES_PID"
+wait_for "http://127.0.0.1:$BUDGET_GENERAL_PORT/health" "scripted budget General node" "$BUDGET_NODES_PID"
+
+echo "== start budget router (port $BUDGET_ROUTER_PORT) =="
+cat >"$WORK/budget-router.json" <<JSON
+{
+  "listen": ["127.0.0.1:$BUDGET_ROUTER_PORT"],
+  "request": {"pre_commit_budget_ms": 1500},
+  "nodes": [
+    {"id": "coder", "url": "http://127.0.0.1:$BUDGET_CODER_PORT"},
+    {"id": "general", "url": "http://127.0.0.1:$BUDGET_GENERAL_PORT"}
+  ],
+  "routes": [
+    {"name": "General", "deployments": [{"node": "general", "model": "General"}]},
+    {"name": "Coder", "deployments": [{"node": "coder", "model": "Coder"}]}
+  ],
+  "auto_route": {
+    "enabled": true,
+    "fallback_route": "General",
+    "rules": [{"name": "tools", "when": {"requires_tools": true}, "route": "Coder"}],
+    "cross_route_fallback": {"Coder": ["General"]}
+  }
+}
+JSON
+./target/debug/lightweight router --config "$WORK/budget-router.json" \
+  --web-root frontend/dist >"$BUDGET_ROUTER_LOG" 2>&1 &
+BUDGET_ROUTER_PID=$!
+wait_for "http://127.0.0.1:$BUDGET_ROUTER_PORT/health" "budget router" "$BUDGET_ROUTER_PID"
+
 echo "== render the router's panel in a headless browser =="
 PANEL_BASE="http://127.0.0.1:$ROUTER_PORT" OUT_DIR="$OUT_DIR" SECRET_SENTINEL="$JEV_KEY" \
+  BUDGET_PANEL_BASE="http://127.0.0.1:$BUDGET_ROUTER_PORT" \
   EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" \
   MOCK_NODE_URLS="http://127.0.0.1:$CODER_NODE_PORT,http://127.0.0.1:$GENERAL_NODE_PORT" \
   node e2e/render-router.mjs

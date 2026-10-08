@@ -2985,3 +2985,38 @@ Also deferred: the budget UI card, a post-commit stream deadline, node
 deadline forwarding, client-supplied deadlines.
 
 **Next:** nothing started. R9.4 not started; no release.
+
+## R9.3.2 budget wording follow-up (feature/router-request-budget-ui-wording)
+
+From frozen master `91d2fb2`. **Presentation only:** no Rust, no trace,
+metric, config or API change; R9.3.2 slice 1 stays frozen.
+
+**The mismatch.** The R9.3 card (`CrossRouteFallback.tsx`, `TraceSteps`)
+chose its pill from `cross_route_fallback.exhausted` alone: `Exhausted`, or
+else always `Served by {final_route}`. A budget-ended request keeps
+`exhausted: false` by design (time ran out, not the list), so a 504 read
+"Served by General" — and a refused next fallback read "Served by Coder".
+
+**The fix.** `traceVerdict()` (`fallbackModel.ts`) reads existing fields in
+this order: `outcome == "request_budget_exhausted"` or
+`request_budget.exhausted` → budget (`next_unattempted_route` → "Budget
+expired before attempting X"; `stage == "classifier"` → "Budget expired
+during classification"; otherwise "Budget expired while attempting
+{final route}"; never `Auto` as an attempted route); then an exhausted list →
+"Exhausted"; then "Served by X". The card adds a line saying the client got
+`504 request_budget_exhausted` before any response started, and the cut
+step's reason reads "Budget expired". No budget configuration UI, no
+post-commit deadline.
+
+**Tests.** 12 model tests (frontend 68 passing); render: a second router
+with `pre_commit_budget_ms: 1500` and scripted nodes (`mock-node.mjs` gains
+`hang` and `:loaded`) renders a live budget cut on General and a live
+explicit cut, plus the refused-fallback and classifier shapes from fixtures
+matching the router's own tests (126 render checks locally, 0 failed; the
+original 110 unchanged).
+
+**Known, not changed (pre-existing R9.3 behaviour, no budget involved):** a
+chain that ends on a context overflow on a fallback route also keeps
+`exhausted: false`, so the card still reads "Served by" for it.
+
+R9.4 not started; no release.
