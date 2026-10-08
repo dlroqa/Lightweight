@@ -98,12 +98,17 @@ async function main() {
   check((await page.locator('[data-exhausted-route="Coder"]').innerText()).includes("route_unavailable: 1"), "the exhausted list is counted");
   check((await page.locator("[data-identity-help]").innerText()).includes('model: "General"'), "response identity is explained");
   check((await page.locator("[data-requests-total-help]").innerText()).includes("counts each client request once"), "router_requests_total's final-route meaning is explained");
+  // Each route step's badge tone: green ("ok") only for a step that served a
+  // successful response; anything else is a warning, never green.
+  const stepTones = (card) => card.locator("[data-trace-step]").evaluateAll((items) =>
+    items.map((item) => `${item.getAttribute("data-trace-step")}:${item.querySelector("[data-step-tone]")?.getAttribute("data-step-tone")}`).join(","));
   const trace = page.locator("[data-fallback-trace]").first();
   await trace.waitFor({ timeout: TIMEOUT });
   const traceText = await trace.innerText();
   check(traceText.includes("Requested Auto") && traceText.includes("initial Coder") && traceText.includes("final General"), "the trace shows requested, initial and final routes");
   check((await trace.locator('[data-trace-step="Coder"]').innerText()).includes("route_unavailable"), "the trace shows Coder failing as route_unavailable");
   check((await trace.locator("[data-trace-exhausted]").count()) === 1 && traceText.includes("Exhausted"), "the exhausted chain is shown as exhausted");
+  check(await stepTones(trace) === "Coder:warn,General:warn", `an exhausted chain has no green step (got ${await stepTones(trace)})`);
 
   // The draft: valid as running, then every refusal, then the snippet again.
   check((await page.locator("[data-fallback-snippet]").innerText()).includes('"Coder": ['), "the running lists produce a snippet");
@@ -186,6 +191,7 @@ async function main() {
   const generalStep = await success.locator('[data-trace-step="General"]').innerText();
   check(coderStep.includes("Route exhausted (route_exhausted)"), "Coder's step renders its fallback reason, route_exhausted");
   check(generalStep.includes("answered (200)"), "General's step renders it answered (ok, 200)");
+  check(await stepTones(success) === "Coder:warn,General:ok", `a 200 fallback: Coder's failed step warns, General's is green (got ${await stepTones(success)})`);
   check(coderStep.includes("coder-b") && coderStep.includes("503") && !coderStep.includes("general-b"), "Coder's same-route attempt (coder-b, 503) stays with Coder");
   check(generalStep.includes("general-b") && !generalStep.includes("coder-b"), "General's same-route attempt (general-b) stays with General");
   check((await page.locator("[data-identity-help]").innerText()).includes('model: "General"'), "the response identity help agrees with the served response");
@@ -374,6 +380,7 @@ async function main() {
   const cutText = await cutTrace.innerText();
   check(cutText.includes("Budget expired while attempting General"), "a budget cut on General reads: Budget expired while attempting General");
   check(!cutText.includes("Served by"), "a budget cut on General never reads as served");
+  check(await stepTones(cutTrace) === "Coder:warn,General:warn", `a budget cut has no green step (got ${await stepTones(cutTrace)})`);
   check((await cutTrace.locator('[data-trace-verdict="budget"]').count()) === 1, "its verdict is the budget, not served or exhausted");
   check((await cutTrace.locator("[data-trace-budget]").innerText()).includes("504 request_budget_exhausted before any response started"), "it says the client got 504 before any response started");
   check((await cutTrace.locator("[data-trace-exhausted]").count()) === 0 && !cutText.includes("Exhausted"), "a budget cut is not shown as an exhausted list");
@@ -395,6 +402,101 @@ async function main() {
   await budgetPage.close();
   // The first router's traces are untouched by any of this: success still reads
   // served and the exhausted list still reads exhausted (checked above).
+
+  // --- a request a context overflow ended, and a stream that outlived its budget --------
+  // Two more routers, both Auto → Coder (503) → General. On the first, General
+  // refuses the prompt with `400 context_length_exceeded`: R9.3's block keeps
+  // `exhausted: false` (the chain stopped, the list did not run out), and the
+  // card must not call it served. On the second, General streams for about
+  // two seconds past a 1500 ms pre-commit budget: committed, so served.
+  const OVERFLOW_BASE = (process.env.OVERFLOW_PANEL_BASE ?? "").replace(/\/+$/, "");
+  const STREAM_BASE = (process.env.STREAM_PANEL_BASE ?? "").replace(/\/+$/, "");
+  check(OVERFLOW_BASE.length > 0 && STREAM_BASE.length > 0, "the overflow and stream routers are given to the render");
+  const send = async (base, body) => {
+    const started = Date.now();
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    return { status: response.status, id: response.headers.get("x-request-id") ?? "", text, ms: Date.now() - started };
+  };
+  const toolRequest = (content, extra = {}) => ({
+    model: "Auto",
+    tools: [{ type: "function", function: { name: "f", parameters: { type: "object" } } }],
+    messages: [{ role: "user", content }],
+    ...extra,
+  });
+
+  const overflow = await send(OVERFLOW_BASE, toolRequest("render a context overflow"));
+  check(overflow.status === 400 && overflow.text.includes("context_length_exceeded"), `Auto → Coder → General, General overflows: 400 context_length_exceeded (got ${overflow.status})`);
+  const overflowPage = await context.newPage();
+  overflowPage.on("pageerror", (err) => errors.push(String(err)));
+  await overflowPage.goto(`${OVERFLOW_BASE}/#/auto`, { waitUntil: "domcontentloaded" });
+  const overflowTrace = overflowPage.locator(`[data-fallback-trace="${overflow.id}"]`);
+  await overflowTrace.waitFor({ timeout: TIMEOUT });
+  const overflowText = await overflowTrace.innerText();
+  check(overflowText.includes("Context limit exceeded while attempting General"), "a context overflow on General reads: Context limit exceeded while attempting General");
+  check(!overflowText.includes("Served by"), "a context overflow on General never reads as served");
+  check(await stepTones(overflowTrace) === "Coder:warn,General:warn", `a context overflow has no green step (got ${await stepTones(overflowTrace)})`);
+  check(!overflowText.includes("Exhausted") && (await overflowTrace.locator("[data-trace-exhausted]").count()) === 0, "a context overflow is not shown as an exhausted list");
+  check(!overflowText.includes("Budget"), "a context overflow is not shown as a budget expiry");
+  check((await overflowTrace.locator('[data-trace-verdict="context_overflow"]').count()) === 1, "its verdict is the context overflow");
+  check((await overflowTrace.locator("[data-trace-context-overflow]").innerText()).includes("the client got General's own 400 context_length_exceeded"), "it says the client got General's own 400");
+  check((await overflowTrace.locator('[data-trace-step="General"]').innerText()).includes("Context overflow (context_length_exceeded)"), "General's step reads Context overflow");
+  check((await overflowTrace.locator('[data-trace-step="Coder"]').innerText()).includes("Route exhausted (route_exhausted)"), "Coder's step keeps its own fallback reason");
+  await overflowTrace.screenshot({ path: `${OUT_DIR}/router-context-overflow-trace.png` });
+  const explicitOverflow = await send(OVERFLOW_BASE, { model: "General", messages: [{ role: "user", content: "render an explicit overflow" }] });
+  check(explicitOverflow.status === 400, `an explicit General request overflows too: 400 (got ${explicitOverflow.status})`);
+  await overflowPage.reload({ waitUntil: "domcontentloaded" });
+  await overflowPage.locator(`[data-fallback-trace="${overflow.id}"]`).waitFor({ timeout: TIMEOUT });
+  check((await overflowPage.locator(`[data-fallback-trace="${explicitOverflow.id}"]`).count()) === 0, "an explicit overflow never appears as a cross-route fallback");
+  check((await overflowPage.locator('[data-trace-verdict="served"]').count()) === 0, "nothing on the overflow router reads as served");
+  await overflowPage.close();
+
+  const streamed = await send(STREAM_BASE, toolRequest("render a stream", { stream: true }));
+  check(streamed.status === 200 && streamed.text.includes("data: [DONE]") && streamed.ms > 1500, `Auto → Coder → General streams 200 to [DONE] past the 1500 ms budget (${streamed.ms} ms)`);
+  const streamPage = await context.newPage();
+  streamPage.on("pageerror", (err) => errors.push(String(err)));
+  await streamPage.goto(`${STREAM_BASE}/#/auto`, { waitUntil: "domcontentloaded" });
+  const streamTrace = streamPage.locator(`[data-fallback-trace="${streamed.id}"]`);
+  await streamTrace.waitFor({ timeout: TIMEOUT });
+  const streamText = await streamTrace.innerText();
+  check(streamText.includes("Served by General") && (await streamTrace.locator('[data-trace-verdict="served"]').count()) === 1, "a committed stream reads: Served by General");
+  check(await stepTones(streamTrace) === "Coder:warn,General:ok", `a completed stream's General step is green (got ${await stepTones(streamTrace)})`);
+  check(!streamText.includes("Budget") && !streamText.includes("Context limit"), "a committed stream has no budget or context-overflow wording");
+  await streamTrace.screenshot({ path: `${OUT_DIR}/router-stream-served-trace.png` });
+  await streamPage.close();
+
+  // --- an error that is neither a fallback reason nor a context overflow -----------------
+  // General commits a plain 400 on one router and a 500 on another (neither
+  // moves a request on): `exhausted: false`, final route General, and nothing
+  // served. "Served by" needs `outcome: "ok"`; these read neutrally instead.
+  for (const [name, envName, status, outcome] of [
+    ["client-error", "CLIENT_ERROR_PANEL_BASE", 400, "client_error"],
+    ["server-error", "SERVER_ERROR_PANEL_BASE", 500, "server_error"],
+  ]) {
+    const base = (process.env[envName] ?? "").replace(/\/+$/, "");
+    check(base.length > 0, `the ${name} router is given to the render`);
+    const answer = await send(base, toolRequest(`render a ${name}`));
+    check(answer.status === status, `Auto → Coder → General, General answers ${status} (got ${answer.status})`);
+    const page = await context.newPage();
+    page.on("pageerror", (err) => errors.push(String(err)));
+    await page.goto(`${base}/#/auto`, { waitUntil: "domcontentloaded" });
+    const card = page.locator(`[data-fallback-trace="${answer.id}"]`);
+    await card.waitFor({ timeout: TIMEOUT });
+    const text = await card.innerText();
+    check(text.includes("Request ended while attempting General"), `a ${status} on General reads: Request ended while attempting General`);
+    check(!text.includes("Served by"), `a ${status} on General never reads as served, though the list was not exhausted`);
+    check((await card.locator('[data-trace-step="General"]').innerText()).includes(`answered (${status})`), `General's step still says it answered (${status})`);
+    check(await stepTones(card) === "Coder:warn,General:warn", `a ${status} on General is not a green step (got ${await stepTones(card)})`);
+    check(!text.includes("Exhausted") && !text.includes("Budget") && !text.includes("Context limit"), `a ${status} on General guesses no exhaustion, budget or context cause`);
+    check((await card.locator('[data-trace-verdict="unsuccessful"]').count()) === 1, `its verdict is unsuccessful`);
+    check((await card.locator("[data-trace-unsuccessful]").innerText()).includes(`outcome ${outcome}, status ${status}`), `it names the outcome ${outcome} and status ${status}`);
+    await card.screenshot({ path: `${OUT_DIR}/router-${name}-trace.png` });
+    await page.close();
+  }
 
   // --- the key never reaches the browser ------------------------------------------------
   const html = await page.content();

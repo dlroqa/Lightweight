@@ -2213,10 +2213,19 @@ with their descriptions and availability.
   request that changed route shows its requested, initial and final routes,
   each route attempt with its reason (and that route's deployment attempts,
   the same-route part, beside it), and *Exhausted* when the list ran out.
-  Known limitation (deferred, unchanged): a chain that ends on a context
-  overflow keeps `exhausted: false` in its trace, so the card still reads
-  "Served by <route>" although the client got that route's `400
-  context_length_exceeded`.
+  A chain that ended on a context overflow (the last route's `400
+  context_length_exceeded`; its trace keeps `exhausted: false`, since the
+  chain stopped and the list did not run out) reads *Context limit exceeded
+  while attempting <route>*, never "Served by". "Served by <route>" needs
+  the trace's `outcome: "ok"` (a 2xx/3xx answer, or a stream that ran to
+  its end), never `exhausted: false` alone; any other ending (another
+  client or server error, an interrupted stream, a client that left) reads
+  *Request ended while attempting <route>* with its outcome and status. The
+  card's precedence: request budget, context overflow, exhausted list,
+  served, then that neutral verdict.
+  A route step's badge is green only for the step that served a successful
+  response; a step that answered with an error ("answered (400)") is shown
+  as a warning, like a failed one.
 
 **Classifier** has three parts:
 

@@ -3084,3 +3084,69 @@ and no context-overflow routing, trace or capability behaviour changes.
 
 **Next:** nothing started. Separate decision on the context-overflow
 follow-up, then release readiness. R9.4 not started; no release.
+
+## R9.3 context-overflow wording follow-up (feature/router-context-overflow-ui-wording)
+
+From frozen master `357a61b`. **Presentation only:** no Rust, no trace,
+metric, config, API or routing change; R9.3.1 fallback semantics, the R9.3.2
+slice 1 backend and the request-budget UI wording stay frozen.
+
+**The mismatch.** Auto → Coder (503) → General, General answering `400
+context_length_exceeded`: the client got 400, the trace reads `outcome:
+client_error` with `cross_route_fallback.exhausted: false` (the chain
+stopped; the list did not run out), and the card read "Served by General"
+because anything not exhausted fell through to served.
+
+**The trace already says it.** `conclude_chain` records the last route
+attempt as `failed` / `context_length_exceeded` only when the chain ended
+with no fallback reason and that route's own `context_overflow` was set,
+which the router sets only from the node's structured `error.code`. Without
+a fallback block, the last deployment attempt reads `context_overflow` and
+the request `client_error`. No field was missing.
+
+**The fix.** `traceVerdict()` gains one verdict, between the budget and the
+exhausted list: "Context limit exceeded while attempting {route}", the
+route being the one whose attempt overflowed (General, never Coder or
+Auto). The card adds a line: the client got that route's own `400
+context_length_exceeded`; no response was served. Precedence: request
+budget, context overflow, exhausted list, served. Any other `client_error`
+is not read as an overflow; an overflow a larger deployment then answered
+is served.
+
+**Tests.** 9 model tests (frontend 77 passing, was 68). Render: two more
+routers sharing the budget router's refusing Coder (`mock-node.mjs` gains
+`overflow` and `stream`): a live overflow on General, a live explicit
+overflow (never in the card) and a live stream relayed past a 1500 ms
+budget ("Served by General"). 142 render checks locally, 0 failed (the
+original 126 unchanged). Local tip: `render-panel.sh` builds the frontend
+only when `frontend/dist` is missing, so rebuild it after a frontend change.
+
+**Truthfulness hardening (same PR, before merge).** The root cause was wider
+than context overflow: anything not `exhausted` fell through to "Served
+by". "Served by <route>" now needs positive evidence, the trace's `outcome:
+"ok"` (`Outcome::of_status` 2xx/3xx; a stream is `ok` only when it ran to
+its end, else `interrupted`). Every other ending that is not a budget,
+context-overflow or exhausted verdict reads, without guessing a cause,
+"Request ended while attempting <route>" (or "Request ended without a
+successful response" if no route left `Auto`), and the card adds the
+outcome and status. Precedence: request budget, context overflow, exhausted
+list, served, neutral. 13 more model tests (frontend 90), including a guard
+that fails if `!exhausted` alone ever reads as served again (reintroducing
+that rule fails 9 tests); render adds two routers whose General commits a
+plain 400 and a 500 (`exhausted: false`, final route General): 156 checks
+locally, 0 failed.
+
+**Step badges (same PR, before merge).** A route step's badge was green
+whenever the step had `committed` (answered), so General's step in a chain
+ending on its own 400 or 500 read "answered (400)" in green under a
+non-success verdict. `stepTone()` (`fallbackModel.ts`) makes it green only
+for a committed step on a request whose `outcome` is `"ok"` (only the final
+step can commit, and the request's outcome is that answer's own result,
+a stream counting only when it ran to its end); every other step (failed,
+budget-cut, context overflow, a committed 4xx/5xx, interrupted, cancelled)
+is a warning. The text ("answered (400)") is unchanged. 10 more model tests
+(frontend 100), including a guard that fails if a committed step alone is
+styled as success again (reintroducing that rule fails 6 tests); render
+checks each live card's step tones (165 checks locally, 0 failed).
+
+R9.4 not started; no release.

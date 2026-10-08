@@ -13,7 +13,11 @@
 // `port:model:status[:loaded]`, for example `11502:Coder:503,11503:General:200`.
 // `status` may be `hang`: the node accepts the request and never answers (a
 // queue that never moves, a generation that never ends), which is what a
-// router's pre-commit request budget cuts. `:loaded` starts the node loaded.
+// router's pre-commit request budget cuts. `overflow` refuses the prompt as
+// longer than the node's context (400, `context_length_exceeded`, the
+// structured code the router reads). `stream` answers every request with a
+// server-sent-events stream spread over about two seconds. `:loaded` starts
+// the node loaded.
 
 import { createServer } from "node:http";
 
@@ -23,9 +27,12 @@ const specs = (process.env.MOCK_NODES ?? "")
   .map((spec) => {
     const [port, model, status, initially] = spec.split(":");
     const hang = status === "hang";
-    return { port: Number(port), model, status: hang ? 0 : Number(status), hang, loaded: initially === "loaded" };
+    const overflow = status === "overflow";
+    const stream = status === "stream";
+    const scripted = hang || overflow || stream;
+    return { port: Number(port), model, status: scripted ? 0 : Number(status), hang, overflow, stream, loaded: initially === "loaded" };
   });
-if (!specs.length || specs.some((s) => !s.port || !s.model || (!s.status && !s.hang))) {
+if (!specs.length || specs.some((s) => !s.port || !s.model || (!s.status && !s.hang && !s.overflow && !s.stream))) {
   console.error("MOCK_NODES must list port:model:status entries");
   process.exit(2);
 }
@@ -64,6 +71,25 @@ for (const spec of specs) {
       if (request.method === "POST" && request.url === "/v1/chat/completions") {
         if (!loaded) return json(404, { error: { message: "no model is loaded", type: "invalid_request_error", code: "model_not_found" } });
         if (spec.hang) return; // never answered: the client gives up first
+        if (spec.overflow) {
+          return json(400, { error: { message: "the prompt is longer than the model's context", type: "invalid_request_error", code: "context_length_exceeded" } });
+        }
+        if (spec.stream) {
+          response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          const chunk = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({
+            id: "chatcmpl-render", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000),
+            model: spec.model, choices: [{ index: 0, delta, finish_reason }],
+          })}\n\n`);
+          chunk({ role: "assistant" });
+          let sent = 0;
+          const timer = setInterval(() => {
+            if (sent < 4) return chunk({ content: `part ${sent++} ` });
+            clearInterval(timer);
+            chunk({}, "stop");
+            response.end("data: [DONE]\n\n");
+          }, 500);
+          return;
+        }
         if (spec.status !== 200) {
           return json(spec.status, { error: { message: `${spec.model} is scripted to refuse`, type: "server_error", code: "unavailable" } });
         }
