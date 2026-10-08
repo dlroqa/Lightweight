@@ -19,6 +19,7 @@ import {
   fallbackTraces,
   hasChainProblems,
   reasonLabel,
+  stepTone,
   traceVerdict,
   transitionRows,
   validateChains,
@@ -431,7 +432,9 @@ function TraceSteps({ trace }: { trace: RoutingTraceView }) {
             <li key={`${attempt.route}-${index}`} data-trace-step={attempt.route}>
               {index > 0 && <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />}
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                <Pill tone={attempt.outcome === "committed" ? "ok" : "warn"}>{attempt.route}</Pill>
+                <span data-step-tone={stepTone(attempt, trace)}>
+                  <Pill tone={stepTone(attempt, trace)}>{attempt.route}</Pill>
+                </span>
                 <span>
                   {attempt.outcome === "committed"
                     ? `answered${trace.status ? ` (${trace.status})` : ""}`

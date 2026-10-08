@@ -2223,6 +2223,9 @@ with their descriptions and availability.
   *Request ended while attempting <route>* with its outcome and status. The
   card's precedence: request budget, context overflow, exhausted list,
   served, then that neutral verdict.
+  A route step's badge is green only for the step that served a successful
+  response; a step that answered with an error ("answered (400)") is shown
+  as a warning, like a failed one.
 
 **Classifier** has three parts:
 

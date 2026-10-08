@@ -3134,7 +3134,19 @@ list, served, neutral. 13 more model tests (frontend 90), including a guard
 that fails if `!exhausted` alone ever reads as served again (reintroducing
 that rule fails 9 tests); render adds two routers whose General commits a
 plain 400 and a 500 (`exhausted: false`, final route General): 156 checks
-locally, 0 failed. Not changed: a committed step's badge stays green
-("answered (400)"); only the verdict changed.
+locally, 0 failed.
+
+**Step badges (same PR, before merge).** A route step's badge was green
+whenever the step had `committed` (answered), so General's step in a chain
+ending on its own 400 or 500 read "answered (400)" in green under a
+non-success verdict. `stepTone()` (`fallbackModel.ts`) makes it green only
+for a committed step on a request whose `outcome` is `"ok"` (only the final
+step can commit, and the request's outcome is that answer's own result,
+a stream counting only when it ran to its end); every other step (failed,
+budget-cut, context overflow, a committed 4xx/5xx, interrupted, cancelled)
+is a warning. The text ("answered (400)") is unchanged. 10 more model tests
+(frontend 100), including a guard that fails if a committed step alone is
+styled as success again (reintroducing that rule fails 6 tests); render
+checks each live card's step tones (165 checks locally, 0 failed).
 
 R9.4 not started; no release.

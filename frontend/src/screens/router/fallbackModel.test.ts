@@ -26,6 +26,7 @@ import {
   hasChainProblems,
   parseTargets,
   reasonLabel,
+  stepTone,
   traceVerdict,
   transitionRows,
   validateChains,
@@ -593,5 +594,55 @@ describe("Served by needs a successful outcome", () => {
   it("no route is invented when the request never left Auto", () => {
     assert.deepEqual(traceVerdict(trace({ route: "Auto", outcome: "client_error", status: 400 })),
       { kind: "unsuccessful", label: "Request ended without a successful response" });
+  });
+});
+
+describe("a step is green only when it served a successful response", () => {
+  const trace = (fields: Record<string, unknown>) =>
+    ({ request_id: "r", received_at: 0, requested_route: "Auto", ...fields }) as unknown as RoutingTraceView;
+  const coderFailed = { route: "Coder", outcome: "failed", reason: "route_exhausted" };
+  const generalCommitted = { route: "General", outcome: "committed" };
+  // Coder (503) → General, General answered with `status`, the request ended `outcome`.
+  const chain = (outcome: string, status: number | undefined, general: { route: string; outcome: string; reason?: string } = generalCommitted, exhausted = false) => {
+    const t = trace({
+      route: "General", outcome, status,
+      cross_route_fallback: { initial_route: "Coder", final_route: "General", exhausted, attempts: [coderFailed, general] },
+    });
+    return { t, coder: stepTone(coderFailed, t), general: stepTone(general, t) };
+  };
+
+  it("guards the old rule: a committed 400 client_error is not green, and not served", () => {
+    // Fails if answering alone (a committed step, an upstream status) is ever styled as success again.
+    const { t, general } = chain("client_error", 400);
+    assert.equal(general, "warn");
+    assert.ok(!traceVerdict(t).label.includes("Served by"));
+  });
+
+  it("a 200 fallback: Coder's failed step warns, General's step is green, and it is served", () => {
+    const { t, coder, general } = chain("ok", 200);
+    assert.deepEqual([coder, general], ["warn", "ok"]);
+    assert.equal(traceVerdict(t).label, "Served by General");
+  });
+
+  it("a committed stream that ran to its end is green", () => {
+    assert.equal(chain("ok", 200).general, "ok");
+  });
+
+  for (const [outcome, status] of [["server_error", 500], ["interrupted", 200], ["cancelled", undefined], ["unavailable", 503], ["something_new", 200]] as const) {
+    it(`a committed step whose request ended ${outcome} is not green`, () => {
+      assert.equal(chain(outcome, status).general, "warn");
+    });
+  }
+
+  it("a context overflow, a budget cut and an exhausted list are never green", () => {
+    assert.equal(chain("client_error", 400, { route: "General", outcome: "failed", reason: "context_length_exceeded" }).general, "warn");
+    assert.equal(chain("request_budget_exhausted", 504, { route: "General", outcome: "failed", reason: "request_budget_exhausted" }).general, "warn");
+    const exhausted = chain("unavailable", 503, { route: "General", outcome: "failed", reason: "route_unavailable" }, true);
+    assert.deepEqual([exhausted.coder, exhausted.general], ["warn", "warn"]);
+  });
+
+  it("a failed step is never green, even on a request that succeeded later", () => {
+    // Coder's 503 was a fallback reason; the request then succeeded on General.
+    assert.equal(chain("ok", 200).coder, "warn");
   });
 });

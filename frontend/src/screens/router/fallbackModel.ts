@@ -10,6 +10,7 @@
 import type {
   AutoView,
   CrossRouteFallbackView,
+  FallbackAttemptView,
   RouterRouteView,
   RoutingTraceView,
   TracesBody,
@@ -124,6 +125,18 @@ export function traceVerdict(trace: RoutingTraceView): TraceVerdict {
 
 /** The one trace outcome that means a response was served (`Outcome::Ok`). */
 const SUCCESS = "ok";
+
+/**
+ * A route step's badge tone. `ok` (green) only for the step that committed
+ * a response *and* a request that succeeded (`outcome: "ok"`). A committed
+ * step merely answered — a 400, a 500, a stream the node broke off or a
+ * client that left are answers too — so answering alone is never success;
+ * every other step (failed, cut by the budget, refused for its context)
+ * reads as a warning.
+ */
+export function stepTone(attempt: FallbackAttemptView, trace: RoutingTraceView): "ok" | "warn" {
+  return attempt.outcome === "committed" && trace.outcome === SUCCESS ? "ok" : "warn";
+}
 
 /**
  * The route whose context overflow ended the request, if one did. With a
