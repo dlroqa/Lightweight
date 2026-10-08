@@ -30,8 +30,10 @@
 #                 +2 is a second router with a pre-commit request budget, and
 #                 +3/+4 its two scripted nodes; +5 is a router whose
 #                 General overflows its context, +6 that General; +7 is a
-#                 router whose General streams, +8 that General. Both reuse
-#                 the budget router's Coder.)
+#                 router whose General streams, +8 that General; +9 is a
+#                 router whose General answers a plain 400, +10 that General;
+#                 +11 is a router whose General answers 500, +12 that
+#                 General. All reuse the budget router's Coder.)
 #   OUT_DIR       where screenshots land    (default e2e/screens)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -54,6 +56,12 @@ OVERFLOW_ROUTER_PORT="$((NODE_PORT + 5))"
 OVERFLOW_GENERAL_PORT="$((NODE_PORT + 6))"
 STREAM_ROUTER_PORT="$((NODE_PORT + 7))"
 STREAM_GENERAL_PORT="$((NODE_PORT + 8))"
+# And two whose General commits an error that is neither a fallback reason nor
+# a context overflow, so the chain is not exhausted and nothing was served.
+CLIENT_ERROR_ROUTER_PORT="$((NODE_PORT + 9))"
+CLIENT_ERROR_GENERAL_PORT="$((NODE_PORT + 10))"
+SERVER_ERROR_ROUTER_PORT="$((NODE_PORT + 11))"
+SERVER_ERROR_GENERAL_PORT="$((NODE_PORT + 12))"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -79,11 +87,15 @@ OVERFLOW_ROUTER_LOG="$WORK/overflow-router.log"
 STREAM_ROUTER_LOG="$WORK/stream-router.log"
 OVERFLOW_ROUTER_PID=""
 STREAM_ROUTER_PID=""
+CLIENT_ERROR_ROUTER_LOG="$WORK/client-error-router.log"
+SERVER_ERROR_ROUTER_LOG="$WORK/server-error-router.log"
+CLIENT_ERROR_ROUTER_PID=""
+SERVER_ERROR_ROUTER_PID=""
 TERMINAL_NODES_PID=""
 
 cleanup() {
   local status=$?
-  for pid in "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
+  for pid in "$CLIENT_ERROR_ROUTER_PID" "$SERVER_ERROR_ROUTER_PID" "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
@@ -93,6 +105,8 @@ cleanup() {
     echo "== budget router log =="; [ -f "$BUDGET_ROUTER_LOG" ] && cat "$BUDGET_ROUTER_LOG" || echo "(none)"
     echo "== overflow router log =="; [ -f "$OVERFLOW_ROUTER_LOG" ] && cat "$OVERFLOW_ROUTER_LOG" || echo "(none)"
     echo "== stream router log =="; [ -f "$STREAM_ROUTER_LOG" ] && cat "$STREAM_ROUTER_LOG" || echo "(none)"
+    echo "== client-error router log =="; [ -f "$CLIENT_ERROR_ROUTER_LOG" ] && cat "$CLIENT_ERROR_ROUTER_LOG" || echo "(none)"
+    echo "== server-error router log =="; [ -f "$SERVER_ERROR_ROUTER_LOG" ] && cat "$SERVER_ERROR_ROUTER_LOG" || echo "(none)"
   fi
   rm -rf "$WORK"
   exit "$status"
@@ -234,12 +248,14 @@ JSON
 BUDGET_ROUTER_PID=$!
 wait_for "http://127.0.0.1:$BUDGET_ROUTER_PORT/health" "budget router" "$BUDGET_ROUTER_PID"
 
-echo "== start overflow and stream nodes (ports $OVERFLOW_GENERAL_PORT, $STREAM_GENERAL_PORT) =="
-MOCK_NODES="$OVERFLOW_GENERAL_PORT:General:overflow:loaded,$STREAM_GENERAL_PORT:General:stream:loaded" \
+echo "== start overflow, stream and error nodes (ports $OVERFLOW_GENERAL_PORT, $STREAM_GENERAL_PORT, $CLIENT_ERROR_GENERAL_PORT, $SERVER_ERROR_GENERAL_PORT) =="
+MOCK_NODES="$OVERFLOW_GENERAL_PORT:General:overflow:loaded,$STREAM_GENERAL_PORT:General:stream:loaded,$CLIENT_ERROR_GENERAL_PORT:General:400:loaded,$SERVER_ERROR_GENERAL_PORT:General:500:loaded" \
   node e2e/mock-node.mjs >"$WORK/terminal-nodes.log" 2>&1 &
 TERMINAL_NODES_PID=$!
 wait_for "http://127.0.0.1:$OVERFLOW_GENERAL_PORT/health" "scripted overflow General node" "$TERMINAL_NODES_PID"
 wait_for "http://127.0.0.1:$STREAM_GENERAL_PORT/health" "scripted streaming General node" "$TERMINAL_NODES_PID"
+wait_for "http://127.0.0.1:$CLIENT_ERROR_GENERAL_PORT/health" "scripted 400 General node" "$TERMINAL_NODES_PID"
+wait_for "http://127.0.0.1:$SERVER_ERROR_GENERAL_PORT/health" "scripted 500 General node" "$TERMINAL_NODES_PID"
 
 # Auto → Coder (503) → General, the same shape as the budget router.
 fallback_router_json() { # listen port, "request" member or "", General's port
@@ -281,11 +297,27 @@ fallback_router_json "$STREAM_ROUTER_PORT" ' "request": {"pre_commit_budget_ms":
 STREAM_ROUTER_PID=$!
 wait_for "http://127.0.0.1:$STREAM_ROUTER_PORT/health" "stream router" "$STREAM_ROUTER_PID"
 
+echo "== start client-error and server-error routers (ports $CLIENT_ERROR_ROUTER_PORT, $SERVER_ERROR_ROUTER_PORT) =="
+# General's 400 (not context_length_exceeded) and 500 are its answer: neither
+# moves the request on, so the chain ends there with `exhausted: false`.
+fallback_router_json "$CLIENT_ERROR_ROUTER_PORT" "" "$CLIENT_ERROR_GENERAL_PORT" >"$WORK/client-error-router.json"
+./target/debug/lightweight router --config "$WORK/client-error-router.json" \
+  --web-root frontend/dist >"$CLIENT_ERROR_ROUTER_LOG" 2>&1 &
+CLIENT_ERROR_ROUTER_PID=$!
+wait_for "http://127.0.0.1:$CLIENT_ERROR_ROUTER_PORT/health" "client-error router" "$CLIENT_ERROR_ROUTER_PID"
+fallback_router_json "$SERVER_ERROR_ROUTER_PORT" "" "$SERVER_ERROR_GENERAL_PORT" >"$WORK/server-error-router.json"
+./target/debug/lightweight router --config "$WORK/server-error-router.json" \
+  --web-root frontend/dist >"$SERVER_ERROR_ROUTER_LOG" 2>&1 &
+SERVER_ERROR_ROUTER_PID=$!
+wait_for "http://127.0.0.1:$SERVER_ERROR_ROUTER_PORT/health" "server-error router" "$SERVER_ERROR_ROUTER_PID"
+
 echo "== render the router's panel in a headless browser =="
 PANEL_BASE="http://127.0.0.1:$ROUTER_PORT" OUT_DIR="$OUT_DIR" SECRET_SENTINEL="$JEV_KEY" \
   BUDGET_PANEL_BASE="http://127.0.0.1:$BUDGET_ROUTER_PORT" \
   OVERFLOW_PANEL_BASE="http://127.0.0.1:$OVERFLOW_ROUTER_PORT" \
   STREAM_PANEL_BASE="http://127.0.0.1:$STREAM_ROUTER_PORT" \
+  CLIENT_ERROR_PANEL_BASE="http://127.0.0.1:$CLIENT_ERROR_ROUTER_PORT" \
+  SERVER_ERROR_PANEL_BASE="http://127.0.0.1:$SERVER_ERROR_ROUTER_PORT" \
   EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" \
   MOCK_NODE_URLS="http://127.0.0.1:$CODER_NODE_PORT,http://127.0.0.1:$GENERAL_NODE_PORT" \
   node e2e/render-router.mjs

@@ -460,6 +460,33 @@ async function main() {
   await streamTrace.screenshot({ path: `${OUT_DIR}/router-stream-served-trace.png` });
   await streamPage.close();
 
+  // --- an error that is neither a fallback reason nor a context overflow -----------------
+  // General commits a plain 400 on one router and a 500 on another (neither
+  // moves a request on): `exhausted: false`, final route General, and nothing
+  // served. "Served by" needs `outcome: "ok"`; these read neutrally instead.
+  for (const [name, envName, status, outcome] of [
+    ["client-error", "CLIENT_ERROR_PANEL_BASE", 400, "client_error"],
+    ["server-error", "SERVER_ERROR_PANEL_BASE", 500, "server_error"],
+  ]) {
+    const base = (process.env[envName] ?? "").replace(/\/+$/, "");
+    check(base.length > 0, `the ${name} router is given to the render`);
+    const answer = await send(base, toolRequest(`render a ${name}`));
+    check(answer.status === status, `Auto → Coder → General, General answers ${status} (got ${answer.status})`);
+    const page = await context.newPage();
+    page.on("pageerror", (err) => errors.push(String(err)));
+    await page.goto(`${base}/#/auto`, { waitUntil: "domcontentloaded" });
+    const card = page.locator(`[data-fallback-trace="${answer.id}"]`);
+    await card.waitFor({ timeout: TIMEOUT });
+    const text = await card.innerText();
+    check(text.includes("Request ended while attempting General"), `a ${status} on General reads: Request ended while attempting General`);
+    check(!text.includes("Served by"), `a ${status} on General never reads as served, though the list was not exhausted`);
+    check(!text.includes("Exhausted") && !text.includes("Budget") && !text.includes("Context limit"), `a ${status} on General guesses no exhaustion, budget or context cause`);
+    check((await card.locator('[data-trace-verdict="unsuccessful"]').count()) === 1, `its verdict is unsuccessful`);
+    check((await card.locator("[data-trace-unsuccessful]").innerText()).includes(`outcome ${outcome}, status ${status}`), `it names the outcome ${outcome} and status ${status}`);
+    await card.screenshot({ path: `${OUT_DIR}/router-${name}-trace.png` });
+    await page.close();
+  }
+
   // --- the key never reaches the browser ------------------------------------------------
   const html = await page.content();
   const storage = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));

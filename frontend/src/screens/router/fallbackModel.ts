@@ -65,7 +65,7 @@ export function reasonLabel(reason: string | undefined | null): string {
 
 /** How a request that changed route ended, in the card's words. */
 export interface TraceVerdict {
-  kind: "budget" | "context_overflow" | "exhausted" | "served";
+  kind: "budget" | "context_overflow" | "exhausted" | "served" | "unsuccessful";
   label: string;
 }
 
@@ -85,7 +85,12 @@ export interface TraceVerdict {
  *    for it (the chain stopped, the list did not run out), so it is read from
  *    the structured reason the router recorded, never from `client_error`.
  * 3. The fallback list ran out: the last route's own error.
- * 4. A route answered.
+ * 4. The request succeeded (`outcome: "ok"`: a 2xx/3xx answer, or a stream
+ *    that ran to its end). Only this reads "Served by"; `exhausted: false`
+ *    is not success, and neither is a final route or an attempt.
+ * 5. Anything else (another client or server error, a stream the node broke
+ *    off, a client that left, an unknown outcome) is named neutrally, with
+ *    no cause guessed.
  *
  * A trace without a `request_budget` block (no budget configured, or a router
  * from before R9.3.2) reads exactly as before.
@@ -110,8 +115,15 @@ export function traceVerdict(trace: RoutingTraceView): TraceVerdict {
     return { kind: "context_overflow", label: `Context limit exceeded while attempting ${overflowed}` };
   }
   if (block?.exhausted) return { kind: "exhausted", label: "Exhausted" };
-  return { kind: "served", label: `Served by ${block?.final_route ?? trace.route}` };
+  const last = block?.final_route ?? trace.route;
+  if (trace.outcome === SUCCESS) return { kind: "served", label: `Served by ${last}` };
+  return last && last !== AUTO
+    ? { kind: "unsuccessful", label: `Request ended while attempting ${last}` }
+    : { kind: "unsuccessful", label: "Request ended without a successful response" };
 }
+
+/** The one trace outcome that means a response was served (`Outcome::Ok`). */
+const SUCCESS = "ok";
 
 /**
  * The route whose context overflow ended the request, if one did. With a

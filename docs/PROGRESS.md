@@ -3121,4 +3121,20 @@ budget ("Served by General"). 142 render checks locally, 0 failed (the
 original 126 unchanged). Local tip: `render-panel.sh` builds the frontend
 only when `frontend/dist` is missing, so rebuild it after a frontend change.
 
+**Truthfulness hardening (same PR, before merge).** The root cause was wider
+than context overflow: anything not `exhausted` fell through to "Served
+by". "Served by <route>" now needs positive evidence, the trace's `outcome:
+"ok"` (`Outcome::of_status` 2xx/3xx; a stream is `ok` only when it ran to
+its end, else `interrupted`). Every other ending that is not a budget,
+context-overflow or exhausted verdict reads, without guessing a cause,
+"Request ended while attempting <route>" (or "Request ended without a
+successful response" if no route left `Auto`), and the card adds the
+outcome and status. Precedence: request budget, context overflow, exhausted
+list, served, neutral. 13 more model tests (frontend 90), including a guard
+that fails if `!exhausted` alone ever reads as served again (reintroducing
+that rule fails 9 tests); render adds two routers whose General commits a
+plain 400 and a 500 (`exhausted: false`, final route General): 156 checks
+locally, 0 failed. Not changed: a committed step's badge stays green
+("answered (400)"); only the verdict changed.
+
 R9.4 not started; no release.

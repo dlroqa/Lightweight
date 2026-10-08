@@ -463,6 +463,15 @@ function TraceSteps({ trace }: { trace: RoutingTraceView }) {
             </div>
           </li>
         )}
+        {verdict.kind === "unsuccessful" && (
+          <li data-trace-unsuccessful>
+            <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />
+            <div>
+              {verdict.label}: no successful response was served (outcome {trace.outcome}
+              {trace.status ? `, status ${trace.status}` : ""}).
+            </div>
+          </li>
+        )}
         {verdict.kind === "exhausted" && (
           <li data-trace-exhausted>
             <ArrowDown size={13} aria-label="then" style={{ margin: "2px 0 2px 6px" }} />

@@ -2216,8 +2216,13 @@ with their descriptions and availability.
   A chain that ended on a context overflow (the last route's `400
   context_length_exceeded`; its trace keeps `exhausted: false`, since the
   chain stopped and the list did not run out) reads *Context limit exceeded
-  while attempting <route>*, never "Served by". The card's precedence:
-  request budget, context overflow, exhausted list, served.
+  while attempting <route>*, never "Served by". "Served by <route>" needs
+  the trace's `outcome: "ok"` (a 2xx/3xx answer, or a stream that ran to
+  its end), never `exhausted: false` alone; any other ending (another
+  client or server error, an interrupted stream, a client that left) reads
+  *Request ended while attempting <route>* with its outcome and status. The
+  card's precedence: request budget, context overflow, exhausted list,
+  served, then that neutral verdict.
 
 **Classifier** has three parts:
 
