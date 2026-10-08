@@ -3150,3 +3150,67 @@ styled as success again (reintroducing that rule fails 6 tests); render
 checks each live card's step tones (165 checks locally, 0 failed).
 
 R9.4 not started; no release.
+
+### Presentation truthfulness MERGED and FROZEN
+
+PR #53 (final head `65e5299`: `2fd45c1` context overflow, `891d42a`
+"Served by" needs success, `65e5299` step tones) merged with a merge commit
+as **`a454a47`**, the validated master head. Frontend, render harness and
+docs only: no file under `crates/`, no Cargo, packaging or workflow change.
+v0.6.0 (`a8f0c89`) is unchanged and remains the latest release; none of
+R9.3.2 slice 1, the budget wording or this work is in a release yet.
+
+**Frozen behaviour (R9.3 *Recent cross-route fallbacks* card):**
+- "Served by <route>" requires the trace's `outcome: "ok"`
+  (`Outcome::of_status` 2xx/3xx; a stream only once it ran to its end).
+  `exhausted: false`, a final route, an attempt or a committed response is
+  not success.
+- Verdict precedence: request budget, context overflow ("Context limit
+  exceeded while attempting <route>"), exhausted list ("Exhausted"),
+  served, then the neutral "Request ended while attempting <route>" (with
+  its outcome and status; no cause guessed).
+- A step's badge is green only for a committed step on a request whose
+  `outcome` is `"ok"`; a failed, budget-cut, context-overflow, 4xx/5xx,
+  interrupted, cancelled or unavailable step is a warning. Step text is
+  unchanged ("answered (400)").
+- Budget wording ("Budget expired while attempting / before attempting
+  <route>", "Budget expired during classification") and committed-stream
+  success unchanged; traces without a `request_budget` block read as
+  before, except that a known failure no longer reads served.
+- Guards: a test fails if `!exhausted` alone reads served (the old rule
+  fails 9 tests) and one if a committed step alone is green (the old rule
+  fails 6).
+- No backend, trace schema, metric, config, API or routing change; R9.3.1
+  and R9.3.2 stay frozen.
+
+**Master validation (`a454a47`, push):** check
+[37775745576](https://github.com/dlroqa/Lightweight/actions/runs/37775745576)
+and render panel
+[37775745564](https://github.com/dlroqa/Lightweight/actions/runs/37775745564),
+both attempt 1, no reruns. Linux x64, Windows x64, macOS x64, macOS arm64:
+contract suite `47 passed, 2 skipped`; secrets gate `ok no credentials, home
+paths or machine addresses in tracked files`; frontend `# pass 100 / # fail
+0`; desktop `# pass 26 / # fail 0`; `All checks passed.`. Flatpak "Flatpak
+checks passed.", Linux artifacts "Artifact checks passed.", render icons
+"icons ok", render panel 165 `[ok]`, 0 failed.
+
+**Post-merge UI smoke** (`hermes router` and `frontend/dist` built from
+`a454a47`, scripted nodes, headless Chromium; step tones read from
+`data-step-tone`): 12/12 — Coder 503 → General 200 "Served by General",
+Coder amber / General green; General 400 and 500 "Request ended while
+attempting General", both steps amber; General `400 context_length_exceeded`
+"Context limit exceeded while attempting General", amber; General cut by a
+1500 ms budget at 1.512 s "Budget expired while attempting General", amber;
+Coder 503 → General 503 "Exhausted", amber; a stream relayed 3.5 s past a
+1500 ms budget "Served by General", General green; fixtures for
+interrupted, cancelled, unavailable and a legacy `server_error` read
+neutrally with no green step, a legacy `ok` reads served. Screenshots of all
+eight live/fixture states inspected by eye: only the 200 and the completed
+stream are green.
+
+**Deferred (not part of this freeze):** the card lists only requests that
+changed route (explicit and same-route requests never appear in it), and
+the same-route attempt detail is plain text with no tone.
+
+**Next:** nothing started. Release-readiness review (likely v0.7.0) is the
+next separate task. R9.4 not started; no release.
