@@ -4,6 +4,62 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-08
+
+This release gives the router a **shared pre-commit request budget
+(R9.3.2)** and makes the router panel's request traces **say only what
+actually happened**.
+
+**Shared request budget.** An optional `request.pre_commit_budget_ms` gives
+each client request **one** deadline, shared by classification, routing,
+same-route failover and cross-route fallback. No stage gets a fresh budget,
+and no new attempt starts once it is spent.
+- **Pre-commit only.** It covers the time until the response starts. A
+  non-streamed response starts only when it is complete, so there it bounds
+  the whole generation. A stream that has started continues exactly as
+  before. This is not a whole-request lifetime timeout.
+- **Errors.** When the budget is what ended the request, the client gets
+  `504` with code `request_budget_exhausted`. A route error that had
+  already happened is returned unchanged, and other timeouts and server
+  errors are not reported as budget exhaustion.
+- **Routing safety.** A budget cut is neutral to route history and node
+  health and is never a routing input. Explicit routes get the budget but
+  still never fall back to another route.
+- **Observability.** Each request is counted once in `router_requests_total`,
+  with its own `request_budget_exhausted` outcome. There is also a
+  `request_budget` trace block, `router_request_budget_*` metrics and
+  `GET /api/router/v1/request-budget`.
+
+**Accurate request traces in the panel.**
+- `Served by <route>` now appears only when the request actually
+  succeeded.
+- A request the budget ended reads `Budget expired …`, and one that ran out
+  of context reads `Context limit exceeded while attempting <route>`.
+  Any other unsuccessful ending reads `Request ended …`.
+- A route step is green only when it served a successful response.
+
+**Compatibility and upgrading.**
+- Without `request.pre_commit_budget_ms` the router behaves exactly as in
+  v0.6.0, and no budget metrics are emitted.
+- Valid values are 1 000 – 3 600 000; `0` is refused.
+  `hermes router validate-config` reports the configured budget and warns
+  when a classifier's `timeout_ms` is not below it.
+- Traces from a v0.6.0 router, which have no budget block, display as
+  before. Successful requests, completed streams included, still read
+  `Served by <route>`.
+
+**Not in this release:**
+- No R9.4: no mixture-of-agents, parallel route execution, expert voting,
+  synthesis, speculative routing or answer-quality scoring.
+- No post-commit stream deadline, whole-request lifetime timeout or
+  client-supplied deadline. The deadline is not forwarded to nodes.
+- No panel screen for configuring the budget; it is set in `router.json`.
+- No explicit-route cross-route fallback, transitive fallback or scoring
+  of route history from budget outcomes.
+- Known panel limits, unchanged: the recent cross-route fallbacks card lists
+  only requests that changed route, and same-route attempt details are plain
+  text.
+
 ### Added
 
 - **Router: shared pre-commit request budget (R9.3.2 slice 1).** An optional
@@ -28,6 +84,30 @@ All notable changes to this project are documented in this file.
   - neutral to route history and node health; never a routing input;
   - a `request_budget` trace block, `router_request_budget_*` metrics (only
     while configured), and `GET /api/router/v1/request-budget`.
+
+### Fixed
+
+- **Router panel: request traces no longer show a request as served when
+  it was not.** On the Auto Routing screen's recent cross-route fallbacks
+  card, `Served by <route>` now requires the trace's `outcome` to be `ok`.
+  Before, any request that had not exhausted its fallback list read as
+  served, even when it had ended without a successful response:
+  - a request the pre-commit budget ended reads `Budget expired before any
+    route was attempted`, `… during classification`, `… while attempting
+    <route>` or `… before attempting <route>`. The panel also notes that
+    the client got `504 request_budget_exhausted`;
+  - a request that ended because a route's context was too small reads
+    `Context limit exceeded while attempting <route>`. The panel also notes
+    that the client got that route's own `400 context_length_exceeded`;
+  - any other unsuccessful ending (a 4xx or 500, an interrupted stream or a
+    cancelled request) reads `Request ended while
+    attempting <route>`, with its outcome and status;
+  - `Exhausted` and its wording are unchanged.
+- **Router panel: a route step's badge is green only when that step served
+  a successful response.** The hop must have committed and the request's
+  outcome must be `ok`. A route that answered with an error, or whose
+  attempt was cut by the budget or refused for its context, now shows as a
+  warning. The step's text is unchanged.
 
 ## [0.6.0] - 2026-10-07
 
@@ -640,7 +720,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/dlroqa/Lightweight/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dlroqa/Lightweight/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dlroqa/Lightweight/compare/v0.4.0...v0.4.1
