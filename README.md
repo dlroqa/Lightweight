@@ -37,7 +37,10 @@ Two facts worth knowing before the first launch:
   Authenticode certificate for this project, so macOS asks you to right-click →
   Open the first time and SmartScreen offers *More info* → *Run anyway*. Each
   release carries `SHA256SUMS` and a build-provenance attestation naming the
-  workflow run that produced the bytes; neither is a code signature.
+  workflow run that produced the bytes; neither is a code signature. To check
+  a download, run `sha256sum -c SHA256SUMS --ignore-missing` and
+  `gh attestation verify <file> --repo dlroqa/Lightweight`. Every release is
+  checked the same way by `.github/workflows/verify-release.yml`.
 - **The inference engine is downloaded, not bundled.** On first use Hermes
   fetches the pinned llama.cpp build for your platform and checks it against a
   SHA-256 recorded in this source tree. Nothing is compiled on your machine.

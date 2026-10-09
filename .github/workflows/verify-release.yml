@@ -1,0 +1,214 @@
+# Verify a release's files against their build-provenance attestations.
+#
+# Read-only by construction: the token can read contents, Actions artifacts and
+# attestations, and nothing else. It cannot publish, edit or delete a release,
+# push a tag, or sign anything, and no secret is used.
+#
+# Two sources of bytes, because a draft release is visible only to accounts
+# with push access, which this token deliberately does not have:
+#
+#   release  the assets of a published release, downloaded from the release,
+#            with GitHub's own digest for each one checked too.
+#   run      the artifacts of the release workflow run that built a draft: the
+#            seven binaries its build jobs uploaded (the same files its draft
+#            job attests and uploads) and the SHA256SUMS it wrote.
+#
+# Either way scripts/verify-release.sh checks the eight-file inventory, every
+# checksum against the bytes, and every attestation's signature and identity:
+# this repository, .github/workflows/release.yml, refs/tags/<tag>, and the
+# commit the tag points at.
+#
+# Triggers:
+#   workflow_run       after every successful tag-push release run (run source)
+#   workflow_dispatch  any tag; give run_id to verify a draft's run instead
+#   pull_request       when this file or the script changes: verifies the
+#                      published v0.7.0, then proves that tampered, unattested,
+#                      wrongly-bound, missing and extra files are all rejected.
+name: verify release
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to verify (e.g. v0.8.0)"
+        required: true
+      run_id:
+        description: "Release workflow run id: verify that run's artifacts (use for a draft)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - '.github/workflows/verify-release.yml'
+      - 'scripts/verify-release.sh'
+
+permissions:
+  contents: read
+  actions: read
+  attestations: read
+
+concurrency:
+  group: verify-release-${{ github.event_name }}-${{ github.event.workflow_run.id || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify release files
+    # Only tag pushes produce a real release; a manual release run makes a
+    # `dry-run-<id>` draft that is not verified here.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: What to verify
+        id: what
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_RUN: ${{ inputs.run_id }}
+          WR_TAG: ${{ github.event.workflow_run.head_branch }}
+          WR_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          case "$EVENT" in
+            workflow_run)      tag="$WR_TAG"; run="$WR_RUN" ;;
+            workflow_dispatch) tag="$IN_TAG"; run="$IN_RUN" ;;
+            pull_request)      tag="v0.7.0"; run="" ;;
+          esac
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: $tag" >&2; exit 1; }
+          [[ -z "$run" || "$run" =~ ^[0-9]+$ ]] || { echo "not a run id: $run" >&2; exit 1; }
+          source=release; [ -n "$run" ] && source=run
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "verifying $tag from the $source${run:+ (run $run)}"
+
+      # The tag is resolved here, from the repository, rather than taken from
+      # the run or the release; an annotated tag is peeled to its commit.
+      - name: The commit the tag points at
+        id: commit
+        env:
+          TAG: ${{ steps.what.outputs.tag }}
+        run: |
+          ref="$(gh api "repos/$REPO/git/ref/tags/$TAG")"
+          type="$(echo "$ref" | jq -r .object.type)"; sha="$(echo "$ref" | jq -r .object.sha)"
+          if [ "$type" = tag ]; then
+            sha="$(gh api "repos/$REPO/git/tags/$sha" -q .object.sha)"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "could not resolve $TAG" >&2; exit 1; }
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha"
+
+      - name: Fetch the published release's assets
+        if: steps.what.outputs.source == 'release'
+        env:
+          TAG: ${{ steps.what.outputs.tag }}
+        run: |
+          release="$(gh api "repos/$REPO/releases" --paginate \
+            -q ".[] | select(.tag_name == \"$TAG\")")"
+          if [ -z "$release" ]; then
+            echo "no release visible for $TAG. A draft is visible only with push access;" >&2
+            echo "verify a draft from its release run instead (run_id)." >&2
+            exit 1
+          fi
+          echo "$release" | jq -r '"draft=\(.draft) prerelease=\(.prerelease) published_at=\(.published_at)"'
+          echo "$release" | jq -r '.assets[] | "\(.digest | ltrimstr("sha256:"))  \(.name)"' > github-digests.txt
+          cat github-digests.txt
+          gh release download "$TAG" --repo "$REPO" --dir files
+          ls -la files
+
+      # The run must be this repository's release workflow, pushed by the tag,
+      # at the commit the tag points at; otherwise its artifacts are not the
+      # release's.
+      - name: Fetch the release run's artifacts
+        if: steps.what.outputs.source == 'run'
+        env:
+          TAG: ${{ steps.what.outputs.tag }}
+          RUN: ${{ steps.what.outputs.run }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          run="$(gh api "repos/$REPO/actions/runs/$RUN")"
+          echo "$run" | jq -r '"run \(.id): \(.path) event=\(.event) ref=\(.head_branch) sha=\(.head_sha) conclusion=\(.conclusion)"'
+          echo "$run" | jq -e --arg t "$TAG" --arg c "$COMMIT" '
+            .path == ".github/workflows/release.yml" and .event == "push"
+            and .head_branch == $t and .head_sha == $c and .conclusion == "success"
+            and .repository.full_name == env.REPO' >/dev/null \
+            || { echo "run $RUN is not a successful tag-push release run of $TAG at $COMMIT" >&2; exit 1; }
+          gh run download "$RUN" --repo "$REPO" --dir raw
+          mkdir files
+          find raw -type f -exec mv -n -t files {} +
+          ls -la files
+
+      - name: Verify the files
+        env:
+          TAG: ${{ steps.what.outputs.tag }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          digests=""; [ -f github-digests.txt ] && digests=github-digests.txt
+          ./scripts/verify-release.sh files "$TAG" "$COMMIT" $digests
+
+      # Each case must fail, and fail for the reason it is testing; a check
+      # that cannot fail proves nothing.
+      - name: The verifier rejects what it must
+        if: github.event_name == 'pull_request'
+        env:
+          TAG: ${{ steps.what.outputs.tag }}
+          COMMIT: ${{ steps.commit.outputs.commit }}
+        run: |
+          v="${TAG#v}"; cli="hermes-$v-x86_64-unknown-linux-gnu.tar.gz"
+          failures=0
+          expect_fail() {  # <case> <expected FAIL text> <dir> [tag] [commit]
+            local out
+            if out="$(./scripts/verify-release.sh "$3" "${4:-$TAG}" "${5:-$COMMIT}" 2>&1)"; then
+              echo "  FAIL  $1: accepted"; failures=$((failures + 1))
+            elif echo "$out" | grep -qF -- "$2"; then
+              echo "  ok    $1: rejected ($(echo "$out" | grep -F -- "$2" | head -1 | sed 's/^ *//'))"
+            else
+              echo "  FAIL  $1: rejected, but not for this reason:"; echo "$out" | grep FAIL | head -5
+              failures=$((failures + 1))
+            fi
+          }
+          fresh() { rm -rf "$1"; cp -al files "$1"; }
+
+          fresh t1; cp --remove-destination files/"$cli" t1/"$cli"; printf 'x' >> t1/"$cli"
+          expect_fail "a tampered binary" "sha256 mismatch: $cli" t1
+
+          fresh t2; cp --remove-destination files/"$cli" t2/"$cli"; printf 'x' >> t2/"$cli"
+          cp --remove-destination files/SHA256SUMS t2/SHA256SUMS
+          new="$(sha256sum t2/"$cli" | cut -d' ' -f1)"
+          sed -i "s|^[0-9a-f]\{64\}  $cli\$|$new  $cli|" t2/SHA256SUMS
+          expect_fail "a tampered binary with a matching SHA256SUMS (no attestation)" "attestation did not verify: $cli" t2
+
+          fresh t3
+          expect_fail "the right files bound to another commit" "attestation did not verify" t3 "$TAG" "93dd696a927c7803d5f982945c1e6aac7f5398c0"
+
+          fresh t4; rm t4/"Lightweight-Setup-$v-x64.exe"
+          expect_fail "a missing binary" "missing: Lightweight-Setup-$v-x64.exe" t4
+
+          fresh t5; echo stray > t5/notes.txt
+          expect_fail "an unexpected file" "unexpected files: notes.txt" t5
+
+          fresh t6; cp --remove-destination files/SHA256SUMS t6/SHA256SUMS
+          echo "$(printf '0%.0s' {1..64})  extra.bin" >> t6/SHA256SUMS
+          expect_fail "a SHA256SUMS listing a file that is not released" "FAIL  lists " t6
+
+          fresh t7; rm t7/SHA256SUMS
+          expect_fail "no SHA256SUMS" "missing: SHA256SUMS" t7
+
+          echo
+          [ "$failures" -eq 0 ] && echo "Every bad input was rejected." || { echo "$failures case(s) were not rejected correctly." >&2; exit 1; }
