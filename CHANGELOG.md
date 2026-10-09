@@ -9,7 +9,8 @@ All notable changes to this project are documented in this file.
 This release adds **Jev Settings** to the router panel. An operator can now
 switch the classifier to Jev and give it a TypeSafe key from the browser
 instead of editing `router.json` and exporting a variable. It also moves
-the Flatpak to the supported Freedesktop 25.08 runtime.
+the Flatpak to the supported Freedesktop 25.08 runtime, and updates
+Electron to 43.5.1 for a high-severity Electron advisory.
 
 **Jev Settings.**
 - **Panel.** The Classifier screen sets the provider, the TypeSafe endpoint,
@@ -95,6 +96,28 @@ unchanged.
   release now take the runtime from `apps/desktop/package.json`, and fail if
   Flathub marks the runtime, an extension or the installed bundle's runtime
   end-of-life.
+
+### Security
+
+- **Electron 43.4.1 → 43.5.1 (GHSA-qmv3-fv6v-rmhq, CVE-2026-102677, high).**
+  Electron's cache for sandboxed preload scripts did not check that a cached
+  entry belonged to the preload it was served for, so a renderer that had
+  already been compromised could get its own code run in the preload on a
+  later load. Lightweight's window loads only its own panel from the local
+  gateway, with the sandbox and context isolation on, so reaching this first
+  needs a separate compromise of that page; it is fixed rather than argued
+  about, because there is no workaround short of updating Electron. 43.5.1 is
+  the patched 43.5 line with its bug fixes, on the same Chromium as the newest
+  43.x. Every desktop package (AppImage, Flatpak, Windows installer, DMG) is
+  now checked to carry the Electron the lockfile pins, read from the packaged
+  binary.
+- **CI fails on a known high or critical advisory in anything shipped.** The
+  panel's runtime dependencies, the Electron runtime and every crate the
+  `hermes` binary links are checked against the npm registry and OSV
+  (RustSec and the GitHub Advisory Database). Advisories in build and test
+  tools are reported with their severity but do not fail the build. A waiver
+  needs a dated, approved entry in `scripts/advisory-exceptions.json`, and
+  expires.
 
 ## [0.7.0] - 2026-10-08
 

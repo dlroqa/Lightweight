@@ -83,6 +83,23 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
 
+      # The Electron binary for this platform carries the version the lockfile
+      # pins. Read the same way the artifact checks read a packaged app, so the
+      # reader is proved on the Windows executable and the macOS framework on
+      # every pull request, not first on a release build. Electron's package no
+      # longer downloads its binary on install, only on first use, so its own
+      # installer fetches it here (and checks it against the package's
+      # checksums.json).
+      - name: The Electron this platform installed
+        run: |
+          node apps/desktop/node_modules/electron/install.js
+          dist=apps/desktop/node_modules/electron/dist
+          if [ -d "$dist/Electron.app" ]; then dist="$dist/Electron.app"; fi
+          locked="$(bash ./scripts/electron-version.sh --locked)"
+          installed="$(bash ./scripts/electron-version.sh "$dist")"
+          echo "locked $locked, installed $installed"
+          [ "$installed" = "$locked" ]
+
       # Invoked through `bash` rather than executed, so the answer does not also
       # depend on the executable bit surviving a Windows checkout.
       - name: scripts/check.sh
@@ -93,6 +110,45 @@ jobs:
       # this is where those numbers come from.
       - name: What this machine reports
         run: cargo run -q -p lightweight-cli --bin hermes -- sysinfo
+
+  # Known advisories in what the product ships: the panel's runtime
+  # dependencies, the Electron runtime, and every crate `hermes` links. A high
+  # or critical one fails; build- and test-only advisories are listed in the
+  # log and the job summary, with their severity, and do not.
+  #
+  # One job, not a step in the matrix above: the answer depends on the
+  # lockfiles, not on the runner, and asking four times would only quadruple
+  # the requests. Read-only, with no secret; its sources are the npm registry
+  # and OSV, not the GitHub API.
+  advisories:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: advisories
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # First the check proves it can fail: Electron 43.4.1, the version the
+      # v0.8.0 candidate shipped before this job existed, must be rejected.
+      - name: The check rejects a known-vulnerable Electron
+        run: python3 scripts/check-advisories.py --self-test
+
+      - name: Advisories in what ships
+        run: python3 scripts/check-advisories.py
 
   # Rendering: prove the icon pipeline runs and produces the right shape.
   #

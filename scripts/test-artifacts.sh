@@ -70,6 +70,16 @@ else
   fail "the packaged hermes binary does not run"
 fi
 
+# The Electron inside the artifact is the one the lockfile pins: the version
+# `scripts/check-advisories.py` checked, read from the packaged binary itself.
+electron_locked="$(./scripts/electron-version.sh --locked)"
+if electron_packaged="$(./scripts/electron-version.sh "$EXTRACT" 2>&1)" \
+  && [ "$electron_packaged" = "$electron_locked" ]; then
+  pass "it carries Electron $electron_packaged, the version the lockfile pins"
+else
+  fail "it carries Electron '$electron_packaged', but the lockfile pins $electron_locked"
+fi
+
 # The tray and window icons travel in `dist/`, not `build/`: an icon loaded from
 # `build/` is present in a checkout and absent from the artifact, which is the
 # worst kind of difference because only the shipped copy is wrong.

@@ -98,6 +98,16 @@ Darwin)
         fail "the app bundle carries no hermes binary"
       fi
 
+      # The Electron inside the bundle is the one the lockfile pins: the
+      # version `scripts/check-advisories.py` checked, read from the framework.
+      electron_locked="$(./scripts/electron-version.sh --locked)"
+      if electron_packaged="$(./scripts/electron-version.sh "$app" 2>&1)" \
+        && [ "$electron_packaged" = "$electron_locked" ]; then
+        pass "it carries Electron $electron_packaged, the version the lockfile pins"
+      else
+        fail "it carries Electron '$electron_packaged', but the lockfile pins $electron_locked"
+      fi
+
       # What Gatekeeper actually says, captured rather than described. Nothing
       # here is signed, so this is expected to report an ad-hoc signature or a
       # rejection - the point is that the release notes quote a real run.
@@ -212,6 +222,15 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT)
       pass "the installed hermes runs ($("$installed" --version))"
     else
       fail "the installed hermes does not run"
+    fi
+    # The Electron the installer wrote is the one the lockfile pins: the
+    # version `scripts/check-advisories.py` checked, read from the executable.
+    electron_locked="$(./scripts/electron-version.sh --locked)"
+    if electron_packaged="$(./scripts/electron-version.sh "$target" 2>&1)" \
+      && [ "$electron_packaged" = "$electron_locked" ]; then
+      pass "it carries Electron $electron_packaged, the version the lockfile pins"
+    else
+      fail "it carries Electron '$electron_packaged', but the lockfile pins $electron_locked"
     fi
     # Static CRT: a machine without the Visual C++ redistributable must not be
     # told about it by a missing-DLL dialog on first launch.
