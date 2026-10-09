@@ -90,7 +90,7 @@ jobs:
       - name: The Electron this platform installed
         run: |
           dist=apps/desktop/node_modules/electron/dist
-          [ -d "$dist/Electron.app" ] && dist="$dist/Electron.app"
+          if [ -d "$dist/Electron.app" ]; then dist="$dist/Electron.app"; fi
           locked="$(bash ./scripts/electron-version.sh --locked)"
           installed="$(bash ./scripts/electron-version.sh "$dist")"
           echo "locked $locked, installed $installed"
