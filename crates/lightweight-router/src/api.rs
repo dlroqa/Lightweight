@@ -11,7 +11,10 @@
 //!   key, a session id (only a keyed fingerprint) or any request content. Its
 //!   few `POST`s act on the router's own bookkeeping — run a placement pass,
 //!   check the classifier, reset adaptive scoring's route history — never on
-//!   the configuration.
+//!   the configuration. The one exception is the classifier's provider
+//!   settings ([`crate::classifier_settings`]): written to the file only, under
+//!   a separate admin token from a loopback same-origin request, and applied
+//!   at the next start.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -82,6 +85,14 @@ pub fn app_with_panel(state: Arc<RouterState>, web_root: Option<PathBuf>) -> Rou
         .route("/api/router/v1/request-budget", get(request_budget))
         .route("/api/router/v1/classifier/check", post(classifier_check))
         .route(
+            "/api/router/v1/classifier/settings",
+            get(crate::classifier_settings::view).put(crate::classifier_settings::save),
+        )
+        .route(
+            "/api/router/v1/classifier/key",
+            axum::routing::delete(crate::classifier_settings::remove_key),
+        )
+        .route(
             "/api/router/v1/adaptive-scoring/reset",
             post(adaptive_scoring_reset),
         )
@@ -100,7 +111,7 @@ fn is_api_path(path: &str) -> bool {
 }
 
 /// Check the client's credential against the router's own policy.
-fn authorize(state: &RouterState, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn authorize(state: &RouterState, headers: &HeaderMap) -> Option<Response> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());

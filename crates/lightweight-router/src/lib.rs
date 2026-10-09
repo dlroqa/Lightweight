@@ -28,12 +28,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod admin;
 pub mod affinity;
 pub mod api;
 pub mod auto_route;
 pub mod budget;
 pub mod capability;
 pub mod classifier;
+pub mod classifier_settings;
 pub mod config;
 pub mod controller;
 pub mod domain;
@@ -46,6 +48,7 @@ pub mod placement;
 pub mod proxy;
 pub mod requirements;
 pub mod scoring;
+pub mod secret_store;
 pub mod select;
 pub mod sse;
 pub mod trace;
@@ -58,7 +61,7 @@ use lightweight_gateway::AuthPolicy;
 use lightweight_observability::targets;
 use tokio_util::sync::CancellationToken;
 
-pub use config::{RouterConfig, load, validate};
+pub use config::{Loaded, RouterConfig, load, load_with_store, validate};
 pub use domain::Topology;
 
 use crate::affinity::AffinityBook;
@@ -109,6 +112,9 @@ pub struct RouterState {
     /// placement controller and the admin view, never by a request.
     pub placement: crate::placement::PlacementBook,
     pub started: SystemTime,
+    /// Saving the classifier's settings from the panel. Set only for a router
+    /// started from a configuration file (`BoundRouter::with_settings`).
+    pub settings: std::sync::OnceLock<Arc<crate::classifier_settings::ClassifierSettings>>,
 }
 
 /// Why a router could not be started.
@@ -187,6 +193,7 @@ impl RouterState {
             phase_delays: crate::proxy::PhaseDelays::default(),
             placement: crate::placement::PlacementBook::new(config.placement),
             started: SystemTime::now(),
+            settings: std::sync::OnceLock::new(),
         })
     }
 
@@ -215,6 +222,14 @@ impl BoundRouter {
     #[must_use]
     pub fn with_web_root(mut self, web_root: Option<std::path::PathBuf>) -> Self {
         self.web_root = web_root;
+        self
+    }
+
+    /// Let the panel save the classifier's settings to the file this router
+    /// was started from (see [`classifier_settings`]).
+    #[must_use]
+    pub fn with_settings(self, settings: crate::classifier_settings::ClassifierSettings) -> Self {
+        let _ = self.state.settings.set(Arc::new(settings));
         self
     }
 
