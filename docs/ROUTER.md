@@ -2681,6 +2681,27 @@ under its own name), an `Origin` equal to it, `Content-Type:
 application/json` for a body, at most 16 KiB. Every save, refusal and key
 removal is logged with its outcome and never a value.
 
+**On a host shared by several local users.** `hermes router admin-token`
+is a privileged operation: it hands out the right to change the router's
+classifier settings and its saved key. Who can run it is decided by the
+operating system, not by the router: the router process's own user account
+and the ownership of its configuration remain part of the security model.
+
+- Run the router as a dedicated account, or as the operator's own, and never
+  as a shared or guest account. Anyone who can act as that account (log in
+  as it, `sudo -u` it, or read its data directory) can read its admin
+  token, can edit its `router.json`, and can read its credential store, so
+  they could already change what the panel changes.
+- Keep `router.json` and its directory writable only by that account. The
+  admin token is stored in the account's own data directory, not beside the
+  file, but a configuration others can edit is a configuration others
+  control, panel or not.
+- Other local users can reach a loopback port, but cannot read the token
+  file (`0600` in a `0700` directory on Unix; the account's own profile on
+  Windows and macOS). Without the token, every write is refused.
+- An administrator (root, or a Windows administrator) can read any account's
+  files and is trusted here, as for every other secret on the machine.
+
 **How the file changes.** `PUT /api/router/v1/classifier/settings` needs
 `If-Match` with the revision (the file's SHA-256) last read, so two panels, or
 a panel and an editor, cannot overwrite each other (`412 revision_conflict`).
