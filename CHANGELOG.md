@@ -4,6 +4,65 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-09
+
+This release adds **Jev Settings** to the router panel. An operator can now
+switch the classifier to Jev and give it a TypeSafe key from the browser
+instead of editing `router.json` and exporting a variable.
+
+**Jev Settings.**
+- **Panel.** The Classifier screen sets the provider, the TypeSafe endpoint,
+  model, timeout, confidence threshold and API key. It shows **Pending
+  Restart** until the router restarts, and **Test Connection** checks the
+  running settings.
+- **Credential store.** The key is kept only in the operating system's
+  credential store: the macOS Keychain, Windows Credential Manager or the
+  Linux Secret Service. There is no file fallback, and `TYPESAFE_API_KEY` in
+  the environment still wins.
+- **Protected writes.** Saving needs a per-start admin token, separate from
+  the client key. A save is accepted only on a loopback-only router, with a
+  loopback `Host`, a matching `Origin`, a JSON body of at most 16 KiB and the
+  current revision in `If-Match`.
+- **`hermes router admin-token`.** It prints that token for the account that
+  started the router. The token is kept in that account's own data
+  directory, never beside `router.json`.
+
+**Validated against the real Jev service.** The protected
+`jev-live-validation` workflow ran on `fc0919d` (run 37913409376) with an
+operator-held key. Jev classified all four live Auto requests as `chosen`:
+two coding requests to Coder and two general ones to General, with model
+`jev-latest`, confidence 1.0 and 137–150 ms per classification. The panel's
+Test Connection reported Connected, and the key appeared in no log, page,
+storage area or response.
+
+**Compatibility and upgrading.** Nothing to change. A router configured
+through `TYPESAFE_API_KEY` behaves exactly as in v0.7.0. Routing, Auto rules,
+the classifier fallback, the shared request budget, metrics and traces are
+unchanged.
+
+**Known limits:**
+- **macOS Keychain.** A Keychain item is tied to the program that wrote it,
+  so a new `hermes` binary (after an update) may ask once to allow access.
+- **Flatpak.** The Flatpak build has no access to the Secret Service and
+  cannot save a key; set `TYPESAFE_API_KEY` in its environment instead. The
+  same applies to a headless account with no session bus.
+- **Remote routers.** A router with any listener off loopback has no admin
+  token and refuses every write. Configure a remote router with its file and
+  environment on that machine.
+- **Restart required.** There is no hot reload. Saved settings take effect
+  at the next router restart, and the panel shows Pending Restart until then.
+- **Candidate routes.** Jev Settings changes only the provider and the Jev
+  block. Candidate routes, route descriptions and include-user-text are still
+  changed by copying the panel's snippet into `router.json`, checking it with
+  `hermes router validate-config` and restarting.
+
+**Not in this release:**
+- No R9.4: no mixture-of-agents, parallel route execution, expert voting,
+  synthesis, speculative routing or answer-quality scoring.
+- No multi-user accounts or per-user settings. The admin token belongs to
+  the account that runs the router.
+- No hot reload, remote administration, or file-based key storage.
+
 ### Added
 
 - **Jev Settings in the router panel.** An operator can set the classifier
@@ -24,12 +83,6 @@ All notable changes to this project are documented in this file.
 - `hermes router admin-token`, `GET`/`PUT /api/router/v1/classifier/settings`
   and `DELETE /api/router/v1/classifier/key`. `/api/router/v1/auto` gains
   `jev.api_key_source`.
-
-**Upgrading.** Nothing to change. A router configured through
-`TYPESAFE_API_KEY` behaves exactly as before. Routing, Auto rules, the
-classifier fallback, the request budget, metrics and traces are unchanged.
-The Flatpak build has no credential-store access and keeps the environment
-variable.
 
 ## [0.7.0] - 2026-10-08
 
@@ -747,7 +800,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/dlroqa/Lightweight/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dlroqa/Lightweight/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dlroqa/Lightweight/compare/v0.4.1...v0.5.0

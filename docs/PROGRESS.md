@@ -3441,3 +3441,26 @@ nowhere. Normal CI never sees the secret.
 There is no v0.7.1 plan in the repository. This run is the live gate before
 any v0.7.1 release work, which will follow the usual release process once the
 operator asks for it.
+
+The live run passed on `fc0919d` (run 37913409376). Jev chose Coder for both
+coding requests and General for both general ones (`jev-latest`, confidence
+1.0, 137–150 ms), Test Connection reported Connected, and the key appeared
+nowhere. The operator then chose a minor bump, **v0.8.0**, instead of v0.7.1,
+because the release adds backward-compatible features.
+
+## v0.8.0 release preparation (2026-10-09, branch `release/v0.8.0`)
+
+Branched from `fc0919d`, which was still the remote head. `release: prepare
+v0.8.0` touches the same seven files as v0.7.0: the three version manifests,
+both npm lockfiles, `Cargo.lock` (the 18 workspace crates only) and
+`CHANGELOG.md`. The changelog's `[0.8.0]` section is the release notes. It
+covers Jev Settings, the credential store, the protected admin endpoints,
+`hermes router admin-token` and the live result, plus the known limits: the
+macOS Keychain prompt, Flatpak, remote routers, the restart requirement and
+the snippet-based candidate-route configuration.
+
+The gates are the PR's Actions runs, the master matrix after the merge, and
+one more live Jev run on the merged commit, which waits for the operator's
+approval. The tag, the release workflow and publishing wait for the
+operator's approval of the readiness report. v0.7.0 is untouched, and R9.4
+is not started.
