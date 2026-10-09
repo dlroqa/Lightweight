@@ -62,6 +62,9 @@ CLIENT_ERROR_ROUTER_PORT="$((NODE_PORT + 9))"
 CLIENT_ERROR_GENERAL_PORT="$((NODE_PORT + 10))"
 SERVER_ERROR_ROUTER_PORT="$((NODE_PORT + 11))"
 SERVER_ERROR_GENERAL_PORT="$((NODE_PORT + 12))"
+# A router whose classifier settings the panel saves (Jev Settings): it starts
+# on the Lightweight provider and is restarted once the panel has saved Jev.
+SETTINGS_ROUTER_PORT="$((NODE_PORT + 13))"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -89,13 +92,15 @@ OVERFLOW_ROUTER_PID=""
 STREAM_ROUTER_PID=""
 CLIENT_ERROR_ROUTER_LOG="$WORK/client-error-router.log"
 SERVER_ERROR_ROUTER_LOG="$WORK/server-error-router.log"
+SETTINGS_ROUTER_LOG="$WORK/settings-router.log"
+SETTINGS_ROUTER_PID=""
 CLIENT_ERROR_ROUTER_PID=""
 SERVER_ERROR_ROUTER_PID=""
 TERMINAL_NODES_PID=""
 
 cleanup() {
   local status=$?
-  for pid in "$CLIENT_ERROR_ROUTER_PID" "$SERVER_ERROR_ROUTER_PID" "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
+  for pid in "$SETTINGS_ROUTER_PID" "$CLIENT_ERROR_ROUTER_PID" "$SERVER_ERROR_ROUTER_PID" "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
@@ -107,6 +112,7 @@ cleanup() {
     echo "== stream router log =="; [ -f "$STREAM_ROUTER_LOG" ] && cat "$STREAM_ROUTER_LOG" || echo "(none)"
     echo "== client-error router log =="; [ -f "$CLIENT_ERROR_ROUTER_LOG" ] && cat "$CLIENT_ERROR_ROUTER_LOG" || echo "(none)"
     echo "== server-error router log =="; [ -f "$SERVER_ERROR_ROUTER_LOG" ] && cat "$SERVER_ERROR_ROUTER_LOG" || echo "(none)"
+    echo "== settings router log =="; [ -f "$SETTINGS_ROUTER_LOG" ] && cat "$SETTINGS_ROUTER_LOG" || echo "(none)"
   fi
   rm -rf "$WORK"
   exit "$status"
@@ -208,7 +214,10 @@ cat >"$WORK/router.json" <<JSON
   }
 }
 JSON
-TYPESAFE_API_KEY="$JEV_KEY" ./target/debug/lightweight router --config "$WORK/router.json" \
+# No credential store (a debug-build test switch), so this router reads its
+# key from the environment on every machine alike, as a headless one does.
+TYPESAFE_API_KEY="$JEV_KEY" LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=unavailable \
+  ./target/debug/lightweight router --config "$WORK/router.json" \
   --web-root frontend/dist >"$ROUTER_LOG" 2>&1 &
 ROUTER_PID=$!
 wait_for "http://127.0.0.1:$ROUTER_PORT/health" "router" "$ROUTER_PID"
@@ -321,5 +330,84 @@ PANEL_BASE="http://127.0.0.1:$ROUTER_PORT" OUT_DIR="$OUT_DIR" SECRET_SENTINEL="$
   EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" \
   MOCK_NODE_URLS="http://127.0.0.1:$CODER_NODE_PORT,http://127.0.0.1:$GENERAL_NODE_PORT" \
   node e2e/render-router.mjs
+
+echo "== start settings router (port $SETTINGS_ROUTER_PORT) =="
+# Running the Lightweight provider, with no Jev key anywhere: Jev Settings
+# switches it to Jev and saves a key into an in-memory credential store (a
+# debug-build test switch: CI machines have no Secret Service).
+cat >"$WORK/settings-router.json" <<JSON
+{
+  "listen": ["127.0.0.1:$SETTINGS_ROUTER_PORT"],
+  "nodes": [{"id": "local", "url": "http://127.0.0.1:$GATEWAY_PORT"}],
+  "routes": [
+    {"name": "General", "description": "Everyday conversation and questions", "deployments": [{"node": "local", "model": "General"}]},
+    {"name": "Coder", "description": "Programming, debugging and code generation", "deployments": [{"node": "local", "model": "Coder"}]},
+    {"name": "Research", "deployments": [{"node": "local", "model": "Research"}]}
+  ],
+  "auto_route": {
+    "enabled": true,
+    "fallback_route": "General",
+    "rules": [
+      {"name": "tools", "when": {"requires_tools": true}, "route": "Coder"},
+      {"name": "semantic", "when": {}, "classify": true}
+    ],
+    "classifier": {
+      "provider": "lightweight",
+      "routes": ["General", "Coder", "Research"],
+      "fallback_route": "General",
+      "lightweight": {"route": "Research", "timeout_ms": 30000}
+    }
+  }
+}
+JSON
+start_settings_router() { # extra environment for the router, as NAME=value words
+  env -u TYPESAFE_API_KEY LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=memory "$@" \
+    ./target/debug/lightweight router --config "$WORK/settings-router.json" \
+    --web-root frontend/dist >>"$SETTINGS_ROUTER_LOG" 2>&1 &
+  SETTINGS_ROUTER_PID=$!
+  wait_for "http://127.0.0.1:$SETTINGS_ROUTER_PORT/health" "settings router" "$SETTINGS_ROUTER_PID"
+}
+start_settings_router
+SETTINGS_TOKEN="$(cat "$WORK/settings-router.json.admin-token")"
+TYPED_KEY="typed-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+
+echo "== render Jev Settings: save =="
+PHASE=save SETTINGS_BASE="http://127.0.0.1:$SETTINGS_ROUTER_PORT" MAIN_BASE="http://127.0.0.1:$ROUTER_PORT" \
+  ADMIN_TOKEN="$SETTINGS_TOKEN" TYPED_KEY="$TYPED_KEY" OUT_DIR="$OUT_DIR" \
+  EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" node e2e/render-jev-settings.mjs
+
+echo "== the saved files hold the settings and never the key =="
+grep -q '"provider": "jev"' "$WORK/settings-router.json" || { echo "router.json was not saved as Jev" >&2; exit 1; }
+grep -q "\"base_url\": \"http://127.0.0.1:$JEV_PORT\"" "$WORK/settings-router.json" || { echo "the endpoint was not saved" >&2; exit 1; }
+for file in "$WORK/settings-router.json" "$WORK/settings-router.json.bak"; do
+  if grep -qF "$TYPED_KEY" "$file"; then echo "the key reached $file" >&2; exit 1; fi
+done
+echo "  [ok] router.json holds the saved Jev settings, and neither it nor its backup holds the key"
+
+echo "== restart the settings router: the supported activation =="
+kill -INT "$SETTINGS_ROUTER_PID" 2>/dev/null || true
+wait "$SETTINGS_ROUTER_PID" 2>/dev/null || true
+if [ -f "$WORK/settings-router.json.admin-token" ]; then
+  echo "the admin token file outlived the router" >&2; exit 1
+fi
+echo "  [ok] the admin token file is removed when the router stops"
+# The in-memory store does not survive a process, so the restarted router
+# reads its key from the environment, as a service would.
+start_settings_router TYPESAFE_API_KEY="$JEV_KEY"
+RESTARTED_TOKEN="$(cat "$WORK/settings-router.json.admin-token")"
+if [ "$RESTARTED_TOKEN" = "$SETTINGS_TOKEN" ]; then echo "a restart kept the old admin token" >&2; exit 1; fi
+echo "  [ok] a restart mints a new admin token"
+
+echo "== render Jev Settings: restarted =="
+PHASE=restarted SETTINGS_BASE="http://127.0.0.1:$SETTINGS_ROUTER_PORT" \
+  ADMIN_TOKEN="$RESTARTED_TOKEN" OUT_DIR="$OUT_DIR" \
+  EXPECT_BASE_URL="http://127.0.0.1:$JEV_PORT" node e2e/render-jev-settings.mjs
+
+echo "== no key or admin token in any router log =="
+for secret in "$TYPED_KEY" "$JEV_KEY" "$SETTINGS_TOKEN" "$RESTARTED_TOKEN"; do
+  if grep -qF "$secret" "$ROUTER_LOG" "$SETTINGS_ROUTER_LOG"; then echo "a secret reached a router log" >&2; exit 1; fi
+done
+grep -q "classifier_settings_saved" "$SETTINGS_ROUTER_LOG" || { echo "the save was not audited" >&2; exit 1; }
+echo "  [ok] the save is audited in the router log, and no key or token appears in it"
 
 echo "Panel render complete. Screenshots in $OUT_DIR/"

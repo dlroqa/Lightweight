@@ -21,6 +21,9 @@ const SECRET = process.env.SECRET_SENTINEL ?? "";
 const TIMEOUT = Number(process.env.RENDER_SETTLE_MS ?? 15000);
 
 const failures = [];
+// The Provider status card's own controls. Jev Settings has a Test Connection
+// of its own, checked in render-jev-settings.mjs.
+const providerStatus = (page) => page.locator(".card", { hasText: "Provider status" });
 function check(condition, message) {
   if (!condition) failures.push(message);
   console.log(`  [${condition ? "ok" : "FAIL"}] ${message}`);
@@ -205,8 +208,10 @@ async function main() {
   // --- Classifier: Jev, as running -----------------------------------------------------
   await page.goto(`${BASE}/#/classifier`, { waitUntil: "domcontentloaded" });
   await page.getByText("Classifier Provider", { exact: true }).waitFor({ timeout: TIMEOUT });
-  const jevRadio = page.getByRole("radio", { name: /Jev \/ TypeSafe/ });
-  const lwRadio = page.getByRole("radio", { name: /Lightweight/ });
+  // The draft's own selector: Jev Settings above has a provider choice too.
+  const draftProvider = page.getByRole("group", { name: "Classifier Provider", exact: true });
+  const jevRadio = draftProvider.getByRole("radio", { name: /Jev \/ TypeSafe/ });
+  const lwRadio = draftProvider.getByRole("radio", { name: /Lightweight/ });
   check(await jevRadio.isChecked(), "the provider selector shows the running provider (Jev)");
   const jevPanel = page.locator('[data-panel="jev"]');
   check(await jevPanel.isVisible(), "the Jev panel is shown for Jev");
@@ -244,7 +249,7 @@ async function main() {
   await page.screenshot({ path: `${OUT_DIR}/router-classifier-jev.png`, fullPage: true });
 
   // --- Test Connection, against the real router and scripted TypeSafe -----------------
-  await page.getByRole("button", { name: "Test Connection" }).click();
+  await providerStatus(page).getByRole("button", { name: "Test Connection" }).click();
   await page.locator('[data-check-status="ok"]').waitFor({ timeout: TIMEOUT });
   check((await page.locator('[data-check-status="ok"]').innerText()).includes("Connected"), "Test Connection reaches the real provider: Connected");
 
@@ -274,7 +279,7 @@ async function main() {
         }),
       }),
     );
-    await page.getByRole("button", { name: "Test Connection" }).click();
+    await providerStatus(page).getByRole("button", { name: "Test Connection" }).click();
     const shown = page.locator(`[data-check-status="${status}"]`);
     await shown.waitFor({ timeout: TIMEOUT });
     const text = await shown.innerText();
