@@ -3362,3 +3362,64 @@ assertion changed.
   every view and save), the browser (render: DOM after reload, storage, URLs,
   console, all bodies) and files (render: `router.json` and `.bak`). No
   metric or trace field was added.
+
+**MERGED and FROZEN (2026-10-09).** PR #57 (head `6d1d7f6`) was approved at
+that commit, marked ready, and merged with `--match-head-commit` pinned to it.
+The merge commit is **`9f86521`** (parents `47d821d`, `6d1d7f6`).
+
+- **PR CI.** On `6d1d7f6`, check
+  [37884144400](https://github.com/dlroqa/Lightweight/actions/runs/37884144400)
+  and render
+  [37884144406](https://github.com/dlroqa/Lightweight/actions/runs/37884144406)
+  passed, every job on attempt 1.
+- **Master CI.** On `9f86521`, check
+  [37885116644](https://github.com/dlroqa/Lightweight/actions/runs/37885116644)
+  and render
+  [37885116672](https://github.com/dlroqa/Lightweight/actions/runs/37885116672)
+  passed, every job on attempt 1. Read from each job's log:
+  - Contract `47 passed, 2 skipped` and secrets
+    `ok  no credentials, home paths or machine addresses in tracked files`
+    on macOS x64, macOS arm64, Linux x64 and Windows x64.
+  - Dependency policy satisfied; frontend `# pass 111 / # fail 0`; desktop
+    `# pass 26 / # fail 0`.
+  - Rust: 1405, 1405, 1432 and 1400 passed, 0 failed.
+  - `tests/classifier_settings.rs`: 25/25 on every platform. The real OS
+    credential-store round trip passed: through the Keychain and Credential
+    Manager on macOS and Windows; on headless Linux it reports "unavailable".
+  - The Flatpak installed and ran `hermes 0.7.0`; Linux artifacts and render
+    icons passed.
+  - Render: 233 `[ok]`, 0 failed (165 before this feature).
+- **Smoke.** This runs in the master render job; it is the scripted Jev
+  configuration smoke the brief asked for.
+  1. Save switched a Lightweight router to Jev with a typed key; Pending
+     Restart was shown.
+  2. `hermes router admin-token` read an owner-only token from the user's
+     data directory.
+  3. A real SIGINT restart removed the token, and the next start minted a
+     new one.
+  4. Test Connection reported Connected, and every failure state was shown
+     in words.
+  5. Two Auto requests were classified by Jev with the saved settings: code
+     to Coder (200 Coder), a greeting to General (200 General). Both reached
+     the scripted System One with the right key, and the trace names the
+     semantic rule.
+  6. The key was found in no file, log, page, storage area, URL or response.
+- **Not proven by CI.** CI ran against a scripted TypeSafe-compatible
+  endpoint and needed no real credential. Compatibility with the real Jev
+  service still needs a live smoke, run deliberately with an
+  operator-provided key that is never echoed.
+- **Security model (frozen).**
+  - The Jev key lives only in the OS credential store; the environment wins;
+    there is no file fallback, and Flatpak gets no new permission.
+  - Writes need a per-start admin token that is separate from the inference
+    key and kept in the user's own data directory.
+  - Writes are accepted on loopback-only routers alone, and need a loopback
+    `Host`, a matching `Origin`, JSON, at most 16 KiB, and `If-Match`.
+  - `hermes router admin-token` is privileged. On shared hosts, the router's
+    account and the ownership of its configuration stay part of the model
+    (docs/ROUTER.md).
+  - Two routers of one user that both use `TYPESAFE_API_KEY` share one saved
+    key; give each its own `api_key_env` to separate them.
+- **Unchanged.** v0.7.0 (`e2eb732`, Latest) is untouched. No version bump,
+  tag or release. Routing, Auto, the classifier fallback, the request
+  budget, metrics and traces are unchanged. R9.4 is not started.
