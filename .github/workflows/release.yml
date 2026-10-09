@@ -328,6 +328,16 @@ jobs:
           fi
           exit "$missing"
 
+      # The draft is visible only to accounts with push access, so the
+      # read-only verifier (verify-release.yml) cannot download it. It verifies
+      # this run's artifacts instead: the binaries the build jobs uploaded, and
+      # this file, which is otherwise written only into the draft.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
       # Not a code signature, and the release notes must not let it read as one.
       # What it does prove is which workflow, commit and repository produced
       # these bytes - which is the one integrity guarantee available without a
