@@ -4,6 +4,33 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Jev Settings in the router panel.** An operator can set the classifier
+  provider, the TypeSafe endpoint, model, timeout, confidence threshold and
+  API key from the Classifier screen, save, restart the router, and test the
+  connection, without editing `router.json` or exporting a variable. The key
+  goes only to the operating system's credential store (macOS Keychain,
+  Windows Credential Manager, Linux Secret Service); there is no file
+  fallback, and `TYPESAFE_API_KEY` in the environment still wins. Saving
+  needs a per-start admin token (`hermes router admin-token`), separate from
+  the client key, and is refused on any router listening off loopback, from
+  another origin or host, or against a stale revision. Only
+  `auto_route.classifier` changes; the rest of the file keeps its values and
+  order, the previous file is kept as `<config>.bak`, and a failed write puts
+  the previous key back. Changes apply at the next restart (shown as Pending
+  Restart); Test Connection checks the running settings. See
+  [docs/ROUTER.md](docs/ROUTER.md#jev-settings-saving-the-classifier-provider-from-the-panel).
+- `hermes router admin-token`, `GET`/`PUT /api/router/v1/classifier/settings`
+  and `DELETE /api/router/v1/classifier/key`. `/api/router/v1/auto` gains
+  `jev.api_key_source`.
+
+**Upgrading.** Nothing to change. A router configured through
+`TYPESAFE_API_KEY` behaves exactly as before. Routing, Auto rules, the
+classifier fallback, the request budget, metrics and traces are unchanged.
+The Flatpak build has no credential-store access and keeps the environment
+variable.
+
 ## [0.7.0] - 2026-10-08
 
 This release gives the router a **shared pre-commit request budget

@@ -2208,7 +2208,8 @@ with their descriptions and availability.
   the same route, and any cycle ("Fallback cycle detected: Coder → General →
   Coder"). A valid draft becomes the canonical `cross_route_fallback`
   snippet, with Copy, then `hermes router validate-config` and a restart.
-  Nothing is saved from the panel; the router has no config write API.
+  Nothing in this card is saved from the panel; the only settings the panel
+  saves are Jev Settings' (below).
 - **Recent cross-route fallbacks**, from `GET /api/router/v1/traces`. Each
   request that changed route shows its requested, initial and final routes,
   each route attempt with its reason (and that route's deployment attempts,
@@ -2622,6 +2623,89 @@ clients cannot add labels by inventing model names.
   every Lightagent chat therefore matches a `requires_tools: true` rule; a
   plain-chat rule only ever sees other clients. Its status bar shows the model
   it selected (`Auto`), not the route that answered.
+
+### Jev Settings (saving the classifier provider from the panel)
+
+The one write the router offers, and the smallest that lets an operator set
+Jev up without editing `router.json` or exporting a variable: the provider,
+the TypeSafe endpoint, the model, the timeout and confidence threshold, and
+the API key. Candidates, route descriptions, the Lightweight provider and
+include-user-text stay with the draft and snippet above.
+
+**Using it.**
+
+1. Start the router with the panel: `hermes router --web-root <dist>`. It
+   prints `admin    settings from the panel (admin token: ...)`.
+2. Run `hermes router admin-token` (with the same `--config`, if you gave
+   one) where the router runs, and paste the token into **Admin token** on
+   the Classifier screen. A new token is minted at every start.
+3. Choose **Jev / TypeSafe**, check the endpoint (default
+   `https://api.typesafe.ai`) and model (default `jev-latest`), give a
+   timeout if the file has none, type the API key, and press **Save
+   Settings**. An empty key field keeps the saved key.
+4. The card shows **Pending Restart**. Stop the router (Ctrl-C) and start it
+   again with the same command. Then press **Test Connection**.
+
+**Where the key goes.** Only to the operating system's credential store,
+under service `lightweight-router`, account `jev/<api_key_env>` (by default
+`jev/TYPESAFE_API_KEY`): the macOS login Keychain, Windows Credential Manager,
+or the Linux Secret Service (GNOME Keyring, KWallet). Never to `router.json`,
+its backup, a log, a trace, a metric, a URL or the browser. There is no file
+fallback: a router that cannot reach a store — a headless server or service
+account with no session bus, or the Flatpak build, which is given no access
+to the Secret Service — refuses to save a key and says to set the environment
+variable instead. **The environment variable always wins**: with
+`TYPESAFE_API_KEY` set, the router uses it whatever the store holds, so every
+existing deployment behaves as before. The API never returns a key; the
+settings view says only where one was found (`environment`,
+`credential_store`, `missing`). **Remove saved key** deletes the entry, and is
+refused while the saved settings use Jev with no environment variable (the
+router could not start).
+
+**Who may save.** Not the router's client key — that is the inference key
+every agent holds. Writes need the **admin token**: 32 random bytes per start,
+written owner-only (`0600` on Unix; on Windows, the configuration directory's
+own permissions) to `<config>.admin-token` beside the configuration, removed
+on a clean stop, never logged. A router with any listener off loopback has no
+admin token, so a remote router's settings and key can never be changed from
+another machine: configure those with the file and environment on that
+machine. Each write must also come from the router's own panel: a `Host` that
+is a loopback name on a port the router bound (a DNS-rebinding page arrives
+under its own name), an `Origin` equal to it, `Content-Type:
+application/json` for a body, at most 16 KiB. Every save, refusal and key
+removal is logged with its outcome and never a value.
+
+**How the file changes.** `PUT /api/router/v1/classifier/settings` needs
+`If-Match` with the revision (the file's SHA-256) last read, so two panels, or
+a panel and an editor, cannot overwrite each other (`412 revision_conflict`).
+Only `auto_route.classifier.provider` and the `jev` block's `base_url`,
+`model`, `timeout_ms` and `min_confidence` change; every other key keeps its
+value and its place (whitespace is re-indented). The whole new file is
+validated exactly as a start validates it before anything is written. A file
+with no `auto_route.classifier` section is refused (`classifier_not_configured`):
+candidate routes are the operator's to choose, never invented. The key is
+stored first and read back; the previous file is kept as `<config>.bak`; the
+new file replaces the old by an atomic rename that keeps its permissions. If
+the file cannot be written, the previous key is put back.
+
+**Activation.** There is no hot reload. The settings view compares the saved
+section with the one the router started with (and notes a key replaced or
+removed since) and reports `restart_required`. **Test Connection always
+checks the running settings** — never unsaved ones, never saved-but-inactive
+ones — so a key is sent only to the endpoint the router already uses.
+
+| Endpoint | Auth | What it does |
+| --- | --- | --- |
+| `GET /api/router/v1/classifier/settings` | client key (as `/auto`) | saved and running settings, key source, store availability, revision, `restart_required` |
+| `PUT /api/router/v1/classifier/settings` | admin token, loopback, same origin, `If-Match` | save `provider` + `jev {base_url, model, timeout_ms?, min_confidence?}` + optional `api_key` |
+| `DELETE /api/router/v1/classifier/key` | admin token, loopback, same origin, `If-Match` | remove the saved key |
+
+**Known limits.** macOS ties a Keychain item to the program that wrote it: a
+new `hermes` binary (after an update) may ask once to allow access. A router
+stopped by `SIGTERM` rather than Ctrl-C leaves its token file behind; it is
+useless (the next start mints a new one and replaces it). Two routers on one
+machine using the same `api_key_env` share one saved key, as they would share
+the variable. The panel must be served by the router whose settings it saves.
 
 ## Lightagent's runtime panel
 
