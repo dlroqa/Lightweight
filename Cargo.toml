@@ -118,6 +118,19 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Networking_WinSock",
 ] }
 getrandom = "0.4.3"   # OS entropy for the per-run engine API key
+# The router keeps a Jev key saved from the panel in the operating system's own
+# credential store, never in a file. keyring-core is the API; each platform's
+# store is its own crate, named per target in lightweight-router. All pure Rust
+# or system frameworks: the Linux store speaks D-Bus through zbus (no libdbus),
+# with RustCrypto for the session encryption (no OpenSSL), so the dependency
+# policy above holds unchanged.
+keyring-core = "1.0.0"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-tokio-crypto-rust"] }
+# Already in the tree; `serde` lets the router rewrite one section of
+# router.json while keeping every other key where the operator wrote it.
+indexmap = { version = "2.14.0", features = ["serde"] }
 
 # --- internal ---
 lightweight-core = { path = "crates/lightweight-core" }

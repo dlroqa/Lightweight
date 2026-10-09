@@ -20,12 +20,22 @@ fn default_config_path() -> Result<PathBuf, String> {
     Ok(paths.config_dir().join("router.json"))
 }
 
-fn load(config: Option<PathBuf>) -> Result<(PathBuf, RouterConfig), String> {
-    let path = match config {
-        Some(path) => path,
-        None => default_config_path()?,
-    };
-    let loaded = lightweight_router::load(&path).map_err(|err| match err {
+fn config_path(config: Option<PathBuf>) -> Result<PathBuf, String> {
+    match config {
+        Some(path) => Ok(path),
+        None => default_config_path(),
+    }
+}
+
+/// Read and validate the file. A Jev key the environment does not hold is
+/// looked for in the operating system's credential store, where the panel
+/// saves one.
+fn load(
+    config: Option<PathBuf>,
+    store: &dyn lightweight_router::secret_store::SecretStore,
+) -> Result<(PathBuf, lightweight_router::Loaded), String> {
+    let path = config_path(config)?;
+    let loaded = lightweight_router::load_with_store(&path, store).map_err(|err| match err {
         lightweight_router::config::LoadError::Read { .. } => {
             format!("{err}. Write one, or pass --config <path>.")
         }
@@ -34,10 +44,34 @@ fn load(config: Option<PathBuf>) -> Result<(PathBuf, RouterConfig), String> {
     Ok((path, loaded))
 }
 
+/// Where this user's routers keep their admin tokens: the user's own data
+/// directory (owner-only on Unix; per-user on Windows and macOS).
+fn admin_token_dir() -> Result<PathBuf, String> {
+    let paths = DataPaths::discover().map_err(crate::serve::describe)?;
+    Ok(paths.data_dir().join("router-admin"))
+}
+
+/// `hermes router admin-token`: print the running router's admin token, which
+/// the panel asks for before it saves settings. It reads the calling user's
+/// own data directory, so it can show only a router that user started.
+pub fn admin_token(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, String> {
+    let path = lightweight_router::admin::token_path(&admin_token_dir()?, &config_path(config)?);
+    let token = std::fs::read_to_string(&path).map_err(|_| {
+        "no admin token for this configuration: start the router with it first, as this user \
+         (a router listening off loopback has none; a restarted one has a new one)"
+            .to_owned()
+    })?;
+    out.push_str(token.trim());
+    out.push('\n');
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `hermes router validate-config`: check the file and the environment it
 /// names, without listening or contacting a node.
 pub fn validate(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, String> {
-    let (path, config) = load(config)?;
+    let store = lightweight_router::secret_store::os_store();
+    let (path, loaded) = load(config, store.as_ref())?;
+    let config = loaded.config;
     let topology = &config.topology;
     out.push_str(&format!("{} is valid.\n", path.display()));
     out.push_str(&format!(
@@ -109,7 +143,16 @@ pub fn run(
     listen: &[String],
     web_root: Option<PathBuf>,
 ) -> Result<ExitCode, String> {
-    let (path, mut config) = load(config)?;
+    let path_is_default = config.is_none();
+    // One store for the whole run: the key read at start and the key the
+    // panel saves are the same entry.
+    let store = lightweight_router::secret_store::os_store();
+    let (path, loaded) = load(config, store.as_ref())?;
+    let lightweight_router::Loaded {
+        mut config,
+        text,
+        store_note,
+    } = loaded;
     if !listen.is_empty() {
         config.listen = listen
             .iter()
@@ -139,6 +182,48 @@ pub fn run(
             .await
             .map_err(|err| err.to_string())?
             .with_web_root(web_root.clone());
+
+        // The admin token: minted now, written owner-only beside the file,
+        // removed at stop. A router listening off loopback gets none.
+        let token_dir = admin_token_dir()?;
+        let token_path = lightweight_router::admin::token_path(&token_dir, &path);
+        let mut token = None;
+        let admin = lightweight_router::admin::loopback_only(&bound.addresses())
+            .map_err(str::to_owned)
+            .and_then(|()| {
+                lightweight_store::atomic::create_private_dir(&token_dir)
+                    .map_err(|err| format!("the admin token directory could not be created: {err}"))
+            })
+            .and_then(|()| lightweight_router::admin::generate_token())
+            .and_then(|minted| {
+                lightweight_router::admin::write_token(&token_path, &minted)
+                    .map_err(|err| format!("the admin token could not be written: {err}"))?;
+                let access =
+                    lightweight_router::admin::AdminAccess::new(&minted, &bound.addresses())
+                        .map_err(str::to_owned);
+                token = Some(minted);
+                access
+            });
+        let admin_line = match &admin {
+            Ok(_) => format!(
+                "settings from the panel (admin token: `hermes router admin-token`{})",
+                if path_is_default {
+                    ""
+                } else {
+                    " --config <same path>"
+                }
+            ),
+            Err(reason) => format!("read-only ({reason})"),
+        };
+        let bound = bound.with_settings(
+            lightweight_router::classifier_settings::ClassifierSettings::new(
+                path.clone(),
+                &text,
+                lightweight_router::secret_store::os_store(),
+                std::sync::Arc::new(|name: &str| std::env::var(name).ok()),
+                admin,
+            ),
+        );
         let state = bound.state();
 
         let mut summary = String::new();
@@ -164,6 +249,10 @@ pub fn run(
                 "disabled (loopback only)"
             }
         ));
+        summary.push_str(&format!("  admin    {admin_line}\n"));
+        if let Some(note) = &store_note {
+            summary.push_str(&format!("  key store {note}\n"));
+        }
         summarize(&config, &mut summary);
         summary.push_str("\nPress Ctrl-C to stop.\n");
         // Through the same broken-pipe-tolerant path the rest of the CLI uses:
@@ -177,7 +266,11 @@ pub fn run(
             let _ = tokio::signal::ctrl_c().await;
             stopping.cancel();
         });
-        bound.serve(stop).await
+        let served = bound.serve(stop).await;
+        if let Some(token) = &token {
+            lightweight_router::admin::remove_token(&token_path, token);
+        }
+        served
     })?;
     Ok(ExitCode::SUCCESS)
 }

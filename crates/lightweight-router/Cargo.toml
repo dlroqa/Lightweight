@@ -30,6 +30,18 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 getrandom.workspace = true
+indexmap.workspace = true
+sha2.workspace = true
+keyring-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
 
 [dev-dependencies]
 lightweight-backend-mock.workspace = true

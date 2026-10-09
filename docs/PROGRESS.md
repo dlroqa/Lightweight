@@ -3288,3 +3288,77 @@ requests that changed route, and same-route attempt detail has no tone.
 
 **Next:** nothing started. v0.7.0 is immutable. Any later fix ships as a new
 version. R9.4 stays untouched until it is separately approved.
+
+## Jev Settings in the router panel (post-v0.7.0, branch `feature/router-jev-settings`)
+
+**Audit first (2026-10-08).** Master was still `47d821d`. The audit found
+no credential store in the workspace (the Jev key came only from
+`TYPESAFE_API_KEY`), no admin boundary (one shared client key, turned off on
+a keyless loopback router; the panel sent no `Authorization`), no
+Origin/Host guard on the router, and no reload (`router.json` read once).
+Work stopped there for approval. The approved decisions were: (A) OS
+credential store via `keyring`, with the environment winning and no file
+fallback; (B) a separate local-only admin capability; (C) no new Flatpak
+permission.
+
+**Built.**
+- `secret_store.rs`: `keyring-core` 1.0 with a per-target store crate (Apple
+  Keychain, Windows Credential Manager, zbus Secret Service with RustCrypto).
+  It is pure Rust, so the dependency policy holds. Flatpak reports no store.
+  Platform errors are reduced to fixed sentences, never bytes. A debug-build
+  test switch, `LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=memory|unavailable`,
+  exists for the render and is never compiled into a release.
+- Config: `validate_with_store` and `load_with_store`. Only the Jev key falls
+  back to the store, and only when the environment has none. Jev reports a
+  `key_source`. `validate` is unchanged for its 45 callers.
+- `admin.rs`: a 32-byte token minted per start and written owner-only to
+  `<config>.admin-token`. It is removed on Ctrl-C, and there is none when any
+  listener is off loopback. Each write is checked for a loopback `Host` on a
+  bound port, a matching `Origin`, a JSON `Content-Type`, and a
+  constant-time token comparison.
+- `classifier_settings.rs`: GET, PUT and DELETE. PUT needs `If-Match` (the
+  file's SHA-256) and holds a per-process write lock. The file is edited
+  order-preserving (IndexMap) in `auto_route.classifier` only, and the whole
+  file is validated before any write. The order is: key first (read back),
+  then `.bak`, then an atomic rename that keeps the file's mode; a failed
+  write rolls the key back. `restart_required` is the saved section compared
+  with the one loaded at start, or a key changed. The audit log carries
+  outcomes only.
+- CLI: one store per run, the token lifecycle, an `admin` summary line, and
+  `hermes router admin-token`.
+- Panel: a Jev Settings card on the Classifier screen, backed by
+  `classifierModel.ts` (settings draft, validation, request, status words)
+  and `ApiError.details`.
+
+**Verified locally.** Router and CLI tests: 554 passed, 0 failed, including
+the new `tests/classifier_settings.rs` (24). Frontend: 111/0. The render
+(`render-panel.sh`, scratch ports) reported 228 `[ok]` and 0 failed:
+the existing 165, plus Jev Settings (a save phase, a real SIGINT restart, a
+restarted phase), checks on the saved files, the token lifecycle and the
+logs. Existing render selectors were scoped to their own cards, and no
+assertion changed.
+
+**Pre-merge security verification (conditional approval).**
+- **Two routers.** Each has its own token, and neither accepts the other's
+  (`one_routers_token_is_not_anothers`, and over HTTP
+  `two_routers_never_accept_each_others_admin_token_but_share_one_users_saved_key`).
+  Under one user, both naming `TYPESAFE_API_KEY` share one store entry, as
+  the variable would; this is now documented.
+- **Token disclosure.** One correction. The token moved from beside
+  `router.json`, where a `--config` in a shared directory would have given it
+  that directory's Windows ACL, to the user's own data directory
+  (`router-admin/`, `0700`; file `0600`; one file per configuration path).
+  `hermes router admin-token` reads only the calling user's directory. The
+  render asserts mode 600, that nothing is written beside `router.json`, that
+  the command fails after a stop, and that a restart rotates the token.
+- **Inference key.** It is not an admin token
+  (`the_inference_key_is_not_an_admin_token`; the HTTP case is in
+  `writes_without_the_admin_token_are_refused`).
+- **Failed updates.** `a_failed_write_leaves_the_file_and_the_previous_key_in_place`
+  covers file failure (the key is rolled back) and store failure (the file is
+  untouched). Invalid and refused saves leave the file byte-identical.
+- **No secret leaks.** Logs (`no_key_or_admin_token_ever_reaches_a_log_line`
+  and the render's grep of the router logs), responses (`assert_no_key` on
+  every view and save), the browser (render: DOM after reload, storage, URLs,
+  console, all bodies) and files (render: `router.json` and `.bak`). No
+  metric or trace field was added.

@@ -544,6 +544,8 @@ export interface ApiErrorBody {
     param?: string | null;
     hermes?: { remedies?: Remedy[] } | null;
   };
+  /** The router's settings endpoints list every validation problem here. */
+  errors?: string[];
 }
 
 /**
@@ -669,6 +671,8 @@ export interface JevProviderView {
   model: string;
   api_key_env: string;
   api_key_configured: boolean;
+  /** Where the running router found the key. Absent from routers before it. */
+  api_key_source?: "environment" | "credential_store" | "missing";
   timeout_ms: number;
   min_confidence: number;
   max_input_chars: number;
@@ -785,4 +789,56 @@ export interface TracesBody {
   object: string;
   capacity: number;
   data: RoutingTraceView[];
+}
+
+/** One side (saved or running) of `GET /api/router/v1/classifier/settings`. */
+export interface ClassifierSettingsSummary {
+  provider: "lightweight" | "jev" | null;
+  candidates: string[];
+  fallback_route: string | null;
+  jev: {
+    base_url: string;
+    model: string | null;
+    api_key_env: string;
+    timeout_ms: number | null;
+    min_confidence: number | null;
+  } | null;
+  /** Running side only: where the running router found the Jev key. */
+  key_source?: "environment" | "credential_store" | "missing" | null;
+}
+
+/**
+ * `GET /api/router/v1/classifier/settings`: what the file holds, what is
+ * running, where the key would come from, and whether a restart is pending.
+ * Never a key.
+ */
+export interface ClassifierSettingsView {
+  file: string | null;
+  revision: string;
+  configured: boolean;
+  providers: ("lightweight" | "jev")[];
+  saved: ClassifierSettingsSummary;
+  active: ClassifierSettingsSummary;
+  restart_required: boolean;
+  restart_reasons: ("settings_changed" | "key_changed")[];
+  key: {
+    api_key_env: string;
+    source: "environment" | "credential_store" | "missing";
+    environment: boolean;
+    /** `null` when the store could not be asked. */
+    stored: boolean | null;
+    store: { available: boolean; backend: string; detail?: string };
+  };
+  admin: { available: boolean; token_command?: string; detail?: string };
+  /** Present on a save's answer. */
+  outcome?: "saved";
+  key_action?: "replaced" | "unchanged" | "removed";
+}
+
+/** The body of `PUT /api/router/v1/classifier/settings`. */
+export interface ClassifierSettingsSave {
+  provider: "lightweight" | "jev";
+  jev?: { base_url: string; model: string; timeout_ms?: number; min_confidence?: number };
+  /** Only when replacing the key; never echoed back. */
+  api_key?: string;
 }

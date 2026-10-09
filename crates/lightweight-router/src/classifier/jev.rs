@@ -95,13 +95,34 @@ pub struct JevClassifier {
     pub base_url: String,
     pub api_key_env: String,
     key: Option<Secret>,
+    /// Where `key` came from when the router started.
+    pub key_source: KeySource,
     pub model: String,
     pub limits: Limits,
     pub include_user_text: bool,
 }
 
+/// Where a Jev key was found. The environment always wins over the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    Environment,
+    CredentialStore,
+    Missing,
+}
+
+impl KeySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::CredentialStore => "credential_store",
+            Self::Missing => "missing",
+        }
+    }
+}
+
 impl JevClassifier {
-    /// Whether the key's environment variable was set when the router started.
+    /// Whether a key was found — in the environment variable, or in the
+    /// credential store under its name — when the router started.
     pub const fn api_key_configured(&self) -> bool {
         self.key.is_some()
     }
@@ -119,6 +140,7 @@ impl JevClassifier {
             "model": self.model,
             "api_key_env": self.api_key_env,
             "api_key_configured": self.api_key_configured(),
+            "api_key_source": self.key_source.as_str(),
             "timeout_ms": u64::try_from(self.limits.timeout.as_millis()).unwrap_or(u64::MAX),
             "min_confidence": self.limits.min_confidence,
             "max_input_chars": self.limits.max_input_chars,
@@ -133,10 +155,14 @@ impl JevClassifier {
 /// node's key is not: a configured but inactive block must not stop a router
 /// that does not use it. Inactive, its key is still read if present, so the
 /// admin view can say whether switching would work.
+///
+/// `stored` is consulted only when the environment has no value: a key saved
+/// from the panel to the credential store, under the same variable name.
 pub(super) fn validate(
     raw: &JevFile,
     active: bool,
     env: &dyn Fn(&str) -> Option<String>,
+    stored: &dyn Fn(&str) -> Option<String>,
     fail: &mut dyn FnMut(String),
     errors: &mut Vec<crate::config::ConfigError>,
 ) -> Option<JevClassifier> {
@@ -183,21 +209,50 @@ pub(super) fn validate(
         raw.max_input_chars,
         fail,
     );
-    let key = if active {
-        crate::config::read_secret("auto_route.classifier.jev", &raw.api_key_env, env, errors)
-    } else {
-        env(&raw.api_key_env)
+    let present = |value: Option<String>| {
+        value
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .map(Secret::new)
     };
-    if active && key.is_none() {
-        return None;
-    }
+    let from_store = || {
+        crate::config::usable_env_name(&raw.api_key_env)
+            .then(|| present(stored(&raw.api_key_env)))
+            .flatten()
+    };
+    let (key, key_source) = if active {
+        // The environment is read exactly as before, so a missing or
+        // misnamed variable is refused as it always was — unless the store
+        // holds a key under that name.
+        let mut env_errors = Vec::new();
+        match crate::config::read_secret(
+            "auto_route.classifier.jev",
+            &raw.api_key_env,
+            env,
+            &mut env_errors,
+        ) {
+            Some(key) => (Some(key), KeySource::Environment),
+            None => match from_store() {
+                Some(value) => (Some(Secret::new(value)), KeySource::CredentialStore),
+                None => {
+                    errors.extend(env_errors);
+                    return None;
+                }
+            },
+        }
+    } else {
+        match present(env(&raw.api_key_env)) {
+            Some(value) => (Some(Secret::new(value)), KeySource::Environment),
+            None => match from_store() {
+                Some(value) => (Some(Secret::new(value)), KeySource::CredentialStore),
+                None => (None, KeySource::Missing),
+            },
+        }
+    };
     Some(JevClassifier {
         base_url: base_url?,
         api_key_env: raw.api_key_env.clone(),
         key,
+        key_source,
         model: model?,
         limits: limits?,
         include_user_text: raw.include_user_text,

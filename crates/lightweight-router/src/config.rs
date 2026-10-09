@@ -593,6 +593,55 @@ pub fn load(path: &Path) -> Result<RouterConfig, LoadError> {
     })
 }
 
+/// A configuration as the router started with it: the validated settings,
+/// the exact text they came from, and what the credential store said.
+pub struct Loaded {
+    pub config: RouterConfig,
+    /// The file's bytes as read, so a later save compares against exactly what
+    /// was loaded.
+    pub text: String,
+    /// Set when the credential store was asked for the Jev key and could not
+    /// answer. Never a value.
+    pub store_note: Option<String>,
+}
+
+/// [`load`], also reading a Jev key the environment does not hold from the
+/// credential store.
+pub fn load_with_store(
+    path: &Path,
+    store: &dyn crate::secret_store::SecretStore,
+) -> Result<Loaded, LoadError> {
+    let display = path.display().to_string();
+    let text = std::fs::read_to_string(path).map_err(|source| LoadError::Read {
+        path: display.clone(),
+        source,
+    })?;
+    let file: RouterFile = serde_json::from_str(&text).map_err(|source| LoadError::Parse {
+        path: display.clone(),
+        source,
+    })?;
+    let note = std::cell::RefCell::new(None);
+    let stored = |var: &str| match store.get(&crate::secret_store::jev_account(var)) {
+        Ok(found) => found.map(|secret| secret.expose().to_owned()),
+        Err(failure) => {
+            *note.borrow_mut() = Some(failure.message().to_owned());
+            None
+        }
+    };
+    let config =
+        validate_with_store(file, &|name| std::env::var(name).ok(), &stored).map_err(|errors| {
+            LoadError::Invalid {
+                path: display,
+                errors,
+            }
+        })?;
+    Ok(Loaded {
+        config,
+        text,
+        store_note: note.into_inner(),
+    })
+}
+
 /// Check a parsed file, resolving secrets through `env`.
 ///
 /// `env` is a parameter so tests can supply an environment without mutating
@@ -600,6 +649,18 @@ pub fn load(path: &Path) -> Result<RouterConfig, LoadError> {
 pub fn validate(
     file: RouterFile,
     env: &dyn Fn(&str) -> Option<String>,
+) -> Result<RouterConfig, ConfigErrors> {
+    validate_with_store(file, env, &|_| None)
+}
+
+/// [`validate`], also reading a Jev key the environment does not hold from
+/// `stored` — the credential store, under the variable's name. Only the Jev
+/// key is ever looked up there: a node's key and the router's client key come
+/// from the environment alone, as before.
+pub fn validate_with_store(
+    file: RouterFile,
+    env: &dyn Fn(&str) -> Option<String>,
+    stored: &dyn Fn(&str) -> Option<String>,
 ) -> Result<RouterConfig, ConfigErrors> {
     let mut errors = Vec::new();
 
@@ -660,7 +721,7 @@ pub fn validate(
     let auto = file
         .auto_route
         .as_ref()
-        .and_then(|raw| crate::auto_route::validate(raw, &routes, env, &mut errors));
+        .and_then(|raw| crate::auto_route::validate(raw, &routes, env, stored, &mut errors));
 
     if !errors.is_empty() {
         return Err(ConfigErrors(errors));
@@ -866,16 +927,21 @@ fn validate_health(raw: &HealthFile, errors: &mut Vec<ConfigError>) -> HealthPol
 }
 
 /// Read one secret from the environment, recording why it could not be.
+/// A name `read_secret` will look up: letters, digits and `_`, not starting
+/// with a digit.
+pub(crate) fn usable_env_name(var: &str) -> bool {
+    !var.is_empty()
+        && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !var.starts_with(|c: char| c.is_ascii_digit())
+}
+
 pub(crate) fn read_secret(
     owner: &str,
     var: &str,
     env: &dyn Fn(&str) -> Option<String>,
     errors: &mut Vec<ConfigError>,
 ) -> Option<Secret> {
-    let usable_name = !var.is_empty()
-        && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !var.starts_with(|c: char| c.is_ascii_digit());
-    if !usable_name {
+    if !usable_env_name(var) {
         errors.push(ConfigError::BadEnvName {
             owner: owner.to_owned(),
             var: var.to_owned(),

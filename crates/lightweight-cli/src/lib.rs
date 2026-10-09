@@ -365,6 +365,10 @@ enum RouterAction {
     /// Check the configuration and the environment variables it names, then
     /// exit without listening or contacting a node.
     ValidateConfig,
+    /// Print the running router's admin token, which the panel asks for
+    /// before it saves the classifier's settings. A new one is minted at
+    /// every start; a router listening off loopback has none.
+    AdminToken,
 }
 
 #[derive(Subcommand)]
@@ -838,6 +842,11 @@ fn run(
             config,
             ..
         } => router::validate(config.clone(), out),
+        Command::Router {
+            action: Some(RouterAction::AdminToken),
+            config,
+            ..
+        } => router::admin_token(config.clone(), out),
         Command::Router {
             action: None,
             config,

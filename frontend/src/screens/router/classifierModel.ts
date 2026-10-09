@@ -7,14 +7,18 @@
  * wrong next to the field while a person types; the router remains the
  * authority, and `hermes router validate-config` is the last word.
  *
- * Nothing in this module ever holds a secret. The TypeSafe key is read by the
- * router from the environment variable `api_key_env` names; the panel edits
- * that *name* and shows only whether the router found a value behind it.
+ * Nothing in this module ever holds a stored secret. The TypeSafe key is read
+ * by the router from the environment variable `api_key_env` names, or from the
+ * operating system's credential store under that name; the panel shows only
+ * where it was found. A key typed into Jev Settings passes through
+ * `settingsRequest` once, on its way to the router, and is never kept.
  */
 
 import type {
   AutoView,
   ClassifierCheckReport,
+  ClassifierSettingsSave,
+  ClassifierSettingsView,
   ClassifierView,
   RouterRouteView,
 } from "../../api/types";
@@ -481,4 +485,148 @@ export function keyStatus(view: ClassifierView | null): "configured" | "missing"
 /** An Auto rule's action, as an operator reads it. */
 export function ruleAction(rule: { route: string; classify: boolean }): string {
   return rule.classify ? "Semantic classification" : `Route directly to ${rule.route}`;
+}
+
+// --- Jev Settings: what the panel can save ------------------------------------------
+
+/** The default model a new Jev configuration starts from. */
+export const DEFAULT_JEV_MODEL = "jev-latest";
+export const MAX_KEY_CHARS = 4096;
+
+/** Jev Settings form state. `api_key` is the replacement typed now, or "". */
+export interface JevSettingsDraft {
+  provider: ProviderKind;
+  base_url: string;
+  model: string;
+  timeout_ms: string;
+  min_confidence: string;
+  api_key: string;
+}
+
+/** The form a settings view reads back as: the saved file, never a key. */
+export function settingsDraftFrom(view: ClassifierSettingsView): JevSettingsDraft {
+  const jev = view.saved.jev;
+  return {
+    provider: view.saved.provider ?? "lightweight",
+    base_url: jev?.base_url ?? DEFAULT_BASE_URL,
+    model: jev?.model ?? DEFAULT_JEV_MODEL,
+    timeout_ms: text(jev?.timeout_ms, ""),
+    min_confidence: text(jev?.min_confidence, ""),
+    api_key: "",
+  };
+}
+
+/** A replacement key: empty keeps the saved one; otherwise one line, no spaces. */
+export function checkApiKey(raw: string): Problem {
+  const value = raw.trim();
+  if (value === "") return null;
+  if (value.length > MAX_KEY_CHARS) return `At most ${MAX_KEY_CHARS} characters.`;
+  if (/\s/.test(value) || CONTROL.test(value)) return "One line, with no spaces.";
+  return null;
+}
+
+export type SettingsProblems = Partial<Record<keyof JevSettingsDraft, Problem>>;
+
+/**
+ * Every field's problem. The Jev fields are checked only when Jev is chosen;
+ * timeout is required only when the saved file has none (the router has no
+ * default), min confidence may stay empty (the router's default applies).
+ */
+export function validateSettings(
+  draft: JevSettingsDraft,
+  view: ClassifierSettingsView | null,
+): SettingsProblems {
+  if (draft.provider !== "jev") return {};
+  const savedTimeout = view?.saved.jev?.timeout_ms ?? null;
+  return {
+    base_url: checkBaseUrl(draft.base_url),
+    model: checkModel(draft.model),
+    timeout_ms:
+      draft.timeout_ms.trim() === "" && savedTimeout !== null ? null : checkTimeout(draft.timeout_ms),
+    min_confidence: draft.min_confidence.trim() === "" ? null : checkConfidence(draft.min_confidence),
+    api_key: checkApiKey(draft.api_key),
+  };
+}
+
+export function hasSettingsProblems(problems: SettingsProblems): boolean {
+  return Object.values(problems).some((problem) => problem !== null && problem !== undefined);
+}
+
+/**
+ * The save body. The key is included only when one was typed, so an empty
+ * field leaves the saved key as it is.
+ */
+export function settingsRequest(draft: JevSettingsDraft): ClassifierSettingsSave {
+  const body: ClassifierSettingsSave = { provider: draft.provider };
+  if (draft.provider === "jev") {
+    body.jev = { base_url: draft.base_url.trim(), model: draft.model.trim() };
+    if (draft.timeout_ms.trim() !== "") body.jev.timeout_ms = Number(draft.timeout_ms.trim());
+    if (draft.min_confidence.trim() !== "") {
+      body.jev.min_confidence = Number(draft.min_confidence.trim());
+    }
+  }
+  const key = draft.api_key.trim();
+  if (key !== "") body.api_key = key;
+  return body;
+}
+
+export type KeyState = "configured" | "missing";
+
+/** Configured or Missing, and where from, for the key the saved settings use. */
+export function savedKeyState(view: ClassifierSettingsView): { state: KeyState; label: string } {
+  const env = view.key.api_key_env;
+  switch (view.key.source) {
+    case "environment":
+      return { state: "configured", label: `Configured — environment variable ${env}` };
+    case "credential_store":
+      return { state: "configured", label: "Configured — this machine's credential store" };
+    default:
+      return { state: "missing", label: `Missing — not in ${env} or the credential store` };
+  }
+}
+
+/** Where the running router found its key, in words. */
+export function keySourceLabel(source: string | null | undefined, env: string): string {
+  switch (source) {
+    case "environment":
+      return `the environment variable ${env}`;
+    case "credential_store":
+      return "this machine's credential store";
+    case "missing":
+      return "nowhere (missing)";
+    default:
+      return "not running Jev";
+  }
+}
+
+/** The connection status of the *running* settings, from the last check. */
+export function connectionState(
+  report: ClassifierCheckReport | null,
+): { tone: Tone; label: string } {
+  if (!report) return { tone: "neutral", label: "Not checked" };
+  if (report.status === "ok") return { tone: "ok", label: "Connected" };
+  if (report.status === "model_not_listed") return { tone: "warn", label: "Connected — model not listed" };
+  return { tone: "danger", label: `Error — ${explainCheck(report).title}` };
+}
+
+/** Why a restart is pending, in words. */
+export function restartReasons(view: ClassifierSettingsView): string[] {
+  return view.restart_reasons.map((reason) =>
+    reason === "settings_changed"
+      ? "The saved classifier settings differ from the running ones."
+      : "The saved API key was replaced or removed since the router started.",
+  );
+}
+
+/** A refused or failed save, for an operator: what happened and what to do. */
+export function explainSaveError(code: string, message: string): string {
+  switch (code) {
+    case "admin_token_required":
+    case "admin_token_invalid":
+      return "The admin token is missing or not this router's. Run `hermes router admin-token` where the router runs and paste it again (a restarted router has a new one).";
+    case "revision_conflict":
+      return "The configuration changed since it was loaded (another panel or an editor). The latest settings were reloaded; review them and save again.";
+    default:
+      return message;
+  }
 }
