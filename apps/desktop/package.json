@@ -68,8 +68,8 @@
       "notarize": false
     },
     "flatpak": {
-      "runtimeVersion": "24.08",
-      "baseVersion": "24.08",
+      "runtimeVersion": "25.08",
+      "baseVersion": "25.08",
       "license": "../../LICENSE",
       "finishArgs": [
         "--socket=wayland",

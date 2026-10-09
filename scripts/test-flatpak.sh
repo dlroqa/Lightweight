@@ -46,11 +46,47 @@ echo "== app id   == $APP_ID"
 # ---------------------------------------------------------------------------
 # 1. It installs, and it installs under the id the desktop entry names.
 # ---------------------------------------------------------------------------
-flatpak install --user -y --bundle "$bundle" >/dev/null
+install_log="$(flatpak install --user -y --noninteractive --bundle "$bundle" 2>&1)"
 if flatpak list --user --app --columns=application | grep -qx "$APP_ID"; then
   pass "installs as $APP_ID"
 else
   fail "installed, but not as $APP_ID: $(flatpak list --user --app --columns=application | tr '\n' ' ')"
+fi
+
+# ---------------------------------------------------------------------------
+# 1b. It runs on the runtime package.json names, and that runtime is supported.
+#
+#     electron-builder writes `runtimeVersion` into the manifest; what the
+#     installed app actually requires is read back from the app itself. The
+#     BaseApp leaves no trace in the installed metadata (it is merged into
+#     /app at build time), so its branch is checked where it was installed.
+#     An end-of-life runtime installs and runs, printing only an `Info:` line,
+#     which is how 24.08 went unnoticed (issue #61); here it fails.
+# ---------------------------------------------------------------------------
+runtime_version="$(node -p "require('./apps/desktop/package.json').build.flatpak.runtimeVersion")"
+base_version="$(node -p "require('./apps/desktop/package.json').build.flatpak.baseVersion")"
+arch="$(flatpak --default-arch)"
+app_runtime="$(flatpak info --user --show-runtime "$APP_ID")"
+app_sdk="$(flatpak info --user --show-sdk "$APP_ID")"
+if [ "$app_runtime" = "org.freedesktop.Platform/$arch/$runtime_version" ]; then
+  pass "requires the configured runtime ($app_runtime)"
+else
+  fail "requires $app_runtime, not org.freedesktop.Platform/$arch/$runtime_version"
+fi
+if [ "$app_sdk" = "org.freedesktop.Sdk/$arch/$runtime_version" ]; then
+  pass "was built with the matching SDK ($app_sdk)"
+else
+  fail "was built with $app_sdk, not org.freedesktop.Sdk/$arch/$runtime_version"
+fi
+if flatpak info --user "org.electronjs.Electron2.BaseApp//$base_version" >/dev/null 2>&1; then
+  pass "the Electron BaseApp it was built on is branch $base_version"
+else
+  fail "org.electronjs.Electron2.BaseApp//$base_version is not installed"
+fi
+if echo "$install_log" | grep -qi 'end-of-life'; then
+  fail "installing it reports an end-of-life runtime: $(echo "$install_log" | grep -i 'end-of-life' | tr '\n' ' ')"
+else
+  pass "installing it reports no end-of-life runtime or extension"
 fi
 
 # ---------------------------------------------------------------------------
