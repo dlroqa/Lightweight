@@ -366,6 +366,7 @@ pub(crate) fn validate(
     raw: &AutoRouteFile,
     routes: &[Route],
     env: &dyn Fn(&str) -> Option<String>,
+    stored: &dyn Fn(&str) -> Option<String>,
     errors: &mut Vec<ConfigError>,
 ) -> Option<AutoRoute> {
     let before = errors.len();
@@ -385,7 +386,7 @@ pub(crate) fn validate(
     });
 
     let classifier = raw.classifier.as_ref().and_then(|classifier| {
-        crate::classifier::validate(classifier, routes, &raw.fallback_route, env, errors)
+        crate::classifier::validate(classifier, routes, &raw.fallback_route, env, stored, errors)
     });
     let scoring = raw.adaptive_scoring.as_ref().and_then(|scoring| {
         crate::scoring::validate(

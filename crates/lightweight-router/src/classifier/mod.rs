@@ -542,6 +542,7 @@ pub(crate) fn validate(
     routes: &[Route],
     auto_fallback: &str,
     env: &dyn Fn(&str) -> Option<String>,
+    stored: &dyn Fn(&str) -> Option<String>,
     errors: &mut Vec<ConfigError>,
 ) -> Option<RouteClassifier> {
     let before = errors.len();
@@ -626,7 +627,7 @@ pub(crate) fn validate(
     });
     let jev_active = raw.provider == ProviderKind::Jev;
     let jev = raw.jev.as_ref().and_then(|file| {
-        jev::validate(file, jev_active, env, &mut fail, errors).map(ClassifierProvider::Jev)
+        jev::validate(file, jev_active, env, stored, &mut fail, errors).map(ClassifierProvider::Jev)
     });
 
     match raw.provider {
