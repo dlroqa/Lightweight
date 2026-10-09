@@ -2737,6 +2737,47 @@ one saved key — the same entry in that user's credential store — exactly as
 they would share the variable. Give each its own `api_key_env` to keep their
 keys apart. Routers run by different users have different stores. The panel must be served by the router whose settings it saves.
 
+### Live Jev validation (operator-triggered)
+
+Every normal workflow proves Jev against a scripted TypeSafe-compatible
+endpoint and needs no credential. Compatibility with the real service is
+proven by `.github/workflows/jev-live.yml` (*jev live validation*), the only
+workflow that uses a real key:
+
+- **Manual and master-only.** It runs on `workflow_dispatch` only; there is
+  no `pull_request` or `push` trigger, so pull-request code never runs there.
+  The job refuses any ref but `refs/heads/master`.
+- **Behind the `jev-live-validation` environment**, which holds the
+  `TYPESAFE_API_KEY` secret, allows deployments from `master` only, and
+  requires a reviewer's approval. A run waits at that gate before the secret
+  is readable.
+- **The key reaches one process.** Everything is built and installed before
+  the validation step; only that step has the key, and only the router reads
+  it, from its environment. The job restores but never saves a cache, and
+  persists no git credential. GitHub masks the key, the scripts never print it,
+  and the run fails if it appears in a router log, page, browser storage,
+  request URL or API answer.
+
+`scripts/jev-live.sh` starts a loopback router with Jev on
+`https://api.typesafe.ai` (model from the run's `model` input, default
+`jev-latest`) and two scripted nodes, so the one live party is TypeSafe.
+`e2e/jev-live.mjs` then checks:
+
+- Test Connection: the key is accepted and the model listed.
+- Four Auto requests, two about code and two general: each must be
+  classified by Jev (trace classifier `jev`, outcome `chosen`, never a
+  fallback) into the expected route, and served there.
+- The panel shows the key as configured from the environment and Test
+  Connection as Connected.
+
+The run uploads `jev-live-evidence`: routes, outcomes, confidences, the
+answering Jev model and timings, plus screenshots. It never contains request
+text or the key.
+
+Run it from the Actions tab (*jev live validation* → *Run workflow* on
+`master`), or `gh workflow run jev-live.yml --ref master`, then approve the
+deployment.
+
 ## Lightagent's runtime panel
 
 Lightagent `7d95232` reads a gateway's `/api/v1` control plane in exactly one

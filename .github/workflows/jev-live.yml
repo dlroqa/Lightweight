@@ -1,0 +1,96 @@
+# Live Jev validation: the router's Jev classifier against the real TypeSafe
+# API, with the operator's key, on demand.
+#
+# Every other workflow proves Jev against a scripted TypeSafe-compatible
+# endpoint and never needs a credential. This one is the only place a real key
+# is used, so it is fenced off:
+#
+# * Manual only (`workflow_dispatch`). No `pull_request` or `push` trigger, so
+#   code from a pull request never runs here and never sees the secret.
+# * Master only. The job refuses any other ref, and the `jev-live-validation`
+#   environment (required reviewer, `master`-only deployment policy) holds the
+#   secret, so a run waits at the approval gate before it can read it.
+# * The key reaches only the router process's environment, in the one step
+#   that runs it. Nothing builds, installs or caches while it is present.
+#   GitHub masks it in logs; the script never prints it, and it fails the run
+#   if the key appears in a router log, page, browser storage or API answer.
+# * Read-only token, no persisted git credentials, no cache writes from this
+#   job.
+#
+# Nodes are scripted (e2e/mock-node.mjs): what is live is the classifier.
+name: jev live validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Jev model to send (an alias such as jev-latest, or a pinned version)"
+        required: true
+        default: jev-latest
+
+concurrency:
+  group: jev-live-validation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  live:
+    name: live jev validation
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment: jev-live-validation
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show
+      # Restore only: a run that holds a live secret never writes a cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: render-panel
+          save-if: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix e2e
+      - name: Install the render browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      # Everything is built before the secret is in any environment.
+      - name: Build the router and the panel
+        run: |
+          cargo build --bin lightweight
+          npm run build --prefix frontend
+
+      - name: Validate Jev against the live TypeSafe API
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          JEV_MODEL: ${{ inputs.model }}
+          OUT_DIR: e2e/jev-live
+        run: bash ./scripts/jev-live.sh
+
+      # Screenshots and a summary of routes, outcomes, confidences and timings:
+      # no request text, no key, no token.
+      - name: Upload the live validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jev-live-evidence
+          path: e2e/jev-live/
+          if-no-files-found: warn
+          retention-days: 30

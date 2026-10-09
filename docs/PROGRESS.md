@@ -3423,3 +3423,21 @@ The merge commit is **`9f86521`** (parents `47d821d`, `6d1d7f6`).
 - **Unchanged.** v0.7.0 (`e2eb732`, Latest) is untouched. No version bump,
   tag or release. Routing, Auto, the classifier fallback, the request
   budget, metrics and traces are unchanged. R9.4 is not started.
+
+## Live Jev validation workflow (2026-10-09, branch `ci/jev-live-validation`)
+
+The operator created the `jev-live-validation` environment. It holds the
+`TYPESAFE_API_KEY` secret, allows deployments from `master` only, and requires
+`dlroqa` as reviewer.
+
+Added `.github/workflows/jev-live.yml`. It is manual (`workflow_dispatch`),
+`master`-only and runs in that environment; it builds before the secret is
+present, restores the cache without saving it, and persists no git
+credentials. Also added `scripts/jev-live.sh` and `e2e/jev-live.mjs`, which
+run a live check, four Auto requests that Jev must classify (`chosen`) into
+Coder and General, the panel's Test Connection, and checks that the key leaks
+nowhere. Normal CI never sees the secret.
+
+There is no v0.7.1 plan in the repository. This run is the live gate before
+any v0.7.1 release work, which will follow the usual release process once the
+operator asks for it.
