@@ -1,0 +1,14 @@
+{
+  "_doc": [
+    "Approved waivers for scripts/check-advisories.py. Empty is the normal state.",
+    "One entry waives one advisory for one package, and nothing else. Every field is required:",
+    "  advisory     the id the check prints (GHSA-..., RUSTSEC-...)",
+    "  package      the package it names",
+    "  reason       why the shipped product is not exposed, or what replaces the fix",
+    "  approved_by  who accepted the risk",
+    "  approved_on  YYYY-MM-DD",
+    "  expires      YYYY-MM-DD; after it the check fails again, so a waiver is reviewed rather than forgotten",
+    "A waived advisory is still printed, with its approval. An entry that matches nothing is reported for removal."
+  ],
+  "exceptions": []
+}

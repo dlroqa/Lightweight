@@ -160,6 +160,18 @@ else
   fail "the packaged hermes binary does not run inside the runtime: $version"
 fi
 
+# The Electron inside the installed app is the one the lockfile pins: the
+# version `scripts/check-advisories.py` checked. Read from the deployed files
+# rather than from the BaseApp, which supplies no Electron of its own.
+electron_locked="$(./scripts/electron-version.sh --locked)"
+app_files="$(flatpak info --user --show-location "$APP_ID")/files/lib/$APP_ID"
+if electron_packaged="$(./scripts/electron-version.sh "$app_files" 2>&1)" \
+  && [ "$electron_packaged" = "$electron_locked" ]; then
+  pass "it carries Electron $electron_packaged, the version the lockfile pins"
+else
+  fail "it carries Electron '$electron_packaged', but the lockfile pins $electron_locked"
+fi
+
 # ---------------------------------------------------------------------------
 # 5. The highest-risk unknown in the whole Flatpak: the engine is downloaded at
 #    run time into the app's data directory and then executed. If that
