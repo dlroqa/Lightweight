@@ -924,6 +924,50 @@ async fn oversized_bodies_are_refused() {
     assert_eq!(status, 413, "{response}");
 }
 
+#[tokio::test]
+async fn two_routers_never_accept_each_others_admin_token_but_share_one_users_saved_key() {
+    // One user, one credential store, two routers with their own files.
+    let store = Arc::new(MemoryStore::default());
+    let mut first = Start::new(config(lightweight_classifier()));
+    first.store = Arc::clone(&store);
+    let mut second = Start::new(config(lightweight_classifier()));
+    second.store = Arc::clone(&store);
+    let a = Router::start(first).await;
+    let b = Router::start(second).await;
+    assert_ne!(a.token, b.token);
+
+    // A's token is refused by B, and B's file is untouched.
+    let before = b.file();
+    let revision = b.revision().await;
+    let (status, body, _) = b
+        .put_with(
+            jev_save("https://api.typesafe.ai", Some(NEW_KEY)),
+            &revision,
+            |request| {
+                let (client, request) = request.build_split();
+                let mut request = request.unwrap();
+                request
+                    .headers_mut()
+                    .insert(TOKEN_HEADER, a.token.parse().unwrap());
+                reqwest::RequestBuilder::from_parts(client, request)
+            },
+        )
+        .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], "admin_token_invalid");
+    assert_eq!(b.file(), before);
+
+    // Both name TYPESAFE_API_KEY, so a key saved through A is the entry B
+    // would read — exactly as the one environment variable would be shared.
+    let (status, _, _) = a
+        .put(jev_save("https://api.typesafe.ai", Some(NEW_KEY)))
+        .await;
+    assert_eq!(status, 200);
+    let (_, view) = b.view(None).await;
+    assert_eq!(view["key"]["source"], "credential_store");
+    assert_no_key(&view.to_string(), "the other router's view");
+}
+
 // --- consistency ----------------------------------------------------------------------
 
 #[tokio::test]

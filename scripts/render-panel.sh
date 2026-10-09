@@ -368,7 +368,18 @@ start_settings_router() { # extra environment for the router, as NAME=value word
   wait_for "http://127.0.0.1:$SETTINGS_ROUTER_PORT/health" "settings router" "$SETTINGS_ROUTER_PID"
 }
 start_settings_router
-SETTINGS_TOKEN="$(cat "$WORK/settings-router.json.admin-token")"
+admin_token() { ./target/debug/lightweight router admin-token --config "$WORK/settings-router.json"; }
+# Read as the operator does: through the CLI, from this user's own data
+# directory (the scratch HERMES_GATEWAY_HOME), never from beside router.json.
+SETTINGS_TOKEN="$(admin_token)"
+if ls "$WORK"/*admin-token* >/dev/null 2>&1; then echo "an admin token was written beside router.json" >&2; exit 1; fi
+# Every router of this render keeps its own token file there; each is owner-only.
+for token_file in "$HERMES_GATEWAY_HOME"/data/router-admin/router-*.admin-token; do
+  if [ "$(stat -c %a "$token_file" 2>/dev/null || stat -f %Lp "$token_file")" != "600" ]; then
+    echo "an admin token file is not owner-only: $token_file" >&2; exit 1
+  fi
+done
+echo "  [ok] hermes router admin-token reads an owner-only token from the user's own data directory"
 TYPED_KEY="typed-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 
 echo "== render Jev Settings: save =="
@@ -387,14 +398,14 @@ echo "  [ok] router.json holds the saved Jev settings, and neither it nor its ba
 echo "== restart the settings router: the supported activation =="
 kill -INT "$SETTINGS_ROUTER_PID" 2>/dev/null || true
 wait "$SETTINGS_ROUTER_PID" 2>/dev/null || true
-if [ -f "$WORK/settings-router.json.admin-token" ]; then
-  echo "the admin token file outlived the router" >&2; exit 1
+if admin_token >/dev/null 2>&1; then
+  echo "the admin token outlived the router" >&2; exit 1
 fi
 echo "  [ok] the admin token file is removed when the router stops"
 # The in-memory store does not survive a process, so the restarted router
 # reads its key from the environment, as a service would.
 start_settings_router TYPESAFE_API_KEY="$JEV_KEY"
-RESTARTED_TOKEN="$(cat "$WORK/settings-router.json.admin-token")"
+RESTARTED_TOKEN="$(admin_token)"
 if [ "$RESTARTED_TOKEN" = "$SETTINGS_TOKEN" ]; then echo "a restart kept the old admin token" >&2; exit 1; fi
 echo "  [ok] a restart mints a new admin token"
 

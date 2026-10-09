@@ -2664,9 +2664,15 @@ router could not start).
 
 **Who may save.** Not the router's client key — that is the inference key
 every agent holds. Writes need the **admin token**: 32 random bytes per start,
-written owner-only (`0600` on Unix; on Windows, the configuration directory's
-own permissions) to `<config>.admin-token` beside the configuration, removed
-on a clean stop, never logged. A router with any listener off loopback has no
+never logged, removed on a clean stop. It is written into the router user's
+own data directory, `<data>/router-admin/router-<id>.admin-token` (`<id>`
+from the configuration's absolute path, so two routers never share or
+overwrite one), never beside `router.json`, whose directory may be shared.
+On Unix the directory is `0700` and the file `0600`; on Windows and macOS the
+data directory is the user's own profile (`%APPDATA%`, `~/Library`).
+`hermes router admin-token` reads the same place for the calling user, so it
+can show only a token of a router that user started; another account finds
+nothing. A restart replaces the token, and the old one stops working. A router with any listener off loopback has no
 admin token, so a remote router's settings and key can never be changed from
 another machine: configure those with the file and environment on that
 machine. Each write must also come from the router's own panel: a `Host` that
@@ -2703,9 +2709,12 @@ ones — so a key is sent only to the endpoint the router already uses.
 **Known limits.** macOS ties a Keychain item to the program that wrote it: a
 new `hermes` binary (after an update) may ask once to allow access. A router
 stopped by `SIGTERM` rather than Ctrl-C leaves its token file behind; it is
-useless (the next start mints a new one and replaces it). Two routers on one
-machine using the same `api_key_env` share one saved key, as they would share
-the variable. The panel must be served by the router whose settings it saves.
+useless (the next start mints a new one and replaces it). Two routers of one
+user each have their own admin token, and neither accepts the other's; but
+if both use the same `api_key_env` (by default `TYPESAFE_API_KEY`) they share
+one saved key — the same entry in that user's credential store — exactly as
+they would share the variable. Give each its own `api_key_env` to keep their
+keys apart. Routers run by different users have different stores. The panel must be served by the router whose settings it saves.
 
 ## Lightagent's runtime panel
 

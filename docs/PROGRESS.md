@@ -3337,3 +3337,28 @@ the existing 165, plus Jev Settings (a save phase, a real SIGINT restart, a
 restarted phase), checks on the saved files, the token lifecycle and the
 logs. Existing render selectors were scoped to their own cards, and no
 assertion changed.
+
+**Pre-merge security verification (conditional approval).**
+- **Two routers.** Each has its own token, and neither accepts the other's
+  (`one_routers_token_is_not_anothers`, and over HTTP
+  `two_routers_never_accept_each_others_admin_token_but_share_one_users_saved_key`).
+  Under one user, both naming `TYPESAFE_API_KEY` share one store entry, as
+  the variable would; this is now documented.
+- **Token disclosure.** One correction. The token moved from beside
+  `router.json`, where a `--config` in a shared directory would have given it
+  that directory's Windows ACL, to the user's own data directory
+  (`router-admin/`, `0700`; file `0600`; one file per configuration path).
+  `hermes router admin-token` reads only the calling user's directory. The
+  render asserts mode 600, that nothing is written beside `router.json`, that
+  the command fails after a stop, and that a restart rotates the token.
+- **Inference key.** It is not an admin token
+  (`the_inference_key_is_not_an_admin_token`; the HTTP case is in
+  `writes_without_the_admin_token_are_refused`).
+- **Failed updates.** `a_failed_write_leaves_the_file_and_the_previous_key_in_place`
+  covers file failure (the key is rolled back) and store failure (the file is
+  untouched). Invalid and refused saves leave the file byte-identical.
+- **No secret leaks.** Logs (`no_key_or_admin_token_ever_reaches_a_log_line`
+  and the render's grep of the router logs), responses (`assert_no_key` on
+  every view and save), the browser (render: DOM after reload, storage, URLs,
+  console, all bodies) and files (render: `router.json` and `.bak`). No
+  metric or trace field was added.

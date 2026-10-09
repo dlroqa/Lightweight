@@ -6,9 +6,11 @@
 //! change of settings. Writes need a separate **admin token**:
 //!
 //! * 32 random bytes, minted at every start and never logged. It is written,
-//!   owner-only, next to the configuration (`router.json.admin-token`), where
-//!   `hermes router admin-token` reads it back for the operator to paste. It
-//!   is removed when the router stops, and a restart mints a new one.
+//!   owner-only, into the user's own data directory (one file per
+//!   configuration path; never beside a configuration that may sit in a
+//!   shared directory), where `hermes router admin-token` reads it back for
+//!   the same user to paste. It is removed when the router stops, and a
+//!   restart mints a new one.
 //! * A router with any listener off loopback has no admin token at all, so a
 //!   remote router's settings — and its key — can never be changed from
 //!   another machine. Those keep the environment variable.
@@ -161,14 +163,19 @@ pub fn generate_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Where the admin token of the router started with `config` is written.
-pub fn token_path(config: &Path) -> PathBuf {
-    let mut name = config
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| "router.json".into());
-    name.push(".admin-token");
-    config.with_file_name(name)
+/// Where the admin token of the router started with `config` is written:
+/// in `private_dir` — this user's own data directory, never the
+/// configuration's, which may be shared (`--config` can name any directory,
+/// and on Windows a file there inherits that directory's access) — under a
+/// name derived from the configuration's absolute path, so two routers with
+/// two configurations never share or overwrite one token.
+pub fn token_path(private_dir: &Path, config: &Path) -> PathBuf {
+    let absolute = std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+    let id: String = Sha256::digest(absolute.to_string_lossy().as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    private_dir.join(format!("router-{id}.admin-token"))
 }
 
 /// Write the token readable by this user alone, replacing any left by a
@@ -357,10 +364,66 @@ mod tests {
     }
 
     #[test]
-    fn the_token_file_sits_beside_the_configuration() {
+    fn the_token_file_is_in_the_private_directory_one_per_configuration() {
+        let private = Path::new("/private/dir");
+        let a = token_path(private, Path::new("/etc/lightweight/router.json"));
+        let b = token_path(private, Path::new("/srv/other/router.json"));
+        assert_eq!(a.parent(), Some(private));
+        assert_ne!(a, b, "two configurations never share a token file");
         assert_eq!(
-            token_path(Path::new("/etc/lightweight/router.json")),
-            Path::new("/etc/lightweight/router.json.admin-token")
+            a,
+            token_path(private, Path::new("/etc/lightweight/router.json"))
+        );
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("router-") && name.ends_with(".admin-token"),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn the_token_file_is_owner_only_replaced_and_removed_only_by_its_router() {
+        let dir = std::env::temp_dir().join(format!("lw-admin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("router-test.admin-token");
+        write_token(&path, "first-token").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "owner-only, got {mode:o}");
+        }
+        // A newer router replaces a stale file; the older one's stop leaves it.
+        write_token(&path, "second-token").unwrap();
+        remove_token(&path, "first-token");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second-token");
+        remove_token(&path, "second-token");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_routers_token_is_not_anothers() {
+        let first = generate_token().unwrap();
+        let second = generate_token().unwrap();
+        let bound: [SocketAddr; 1] = ["127.0.0.1:18500".parse().unwrap()];
+        let a = AdminAccess::new(&first, &bound).unwrap();
+        let b = AdminAccess::new(&second, &bound).unwrap();
+        let with = |token: &str| {
+            headers(&[
+                ("host", "127.0.0.1:18500"),
+                ("origin", "http://127.0.0.1:18500"),
+                (TOKEN_HEADER, token),
+            ])
+        };
+        assert_eq!(a.check(&with(&first), false), Ok(()));
+        assert_eq!(
+            b.check(&with(&first), false).unwrap_err().code,
+            "admin_token_invalid"
+        );
+        assert_eq!(
+            a.check(&with(&second), false).unwrap_err().code,
+            "admin_token_invalid"
         );
     }
 }

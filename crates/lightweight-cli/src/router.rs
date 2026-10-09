@@ -44,16 +44,22 @@ fn load(
     Ok((path, loaded))
 }
 
+/// Where this user's routers keep their admin tokens: the user's own data
+/// directory (owner-only on Unix; per-user on Windows and macOS).
+fn admin_token_dir() -> Result<PathBuf, String> {
+    let paths = DataPaths::discover().map_err(crate::serve::describe)?;
+    Ok(paths.data_dir().join("router-admin"))
+}
+
 /// `hermes router admin-token`: print the running router's admin token, which
-/// the panel asks for before it saves settings.
+/// the panel asks for before it saves settings. It reads the calling user's
+/// own data directory, so it can show only a router that user started.
 pub fn admin_token(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, String> {
-    let path = lightweight_router::admin::token_path(&config_path(config)?);
+    let path = lightweight_router::admin::token_path(&admin_token_dir()?, &config_path(config)?);
     let token = std::fs::read_to_string(&path).map_err(|_| {
-        format!(
-            "no admin token at {}: start the router with this configuration first (a router \
-             listening off loopback has none)",
-            path.display()
-        )
+        "no admin token for this configuration: start the router with it first, as this user \
+         (a router listening off loopback has none; a restarted one has a new one)"
+            .to_owned()
     })?;
     out.push_str(token.trim());
     out.push('\n');
@@ -179,15 +185,19 @@ pub fn run(
 
         // The admin token: minted now, written owner-only beside the file,
         // removed at stop. A router listening off loopback gets none.
-        let token_path = lightweight_router::admin::token_path(&path);
+        let token_dir = admin_token_dir()?;
+        let token_path = lightweight_router::admin::token_path(&token_dir, &path);
         let mut token = None;
         let admin = lightweight_router::admin::loopback_only(&bound.addresses())
             .map_err(str::to_owned)
+            .and_then(|()| {
+                lightweight_store::atomic::create_private_dir(&token_dir)
+                    .map_err(|err| format!("the admin token directory could not be created: {err}"))
+            })
             .and_then(|()| lightweight_router::admin::generate_token())
             .and_then(|minted| {
-                lightweight_router::admin::write_token(&token_path, &minted).map_err(|err| {
-                    format!("the admin token could not be written beside the configuration: {err}")
-                })?;
+                lightweight_router::admin::write_token(&token_path, &minted)
+                    .map_err(|err| format!("the admin token could not be written: {err}"))?;
                 let access =
                     lightweight_router::admin::AdminAccess::new(&minted, &bound.addresses())
                         .map_err(str::to_owned);
