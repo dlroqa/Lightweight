@@ -11,6 +11,8 @@ import type {
   AutoView,
   TracesBody,
   ClassifierCheckReport,
+  ClassifierSettingsSave,
+  ClassifierSettingsView,
   RouterRoutesBody,
   VersionBody,
   BenchmarkRun,
@@ -45,13 +47,22 @@ export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly remedies: Remedy[];
+  /** Every problem, when the server lists them (the router's settings save). */
+  readonly details: string[];
 
-  constructor(status: number, code: string, message: string, remedies: Remedy[]) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    remedies: Remedy[],
+    details: string[] = [],
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.remedies = remedies;
+    this.details = details;
   }
 }
 
@@ -129,6 +140,7 @@ async function request<T>(
       error?.code ?? "http_error",
       error?.message ?? `${response.status} ${response.statusText}`,
       error?.hermes?.remedies ?? [],
+      Array.isArray(body?.errors) ? body.errors.filter((e) => typeof e === "string") : [],
     );
   }
 
@@ -333,7 +345,8 @@ export const api = {
  * The router's operator surface, `/api/router/v1`, for a panel served by
  * `hermes router --web-root`. Same origin as the router, like the gateway's
  * own panel: no base URL, no CORS. Read-only, apart from asking the router to
- * check its classifier provider now — which changes nothing.
+ * check its classifier provider now — which changes nothing — and saving the
+ * classifier's provider settings under the router's admin token.
  */
 export const routerApi = {
   version: () => request<VersionBody>("/version", undefined, "router"),
@@ -345,6 +358,36 @@ export const routerApi = {
     request<ClassifierCheckReport>(
       "/api/router/v1/classifier/check",
       { method: "POST" },
+      "router",
+    ),
+  /** What is saved and what is running. Never a key. */
+  classifierSettings: () =>
+    request<ClassifierSettingsView>("/api/router/v1/classifier/settings", undefined, "router"),
+  /**
+   * Save the classifier's provider settings, and replace the key if one is
+   * given. `adminToken` is held by the caller in memory only and sent as a
+   * header — never in a URL, never stored. `revision` is the one last read.
+   */
+  saveClassifierSettings: (body: ClassifierSettingsSave, revision: string, adminToken: string) =>
+    request<ClassifierSettingsView>(
+      "/api/router/v1/classifier/settings",
+      {
+        method: "PUT",
+        body: JSON.stringify(body),
+        headers: { "if-match": `"${revision}"`, "x-lightweight-admin-token": adminToken },
+        cache: "no-store",
+      },
+      "router",
+    ),
+  /** Remove the key saved in the credential store. */
+  removeClassifierKey: (revision: string, adminToken: string) =>
+    request<ClassifierSettingsView>(
+      "/api/router/v1/classifier/key",
+      {
+        method: "DELETE",
+        headers: { "if-match": `"${revision}"`, "x-lightweight-admin-token": adminToken },
+        cache: "no-store",
+      },
       "router",
     ),
 };

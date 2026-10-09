@@ -1,10 +1,11 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
-import { Loader2, PlugZap, ShieldAlert } from "lucide-react";
+import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { Eye, EyeOff, Loader2, PlugZap, RotateCcw, Save, ShieldAlert, Trash2 } from "lucide-react";
 
-import { routerApi } from "../../api/client";
+import { ApiError, routerApi } from "../../api/client";
 import type {
   AutoView,
   ClassifierCheckReport,
+  ClassifierSettingsView,
   ClassifierView,
   RouterRouteView,
 } from "../../api/types";
@@ -26,10 +27,21 @@ import {
   type ClassifierDraft,
   type DraftProblems,
   type JevDraft,
+  type JevSettingsDraft,
+  type SettingsProblems,
   type LightweightDraft,
   type ProviderKind,
   classifierSnippet,
+  connectionState,
   descriptionChanges,
+  explainSaveError,
+  hasSettingsProblems,
+  keySourceLabel,
+  restartReasons,
+  savedKeyState,
+  settingsDraftFrom,
+  settingsRequest,
+  validateSettings,
   draftFrom,
   explainCheck,
   hasProblems,
@@ -62,10 +74,11 @@ function when(unixSeconds: number | null | undefined): string {
  * The semantic classifier: which provider chooses a route for the `Auto`
  * rules that ask for classification, how it is doing, and its settings.
  *
- * The status and Test Connection are the running router's. The settings are a
- * draft: the router reads `router.json` once at start and has no API that
- * writes it, so the panel produces the validated configuration to paste
- * rather than pretending to save it.
+ * The status and Test Connection are the running router's. Jev Settings saves
+ * the provider, endpoint, model and key through the router's admin-token write
+ * (applied at the next restart). The rest of the classifier — candidates,
+ * descriptions, the Lightweight provider — stays a draft that produces the
+ * validated configuration to paste, as before.
  */
 export function ClassifierScreen() {
   const auto = usePoll(routerApi.auto, 5000);
@@ -85,6 +98,7 @@ export function ClassifierScreen() {
         ) : auto.data ? (
           <>
             <StatusCard auto={auto.data} onChecked={auto.refresh} />
+            <JevSettingsCard running={auto.data.classifier ?? null} onChanged={auto.refresh} />
             <Settings auto={auto.data} routes={routes.data?.data ?? []} />
           </>
         ) : null}
@@ -235,6 +249,477 @@ function CheckResult({ report, fresh }: { report: ClassifierCheckReport; fresh: 
   );
 }
 
+
+// --- Jev Settings: save the provider, endpoint, model and key ------------------------
+
+type Notice = { tone: "info" | "warn" | "danger"; text: string; details?: string[] };
+
+/**
+ * The one place the panel writes the router's settings. What it shows is
+ * read from the router (`GET /classifier/settings`), never kept in the
+ * browser. The key and the admin token live in this component's state only,
+ * long enough to send; the key field is never filled from the router, which
+ * never sends a key back.
+ */
+function JevSettingsCard({
+  running,
+  onChanged,
+}: {
+  running: ClassifierView | null;
+  onChanged: () => void;
+}) {
+  const [view, setView] = useState<ClassifierSettingsView | null>(null);
+  const [loadError, setLoadError] = useState<ApiError | Error | null>(null);
+  const [draft, setDraft] = useState<JevSettingsDraft | null>(null);
+  const [token, setToken] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [touched, setTouched] = useState<Partial<Record<keyof JevSettingsDraft, boolean>>>({});
+  const [attempted, setAttempted] = useState(false);
+  const [busy, setBusy] = useState<"save" | "remove" | "check" | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [check, setCheck] = useState<ClassifierCheckReport | null>(null);
+
+  const load = useCallback(async (reseed: boolean) => {
+    try {
+      const next = await routerApi.classifierSettings();
+      setView(next);
+      setLoadError(null);
+      setDraft((current) => (reseed || current === null ? settingsDraftFrom(next) : current));
+    } catch (cause) {
+      setLoadError(cause instanceof Error ? cause : new Error(String(cause)));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load(true);
+  }, [load]);
+
+  const problems: SettingsProblems = useMemo(
+    () => (draft ? validateSettings(draft, view) : {}),
+    [draft, view],
+  );
+  const shown = (field: keyof JevSettingsDraft) =>
+    attempted || touched[field] ? (problems[field] ?? null) : null;
+
+  if (loadError && !view) {
+    return (
+      <Card title="Jev Settings">
+        <div className="notice notice--danger" role="alert" data-jev-settings-error>
+          {loadError.message}
+        </div>
+        <button type="button" className="btn" style={{ marginTop: 12 }} onClick={() => void load(true)}>
+          <RotateCcw size={15} /> Retry
+        </button>
+      </Card>
+    );
+  }
+  if (!view || !draft) return <Loading what="the Jev settings" />;
+
+  const update = (patch: Partial<JevSettingsDraft>) => setDraft((d) => (d ? { ...d, ...patch } : d));
+  const blur = (field: keyof JevSettingsDraft) => setTouched((t) => ({ ...t, [field]: true }));
+  const key = savedKeyState(view);
+  const runningJev = running?.jev ?? null;
+  const lastCheck = check ?? (running?.provider === "jev" ? running.status.last_check : null);
+  const connection = connectionState(running?.provider === "jev" ? lastCheck : null);
+  const storeUsable = view.key.store.available;
+  const canSave = view.configured && view.admin.available && busy === null;
+
+  async function save() {
+    if (!draft || !view) return;
+    setAttempted(true);
+    setNotice(null);
+    if (hasSettingsProblems(problems)) {
+      setNotice({ tone: "warn", text: "Fix the fields marked below, then save again." });
+      return;
+    }
+    if (token.trim() === "") {
+      setNotice({
+        tone: "warn",
+        text: "Enter the router's admin token first: run `hermes router admin-token` where the router runs.",
+      });
+      return;
+    }
+    setBusy("save");
+    try {
+      const saved = await routerApi.saveClassifierSettings(settingsRequest(draft), view.revision, token.trim());
+      setView(saved);
+      setDraft(settingsDraftFrom(saved));
+      setShowKey(false);
+      setTouched({});
+      setAttempted(false);
+      setNotice({
+        tone: "info",
+        text:
+          saved.key_action === "replaced"
+            ? "Saved. The new API key is in this machine's credential store and the settings are in router.json."
+            : "Saved to router.json. The saved API key was left as it was.",
+      });
+      onChanged();
+    } catch (cause) {
+      const error = cause instanceof ApiError ? cause : null;
+      if (error?.code === "revision_conflict") await load(true);
+      setNotice({
+        tone: "danger",
+        text: error ? explainSaveError(error.code, error.message) : String(cause),
+        details: error?.details,
+      });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function removeKey() {
+    if (!view) return;
+    if (token.trim() === "") {
+      setNotice({ tone: "warn", text: "Enter the router's admin token first." });
+      return;
+    }
+    if (!window.confirm("Remove the API key saved in this machine's credential store?")) return;
+    setBusy("remove");
+    setNotice(null);
+    try {
+      const next = await routerApi.removeClassifierKey(view.revision, token.trim());
+      setView(next);
+      setNotice({ tone: "info", text: "The saved API key was removed from the credential store." });
+      onChanged();
+    } catch (cause) {
+      const error = cause instanceof ApiError ? cause : null;
+      setNotice({ tone: "danger", text: error ? explainSaveError(error.code, error.message) : String(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function testConnection() {
+    setBusy("check");
+    setNotice(null);
+    try {
+      setCheck(await routerApi.checkClassifier());
+      onChanged();
+    } catch (cause) {
+      setNotice({ tone: "danger", text: cause instanceof Error ? cause.message : String(cause) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Card
+      title="Jev Settings"
+      action={
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {view.saved.provider === "jev" || draft.provider === "jev" ? (
+            <span data-key-state={key.state}>
+              <Pill tone={key.state === "configured" ? "ok" : "danger"} dot>
+                {key.state === "configured" ? "Key configured" : "Key missing"}
+              </Pill>
+            </span>
+          ) : null}
+          {running?.provider === "jev" && (
+            <span data-connection-state={connection.label}>
+              <Pill tone={connection.tone} dot>
+                {connection.label}
+              </Pill>
+            </span>
+          )}
+          {view.restart_required && (
+            <span data-restart-pill>
+              <Pill tone="warn" dot>
+                Pending Restart
+              </Pill>
+            </span>
+          )}
+        </div>
+      }
+    >
+      <div data-jev-settings style={{ display: "grid", gap: 16 }}>
+        {!view.configured && (
+          <div className="notice notice--warn" role="status" data-not-configured>
+            <div>
+              <code>router.json</code> has no classifier section yet, so there are no candidate
+              routes to classify among. Apply one with the Configuration card below, restart the
+              router, then save Jev settings here. Routes are never invented.
+            </div>
+          </div>
+        )}
+        {!view.admin.available && (
+          <div className="notice notice--warn" role="status" data-admin-unavailable>
+            Read-only here: {view.admin.detail}
+          </div>
+        )}
+        {view.restart_required && (
+          <div className="notice notice--warn" role="status" data-pending-restart>
+            <div>
+              <strong>Pending Restart.</strong> Saved settings are not active yet. Stop the router
+              (Ctrl-C) and start it again with the same command to apply them; they are kept in{" "}
+              <code>{view.file ?? "router.json"}</code> and the credential store until then. Until
+              the restart, Test Connection checks the running settings.
+              <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                {restartReasons(view).map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        <div style={grid}>
+          <Field
+            label="Admin token"
+            help={
+              <>
+                Changing settings needs this router&apos;s admin token, not the API key agents use.
+                Run <code>{view.admin.token_command ?? "hermes router admin-token"}</code> where the
+                router runs and paste it here. It is kept only while this page is open.
+              </>
+            }
+          >
+            {(props) => (
+              <input
+                {...props}
+                className="input"
+                type="password"
+                name="router-admin-token"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={!view.admin.available}
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                data-admin-token
+              />
+            )}
+          </Field>
+        </div>
+
+        <fieldset className="choice-group" aria-label="Provider" data-settings-provider>
+          <legend className="field__label" style={{ marginBottom: 8, width: "100%" }}>
+            Provider
+          </legend>
+          {(view.providers ?? ["lightweight", "jev"]).map((kind) => (
+            <label className="choice" key={kind}>
+              <input
+                type="radio"
+                name="jev-settings-provider"
+                value={kind}
+                checked={draft.provider === kind}
+                onChange={() => update({ provider: kind })}
+              />
+              {PROVIDER_NAMES[kind]}
+              {view.active.provider === kind && (
+                <span style={{ color: "var(--text-muted)", fontSize: 12 }}>(running)</span>
+              )}
+            </label>
+          ))}
+        </fieldset>
+
+        {draft.provider === "jev" ? (
+          <div style={grid} data-jev-fields>
+            <Field
+              label="API endpoint"
+              help={`Default ${DEFAULT_BASE_URL}. https only (http just for a loopback address); no credentials, query or fragment.`}
+              problem={shown("base_url")}
+            >
+              {(props) => (
+                <input
+                  {...props}
+                  className="input"
+                  type="url"
+                  spellCheck={false}
+                  value={draft.base_url}
+                  onChange={(e) => update({ base_url: e.target.value })}
+                  onBlur={() => blur("base_url")}
+                  data-field="base_url"
+                />
+              )}
+            </Field>
+
+            <Field
+              label="API key"
+              help={
+                <span data-key-source={view.key.source}>
+                  {key.label}.{" "}
+                  {view.key.environment
+                    ? "It is set where the router runs, and wins over a saved key."
+                    : storeUsable
+                      ? view.key.stored
+                        ? "Leave empty to keep the saved key; type a new one to replace it."
+                        : "Saved to this machine's credential store, never to router.json."
+                      : `No credential store is available to the router (${view.key.store.detail ?? "unavailable"}). Set ${view.key.api_key_env} in the router's environment instead, then restart it.`}
+                </span>
+              }
+              problem={shown("api_key")}
+            >
+              {(props) => (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    {...props}
+                    className="input"
+                    type={showKey ? "text" : "password"}
+                    name="jev-api-key"
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    placeholder={view.key.stored ? "Saved — leave empty to keep" : "Enter a TypeSafe API key"}
+                    disabled={!storeUsable || !view.admin.available}
+                    value={draft.api_key}
+                    onChange={(e) => update({ api_key: e.target.value })}
+                    onBlur={() => blur("api_key")}
+                    data-field="api_key"
+                  />
+                  <button
+                    type="button"
+                    className="btn btn--icon"
+                    aria-label={showKey ? "Hide API key" : "Show API key"}
+                    aria-pressed={showKey}
+                    onClick={() => setShowKey((v) => !v)}
+                    disabled={!storeUsable || !view.admin.available}
+                    data-toggle-key
+                  >
+                    {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                  </button>
+                </div>
+              )}
+            </Field>
+
+            <Field
+              label="Model"
+              help="An alias such as jev-latest, or a pinned version such as jev-1.13.0."
+              problem={shown("model")}
+            >
+              {(props) => (
+                <input
+                  {...props}
+                  className="input"
+                  spellCheck={false}
+                  value={draft.model}
+                  onChange={(e) => update({ model: e.target.value })}
+                  onBlur={() => blur("model")}
+                  data-field="model"
+                />
+              )}
+            </Field>
+
+            <Field
+              label="Timeout (ms)"
+              help={`Required for a new Jev configuration (the router has no default); ${SUGGESTED_JEV_TIMEOUT_MS} ms is a starting point. Empty keeps the saved value.`}
+              problem={shown("timeout_ms")}
+            >
+              {(props) => (
+                <input
+                  {...props}
+                  className="input"
+                  inputMode="numeric"
+                  placeholder={`1 – ${MAX_TIMEOUT_MS}`}
+                  value={draft.timeout_ms}
+                  onChange={(e) => update({ timeout_ms: e.target.value })}
+                  onBlur={() => blur("timeout_ms")}
+                  data-field="timeout_ms"
+                />
+              )}
+            </Field>
+
+            <Field
+              label="Confidence threshold"
+              help={`0 – 1; below it, Auto uses the fallback route. Empty keeps the saved value (default ${DEFAULT_MIN_CONFIDENCE}).`}
+              problem={shown("min_confidence")}
+            >
+              {(props) => (
+                <input
+                  {...props}
+                  className="input"
+                  inputMode="decimal"
+                  value={draft.min_confidence}
+                  onChange={(e) => update({ min_confidence: e.target.value })}
+                  onBlur={() => blur("min_confidence")}
+                  data-field="min_confidence"
+                />
+              )}
+            </Field>
+          </div>
+        ) : (
+          <p className="card__note" style={{ margin: 0 }}>
+            Saving Lightweight keeps the file&apos;s Lightweight settings and any Jev block as a
+            standby. Edit the Lightweight provider itself with the draft below.
+          </p>
+        )}
+
+        <div className="card__note" style={{ margin: 0 }} data-running-settings>
+          Running now:{" "}
+          {view.active.provider === "jev" && view.active.jev
+            ? `Jev at ${view.active.jev.base_url}, model ${view.active.jev.model ?? "—"}, key from ${keySourceLabel(view.active.key_source, view.active.jev.api_key_env)}.`
+            : view.active.provider
+              ? `${PROVIDER_NAMES[view.active.provider]} provider.`
+              : "no classifier."}
+          {runningJev && running?.provider !== "jev" ? " Jev is configured as a standby." : ""}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="btn btn--primary"
+            onClick={() => void save()}
+            disabled={!canSave}
+            aria-busy={busy === "save"}
+            data-save-settings
+          >
+            {busy === "save" ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
+            Save Settings
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void testConnection()}
+            disabled={busy !== null || !running}
+            aria-busy={busy === "check"}
+            data-test-connection
+          >
+            {busy === "check" ? <Loader2 size={15} className="spin" /> : <PlugZap size={15} />}
+            Test Connection
+          </button>
+          {view.key.stored && (
+            <button
+              type="button"
+              className="btn btn--danger"
+              onClick={() => void removeKey()}
+              disabled={busy !== null || !view.admin.available}
+              aria-busy={busy === "remove"}
+              data-remove-key
+            >
+              {busy === "remove" ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />}
+              Remove saved key
+            </button>
+          )}
+        </div>
+
+        <div aria-live="polite" style={{ display: "grid", gap: 10 }}>
+          {notice && (
+            <div
+              className={`notice notice--${notice.tone}`}
+              role={notice.tone === "danger" ? "alert" : "status"}
+              data-settings-notice={notice.tone}
+            >
+              <div>
+                {notice.text}
+                {notice.details && notice.details.length > 0 && (
+                  <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                    {notice.details.map((detail) => (
+                      <li key={detail}>{detail}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          )}
+          {check && <CheckResult report={check} fresh />}
+        </div>
+        <p className="card__note" style={{ margin: 0 }}>
+          Test Connection checks the settings the router is running, never unsaved ones or saved
+          ones not yet active, so a key is sent only to the endpoint the router already uses.
+        </p>
+      </div>
+    </Card>
+  );
+}
+
 // --- the settings draft --------------------------------------------------------------
 
 function Settings({ auto, routes }: { auto: AutoView; routes: RouterRouteView[] }) {
@@ -281,10 +766,11 @@ function Settings({ auto, routes }: { auto: AutoView; routes: RouterRouteView[] 
         }
       >
         <div className="notice notice--info" style={{ marginBottom: 16 }}>
-          These settings are not saved to the router from here. The router reads{" "}
-          <code>router.json</code> once at start and has no API that writes it, so the panel
-          produces the validated configuration below to paste in. Switching provider changes
-          only this section; Auto rules keep asking for semantic classification.
+          This draft is not saved to the router from here: it produces the validated
+          configuration below to paste into <code>router.json</code>, for the settings Jev
+          Settings above does not cover (candidates, descriptions, the Lightweight provider,
+          include-user-text). Switching provider changes only this section; Auto rules keep
+          asking for semantic classification.
         </div>
 
         <fieldset className="choice-group" aria-label="Classifier Provider" style={{ marginBottom: 18 }}>
