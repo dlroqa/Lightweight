@@ -83,12 +83,16 @@ jobs:
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
 
-      # The Electron binary npm downloaded for this platform carries the version
-      # the lockfile pins. Read the same way the artifact checks read a packaged
-      # app, so the reader is proved on the Windows executable and the macOS
-      # framework on every pull request, not first on a release build.
+      # The Electron binary for this platform carries the version the lockfile
+      # pins. Read the same way the artifact checks read a packaged app, so the
+      # reader is proved on the Windows executable and the macOS framework on
+      # every pull request, not first on a release build. Electron's package no
+      # longer downloads its binary on install, only on first use, so its own
+      # installer fetches it here (and checks it against the package's
+      # checksums.json).
       - name: The Electron this platform installed
         run: |
+          node apps/desktop/node_modules/electron/install.js
           dist=apps/desktop/node_modules/electron/dist
           if [ -d "$dist/Electron.app" ]; then dist="$dist/Electron.app"; fi
           locked="$(bash ./scripts/electron-version.sh --locked)"
