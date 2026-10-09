@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Flatpak: built on the supported Freedesktop 25.08 runtime.** The Flatpak
+  moves from `org.freedesktop.Platform` 24.08, which Flathub marks
+  end-of-life and which no longer receives security fixes, to 25.08 with the
+  matching `org.electronjs.Electron2.BaseApp` 25.08 (#61). The application
+  id, sandbox permissions and launch behaviour are unchanged. CI and the
+  release now take the runtime from `apps/desktop/package.json`, and fail if
+  Flathub marks the runtime, an extension or the installed bundle's runtime
+  end-of-life.
+
 ## [0.8.0] - 2026-10-09
 
 This release adds **Jev Settings** to the router panel. An operator can now

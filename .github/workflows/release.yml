@@ -184,12 +184,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
-          flatpak remote-add --if-not-exists --user flathub \
-            https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y flathub \
-            org.freedesktop.Platform//24.08 \
-            org.freedesktop.Sdk//24.08 \
-            org.electronjs.Electron2.BaseApp//24.08
+          ./scripts/install-flatpak-runtimes.sh
 
       # No `--target` here, deliberately. The build job above passes one, so
       # between them the two branches of the staging script's binary resolution
