@@ -65,6 +65,10 @@ SERVER_ERROR_GENERAL_PORT="$((NODE_PORT + 12))"
 # A router whose classifier settings the panel saves (Jev Settings): it starts
 # on the Lightweight provider and is restarted once the panel has saved Jev.
 SETTINGS_ROUTER_PORT="$((NODE_PORT + 13))"
+# Its own two scripted nodes, loaded and answering, so an Auto request that
+# Jev classifies is served: the smoke of the saved settings.
+SETTINGS_CODER_PORT="$((NODE_PORT + 14))"
+SETTINGS_GENERAL_PORT="$((NODE_PORT + 15))"
 OUT_DIR="${OUT_DIR:-e2e/screens}"
 
 # Same rustup-env dance as check.sh: cargo is absent from a non-login PATH.
@@ -94,13 +98,14 @@ CLIENT_ERROR_ROUTER_LOG="$WORK/client-error-router.log"
 SERVER_ERROR_ROUTER_LOG="$WORK/server-error-router.log"
 SETTINGS_ROUTER_LOG="$WORK/settings-router.log"
 SETTINGS_ROUTER_PID=""
+SETTINGS_NODES_PID=""
 CLIENT_ERROR_ROUTER_PID=""
 SERVER_ERROR_ROUTER_PID=""
 TERMINAL_NODES_PID=""
 
 cleanup() {
   local status=$?
-  for pid in "$SETTINGS_ROUTER_PID" "$CLIENT_ERROR_ROUTER_PID" "$SERVER_ERROR_ROUTER_PID" "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
+  for pid in "$SETTINGS_ROUTER_PID" "$SETTINGS_NODES_PID" "$CLIENT_ERROR_ROUTER_PID" "$SERVER_ERROR_ROUTER_PID" "$OVERFLOW_ROUTER_PID" "$STREAM_ROUTER_PID" "$TERMINAL_NODES_PID" "$BUDGET_ROUTER_PID" "$BUDGET_NODES_PID" "$ROUTER_PID" "$NODES_PID" "$JEV_PID" "$GATEWAY_PID"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
@@ -331,6 +336,13 @@ PANEL_BASE="http://127.0.0.1:$ROUTER_PORT" OUT_DIR="$OUT_DIR" SECRET_SENTINEL="$
   MOCK_NODE_URLS="http://127.0.0.1:$CODER_NODE_PORT,http://127.0.0.1:$GENERAL_NODE_PORT" \
   node e2e/render-router.mjs
 
+echo "== start settings nodes (ports $SETTINGS_CODER_PORT, $SETTINGS_GENERAL_PORT) =="
+MOCK_NODES="$SETTINGS_CODER_PORT:Coder:200:loaded,$SETTINGS_GENERAL_PORT:General:200:loaded" \
+  node e2e/mock-node.mjs >"$WORK/settings-nodes.log" 2>&1 &
+SETTINGS_NODES_PID=$!
+wait_for "http://127.0.0.1:$SETTINGS_CODER_PORT/health" "scripted settings Coder node" "$SETTINGS_NODES_PID"
+wait_for "http://127.0.0.1:$SETTINGS_GENERAL_PORT/health" "scripted settings General node" "$SETTINGS_NODES_PID"
+
 echo "== start settings router (port $SETTINGS_ROUTER_PORT) =="
 # Running the Lightweight provider, with no Jev key anywhere: Jev Settings
 # switches it to Jev and saves a key into an in-memory credential store (a
@@ -338,10 +350,14 @@ echo "== start settings router (port $SETTINGS_ROUTER_PORT) =="
 cat >"$WORK/settings-router.json" <<JSON
 {
   "listen": ["127.0.0.1:$SETTINGS_ROUTER_PORT"],
-  "nodes": [{"id": "local", "url": "http://127.0.0.1:$GATEWAY_PORT"}],
+  "nodes": [
+    {"id": "local", "url": "http://127.0.0.1:$GATEWAY_PORT"},
+    {"id": "settings-coder", "url": "http://127.0.0.1:$SETTINGS_CODER_PORT"},
+    {"id": "settings-general", "url": "http://127.0.0.1:$SETTINGS_GENERAL_PORT"}
+  ],
   "routes": [
-    {"name": "General", "description": "Everyday conversation and questions", "deployments": [{"node": "local", "model": "General"}]},
-    {"name": "Coder", "description": "Programming, debugging and code generation", "deployments": [{"node": "local", "model": "Coder"}]},
+    {"name": "General", "description": "Everyday conversation and questions", "deployments": [{"node": "settings-general", "model": "General"}]},
+    {"name": "Coder", "description": "Programming, debugging and code generation", "deployments": [{"node": "settings-coder", "model": "Coder"}]},
     {"name": "Research", "deployments": [{"node": "local", "model": "Research"}]}
   ],
   "auto_route": {

@@ -203,6 +203,29 @@ async function phaseRestarted(page) {
     await page.unroute("**/api/router/v1/classifier/check");
   }
 
+  // --- smoke: an Auto request classified by Jev with the saved settings ---------------------
+  // The scripted TypeSafe sends a request about code to Coder and anything
+  // else to General, and only with the right key: a failed classification
+  // would fall back to General, so Coder proves Jev answered.
+  const classified = async () => (await (await fetch(`${JEV_URL}/stats`)).json()).systemone;
+  const before = await classified();
+  const auto = async (text) => {
+    const response = await fetch(`${BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "Auto", messages: [{ role: "user", content: text }] }),
+    });
+    return { status: response.status, model: (await response.json()).model };
+  };
+  const coder = await auto("Write a Rust function that parses a config file");
+  check(coder.status === 200 && coder.model === "Coder", `an Auto request about code is classified by Jev to Coder (got ${coder.status} ${coder.model})`);
+  const general = await auto("Good morning! How are you today?");
+  check(general.status === 200 && general.model === "General", `an Auto greeting is classified by Jev to General (got ${general.status} ${general.model})`);
+  check((await classified()) === before + 2, "both Auto requests were answered by Jev, with the saved key");
+  const traces = await (await fetch(`${BASE}/api/router/v1/traces?limit=5`)).json();
+  const text = JSON.stringify(traces);
+  check(text.includes("semantic") && text.includes("Coder"), "the routing trace names the semantic rule and the classified route");
+
   // A save the router refuses lists every problem; one it fails says nothing changed.
   await c.locator("[data-admin-token]").fill(TOKEN);
   await page.route("**/api/router/v1/classifier/settings", (route) =>
