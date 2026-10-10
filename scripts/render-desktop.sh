@@ -23,7 +23,18 @@
 #   npm ci --prefix frontend && npm ci --prefix apps/desktop && npm ci --prefix e2e
 #   xvfb-run --auto-servernum scripts/render-desktop.sh
 #
+# Packaged mode: with DESKTOP_EXECUTABLE set, nothing is built. The app under
+# test is that packaged executable, the Router and the test use the package's
+# own hermes (DESKTOP_HERMES), and an external Gateway and Router serve the
+# package's own panel (DESKTOP_PANEL). scripts/smoke-packaged-desktop.sh sets
+# these for each package the release builds; it is the release's gate.
+#
 # Environment:
+#   DESKTOP_EXECUTABLE, DESKTOP_HERMES, DESKTOP_PANEL
+#                      packaged mode (see above)
+#   DESKTOP_HOME_BASE  where the throwaway data directories and the external
+#                      Router's file go (default: a temporary directory). The
+#                      Flatpak needs one its sandbox can see.
 #   DESKTOP_PORT_BASE  first of five consecutive ports (default 18434): Gateway,
 #                      Router, scripted Jev, scripted Coder, scripted General
 #   OUT_DIR            where screenshots and the app's logs land
@@ -44,6 +55,15 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "${HOME:-}/.cargo/env" ]; then
 fi
 
 WORK="$(mktemp -d)"
+BASE_DIR="${DESKTOP_HOME_BASE:-$WORK}"
+mkdir -p "$BASE_DIR"
+PACKAGED="${DESKTOP_EXECUTABLE:+1}"
+EXPECT_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+
+# Windows: the programs under test are native, so every path handed to one is
+# converted; bash itself keeps working with its own form.
+native() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+posix() { if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
 JEV_PID=""
 NODES_PID=""
 GATEWAY_PID=""
@@ -83,17 +103,27 @@ wait_for() {
   return 1
 }
 
-echo "== build =="
-cargo build -p lightweight-cli --bin hermes
-if [ ! -f frontend/dist/index.html ]; then
-  ( cd frontend && npm run build )
+if [ -n "$PACKAGED" ]; then
+  echo "== packaged: $DESKTOP_EXECUTABLE =="
+  ELECTRON_BIN="$DESKTOP_EXECUTABLE"
+  HERMES_BIN="$DESKTOP_HERMES"
+  WEB_ROOT="$DESKTOP_PANEL"
+  APP_DIR=""
+else
+  echo "== build =="
+  cargo build -p lightweight-cli --bin hermes
+  if [ ! -f frontend/dist/index.html ]; then
+    ( cd frontend && npm run build )
+  fi
+  # Compiled, not `npm run build`: that also runs the shell's test suite, which
+  # check.sh already runs on every platform.
+  ( cd apps/desktop && npm run compile )
+  node apps/desktop/node_modules/electron/install.js
+  ELECTRON_BIN="$(cd apps/desktop && node -e 'process.stdout.write(require("electron"))')"
+  HERMES_BIN="$PWD/target/debug/hermes"
+  WEB_ROOT="$PWD/frontend/dist"
+  APP_DIR="$PWD/apps/desktop"
 fi
-# Compiled, not `npm run build`: that also runs the shell's test suite, which
-# check.sh already runs on every platform.
-( cd apps/desktop && npm run compile )
-node apps/desktop/node_modules/electron/install.js
-ELECTRON_BIN="$(cd apps/desktop && node -e 'process.stdout.write(require("electron"))')"
-HERMES_BIN="$PWD/target/debug/hermes"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
@@ -141,53 +171,64 @@ JSON
 
 common_env() {
   # The app's environment, as a person would launch it: its own throwaway data
-  # directory, its two ports, the binary to run, and the Jev key in the
-  # environment where the Router reads it. No credential store on a headless
-  # runner (a debug-build switch), exactly as render-panel.sh runs its Router.
-  export HERMES_GATEWAY_HOME="$1"
+  # directory, its two ports, and the Jev key in the environment where the
+  # Router reads it. From a checkout, also the binary and panel to use and no
+  # credential store on a headless runner (a debug-build switch, exactly as
+  # render-panel.sh runs its Router). A packaged app is given none of those:
+  # it finds its own bundled binary and panel, and a release build has no
+  # test switches.
+  mkdir -p "$1"
+  export HERMES_GATEWAY_HOME
+  HERMES_GATEWAY_HOME="$(native "$1")"
   export HERMES_PORT="$GATEWAY_PORT"
   export HERMES_ROUTER_PORT="$ROUTER_PORT"
-  export HERMES_BIN
-  export HERMES_WEB_ROOT="$PWD/frontend/dist"
   export TYPESAFE_API_KEY="$JEV_KEY"
-  export LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=unavailable
   unset HERMES_ROUTER_CONFIG
+  if [ -z "$PACKAGED" ]; then
+    export HERMES_BIN
+    export HERMES_WEB_ROOT="$WEB_ROOT"
+    export LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=unavailable
+  else
+    unset HERMES_BIN HERMES_WEB_ROOT LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE
+  fi
 }
 
-run_desktop() { # mode, router config path
-  MODE="$1" ROUTER_CONFIG="$2" ELECTRON_BIN="$ELECTRON_BIN" APP_DIR="$PWD/apps/desktop" \
+run_desktop() { # mode, router config path (as the programs under test name it)
+  MODE="$1" ROUTER_CONFIG="$2" ELECTRON_BIN="$(native "$ELECTRON_BIN")" \
+    APP_DIR="${APP_DIR:+$(native "$APP_DIR")}" ROUTER_CLI="$(native "$HERMES_BIN")" \
     GATEWAY_PORT="$GATEWAY_PORT" ROUTER_PORT="$ROUTER_PORT" JEV_KEY="$JEV_KEY" OUT_DIR="$OUT_DIR" \
-    node e2e/desktop-router.mjs
+    EXPECT_VERSION="$EXPECT_VERSION" node e2e/desktop-router.mjs
 }
 
 echo "== start mode: the app starts the Gateway, then the Router on request =="
 (
-  common_env "$WORK/start-home"
+  common_env "$BASE_DIR/start-home"
   # Where `hermes router config-path` says, so the app's discovery is what is
   # proved — not a path handed to it.
-  config="$("$HERMES_BIN" router config-path)"
-  mkdir -p "$(dirname "$config")"
-  router_json >"$config"
+  config="$("$HERMES_BIN" router config-path | tr -d '\r')"
+  config_here="$(posix "$config")"
+  mkdir -p "$(dirname "$config_here")"
+  router_json >"$config_here"
   run_desktop start "$config"
   # The app wrote nothing of its own beside the Router's file.
-  if [ -e "$(dirname "$config")/router.template.json" ]; then
+  if [ -e "$(dirname "$config_here")/router.template.json" ]; then
     echo "the app wrote a template nobody asked for" >&2
     exit 1
   fi
 )
 
 echo "== attach mode: a Gateway and a Router already serving, started outside the app =="
-common_env "$WORK/attach-home"
-"$HERMES_BIN" serve --host 127.0.0.1 --port "$GATEWAY_PORT" --web-root "$HERMES_WEB_ROOT" \
+common_env "$BASE_DIR/attach-home"
+"$HERMES_BIN" serve --host 127.0.0.1 --port "$GATEWAY_PORT" --web-root "$(native "$WEB_ROOT")" \
   >"$WORK/attach-gateway.log" 2>&1 &
 GATEWAY_PID=$!
 wait_for "http://127.0.0.1:$GATEWAY_PORT/health" "external Gateway" "$GATEWAY_PID"
-router_json >"$WORK/attach-router.json"
-"$HERMES_BIN" router --config "$WORK/attach-router.json" --web-root "$HERMES_WEB_ROOT" \
+router_json >"$BASE_DIR/attach-router.json"
+"$HERMES_BIN" router --config "$(native "$BASE_DIR/attach-router.json")" --web-root "$(native "$WEB_ROOT")" \
   >"$WORK/attach-router.log" 2>&1 &
 ROUTER_PID=$!
 wait_for "http://127.0.0.1:$ROUTER_PORT/health" "external Router" "$ROUTER_PID"
-run_desktop attach "$WORK/attach-router.json"
+run_desktop attach "$(native "$BASE_DIR/attach-router.json")"
 kill -0 "$GATEWAY_PID" && kill -0 "$ROUTER_PID" || { echo "an external process did not survive the app" >&2; exit 1; }
 
 echo "All desktop checks passed."

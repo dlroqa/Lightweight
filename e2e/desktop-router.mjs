@@ -23,10 +23,21 @@
 // token appear in no DOM, browser storage, response body, request URL, app log
 // or artifact.
 //
+// It also saves Jev Settings the authorized way — refused without the admin
+// token and with a wrong one, accepted with the real one, then Pending Restart
+// — and checks the app's own version when EXPECT_VERSION is given. The same
+// script runs against a checkout (ELECTRON_BIN + APP_DIR) and against a
+// packaged app (ELECTRON_BIN is the packaged executable, APP_DIR unset), which
+// is how the release workflow runs it on every package before a draft exists.
+//
 // Environment:
-//   MODE, ELECTRON_BIN, APP_DIR, HERMES_BIN, GATEWAY_PORT, ROUTER_PORT,
-//   ROUTER_CONFIG (the file the Router reads), JEV_KEY, OUT_DIR, and the
-//   app's own environment (HERMES_GATEWAY_HOME, …) passed straight through.
+//   MODE, ELECTRON_BIN, APP_DIR (checkout only), ROUTER_CLI (the hermes the
+//   test itself runs for `admin-token` and `--version`), GATEWAY_PORT,
+//   ROUTER_PORT, ROUTER_CONFIG (the file the Router reads), JEV_KEY, OUT_DIR,
+//   EXPECT_VERSION (optional), and the app's own environment
+//   (HERMES_GATEWAY_HOME, HERMES_PORT, …) passed through. The test's own
+//   variables are removed before the app is launched, so a packaged app finds
+//   its bundled binary and panel exactly as a user's would.
 
 import { execFile } from "node:child_process";
 import { createWriteStream } from "node:fs";
@@ -37,8 +48,9 @@ import { _electron as electron } from "playwright";
 
 const MODE = process.env.MODE ?? "start";
 const ELECTRON_BIN = required("ELECTRON_BIN");
-const APP_DIR = required("APP_DIR");
-const HERMES_BIN = required("HERMES_BIN");
+const APP_DIR = process.env.APP_DIR ?? "";
+const ROUTER_CLI = required("ROUTER_CLI");
+const EXPECT_VERSION = process.env.EXPECT_VERSION ?? "";
 const ROUTER_CONFIG = required("ROUTER_CONFIG");
 const JEV_KEY = required("JEV_KEY");
 const GATEWAY_PORT = Number(required("GATEWAY_PORT"));
@@ -133,9 +145,12 @@ async function main() {
   // ELECTRON_RUN_AS_NODE, which turns the Electron binary into plain Node.
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
+  for (const own of ["MODE", "ELECTRON_BIN", "APP_DIR", "ROUTER_CLI", "ROUTER_CONFIG", "JEV_KEY", "OUT_DIR", "EXPECT_VERSION", "GATEWAY_PORT", "ROUTER_PORT"]) {
+    delete env[own];
+  }
   const app = await electron.launch({
     executablePath: ELECTRON_BIN,
-    args: [APP_DIR],
+    args: APP_DIR ? [APP_DIR] : [],
     env,
     timeout: TIMEOUT * 2,
   });
@@ -146,7 +161,16 @@ async function main() {
   let gatewaySeen = null;
   let routerSeen = null;
   let adminToken = "";
+  const retiredTokens = [];
   try {
+    // --- which build this is ----------------------------------------------------------
+    if (EXPECT_VERSION) {
+      const version = await app.evaluate(({ app: electronApp }) => electronApp.getVersion());
+      check(version === EXPECT_VERSION, `the app reports version ${EXPECT_VERSION} (${version})`);
+      const cli = await run(ROUTER_CLI, ["--version"], { env: process.env });
+      check(cli.stdout.includes(EXPECT_VERSION), `its hermes reports ${EXPECT_VERSION} (${cli.stdout.trim()})`);
+    }
+
     // --- the Gateway window, exactly as before ----------------------------------------
     const gatewayPage = await app.firstWindow({ timeout: TIMEOUT * 2 });
     gatewaySeen = record(gatewayPage);
@@ -180,7 +204,7 @@ async function main() {
 
     // The token exists only while the Router runs; read it the documented way,
     // to prove it never reaches the app's pages.
-    const token = await run(HERMES_BIN, ["router", "admin-token", "--config", ROUTER_CONFIG], { env: process.env });
+    const token = await run(ROUTER_CLI, ["router", "admin-token", "--config", ROUTER_CONFIG], { env: process.env });
     adminToken = token.stdout.trim();
     check(adminToken.length >= 16, "the running Router has an admin token to keep out of every page");
 
@@ -226,6 +250,35 @@ async function main() {
     check(!during.some((url) => url.includes(String(GATEWAY_PORT))), "Test Connection made no request to the Gateway");
     await routerPage.screenshot({ path: join(OUT_DIR, `desktop-${MODE}-router-classifier.png`), fullPage: true });
 
+    // --- an authorized save, through the Router's own checks ----------------------------
+    // The key field stays empty: the key is in the Router's environment, so the
+    // save never touches the credential store and runs on every runner alike.
+    // What is proved is the admin-token write path itself, unchanged.
+    const before_ = await readFile(ROUTER_CONFIG, "utf8");
+    check(before_.includes('"timeout_ms": 5000'), "router.json starts with the classifier's timeout at 5000 ms");
+    await settings.locator('[data-field="timeout_ms"]').fill("6500");
+    await settings.locator("[data-save-settings]").click();
+    await settings.locator('[data-settings-notice="warn"]').waitFor({ timeout: TIMEOUT });
+    check((await settings.locator('[data-settings-notice="warn"]').innerText()).includes("admin token"), "Save without the admin token is refused and asks for it");
+    check((await readFile(ROUTER_CONFIG, "utf8")) === before_, "nothing was written without the admin token");
+    await settings.locator("[data-admin-token]").fill("not-the-token-0000000000000000000000");
+    await settings.locator("[data-save-settings]").click();
+    await settings.locator('[data-settings-notice="danger"]').waitFor({ timeout: TIMEOUT });
+    check(true, "a wrong admin token is refused by the Router");
+    check((await readFile(ROUTER_CONFIG, "utf8")) === before_, "nothing was written with a wrong admin token");
+    const saved = routerPage.waitForResponse((response) => response.url().endsWith("/api/router/v1/classifier/settings") && response.request().method() !== "GET", { timeout: TIMEOUT });
+    await settings.locator("[data-admin-token]").fill(adminToken);
+    await settings.locator("[data-save-settings]").click();
+    const savedResponse = await saved;
+    check(savedResponse.ok() && savedResponse.url().startsWith(`${ROUTER}/`), `the save with the admin token was accepted by the Router (${savedResponse.status()})`);
+    await settings.locator("[data-pending-restart]").waitFor({ timeout: TIMEOUT });
+    check(true, "the saved settings show Pending Restart");
+    const after_ = await readFile(ROUTER_CONFIG, "utf8");
+    check(after_.includes('"timeout_ms": 6500') && !after_.includes('"timeout_ms": 5000'), "router.json now holds the saved timeout (6500 ms)");
+    check((await readFile(`${ROUTER_CONFIG}.bak`, "utf8")) === before_, "the file as it was is kept as router.json.bak");
+    check(!after_.includes(JEV_KEY) && !after_.includes(adminToken), "router.json holds neither the Jev key nor the admin token");
+    await routerPage.screenshot({ path: join(OUT_DIR, `desktop-${MODE}-router-saved.png`), fullPage: true });
+
     // --- an owned Router restarts (how saved settings apply); the Gateway is untouched ---
     if (MODE === "start") {
       const reloaded = routerPage.waitForEvent("load", { timeout: TIMEOUT * 2 });
@@ -234,8 +287,18 @@ async function main() {
       await waitForStatus(app, /Running on port/);
       check((await holder(ROUTER_PORT)) === "router", "Restart Router brings the Router back");
       check((await holder(GATEWAY_PORT)) === "gateway", "Restart Router did not disturb the Gateway");
-      await routerPage.getByRole("heading", { name: /Auto Routing|Classifier/ }).first().waitFor({ timeout: TIMEOUT });
+      await routerPage.locator("[data-jev-settings]").waitFor({ timeout: TIMEOUT });
       check(true, "the Router window reloads onto the restarted Router");
+      check((await routerPage.locator("[data-pending-restart]").count()) === 0, "after Restart Router the saved settings are running: nothing is pending");
+      // A restart mints a new token; both must stay out of every page.
+      retiredTokens.push(adminToken);
+      adminToken = (await run(ROUTER_CLI, ["router", "admin-token", "--config", ROUTER_CONFIG], { env: process.env })).stdout.trim();
+      check(adminToken.length >= 16 && !retiredTokens.includes(adminToken), "the restarted Router has a new admin token");
+    } else {
+      // Clear the typed token from the page the way a person would: reload.
+      await routerPage.reload();
+      await routerPage.locator("[data-jev-settings]").waitFor({ timeout: TIMEOUT });
+      check((await routerPage.locator("[data-pending-restart]").count()) === 1, "after a reload Pending Restart is still shown (read from the Router, which the app does not restart)");
     }
 
     // --- origins, and no key anywhere --------------------------------------------------
@@ -244,6 +307,7 @@ async function main() {
     const secrets = [
       ["the Jev key", JEV_KEY],
       ["the admin token", adminToken],
+      ...retiredTokens.map((retired) => ["the pre-restart admin token", retired]),
     ];
     for (const [page, seen, name] of [
       [gatewayPage, gatewaySeen, "Gateway"],
@@ -278,7 +342,7 @@ async function main() {
   check(appLog.length > 0, `the app's log was captured (${appLog.length} bytes)`);
   for (const file of await readdir(OUT_DIR)) {
     const bytes = await readFile(join(OUT_DIR, file));
-    for (const [label, secret] of [["the Jev key", JEV_KEY], ["the admin token", adminToken]]) {
+    for (const [label, secret] of [["the Jev key", JEV_KEY], ["the admin token", adminToken], ...retiredTokens.map((retired) => ["a pre-restart admin token", retired])]) {
       if (secret && bytes.includes(Buffer.from(secret))) {
         failures.push(`${label} is in the artifact ${file}`);
         // Never upload it: a text file is redacted in place, anything else removed.
@@ -293,7 +357,7 @@ async function main() {
     console.error(`\n${failures.length} check(s) failed:\n  - ${failures.join("\n  - ")}`);
     // Redacted: a failure may be a leak, and the CI log must not repeat it.
     let shown = appLog;
-    for (const secret of [JEV_KEY, adminToken]) if (secret) shown = shown.split(secret).join("[REDACTED]");
+    for (const secret of [JEV_KEY, adminToken, ...retiredTokens]) if (secret) shown = shown.split(secret).join("[REDACTED]");
     console.error(`\n== app log (${logPath}, secrets redacted) ==\n${shown}`);
     process.exit(1);
   }

@@ -11,6 +11,19 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+  # A change to this workflow or to the release gate's own scripts is proved
+  # on real packages before it is trusted with a tag: every job below runs,
+  # except the one that drafts a release, which a pull request never reaches.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/smoke-packaged-desktop.sh
+      - scripts/render-desktop.sh
+      - scripts/smoke-artifacts.sh
+      - scripts/test-artifacts.sh
+      - scripts/test-flatpak.sh
+      - e2e/desktop-router.mjs
+      - apps/desktop/package.json
 
 permissions:
   contents: read
@@ -60,6 +73,7 @@ jobs:
           cache-dependency-path: |
             frontend/package-lock.json
             apps/desktop/package-lock.json
+            e2e/package-lock.json
 
       # Before anything is built: the installer filenames come from the desktop
       # package's version, and a release that shipped `Hermes-0.1.0.dmg` around
@@ -69,6 +83,9 @@ jobs:
 
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
+      # Playwright only, for the packaged-desktop gate; it drives the packaged
+      # Electron, so no browser is downloaded.
+      - run: npm ci --prefix e2e
 
       - run: cargo build --release -p lightweight-cli --target ${{ matrix.triple }}
       - run: npm run build --prefix frontend
@@ -132,6 +149,31 @@ jobs:
           HERMES_REQUIRE_SANDBOXED_LAUNCH: '1'
         run: bash ./scripts/smoke-artifacts.sh
 
+      # The packaged app itself, with a Router beside its Gateway: started as
+      # it ships, its version checked, Router & Jev Settings opened in the
+      # Router's own window, an authorized settings save made with the admin
+      # token, Test Connection reaching only the Router (scripted Jev, no real
+      # key), and quitting stopping only what the app started. On macOS this
+      # is the arm64 half of the universal DMG; the Intel half is run below.
+      - name: The packaged desktop app with a Router
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   xvfb-run --auto-servernum bash ./scripts/smoke-packaged-desktop.sh appimage "$(ls apps/desktop/release/*.AppImage)" ;;
+            Windows) bash ./scripts/smoke-packaged-desktop.sh nsis "$(ls apps/desktop/release/*Setup*.exe)" ;;
+            macOS)   bash ./scripts/smoke-packaged-desktop.sh dmg "$(ls apps/desktop/release/*.dmg)" ;;
+          esac
+
+      # Never named `artifacts-*`: the draft below collects only those, and a
+      # screenshot must not become a release asset.
+      - name: Upload the packaged-desktop screens and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-smoke-${{ matrix.label }}
+          path: e2e/desktop-screens/
+          if-no-files-found: warn
+          retention-days: 14
+
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
@@ -172,6 +214,7 @@ jobs:
           cache-dependency-path: |
             frontend/package-lock.json
             apps/desktop/package-lock.json
+            e2e/package-lock.json
 
       # The bundle's filename carries the version too, so the same gate applies.
       - name: Versions agree with each other and with the tag
@@ -179,6 +222,9 @@ jobs:
 
       - run: npm ci --prefix frontend
       - run: npm ci --prefix apps/desktop
+      # Playwright only, for the packaged-desktop gate; it drives the packaged
+      # Electron, so no browser is downloaded.
+      - run: npm ci --prefix e2e
 
       - name: Install flatpak and the runtimes the manifest names
         run: |
@@ -202,6 +248,20 @@ jobs:
         run: |
           sudo apt-get install -y xvfb dbus-x11
           xvfb-run --auto-servernum ./scripts/test-flatpak.sh
+
+      # The installed Flatpak as a user starts it (`flatpak run`), with a
+      # Router: the same gate as the other packages.
+      - name: The packaged desktop app with a Router
+        run: xvfb-run --auto-servernum bash ./scripts/smoke-packaged-desktop.sh flatpak "$(ls apps/desktop/release/*.flatpak)"
+
+      - name: Upload the packaged-desktop screens and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-smoke-linux-flatpak
+          path: e2e/desktop-screens/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: What was installed
         if: always()
@@ -255,9 +315,32 @@ jobs:
           "$binary" sysinfo || true
           hdiutil detach "$mount"
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - run: npm ci --prefix e2e
+
+      # The whole packaged app on Intel, not only its bundled binary: the
+      # x86-64 half of the universal DMG through the same gate.
+      - name: The packaged desktop app with a Router, on Intel
+        run: bash ./scripts/smoke-packaged-desktop.sh dmg "$(find incoming -name '*.dmg' -print -quit)"
+
+      - name: Upload the packaged-desktop screens and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-smoke-macos-intel
+          path: e2e/desktop-screens/
+          if-no-files-found: warn
+          retention-days: 14
+
   release:
     name: draft the release
     needs: [build, flatpak, macos-intel]
+    # A pull request proves the build and the gate; it never drafts a release.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -266,9 +349,12 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v7
+      # Only the packages. Every other artifact of this run - the
+      # packaged-desktop screens among them - stays out of the release.
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: artifacts-*
           merge-multiple: true
 
       # `upload-artifact` roots an artifact at the least common ancestor of its
