@@ -98,7 +98,8 @@ yourself is attached, never replaced.
   suites fail instead of skipping if it is missing.
 - The release workflow drafted a release from *every* artifact of its run. It
   now takes only the packages, so a test artifact can never become a release
-  asset.
+  asset. The release verifier fetches only those packages and `SHA256SUMS`
+  too, so the gate's screenshots are never mistaken for release files.
 
 ## [0.8.0] - 2026-10-09
 
