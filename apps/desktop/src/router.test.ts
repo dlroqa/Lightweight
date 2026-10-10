@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import {
+  INCONCLUSIVE_TRIES,
   ROUTER_BUILD_PREFIX,
   RouterSupervisor,
   TEMPLATE_NAME,
@@ -131,11 +132,40 @@ describe("recognising what is on the Router's port", () => {
     assert.equal(await identify(11500, refused as unknown as typeof fetch), "nothing");
   });
 
-  it("calls a listener that fails oddly a stranger, not nothing", async () => {
+  it("calls a listener that fails oddly a stranger, not nothing — after every try", async () => {
+    let calls = 0;
     const fetchImpl = (async () => {
+      calls += 1;
       throw new TypeError("other side closed");
     }) as typeof fetch;
     assert.equal(await identify(11500, fetchImpl), "stranger");
+    assert.equal(calls, INCONCLUSIVE_TRIES, "an odd failure is tried again before the port is called taken");
+  });
+
+  it("does not call a free port taken because one probe failed oddly", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("fetch failed");
+      return refused();
+    }) as typeof fetch;
+    assert.equal(await identify(11500, fetchImpl), "nothing");
+  });
+
+  it("does not call a Router a stranger because one probe timed out", async () => {
+    let calls = 0;
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) {
+        // Hang until the probe gives up, as a starved first probe does.
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        });
+      }
+      return json({ build: "lightweight-router-0.8.1" });
+    }) as typeof fetch;
+    assert.equal(await identify(11500, fetchImpl), "router");
+    assert.equal(calls, 2);
   });
 
   it("calls a listener that never answers a stranger", async () => {
