@@ -2764,6 +2764,13 @@ in the tray menu. The design is in [DESKTOP_ROUTER.md](DESKTOP_ROUTER.md).
   `router.template.json` beside it. That file is owner-only, holds no keys,
   is never overwritten, and is never loaded. Edit it and save it as
   `router.json`.
+- **Routes are never generated.** The app does not turn the Gateway's
+  models into Router routes, and does not write `router.json` for a first
+  run. First-run route configuration is manual on purpose: generating
+  routes would invent routing policy the operator never chose, and could
+  overwrite a configuration the operator owns. Write the routes yourself,
+  starting from the template if you like, and check them with `hermes router
+  validate-config`.
 - **Ownership.** **Restart Router** applies saved Jev Settings. It and
   **Stop Router** act only on a Router the app started. Quitting the app
   stops only what it started: the Router first, then the Gateway. An attached

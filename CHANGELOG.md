@@ -22,6 +22,11 @@ Router when asked. The Router stays a separate service from the Gateway.
   missing, unreadable, malformed or invalid file is reported as such. For a
   missing one, an explicit **Create template** writes an owner-only
   `router.template.json` with no keys.
+- **Routes stay yours to write.** The app does not create Router routes from
+  the Gateway's models, and does not write `router.json` for a first run.
+  First-run route configuration remains manual, and deliberately so: creating
+  routes automatically could silently invent routing policy or overwrite a
+  configuration the user owns. The template is a starting point to edit.
 - **Security unchanged.** Jev keys stay in the OS credential store or
   `TYPESAFE_API_KEY`. Saving still needs the admin token, a loopback-only
   Router, a matching origin and `If-Match`. The Router window has no bridge to

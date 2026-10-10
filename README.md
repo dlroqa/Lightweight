@@ -93,7 +93,8 @@ remote agent survives a restart of the shell.
 **Router → Router & Jev Settings…** opens a Router's own panel in a second
 window, from the Router's own origin. The app starts a Router only when asked
 (**Start Router**). The Router keeps its own port (11500), its own `router.json`
-and its own keys. See [docs/DESKTOP_ROUTER.md](docs/DESKTOP_ROUTER.md).
+and its own keys. The app never generates routes from the Gateway's models:
+first-run route configuration is manual, on purpose. See [docs/DESKTOP_ROUTER.md](docs/DESKTOP_ROUTER.md).
 `npm run package` builds this platform's installers — a Flatpak and an AppImage
 on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
 the release binary and the built panel.
