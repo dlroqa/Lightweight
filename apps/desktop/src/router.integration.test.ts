@@ -26,6 +26,11 @@ const repoRoot = join(import.meta.dirname, "..", "..", "..");
 const executable = process.platform === "win32" ? "hermes.exe" : "hermes";
 const binary = join(repoRoot, "target", "debug", executable);
 const available = existsSync(binary);
+// Demanded, not hoped for, where the gate builds the binary: a skip that stays
+// green is how these suites went unrun on every CI platform.
+if (!available && process.env.HERMES_REQUIRE_HERMES_BINARY) {
+  throw new Error(`HERMES_REQUIRE_HERMES_BINARY is set, but there is no binary at ${binary}`);
+}
 
 /** Ports unlikely to collide with a developer's, and apart from the gateway test's 18492. */
 const GATEWAY_PORT = 18493;

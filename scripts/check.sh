@@ -80,11 +80,15 @@ else
 fi
 
 # The desktop shell. Its tests drive the real `hermes` binary - starting a
-# gateway, stopping it, and proving a second shell attaches instead of killing
-# the first one's - so they need the workspace built, which by this point it is.
+# gateway and a router, stopping them, and proving a second shell attaches
+# instead of killing the first one's. `cargo test` never builds that binary
+# (lightweight-cli has no integration tests), so on a fresh runner it did not
+# exist and those suites skipped on every platform. It is built here, and the
+# suites are told to fail rather than skip if it is still missing.
 if [ -d apps/desktop/node_modules ]; then
   echo "== desktop shell (typecheck, build and tests) =="
-  ( cd apps/desktop && npm run build )
+  cargo build -p lightweight-cli --bin hermes
+  ( cd apps/desktop && HERMES_REQUIRE_HERMES_BINARY=1 npm run build )
 elif command -v npm >/dev/null 2>&1; then
   echo "== desktop shell == skipped: run \`npm install\` in apps/desktop/ to include it"
 else
