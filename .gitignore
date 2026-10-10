@@ -7,6 +7,7 @@
 /apps/desktop/release
 /e2e/node_modules
 /e2e/screens
+/e2e/desktop-screens
 /fixtures/generated
 /runtime
 *.gguf
