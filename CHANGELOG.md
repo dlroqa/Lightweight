@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+**Router & Jev Settings in the desktop app.** The desktop app can now open a
+Router's panel (Auto Routing, and Classifier with Jev Settings) and start a
+Router when asked. The Router stays a separate service from the Gateway.
+
+- **Where.** **Router → Router & Jev Settings…** in the menu bar, or the same
+  entry in the tray menu. The Router's panel opens in its own window, from the
+  Router's own address (port 11500, or `HERMES_ROUTER_PORT`). The Gateway's
+  window, port and screens are unchanged.
+- **Opt-in.** Nothing starts a Router when the app opens. The app attaches
+  to one that is already serving. Otherwise **Start Router** runs `hermes
+  router` on loopback with its own configuration. **Restart Router**
+  applies saved Jev Settings. Quitting stops only what the app started.
+- **Configuration.** The app reads the Router's own `router.json`, located
+  with the new `hermes router config-path`, or `HERMES_ROUTER_CONFIG`. It
+  never writes that file and never copies anything from the Gateway. A
+  missing, unreadable, malformed or invalid file is reported as such. For a
+  missing one, an explicit **Create template** writes an owner-only
+  `router.template.json` with no keys.
+- **Security unchanged.** Jev keys stay in the OS credential store or
+  `TYPESAFE_API_KEY`. Saving still needs the admin token, a loopback-only
+  Router, a matching origin and `If-Match`. The Router window has no bridge to
+  the app, and the app never reads the admin token.
+- **Tested.** A new `desktop with router` job in the *render panel* workflow
+  runs the real app under `xvfb` on every pull request, in a start mode and an
+  attach mode, with scripted Jev and nodes.
+
 ## [0.8.0] - 2026-10-09
 
 This release adds **Jev Settings** to the router panel. An operator can now
