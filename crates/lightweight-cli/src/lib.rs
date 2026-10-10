@@ -369,6 +369,11 @@ enum RouterAction {
     /// before it saves the classifier's settings. A new one is minted at
     /// every start; a router listening off loopback has none.
     AdminToken,
+    /// Print the configuration file this command would read, without reading
+    /// it: `--config` when given, otherwise `router.json` in the config
+    /// directory. The desktop shell asks this rather than re-deriving each
+    /// platform's directories itself.
+    ConfigPath,
 }
 
 #[derive(Subcommand)]
@@ -847,6 +852,11 @@ fn run(
             config,
             ..
         } => router::admin_token(config.clone(), out),
+        Command::Router {
+            action: Some(RouterAction::ConfigPath),
+            config,
+            ..
+        } => router::print_config_path(config.clone(), out),
         Command::Router {
             action: None,
             config,
