@@ -3600,3 +3600,17 @@ in any page, storage, response, URL, log or artifact).
 
 Deferred: Desktop does not author first-run routes, there is no persisted auto-start preference, and admin-token
 copying is not offered. The Electron end-to-end test runs only on CI, because this box restricts user namespaces.
+
+## v0.8.1 release preparation (2026-10-10, branch `release/v0.8.1`)
+
+Branched from master `943fc99` (PR #67 merged; nothing after it). v0.8.1 is v0.8.0 plus #66 (docs) and #67 (the
+desktop Router window, `hermes router config-path`, and `check.sh` building `hermes` so the real-binary desktop suites
+run). The Router, routing and the Jev classifier are unchanged from v0.8.0.
+
+The release gains the gate the user required: `scripts/smoke-packaged-desktop.sh` runs `e2e/desktop-router.mjs` against
+every shipped package (AppImage, Flatpak, NSIS, DMG on arm64 and Intel), in the release build jobs before the draft. It
+checks the version, Router & Jev Settings in the packaged app, an authorized Jev Settings save with the admin token,
+Test Connection to scripted Jev only, ownership on quit, and that no key or token leaks. `release.yml` now drafts only
+from `artifacts-*`, and a path-filtered `pull_request` trigger runs everything but the draft on gate changes. The
+version bump is the usual seven files (Cargo.lock: the 18 workspace crates only). No build ran on the dev box; every
+build, test and package is on GitHub Actions.

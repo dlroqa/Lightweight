@@ -202,6 +202,26 @@ Router states, shown in the tray and the Router menu:
   - **No leaks:** the Jev key and the admin token appear in no DOM, browser
     storage, response body, Desktop log or uploaded artifact.
 
+### The release gate (from v0.8.1)
+
+`scripts/smoke-packaged-desktop.sh` runs the same end-to-end test against
+each package the release ships: the AppImage, the installed Flatpak, the
+NSIS installer installed silently, and the universal DMG mounted, on both
+Apple Silicon and Intel. It runs in `release.yml` before the draft is
+created, against the package's own `hermes` and panel. On top of the checks
+above, it:
+
+- confirms the app's version;
+- makes an authorized Jev Settings save. The save is refused without the
+  admin token and with a wrong one, and accepted with the real one; then
+  `router.json` and `router.json.bak` are checked, and Pending Restart clears
+  after Restart Router.
+
+The key stays in the Router's environment and the key field is left empty,
+so the save never needs a credential store. That lets it run on every runner
+alike, while exercising the unchanged admin-token write path. A pull request
+that changes the gate runs the whole release build except the draft.
+
 ## Deliberate deferrals
 
 - **First-run route configuration.** Desktop does not author routes. The
