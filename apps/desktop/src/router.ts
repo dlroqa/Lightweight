@@ -522,6 +522,8 @@ export class RouterSupervisor {
         });
       });
       child.on("error", (error) => {
+        // Quoted by the start path's failure message, which is the one shown.
+        this.lastOutput.push(error.message);
         if (this.child === child) this.child = null;
         this.owned = false;
         if (this.state.kind !== "starting") this.set({ kind: "failed", reason: error.message });

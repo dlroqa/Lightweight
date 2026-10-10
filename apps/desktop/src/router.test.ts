@@ -460,6 +460,18 @@ describe("the Router supervisor", () => {
     assert.equal(supervisor.ownsProcess(), false);
   });
 
+  it("reports a binary that cannot be run, and runs nothing", async () => {
+    // The check runs the binary before anything is spawned to serve, so a
+    // missing binary is caught there, in the operating system's own words.
+    const opts = await options({ binary: join(dir, "no-such-binary"), binaryPrefix: [] });
+    const supervisor = new RouterSupervisor(opts.port);
+    const state = await supervisor.start(opts);
+    assert.equal(state.kind, "needs-config", JSON.stringify(state));
+    assert.match(state.kind === "needs-config" ? state.detail : "", /ENOENT/);
+    assert.equal(supervisor.ownsProcess(), false);
+    assert.equal(await identify(opts.port), "nothing");
+  });
+
   it("gives up on a Router that never answers, and does not leave it running", async () => {
     // Only the fake can be told to hang; the deadline is the supervisor's own.
     const opts = await options({ env: { FAKE_ROUTER_MODE: "hang" } });
