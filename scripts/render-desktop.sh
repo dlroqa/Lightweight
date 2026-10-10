@@ -103,10 +103,13 @@ wait_for() {
   return 1
 }
 
+# CLI_BIN is the hermes this script and the test run themselves. It is kept
+# apart from HERMES_BIN, which only a checkout's app is given: a packaged app
+# must find its own bundled binary, so HERMES_BIN is unset for it.
 if [ -n "$PACKAGED" ]; then
   echo "== packaged: $DESKTOP_EXECUTABLE =="
   ELECTRON_BIN="$DESKTOP_EXECUTABLE"
-  HERMES_BIN="$DESKTOP_HERMES"
+  CLI_BIN="$DESKTOP_HERMES"
   WEB_ROOT="$DESKTOP_PANEL"
   APP_DIR=""
 else
@@ -120,7 +123,7 @@ else
   ( cd apps/desktop && npm run compile )
   node apps/desktop/node_modules/electron/install.js
   ELECTRON_BIN="$(cd apps/desktop && node -e 'process.stdout.write(require("electron"))')"
-  HERMES_BIN="$PWD/target/debug/hermes"
+  CLI_BIN="$PWD/target/debug/hermes"
   WEB_ROOT="$PWD/frontend/dist"
   APP_DIR="$PWD/apps/desktop"
 fi
@@ -185,7 +188,7 @@ common_env() {
   export TYPESAFE_API_KEY="$JEV_KEY"
   unset HERMES_ROUTER_CONFIG
   if [ -z "$PACKAGED" ]; then
-    export HERMES_BIN
+    export HERMES_BIN="$CLI_BIN"
     export HERMES_WEB_ROOT="$WEB_ROOT"
     export LIGHTWEIGHT_ROUTER_TEST_SECRET_STORE=unavailable
   else
@@ -195,7 +198,7 @@ common_env() {
 
 run_desktop() { # mode, router config path (as the programs under test name it)
   MODE="$1" ROUTER_CONFIG="$2" ELECTRON_BIN="$(native "$ELECTRON_BIN")" \
-    APP_DIR="${APP_DIR:+$(native "$APP_DIR")}" ROUTER_CLI="$(native "$HERMES_BIN")" \
+    APP_DIR="${APP_DIR:+$(native "$APP_DIR")}" ROUTER_CLI="$(native "$CLI_BIN")" \
     GATEWAY_PORT="$GATEWAY_PORT" ROUTER_PORT="$ROUTER_PORT" JEV_KEY="$JEV_KEY" OUT_DIR="$OUT_DIR" \
     EXPECT_VERSION="$EXPECT_VERSION" node e2e/desktop-router.mjs
 }
@@ -205,7 +208,7 @@ echo "== start mode: the app starts the Gateway, then the Router on request =="
   common_env "$BASE_DIR/start-home"
   # Where `hermes router config-path` says, so the app's discovery is what is
   # proved — not a path handed to it.
-  config="$("$HERMES_BIN" router config-path | tr -d '\r')"
+  config="$("$CLI_BIN" router config-path | tr -d '\r')"
   config_here="$(posix "$config")"
   mkdir -p "$(dirname "$config_here")"
   router_json >"$config_here"
@@ -219,12 +222,12 @@ echo "== start mode: the app starts the Gateway, then the Router on request =="
 
 echo "== attach mode: a Gateway and a Router already serving, started outside the app =="
 common_env "$BASE_DIR/attach-home"
-"$HERMES_BIN" serve --host 127.0.0.1 --port "$GATEWAY_PORT" --web-root "$(native "$WEB_ROOT")" \
+"$CLI_BIN" serve --host 127.0.0.1 --port "$GATEWAY_PORT" --web-root "$(native "$WEB_ROOT")" \
   >"$WORK/attach-gateway.log" 2>&1 &
 GATEWAY_PID=$!
 wait_for "http://127.0.0.1:$GATEWAY_PORT/health" "external Gateway" "$GATEWAY_PID"
 router_json >"$BASE_DIR/attach-router.json"
-"$HERMES_BIN" router --config "$(native "$BASE_DIR/attach-router.json")" --web-root "$(native "$WEB_ROOT")" \
+"$CLI_BIN" router --config "$(native "$BASE_DIR/attach-router.json")" --web-root "$(native "$WEB_ROOT")" \
   >"$WORK/attach-router.log" 2>&1 &
 ROUTER_PID=$!
 wait_for "http://127.0.0.1:$ROUTER_PORT/health" "external Router" "$ROUTER_PID"
