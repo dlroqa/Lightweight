@@ -102,6 +102,10 @@ export function isRouterVersion(body: unknown): boolean {
   return typeof build === "string" && build.startsWith(ROUTER_BUILD_PREFIX);
 }
 
+/** Probes of `/version` that end with no answer before the port is called taken. */
+export const INCONCLUSIVE_TRIES = 3;
+const INCONCLUSIVE_PAUSE_MS = 250;
+
 /**
  * Say what is listening on `port`.
  *
@@ -109,10 +113,6 @@ export function isRouterVersion(body: unknown): boolean {
  * `/health` shape `GatewaySupervisor` already attaches to — the two tests
  * exclude each other, so neither supervisor can ever claim the other's process.
  */
-/** Probes of `/version` that end with no answer before the port is called taken. */
-export const INCONCLUSIVE_TRIES = 3;
-const INCONCLUSIVE_PAUSE_MS = 250;
-
 export async function identify(port: number, fetchImpl: typeof fetch = fetch): Promise<PortHolder> {
   // A probe that times out or fails oddly says nothing about the port by
   // itself: at launch the app's own start-up can starve one past its timeout,
