@@ -109,8 +109,22 @@ export function isRouterVersion(body: unknown): boolean {
  * `/health` shape `GatewaySupervisor` already attaches to — the two tests
  * exclude each other, so neither supervisor can ever claim the other's process.
  */
+/** Probes of `/version` that end with no answer before the port is called taken. */
+export const INCONCLUSIVE_TRIES = 3;
+const INCONCLUSIVE_PAUSE_MS = 250;
+
 export async function identify(port: number, fetchImpl: typeof fetch = fetch): Promise<PortHolder> {
-  const version = await fetchJson(port, "/version", fetchImpl);
+  // A probe that times out or fails oddly says nothing about the port by
+  // itself: at launch the app's own start-up can starve one past its timeout,
+  // and a free port was once reported as "in use by another program" that way
+  // (the v0.8.1 release run's Intel DMG check). Only a listener that stays
+  // that way across every try is a stranger. A refusal or an HTTP answer is
+  // decided at once, as before.
+  let version = await fetchJson(port, "/version", fetchImpl);
+  for (let tries = 1; (version === "silent" || version === "odd") && tries < INCONCLUSIVE_TRIES; tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, INCONCLUSIVE_PAUSE_MS));
+    version = await fetchJson(port, "/version", fetchImpl);
+  }
   if (version === "refused") return "nothing";
   if (typeof version === "object" && isRouterVersion(version.body)) return "router";
   if (version === "silent" || version === "odd") return "stranger";

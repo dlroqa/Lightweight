@@ -96,6 +96,10 @@ yourself is attached, never replaced.
   had silently skipped on every CI platform, because nothing built the
   `hermes` binary they drive. `scripts/check.sh` now builds it, and the
   suites fail instead of skipping if it is missing.
+- On a slow start, the desktop app could report a free Router port as "in use
+  by another program", because a single launch-time probe had timed out. A
+  probe that gets no clear answer is now retried before the port is called
+  taken. Found by the release gate on the Intel DMG.
 - The release workflow drafted a release from *every* artifact of its run. It
   now takes only the packages, so a test artifact can never become a release
   asset. The release verifier fetches only those packages and `SHA256SUMS`
