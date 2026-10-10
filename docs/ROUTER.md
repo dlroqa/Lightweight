@@ -105,6 +105,7 @@ and so is `Coder → QwenCoder`.
 
 The configuration is JSON, matching `fleet.json`. It is read from
 `<config dir>/router.json`, or from the file passed with `--config <path>`.
+`hermes router config-path` prints which file that is, without reading it.
 Unknown keys are refused, so a misspelt `enabeld` is an error rather than being
 silently ignored.
 
@@ -2736,6 +2737,50 @@ if both use the same `api_key_env` (by default `TYPESAFE_API_KEY`) they share
 one saved key — the same entry in that user's credential store — exactly as
 they would share the variable. Give each its own `api_key_env` to keep their
 keys apart. Routers run by different users have different stores. The panel must be served by the router whose settings it saves.
+
+### In the desktop app
+
+The desktop app opens this same panel, from the Router, in a window of its
+own: **Router → Router & Jev Settings…** in the menu bar, or the same entry
+in the tray menu. The design is in [DESKTOP_ROUTER.md](DESKTOP_ROUTER.md).
+
+- **The Gateway and the Router stay separate.** The main window is the
+  Gateway's panel on the Gateway's port (11434, or `HERMES_PORT`), as it
+  always was. The Router window is the Router's panel on the Router's port
+  (11500, or `HERMES_ROUTER_PORT`). Each page calls only the server it came
+  from, so every protection above holds unchanged. The Router window has no
+  bridge to the app, and it cannot be navigated off the Router's origin.
+- **Opt-in.** The app never starts a Router when it opens. It only looks
+  whether one is already serving on the Router port, and if one is, it
+  *attaches*. **Router → Start Router** starts one. The app runs `hermes
+  router --config <file> --listen 127.0.0.1:<port> --web-root <panel>`:
+  always loopback, which is what makes Jev Settings writable.
+- **Its own configuration.** The app reads the file `hermes router
+  config-path` prints (`router.json` in the config directory), or
+  `HERMES_ROUTER_CONFIG`. It never writes `router.json`, and it never copies
+  anything from the Gateway's configuration or keys. A missing, unreadable,
+  malformed or invalid file is reported as such, with the Router's own
+  `validate-config` messages. For a missing file, **Create template** writes
+  `router.template.json` beside it. That file is owner-only, holds no keys,
+  is never overwritten, and is never loaded. Edit it and save it as
+  `router.json`.
+- **Routes are never generated.** The app does not turn the Gateway's
+  models into Router routes, and does not write `router.json` for a first
+  run. First-run route configuration is manual on purpose: generating
+  routes would invent routing policy the operator never chose, and could
+  overwrite a configuration the operator owns. Write the routes yourself,
+  starting from the template if you like, and check them with `hermes router
+  validate-config`.
+- **Ownership.** **Restart Router** applies saved Jev Settings. It and
+  **Stop Router** act only on a Router the app started. Quitting the app
+  stops only what it started: the Router first, then the Gateway. An attached
+  Router or Gateway is left running.
+- **The admin token** is still typed into the panel. **Router → Router admin
+  token…** shows the command that prints it. The app never reads the token
+  itself.
+- **Keys** stay where Jev Settings puts them: the operating system's
+  credential store, or `TYPESAFE_API_KEY` in the environment the app was
+  started from, which a Router the app starts inherits.
 
 ### Live Jev validation (operator-triggered)
 

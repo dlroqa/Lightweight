@@ -90,6 +90,11 @@ serving or starts one of its own, stops only what it started, and keeps serving
 after its window is closed. Keys are the gateway's own — hashed on disk, created
 in the panel or with `hermes key create`, and shown once — so a key shared with a
 remote agent survives a restart of the shell.
+**Router → Router & Jev Settings…** opens a Router's own panel in a second
+window, from the Router's own origin. The app starts a Router only when asked
+(**Start Router**). The Router keeps its own port (11500), its own `router.json`
+and its own keys. The app never generates routes from the Gateway's models:
+first-run route configuration is manual, on purpose. See [docs/DESKTOP_ROUTER.md](docs/DESKTOP_ROUTER.md).
 `npm run package` builds this platform's installers — a Flatpak and an AppImage
 on Linux, a universal DMG on macOS, an NSIS installer on Windows — each carrying
 the release binary and the built panel.
@@ -672,7 +677,9 @@ provider is active, whether its API key was found — never the key itself —
 **Test Connection**, and a validated settings draft for either provider that
 produces the `auto_route.classifier` section to paste into `router.json`; the
 router has no API that writes its file). Jev's key stays in the router's
-environment: `export TYPESAFE_API_KEY="..."` before starting it.
+environment: `export TYPESAFE_API_KEY="..."` before starting it. In the desktop
+app the same panel opens from **Router → Router & Jev Settings…**
+([details](docs/ROUTER.md#in-the-desktop-app)).
 
 `hermes serve` is unchanged. The router only uses each node's public `/v1`
 surface and never loads, places or inspects a model. See
@@ -853,7 +860,7 @@ Two parts of the product are not crates:
 | Package | Responsibility |
 |---|---|
 | `frontend/` | The control panel: a React and TypeScript SPA, built by Vite and served by the gateway at `/` |
-| `apps/desktop/` | The desktop shell: an Electron window onto a gateway, and a supervisor for one |
+| `apps/desktop/` | The desktop shell: an Electron window onto a gateway, and a supervisor for one; on request, a second window and supervisor for a Router |
 
 And one is not code. `icon/source.png` is the application's artwork; every icon
 the product ships — the window, the tray, the packaged application, the browser

@@ -91,3 +91,62 @@ jobs:
           path: e2e/screens/
           if-no-files-found: error
           retention-days: 14
+
+  # The desktop app with a Router beside its Gateway: the real Electron app,
+  # headless, opening Router & Jev Settings in the Router's own window. One
+  # Linux job, not a matrix: what it proves is the seam between the shell, its
+  # two supervisors and the two origins, which is the same on every platform;
+  # the shell's own tests already run on all four in check.yml. Jev and the
+  # Router's nodes are scripted, so no key and no external service is needed.
+  desktop:
+    name: desktop with router
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: render-desktop
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+            e2e/package-lock.json
+
+      - run: npm ci --prefix frontend
+      - run: npm ci --prefix apps/desktop
+      - run: npm ci --prefix e2e
+
+      # As check.yml's AppImage launch: `ubuntu-latest` restricts unprivileged
+      # user namespaces, which Chromium's sandbox needs, and the app refuses to
+      # run without its sandbox rather than quietly losing it. Lifting the knob
+      # is the configuration the app is for. `|| true` because the knob does not
+      # exist on every image, and its absence is the permissive case. `xvfb`
+      # because the app opens real windows.
+      - name: Render the desktop app with a Router
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          xvfb-run --auto-servernum bash ./scripts/render-desktop.sh
+
+      # Always: a failed run's screenshots and the app's own (redacted) log are
+      # the fastest way to see what it is complaining about.
+      - name: Upload the desktop screens and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-screens
+          path: e2e/desktop-screens/
+          if-no-files-found: error
+          retention-days: 14

@@ -3578,3 +3578,25 @@ There are no draft releases.
 new version. The v0.8.1 maintenance backlog (rustls, the navigation and
 `openExternal` limits, a CSP, a weekly advisory scan, a review of the
 build-tool advisories) waits for approval.
+
+## Router & Jev Settings in the desktop app (2026-10-10, branch `feature/desktop-router-window`, PR #67)
+
+Design first: [DESKTOP_ROUTER.md](DESKTOP_ROUTER.md). The Router stays a separate process, port (11500), config and
+origin. Desktop gains `RouterSupervisor` (`apps/desktop/src/router.ts`) beside the unchanged `GatewaySupervisor`, and a
+second window onto the Router's own panel (no preload, pinned to the Router origin). A Router is discovered at launch
+but started only from **Router → Start Router**. It is identified by `/version` (`lightweight-router-`) and stopped with
+`SIGINT`, its clean stop that removes the admin token. Quit stops only owned children, Router first. New CLI:
+`hermes router config-path`. Desktop never writes `router.json`; the only write it offers is an explicit, no-clobber,
+owner-only `router.template.json`.
+
+Found and fixed on the way: `cargo test --workspace` never builds `hermes`, so the desktop's real-binary suites (the
+existing Gateway one included) had skipped on every CI platform while TAP read `skipped 0`. `check.sh` now builds it
+and sets `HERMES_REQUIRE_HERMES_BINARY`.
+
+Green on GitHub Actions at `b29eb93`: check 38059155372 (all four platforms, 77 desktop tests with both real-binary
+suites running, linux artifacts, flatpak, advisories, icons) and render 38059155384 (render panel, plus the new
+`desktop with router` job: the real Electron app under xvfb, start and attach modes, 97 checks, no key or admin token
+in any page, storage, response, URL, log or artifact).
+
+Deferred: Desktop does not author first-run routes, there is no persisted auto-start preference, and admin-token
+copying is not offered. The Electron end-to-end test runs only on CI, because this box restricts user namespaces.

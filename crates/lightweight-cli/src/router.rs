@@ -66,6 +66,14 @@ pub fn admin_token(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
+/// `hermes router config-path`: print the file `hermes router` would read,
+/// without reading it. Nothing is created and nothing need exist.
+pub fn print_config_path(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, String> {
+    out.push_str(&config_path(config)?.display().to_string());
+    out.push('\n');
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `hermes router validate-config`: check the file and the environment it
 /// names, without listening or contacting a node.
 pub fn validate(config: Option<PathBuf>, out: &mut String) -> Result<ExitCode, String> {
@@ -273,4 +281,26 @@ pub fn run(
         served
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_path_prints_an_explicit_config_unchanged() {
+        let mut out = String::new();
+        let explicit = PathBuf::from("some").join("where").join("router.json");
+        print_config_path(Some(explicit.clone()), &mut out).unwrap();
+        assert_eq!(out, format!("{}\n", explicit.display()));
+    }
+
+    #[test]
+    fn config_path_defaults_to_router_json_in_the_config_directory() {
+        let mut out = String::new();
+        print_config_path(None, &mut out).unwrap();
+        let printed = PathBuf::from(out.trim_end());
+        assert_eq!(printed, default_config_path().unwrap());
+        assert_eq!(printed.file_name().unwrap(), "router.json");
+    }
 }
