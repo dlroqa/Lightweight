@@ -149,7 +149,13 @@ jobs:
             and .head_branch == $t and .head_sha == $c and .conclusion == "success"
             and .repository.full_name == env.REPO' >/dev/null \
             || { echo "run $RUN is not a successful tag-push release run of $TAG at $COMMIT" >&2; exit 1; }
-          gh run download "$RUN" --repo "$REPO" --dir raw
+          # Only what the release is made of: the packages (`artifacts-*`)
+          # and the SHA256SUMS the draft job wrote. A release run also uploads
+          # the packaged-desktop gate's screenshots and logs (`desktop-smoke-*`,
+          # from v0.8.1); fetching every artifact would hand those to the
+          # inventory as unexpected files and fail a good release.
+          gh run download "$RUN" --repo "$REPO" --dir raw \
+            --pattern 'artifacts-*' --pattern 'release-checksums'
           mkdir files
           find raw -type f -exec mv -n -t files {} +
           ls -la files
