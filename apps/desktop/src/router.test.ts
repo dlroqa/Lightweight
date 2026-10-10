@@ -55,7 +55,7 @@ describe("the Router's command line", () => {
   it("is hermes router with its own config, a loopback listener and the panel", () => {
     const launch = planRouterLaunch({
       binary: "/opt/hermes",
-      configPath: "/home/u/.config/x/router.json",
+      configPath: "/cfg/lightweight/router.json",
       port: 11500,
       webRoot: "/app/resources/panel",
     });
@@ -63,7 +63,7 @@ describe("the Router's command line", () => {
     assert.deepEqual(launch.args, [
       "router",
       "--config",
-      "/home/u/.config/x/router.json",
+      "/cfg/lightweight/router.json",
       "--listen",
       "127.0.0.1:11500",
       "--web-root",
