@@ -4,36 +4,101 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-**Router & Jev Settings in the desktop app.** The desktop app can now open a
-Router's panel (Auto Routing, and Classifier with Jev Settings) and start a
-Router when asked. The Router stays a separate service from the Gateway.
+## [0.8.1] - 2026-10-10
 
-- **Where.** **Router → Router & Jev Settings…** in the menu bar, or the same
-  entry in the tray menu. The Router's panel opens in its own window, from the
-  Router's own address (port 11500, or `HERMES_ROUTER_PORT`). The Gateway's
+This patch release brings the router's **Jev Settings into the desktop
+app**. **Router → Router & Jev Settings…** opens the Router's own panel in a
+window of its own. The app can start a Router when you ask, or attach to one
+already running. The Gateway and the Router stay two separate services. The
+Router, its routing and the Jev classifier are unchanged from 0.8.0.
+
+**Desktop Router and Jev Settings.**
+- **Where.** **Router → Router & Jev Settings…** in the menu bar, or the
+  same entry in the tray menu. The Router's panel (Auto Routing, and
+  Classifier with the Jev Settings card) opens in its own window, from the
+  Router's own address: port 11500, or `HERMES_ROUTER_PORT`. The Gateway's
   window, port and screens are unchanged.
-- **Opt-in.** Nothing starts a Router when the app opens. The app attaches
-  to one that is already serving. Otherwise **Start Router** runs `hermes
-  router` on loopback with its own configuration. **Restart Router**
-  applies saved Jev Settings. Quitting stops only what the app started.
-- **Configuration.** The app reads the Router's own `router.json`, located
-  with the new `hermes router config-path`, or `HERMES_ROUTER_CONFIG`. It
-  never writes that file and never copies anything from the Gateway. A
-  missing, unreadable, malformed or invalid file is reported as such. For a
-  missing one, an explicit **Create template** writes an owner-only
-  `router.template.json` with no keys.
-- **Routes stay yours to write.** The app does not create Router routes from
-  the Gateway's models, and does not write `router.json` for a first run.
-  First-run route configuration remains manual, and deliberately so: creating
-  routes automatically could silently invent routing policy or overwrite a
-  configuration the user owns. The template is a starting point to edit.
-- **Security unchanged.** Jev keys stay in the OS credential store or
-  `TYPESAFE_API_KEY`. Saving still needs the admin token, a loopback-only
-  Router, a matching origin and `If-Match`. The Router window has no bridge to
-  the app, and the app never reads the admin token.
-- **Tested.** A new `desktop with router` job in the *render panel* workflow
-  runs the real app under `xvfb` on every pull request, in a start mode and an
-  attach mode, with scripted Jev and nodes.
+- **Owned or attached.** The app never starts a Router when it opens; it
+  only looks for one.
+  - If a Router is already serving on the port, the app *attaches* to it. It
+    never stops or restarts that Router, and quitting leaves it running.
+  - Otherwise **Start Router** runs `hermes router` on loopback with the
+    Router's own configuration. That Router belongs to the app.
+    **Restart Router** applies saved Jev Settings, **Stop Router** stops it,
+    and quitting stops it cleanly before the Gateway.
+  - The Router menu shows which case you are in: running, attached, not
+    started, needs configuration, or port in use.
+- **Configuration and routes.** The app reads the Router's own
+  `router.json`, located with the new `hermes router config-path`, or
+  `HERMES_ROUTER_CONFIG`. It never writes that file, and it never copies
+  anything from the Gateway's configuration or keys.
+  - **The app does not create routes from the Gateway's models.** First-run
+    route configuration remains manual, on purpose: generating routes could
+    silently invent routing policy or overwrite a configuration you own.
+  - A missing, unreadable, malformed or invalid file is reported as such,
+    using the Router's own `validate-config` messages.
+  - For a missing file, an explicit **Create template** writes an owner-only
+    `router.template.json` with no keys. It never overwrites anything and is
+    never loaded; edit it and save it as `router.json`.
+- **The admin token.** Jev Settings still asks for the Router's per-start
+  admin token. **Router → Router admin token…** shows the command that
+  prints it. The app itself never reads the token.
+
+**Security and isolation.**
+- Saving Jev Settings still needs the admin token, a loopback-only Router, a
+  matching origin and `If-Match`. The Jev key still lives only in the
+  operating system's credential store, or in `TYPESAFE_API_KEY`.
+- The Router window has the same sandbox, context isolation and no-Node
+  settings as the main window, has no bridge to the app, and cannot be
+  navigated off the Router's own origin.
+- The Gateway window and the Router window each call only their own server.
+  There is no proxy, no CORS change and no shared API.
+
+**Verified.**
+- Every package this release ships passes a new release gate on GitHub
+  Actions before the draft exists. The universal DMG runs on both Apple
+  Silicon and Intel, the Windows installer is installed, the AppImage is
+  extracted, and the Flatpak is installed. In each, the gate:
+  - checks the app's version;
+  - opens Router & Jev Settings in the packaged app;
+  - makes an authorized settings save with the admin token;
+  - runs Test Connection;
+  - checks that quitting stops only what the app started.
+- Jev and the Router's nodes are scripted test services in these checks.
+  They show that the desktop app talks to the Router correctly, not that a
+  given Jev account works. The Router and the classifier are unchanged from
+  0.8.0, whose live Jev result still stands.
+
+**Compatibility and upgrading.** Nothing to change. The Router is opt-in in
+the app. An existing `router.json` is read as it is, and a Router you start
+yourself is attached, never replaced.
+
+**Known limits:**
+- The app does not author routes. Write `router.json` yourself, starting
+  from the template if you like.
+- There is no setting to start the Router automatically when the app opens.
+- On Windows, stopping a Router the app started ends the process abruptly,
+  because Windows has no Ctrl-C for a child process. A new admin token
+  replaces the old one at the next start.
+
+### Added
+
+- Desktop: a **Router** menu with *Router & Jev Settings…*, *Start Router*,
+  *Restart Router*, *Stop Router* and *Router admin token…*, and the Router's
+  status. The same entries are in the tray menu.
+- `hermes router config-path`, which prints the configuration file `hermes
+  router` would read, without reading it.
+- `docs/DESKTOP_ROUTER.md`, the design of the desktop's Router integration.
+
+### Fixed
+
+- The desktop's real-binary test suites, including the existing Gateway one,
+  had silently skipped on every CI platform, because nothing built the
+  `hermes` binary they drive. `scripts/check.sh` now builds it, and the
+  suites fail instead of skipping if it is missing.
+- The release workflow drafted a release from *every* artifact of its run. It
+  now takes only the packages, so a test artifact can never become a release
+  asset.
 
 ## [0.8.0] - 2026-10-09
 
@@ -866,7 +931,8 @@ on the old `8737`.
   `hermes bench --fit` safely refuses every honest fit, so the shipped estimates
   remain conservative by 1.37×–2.85×.
 
-[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/dlroqa/Lightweight/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/dlroqa/Lightweight/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dlroqa/Lightweight/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dlroqa/Lightweight/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dlroqa/Lightweight/compare/v0.5.0...v0.6.0
