@@ -3464,3 +3464,117 @@ one more live Jev run on the merged commit, which waits for the operator's
 approval. The tag, the release workflow and publishing wait for the
 operator's approval of the readiness report. v0.7.0 is untouched, and R9.4
 is not started.
+
+## Release v0.8.0 (published 2026-10-10)
+
+**Release commit.** Merge **`a1a4833`** (`a1a4833b3f13406ca0d09c59cc377d4c8afcf009`,
+PR #65; tree identical to its reviewed head `c108599`). Since the
+preparation entry above, four more PRs went into the release:
+
+- **#62** (`d194297`) moves the Flatpak to Freedesktop 25.08 (issue #61).
+- **#63** (`43692e3`) records that move in `[0.8.0]`.
+- **#64** (`325933a`) adds the read-only release verifier,
+  `verify-release.yml` with `scripts/verify-release.sh`.
+- **#65** (`a1a4833`) updates Electron 43.4.1 → **43.5.1** for
+  GHSA-qmv3-fv6v-rmhq (CVE-2026-102677, high), and adds two checks:
+  - the shipped-dependency advisory gate (`scripts/check-advisories.py`,
+    the `dependency advisories` job, `scripts/advisory-exceptions.json`
+    kept empty);
+  - a byte-level Electron version check on every package
+    (`scripts/electron-version.sh`).
+
+**Gates on `a1a4833`.**
+
+- Check
+  [38001191490](https://github.com/dlroqa/Lightweight/actions/runs/38001191490):
+  8/8 jobs. On all four platforms:
+  - Rust: every test block ok (53 model-alias tests).
+  - Contract `47 passed, 2 skipped`.
+  - Frontend `# pass 111`, desktop `# pass 26`.
+  - Versions agree, dependency policy satisfied, secrets ok.
+  - Installed Electron `43.5.1` equals the locked version.
+- The AppImage carries Electron 43.5.1. The Flatpak passes 21/21 on 25.08,
+  with no end-of-life notice.
+- The advisory gate reports no high or critical advisory in anything
+  shipped, and its self-test still rejects Electron 43.4.1.
+- Render
+  [38001191502](https://github.com/dlroqa/Lightweight/actions/runs/38001191502):
+  233 `[ok]`, 0 failed.
+- Live Jev
+  [38001375921](https://github.com/dlroqa/Lightweight/actions/runs/38001375921)
+  (environment approval by the operator): 36 `[ok]`, 0 failed, and 4/4
+  requests classified by Jev. The key appears only masked.
+
+**Candidates retired before publication.** Neither was ever published, and
+both audit records are kept outside the repository
+(`~/release-audit/v0.8.0-retired-*`).
+
+1. **Tag object `b403aba` on `93dd696`** (release run 37925314580,
+   draft 407864468). It shipped the Flatpak on runtime 24.08, which is
+   end-of-life.
+2. **Tag object `47830f2` on `325933a`** (release run 37996073622,
+   verifier 37996803465, draft 408381067). It shipped Electron 43.4.1.
+
+**Release.** Annotated tag `v0.8.0` (object `91950e6`, `Release v0.8.0`) on
+`a1a4833`, pushed once. Release run
+[38010418685](https://github.com/dlroqa/Lightweight/actions/runs/38010418685)
+passed all six jobs: the Flatpak, linux-x64, macos-universal, windows-x64,
+the Intel half of the DMG, and the draft.
+
+- **Smoke checks, all reporting `hermes 0.8.0`:**
+  - The NSIS installer installs, and the installed app carries Electron
+    43.5.1.
+  - The DMG mounts. `hermes` has arm64 and x86_64 slices and runs on
+    arm64 and on Intel. The framework carries Electron 43.5.1, and
+    electron-builder packaged both slices from `electron=43.5.1`.
+  - The AppImage passes 13/13, including Electron 43.5.1.
+  - The Flatpak passes 21/21 on Platform, SDK and BaseApp 25.08, with
+    Electron 43.5.1.
+- **Provenance:** 7 subjects
+  ([54516319](https://github.com/dlroqa/Lightweight/attestations/54516319),
+  Rekor 3175314923).
+- **Verifier:** before publication,
+  [38011520531](https://github.com/dlroqa/Lightweight/actions/runs/38011520531)
+  (`workflow_run`, from the run's artifacts); after publication,
+  [38012338128](https://github.com/dlroqa/Lightweight/actions/runs/38012338128)
+  (from the published release, GitHub digests included). Both report
+  `8 files, 7 checksums, 7 attestations`, bound to `release.yml @
+  refs/tags/v0.8.0, a1a4833`.
+- No `workflow_dispatch` release dry run was used.
+
+**Published state.** <https://github.com/dlroqa/Lightweight/releases/tag/v0.8.0>
+(release 408474172), Latest, not a prerelease, published with
+`gh release edit --draft=false --latest`. The asset digests and notes are
+unchanged from the inspected draft.
+
+| Asset | SHA-256 |
+|---|---|
+| `Lightweight-0.8.0-mac-universal.dmg` | `c2e3bba8284772faf752e5b569c9611f6c894e47183a665528d693863899c275` |
+| `Lightweight-Setup-0.8.0-x64.exe` | `61d3d585260bc6d48e57bd6ff3651757c0b153498896551b88f724d09b2ca557` |
+| `Lightweight-0.8.0-linux-x86_64.AppImage` | `535c074465818737f84e89936c512cbed65de7e7fffbebf360ed6a63ccff6b43` |
+| `Lightweight-0.8.0-linux-x86_64.flatpak` | `a57914d9b631b0082439d5725ae3941b61a8c7cc23fcf375ff047d224ce261e8` |
+| `hermes-0.8.0-aarch64-apple-darwin.tar.gz` | `a56f78c4a3625d41e2040d44249959a0270d577bc242ee5a3009b55fc52c950a` |
+| `hermes-0.8.0-x86_64-pc-windows-msvc.zip` | `ad2e41fd81773c99054509615929b9150a288291f44aa1f8b4286c81464a1268` |
+| `hermes-0.8.0-x86_64-unknown-linux-gnu.tar.gz` | `4b90b090a01cdd4892a9f30ae8a6da0b2bb27f514862eae542076f97a85535d5` |
+| `SHA256SUMS` | `52903d389b00b0c176e1240e5a6cfd0c7449d82dda925efe821701b1f6558c53` |
+
+v0.7.0 is unchanged: release 407095348, tag `3ad1dab` → `e2eb732`, and the
+same 8 asset digests and publish time. Issue #61 is closed as completed.
+There are no draft releases.
+
+**Known at release, not blocking.**
+
+- **rustls:** 0.23.43 is in `hermes`, with RUSTSEC-2026-0285 /
+  GHSA-2mjx-qc3c-rqvc (moderate; client-only use, and the handshake
+  transcript stays authenticated). It is fixed in 0.23.45, a one-line
+  `Cargo.lock` change.
+- **Desktop hardening gap:** the window has no navigation guard,
+  `openExternal` accepts any scheme, and there is no CSP. Each only matters
+  after the panel has been compromised.
+- **Build- and test-tool advisories** (electron-builder, Vite, Playwright)
+  are reported by the gate and are not shipped.
+
+**Next:** nothing started. v0.8.0 is immutable; any later fix ships as a
+new version. The v0.8.1 maintenance backlog (rustls, the navigation and
+`openExternal` limits, a CSP, a weekly advisory scan, a review of the
+build-tool advisories) waits for approval.
