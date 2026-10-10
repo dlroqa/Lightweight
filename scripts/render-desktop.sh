@@ -69,12 +69,45 @@ NODES_PID=""
 GATEWAY_PID=""
 ROUTER_PID=""
 
+# Stop one background process and wait for it - boundedly. SIGINT first: on
+# Linux and macOS that is the Router's clean stop, which removes its admin
+# token. On Windows these are native programs (hermes.exe, node.exe) that Git
+# Bash cannot deliver SIGINT to, so they are ended by Windows PID, with their
+# tree. A bare `wait` on one that ignored SIGINT blocked forever: the v0.8.1
+# release run's Windows job passed every check in 45 s, then hung here until
+# its 90-minute timeout - and a survivor also holds the step's output open,
+# which keeps a Windows step from ending even after bash exits.
+stop() { # pid, name
+  local pid="$1" name="$2" winpid=""
+  [ -n "$pid" ] || return 0
+  kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+  if [ -r "/proc/$pid/winpid" ]; then
+    winpid="$(cat "/proc/$pid/winpid")"
+    taskkill //F //T //PID "$winpid" >/dev/null 2>&1 || true
+  else
+    kill -INT "$pid" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "  FAIL  $name (pid $pid${winpid:+, Windows pid $winpid}) did not stop; killing it" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+    STOP_FAILED=1
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+STOP_FAILED=0
 cleanup() {
   local status=$?
-  for pid in "$ROUTER_PID" "$GATEWAY_PID" "$NODES_PID" "$JEV_PID"; do
-    [ -n "$pid" ] && kill -INT "$pid" 2>/dev/null || true
-  done
-  wait 2>/dev/null || true
+  stop "$ROUTER_PID" "the external Router"
+  stop "$GATEWAY_PID" "the external Gateway"
+  stop "$NODES_PID" "the scripted nodes"
+  stop "$JEV_PID" "scripted Jev"
+  # A process that had to be killed is a failure of this run, not a detail.
+  if [ "$status" -eq 0 ] && [ "$STOP_FAILED" -ne 0 ]; then status=1; fi
   if [ "$status" -ne 0 ]; then
     # Redacted: the key is a per-run throwaway, but a log is never the place for it.
     for log in "$WORK"/*.log; do

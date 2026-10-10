@@ -156,6 +156,10 @@ jobs:
       # key), and quitting stopping only what the app started. On macOS this
       # is the arm64 half of the universal DMG; the Intel half is run below.
       - name: The packaged desktop app with a Router
+        # The gate itself takes about a minute on every platform (45 s on
+        # Windows in run 38069204617). A hang must fail this step, named, long
+        # before the job's own limit - that run hung 81 minutes in cleanup.
+        timeout-minutes: 20
         run: |
           case "$RUNNER_OS" in
             Linux)   xvfb-run --auto-servernum bash ./scripts/smoke-packaged-desktop.sh appimage "$(ls apps/desktop/release/*.AppImage)" ;;
@@ -252,6 +256,7 @@ jobs:
       # The installed Flatpak as a user starts it (`flatpak run`), with a
       # Router: the same gate as the other packages.
       - name: The packaged desktop app with a Router
+        timeout-minutes: 20
         run: xvfb-run --auto-servernum bash ./scripts/smoke-packaged-desktop.sh flatpak "$(ls apps/desktop/release/*.flatpak)"
 
       - name: Upload the packaged-desktop screens and logs
@@ -325,6 +330,7 @@ jobs:
       # The whole packaged app on Intel, not only its bundled binary: the
       # x86-64 half of the universal DMG through the same gate.
       - name: The packaged desktop app with a Router, on Intel
+        timeout-minutes: 20
         run: bash ./scripts/smoke-packaged-desktop.sh dmg "$(find incoming -name '*.dmg' -print -quit)"
 
       - name: Upload the packaged-desktop screens and logs
